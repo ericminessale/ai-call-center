@@ -1,0 +1,102 @@
+# SignalWire Phone Number Configurations
+# Configure these SWML scripts in your SignalWire dashboard for each phone number
+
+# ====================================
+# MAIN COMPANY NUMBER
+# Routes to basic receptionist for triage
+# ====================================
+main_company_number:
+  version: 1.0.0
+  sections:
+    main:
+      - answer: {}
+      - ai:
+          url: "https://your-domain.com:8080/receptionist"
+          params:
+            swaig_allow_swml: true
+            post_prompt: "Remember to be brief and route quickly to the appropriate department."
+
+# ====================================
+# DIRECT SALES LINE
+# Goes straight to sales department receptionist
+# ====================================
+sales_direct_number:
+  version: 1.0.0
+  sections:
+    main:
+      - answer: {}
+      - ai:
+          url: "https://your-domain.com:8080/sales"
+          params:
+            swaig_allow_swml: true
+            initial_message: "Thank you for calling our sales department."
+            global_data:
+              entry_point: "direct_sales_line"
+
+# ====================================
+# DIRECT SUPPORT LINE
+# Goes straight to support department receptionist
+# ====================================
+support_direct_number:
+  version: 1.0.0
+  sections:
+    main:
+      - answer: {}
+      - ai:
+          url: "https://your-domain.com:8080/support"
+          params:
+            swaig_allow_swml: true
+            initial_message: "Thank you for calling technical support."
+            global_data:
+              entry_point: "direct_support_line"
+
+# ====================================
+# VIP/PRIORITY LINE
+# Routes with higher priority
+# ====================================
+vip_number:
+  version: 1.0.0
+  sections:
+    main:
+      - answer: {}
+      - ai:
+          url: "https://your-domain.com:8080/receptionist"
+          params:
+            swaig_allow_swml: true
+            initial_message: "Thank you for calling our priority line."
+            global_data:
+              customer_tier: "vip"
+              default_priority: 8
+
+# ====================================
+# FUTURE: HOLD INTERCEPTOR
+# When implementing AI-assisted hold
+# ====================================
+hold_with_ai:
+  version: 1.0.0
+  sections:
+    main:
+      # Play initial queue message
+      - play:
+          url: "say:All agents are currently busy. You are in queue."
+
+      # Offer AI assistance while waiting
+      - prompt:
+          text: "While you wait, would you like to speak with our AI assistant who can help answer questions?"
+          speech_timeout: 3
+
+      # If yes, transfer to hold AI
+      - switch:
+          variable: prompt_value
+          case:
+            "yes":
+              - ai:
+                  url: "https://your-domain.com:8080/hold-ai"
+                  params:
+                    swaig_allow_swml: true
+                    interruptible: true  # Can be interrupted when agent available
+            default:
+              # Just play hold music
+              - play:
+                  url: "https://cdn.signalwire.com/swml/hold_music.mp3"
+                  loop: true

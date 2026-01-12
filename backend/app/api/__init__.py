@@ -9,3 +9,6 @@ admin_bp = Blueprint('admin', __name__)
 
 # Import routes after blueprint creation to avoid circular imports
 from app.api import auth, calls, swml, webhooks, admin
+
+# Import blueprints defined in their own modules
+from app.api.contacts import contacts_bp

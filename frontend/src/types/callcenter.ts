@@ -1,5 +1,86 @@
 export type AgentStatus = 'available' | 'busy' | 'after-call' | 'break' | 'offline';
 
+// Contact types
+export type AccountTier = 'prospect' | 'free' | 'pro' | 'enterprise';
+export type AccountStatus = 'active' | 'churned' | 'prospect';
+
+export interface Contact {
+  id: number;
+  firstName?: string;
+  lastName?: string;
+  displayName: string;
+  phone: string;
+  email?: string;
+  avatarUrl?: string;
+  company?: string;
+  jobTitle?: string;
+  accountTier: AccountTier;
+  accountStatus: AccountStatus;
+  externalId?: string;
+  isVip: boolean;
+  isBlocked: boolean;
+  tags: string[];
+  notes?: string;
+  customFields: Record<string, any>;
+  totalCalls: number;
+  lastInteractionAt?: string;
+  averageSentiment?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ContactMinimal {
+  id: number;
+  displayName: string;
+  phone: string;
+  company?: string;
+  accountTier: AccountTier;
+  isVip: boolean;
+  totalCalls: number;
+  lastInteractionAt?: string;
+  activeCall?: Interaction;
+}
+
+export interface Interaction {
+  id: number;
+  contactId?: number;
+  userId: number;
+  signalwireCallSid: string;
+  fromNumber?: string;
+  destination: string;
+  destinationType: string;
+  direction: 'inbound' | 'outbound';
+  handlerType: 'human' | 'ai';
+  aiAgentName?: string;
+  status: string;
+  transcriptionActive: boolean;
+  recordingUrl?: string;
+  summary?: string;
+  duration?: number;
+  sentimentScore?: number;
+  aiContext: Record<string, any>;
+  createdAt: string;
+  answeredAt?: string;
+  endedAt?: string;
+  contact?: ContactMinimal;
+}
+
+export interface ContactsListResponse {
+  contacts: ContactMinimal[];
+  total: number;
+  page: number;
+  pages: number;
+  hasNext: boolean;
+  hasPrev: boolean;
+}
+
+export interface InteractionsListResponse {
+  interactions: Interaction[];
+  total: number;
+  page: number;
+  pages: number;
+}
+
 export type QueueSeverity = 'normal' | 'warning' | 'critical';
 export type QueueTrend = 'increasing' | 'decreasing' | 'stable';
 export type CallPriority = 'low' | 'medium' | 'high' | 'urgent';
@@ -43,22 +124,39 @@ export interface QueuedCall {
 }
 
 export interface Call {
-  id: string;
+  id: number | string;
   customerName?: string;
-  phoneNumber: string;
+  phoneNumber?: string;
+  from_number?: string;  // Alias for phoneNumber (backend uses snake_case)
   startTime?: string | Date;  // ISO string or Date object
+  created_at?: string;  // Backend timestamp
   duration?: number;
   status: 'waiting' | 'connecting' | 'active' | 'ai_active' | 'on_hold' | 'ended' | 'completed';
   isOnHold?: boolean;
   queueId?: string;
+  queue_id?: string;  // Backend snake_case
   priority?: CallPriority;
+  is_urgent?: boolean;  // For priority calls
   transcription?: TranscriptionMessage[];
   recordingUrl?: string;
   transferHistory?: Transfer[];
   assignedTo?: string;  // Agent ID
   sentiment?: number;  // -1 to 1
   aiSummary?: string;
+  ai_summary?: string;  // Backend snake_case
   transferCount?: number;
+
+  // Handler information
+  handler_type?: 'human' | 'ai';
+  ai_agent_name?: string;
+
+  // Contact linkage
+  contact_id?: number;
+  contact?: ContactMinimal;
+
+  // SignalWire identifiers
+  signalwire_call_sid?: string;
+  call_sid?: string;
 }
 
 export interface TranscriptionMessage {

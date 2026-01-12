@@ -121,18 +121,31 @@ def call_status():
             socketio.emit('call_status', call_data, room=call_id)
 
             # Also emit to user room for CallsList updates
-            socketio.emit('call_status', call_data, room=str(call.user_id))
+            if call.user_id:
+                socketio.emit('call_status', call_data, room=str(call.user_id))
 
             # Emit call_update for Agent Dashboard
-            socketio.emit('call_update', {'call': call_data}, room=str(call.user_id))
+            # For AI-active calls, broadcast to ALL agents so they can see and take over
+            # For human-handled calls, emit to the specific user's room
+            if dashboard_status == 'ai_active' or not call.user_id:
+                logger.info(f"Broadcasting call_update to all agents (status: {dashboard_status}, user_id: {call.user_id})")
+                socketio.emit('call_update', {'call': call_data})  # Broadcast to all
+            else:
+                socketio.emit('call_update', {'call': call_data}, room=str(call.user_id))
 
             # Special handling for ended status to reset UI
             if mapped_status == 'ended':
-                socketio.emit('call_ended', {
+                call_ended_data = {
                     'callId': call.id,  # Use database ID
                     'call_sid': call_id,  # Also provide SignalWire ID
                     'reset_ui': True
-                }, room=str(call.user_id))
+                }
+                # Emit to user room
+                socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
+                # Also emit to all (for AI calls visible to all agents)
+                socketio.emit('call_ended', call_ended_data)
+                # And emit call_update with ended status to all
+                socketio.emit('call_update', {'call': call_data})
 
         return '', 200
 
@@ -239,6 +252,7 @@ def transcription():
                     'is_final': is_final,
                     'sequence': sequence,
                     'role': role,
+                    'speaker': speaker,  # 'caller' or 'agent' (mapped from role)
                     'timestamp': timestamp
                 }
 

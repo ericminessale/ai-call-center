@@ -353,6 +353,127 @@ def get_message_templates():
     })
 
 
+@ai_control_bp.route('/outbound-call', methods=['POST'])
+@jwt_required()
+def initiate_outbound_ai_call():
+    """
+    Initiate an outbound call handled by an AI agent.
+
+    Request body:
+    {
+        "phone": "+1234567890",
+        "contact_id": 123,
+        "agent_type": "sales",  // sales, support, or custom agent name
+        "context": {
+            "contact_name": "John Doe",
+            "account_tier": "enterprise",
+            ...
+        }
+    }
+    """
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json()
+
+        phone = data.get('phone')
+        contact_id = data.get('contact_id')
+        agent_type = data.get('agent_type', 'sales')
+        context = data.get('context', {})
+
+        if not phone:
+            return jsonify({'error': 'phone is required'}), 400
+
+        logger.info(f"User {user_id} initiating outbound AI call to {phone} with agent {agent_type}")
+
+        # Determine which AI agent to use based on type
+        # This should match your AI agent routes
+        agent_routes = {
+            'sales': '/public/ai-sales',
+            'support': '/public/ai-support',
+            'receptionist': '/public/receptionist',
+        }
+
+        agent_address = agent_routes.get(agent_type, f'/public/ai-{agent_type}')
+
+        # Get our phone number for outbound calls
+        from_number = os.getenv('SIGNALWIRE_PHONE_NUMBER')
+
+        if not from_number:
+            return jsonify({'error': 'No outbound phone number configured'}), 500
+
+        # Create the outbound call via SignalWire API
+        url = f"https://{SIGNALWIRE_SPACE}/api/calling/calls"
+
+        # Build global_data to pass customer context to the AI agent
+        global_data = {
+            'contact_id': contact_id,
+            'initiated_by': user_id,
+            'call_type': 'outbound_ai',
+            **context  # Include contact name, tier, etc.
+        }
+
+        payload = {
+            'from': from_number,
+            'to': phone,
+            'ai': {
+                'url': f"{os.getenv('AI_AGENTS_URL', 'http://ai-agents:8080')}{agent_address}",
+                'post_prompt_url': f"{os.getenv('BACKEND_URL', 'http://backend:5000')}/api/webhooks/ai-summary",
+            },
+            'global_data': global_data
+        }
+
+        response = requests.post(
+            url,
+            json=payload,
+            headers=get_signalwire_auth_headers()
+        )
+
+        if response.status_code not in [200, 201]:
+            logger.error(f"Failed to initiate outbound AI call: {response.text}")
+            return jsonify({
+                'error': 'Failed to initiate call',
+                'details': response.text
+            }), 500
+
+        call_data = response.json()
+        call_sid = call_data.get('id') or call_data.get('call_id')
+
+        # Store the call in our database
+        from app import db
+        from app.models import Call
+
+        call = Call(
+            signalwire_call_sid=call_sid,
+            user_id=user_id,
+            from_number=from_number,
+            destination=phone,
+            destination_type='phone',
+            status='ai_active',
+            direction='outbound',
+            handler_type='ai',
+            ai_agent_name=agent_type,
+            contact_id=contact_id,
+            ai_context=context
+        )
+        db.session.add(call)
+        db.session.commit()
+
+        logger.info(f"Outbound AI call initiated: {call_sid}")
+
+        return jsonify({
+            'success': True,
+            'call_sid': call_sid,
+            'call_id': call.id,
+            'agent_type': agent_type,
+            'destination': phone,
+            'status': 'ai_active'
+        })
+
+    except Exception as e:
+        logger.error(f"Error initiating outbound AI call: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @ai_control_bp.route('/pause/<call_id>', methods=['POST'])
 @jwt_required()
 def pause_ai_agent(call_id):

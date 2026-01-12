@@ -1,6 +1,7 @@
 import axios from 'axios';
 import io, { Socket } from 'socket.io-client';
 import { AuthResponse, Call, CallsListResponse, Transcription } from '../types';
+import { Contact, ContactMinimal, ContactsListResponse, Interaction, InteractionsListResponse } from '../types/callcenter';
 
 // CRITICAL: Set axios defaults to prevent it from using window.location.origin
 // DO NOT set a default baseURL - let axios handle relative URLs naturally
@@ -91,15 +92,24 @@ export const callsApi = {
       { destination, destination_type, auto_transcribe }
     ),
 
-  list: (page: number = 1, per_page: number = 10, search?: string) => {
-    const params = new URLSearchParams({
-      page: page.toString(),
-      per_page: per_page.toString(),
-    });
-    if (search?.trim()) {
-      params.append('search', search.trim());
+  list: (params?: {
+    page?: number;
+    per_page?: number;
+    search?: string;
+    status?: string;  // Can be comma-separated for multiple statuses
+    agent_id?: string;
+  }) => {
+    const urlParams = new URLSearchParams();
+    if (params?.page) urlParams.append('page', params.page.toString());
+    if (params?.per_page) urlParams.append('per_page', params.per_page.toString());
+    if (params?.search?.trim()) urlParams.append('search', params.search.trim());
+    // Backend expects multiple status params (e.g., ?status=active&status=ai_active)
+    if (params?.status) {
+      const statuses = params.status.split(',');
+      statuses.forEach(s => urlParams.append('status', s.trim()));
     }
-    return api.get<CallsListResponse>(`/api/calls?${params}`);
+    if (params?.agent_id) urlParams.append('agent_id', params.agent_id);
+    return api.get<{ calls: Call[]; total: number; page: number; pages: number }>(`/api/calls?${urlParams}`);
   },
 
   get: (call_sid: string) =>
@@ -107,6 +117,9 @@ export const callsApi = {
 
   end: (call_sid: string) =>
     api.post<{ success: boolean; call_sid: string; message: string }>(`/api/calls/${call_sid}/end`),
+
+  take: (call_id: number | string) =>
+    api.post<{ success: boolean; call_id: number; message: string }>(`/api/calls/${call_id}/take`),
 
   updateTranscription: (call_sid: string, action: 'start' | 'stop' | 'summarize') =>
     api.put<{ success: boolean; call_sid: string; action: string; message: string }>(
@@ -128,45 +141,78 @@ export const transcriptionApi = {
     ),
 };
 
-// WebSocket service
+export const contactsApi = {
+  list: (params?: {
+    search?: string;
+    page?: number;
+    per_page?: number;
+    sort_by?: 'last_interaction' | 'name' | 'created';
+    include_blocked?: boolean;
+  }) => {
+    const queryParams = new URLSearchParams();
+    if (params?.search) queryParams.append('search', params.search);
+    if (params?.page) queryParams.append('page', params.page.toString());
+    if (params?.per_page) queryParams.append('per_page', params.per_page.toString());
+    if (params?.sort_by) queryParams.append('sort_by', params.sort_by);
+    if (params?.include_blocked) queryParams.append('include_blocked', 'true');
+    return api.get<ContactsListResponse>(`/api/contacts?${queryParams}`);
+  },
+
+  get: (contactId: number) =>
+    api.get<Contact>(`/api/contacts/${contactId}`),
+
+  create: (data: Partial<Contact>) =>
+    api.post<Contact>('/api/contacts', data),
+
+  update: (contactId: number, data: Partial<Contact>) =>
+    api.put<Contact>(`/api/contacts/${contactId}`, data),
+
+  delete: (contactId: number) =>
+    api.delete(`/api/contacts/${contactId}`),
+
+  lookup: (phone: string) =>
+    api.get<Contact | { contact: null; found: false }>(`/api/contacts/lookup?phone=${encodeURIComponent(phone)}`),
+
+  lookupOrCreate: (data: { phone: string; firstName?: string; lastName?: string; displayName?: string; company?: string }) =>
+    api.post<{ contact: Contact; created: boolean }>('/api/contacts/lookup-or-create', data),
+
+  getInteractions: (contactId: number, page?: number, per_page?: number) => {
+    const params = new URLSearchParams();
+    if (page) params.append('page', page.toString());
+    if (per_page) params.append('per_page', per_page.toString());
+    return api.get<InteractionsListResponse>(`/api/contacts/${contactId}/interactions?${params}`);
+  },
+
+  getRecent: (limit?: number) =>
+    api.get<{ contacts: ContactMinimal[] }>(`/api/contacts/recent${limit ? `?limit=${limit}` : ''}`),
+
+  getActive: () =>
+    api.get<{ contacts: ContactMinimal[] }>('/api/contacts/active'),
+};
+
+// WebSocket service - now uses a shared socket from SocketContext
+// This is a legacy compatibility layer. Prefer using useSocketContext() in components.
 class SocketService {
   private socket: Socket | null = null;
 
-  connect() {
-    if (!this.socket) {
-      // Use relative URL for WebSocket connection
-      this.socket = io('/', {
-        path: '/socket.io/',
-        transports: ['websocket', 'polling'],
-      });
+  // Set the shared socket from SocketContext
+  setSocket(socket: Socket | null) {
+    this.socket = socket;
+  }
 
-      this.socket.on('connect', () => {
-        console.log('WebSocket connected');
-
-        // Send authentication token
-        const token = localStorage.getItem('access_token');
-        if (token) {
-          this.socket?.emit('authenticate', { token });
-        }
-      });
-
-      this.socket.on('disconnect', () => {
-        console.log('WebSocket disconnected');
-      });
-    }
+  // Legacy method - no longer creates its own socket
+  connect(): Socket | null {
+    console.warn('[socketService] connect() called - socket should be managed by SocketContext');
     return this.socket;
   }
 
   disconnect() {
-    if (this.socket) {
-      this.socket.disconnect();
-      this.socket = null;
-    }
+    console.warn('[socketService] disconnect() called - socket should be managed by SocketContext');
   }
 
-  getSocket(): Socket {
+  getSocket(): Socket | null {
     if (!this.socket) {
-      return this.connect();
+      console.warn('[socketService] getSocket() called but no socket available. Use useSocketContext() instead.');
     }
     return this.socket;
   }

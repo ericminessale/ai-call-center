@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { callsApi, socketService } from '../services/api';
+import { callsApi } from '../services/api';
+import { useSocketContext } from '../contexts/SocketContext';
 import { Call } from '../types';
 import { Phone, Clock, Calendar, Search, ChevronRight, Loader2, FileText, Mic } from 'lucide-react';
 import { format, formatDistanceToNow } from 'date-fns';
 
 export default function RecentCalls() {
   const navigate = useNavigate();
+  const { socket } = useSocketContext();
   const [calls, setCalls] = useState<Call[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
@@ -33,7 +35,7 @@ export default function RecentCalls() {
 
   // Listen for summary events to refresh the call list
   useEffect(() => {
-    const socket = socketService.getSocket();
+    if (!socket) return;
 
     const handleSummary = (data: any) => {
       // Update the call with the new summary
@@ -51,7 +53,7 @@ export default function RecentCalls() {
     return () => {
       socket.off('summary', handleSummary);
     };
-  }, []);
+  }, [socket]);
 
   const loadCalls = async () => {
     setIsLoading(true);

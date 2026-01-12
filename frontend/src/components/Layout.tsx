@@ -2,6 +2,7 @@ import { ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
 import { Phone, LogOut, User } from 'lucide-react';
+import AgentStatus from './AgentStatus';
 
 interface LayoutProps {
   children: ReactNode;
@@ -32,6 +33,9 @@ export default function Layout({ children }: LayoutProps) {
 
             {user && (
               <div className="flex items-center space-x-4">
+                {/* Agent Status Selector */}
+                <AgentStatus />
+
                 <div className="flex items-center text-sm text-gray-700">
                   <User className="h-4 w-4 mr-1" />
                   {user.email}

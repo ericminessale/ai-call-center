@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { Call } from '../types';
-import { callsApi, transcriptionApi, socketService } from '../services/api';
+import { callsApi, transcriptionApi } from '../services/api';
+import { useSocketContext } from '../contexts/SocketContext';
 import { Phone, PhoneOff, Mic, MicOff, FileText, Radio, Clock, AlertCircle } from 'lucide-react';
 import { format } from 'date-fns';
 import toast from 'react-hot-toast';
@@ -19,6 +20,7 @@ interface TranscriptionLine {
 }
 
 export default function ActiveCall({ activeCall, onCallEnd }: ActiveCallProps) {
+  const { socket } = useSocketContext();
   const [transcriptions, setTranscriptions] = useState<TranscriptionLine[]>([]);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [summary, setSummary] = useState<string | null>(null);
@@ -54,9 +56,7 @@ export default function ActiveCall({ activeCall, onCallEnd }: ActiveCallProps) {
   }, [activeCall]);
 
   useEffect(() => {
-    if (!activeCall) return;
-
-    const socket = socketService.getSocket();
+    if (!activeCall || !socket) return;
 
     // Join call room using the SignalWire call_id as the channel
     const token = localStorage.getItem('access_token');
@@ -89,7 +89,7 @@ export default function ActiveCall({ activeCall, onCallEnd }: ActiveCallProps) {
 
         // Update transcription state based on call status - only when answered
         const isCallAnswered = data.status.toLowerCase() === 'answered';
-        setIsTranscribing(updatedCall.transcription_active && isCallAnswered);
+        setIsTranscribing(activeCall.transcription_active && isCallAnswered);
 
         if (data.status === 'ended') {
           setIsTranscribing(false);
@@ -118,7 +118,7 @@ export default function ActiveCall({ activeCall, onCallEnd }: ActiveCallProps) {
         socket.emit('leave_call', { call_sid: activeCall.signalwire_call_sid });
       }
     };
-  }, [activeCall, onCallEnd]);
+  }, [activeCall, onCallEnd, socket]);
 
   // Auto-scroll transcription box to bottom when new transcriptions arrive
   useEffect(() => {

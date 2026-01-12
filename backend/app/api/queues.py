@@ -35,13 +35,19 @@ def route_call_to_queue(queue_id):
     """
     Route an incoming call to a queue
     Called by AI agents via SWML transfer
+    Returns SWML to place caller on hold while waiting for agent
     """
     try:
+        print(f"🎯 QUEUE ROUTE HIT: /api/queues/{queue_id}/route", flush=True)
         data = request.json or {}
+        logger.info(f"Queue route received data: {json.dumps(data, default=str)[:500]}")
+        print(f"📥 Queue route data: {json.dumps(data, default=str)[:300]}", flush=True)
 
         # Extract call information from SignalWire webhook
-        call_id = data.get('CallSid') or data.get('call_id')
-        caller_number = data.get('From') or data.get('caller_number')
+        # SignalWire sends call info nested under 'call' key
+        call_data = data.get('call', {})
+        call_id = call_data.get('call_id') or data.get('CallSid') or data.get('call_id')
+        caller_number = call_data.get('from_number') or data.get('From') or data.get('caller_number')
 
         # Get context from AI agent (passed via headers or body)
         context = {
@@ -60,14 +66,30 @@ def route_call_to_queue(queue_id):
         priority = context.get('priority', 5)
 
         # Create or update call record in database
-        call = Call.query.filter_by(call_sid=call_id).first()
+        call = Call.query.filter_by(signalwire_call_sid=call_id).first() if call_id else None
         if not call:
+            # Try to find existing call, or get system user for new calls
+            system_user = User.query.filter_by(email='system@signalwire.local').first()
+            if not system_user:
+                system_user = db.session.query(User).first()
+                if not system_user:
+                    # Create system user
+                    system_user = User(
+                        email='system@signalwire.local',
+                        is_active=True
+                    )
+                    system_user.set_password('system_password_change_me')
+                    db.session.add(system_user)
+                    db.session.flush()
+
             call = Call(
-                call_sid=call_id,
+                signalwire_call_sid=call_id,
+                user_id=system_user.id,
                 from_number=caller_number,
-                to_number=data.get('To'),
+                destination=call_data.get('to_number') or data.get('To'),
                 status='queued',
-                direction='inbound',
+                destination_type='phone',
+                handler_type='human',
                 created_at=datetime.utcnow()
             )
             db.session.add(call)
@@ -91,64 +113,213 @@ def route_call_to_queue(queue_id):
 
         # Check for available agents
         available_agents = service.get_available_agents(queue_id)
+        redis_client = get_redis_client()
+
+        # Sort for consistent round-robin ordering (Redis sets are unordered)
+        available_agents = sorted(available_agents) if available_agents else []
 
         if available_agents:
-            # Immediately route to available agent
-            agent_id = available_agents[0]
+            # Round-robin selection: track last agent index in Redis
+            rr_key = f"round_robin:{queue_id}"
+            last_index_raw = redis_client.get(rr_key)
+            last_index = int(last_index_raw) if last_index_raw else -1
 
-            # Get agent's SIP address or phone number (simplified for now)
-            user = User.query.filter_by(id=agent_id).first()
-            if user:
-                # Use email as SIP address for demo purposes
-                transfer_target = f"sip:{user.email}@signalwire.local"
+            # Try each agent in round-robin order until we find one with Call Fabric
+            selected_user = None
+            attempts = 0
+            num_agents = len(available_agents)
+
+            while attempts < num_agents:
+                next_index = (last_index + 1 + attempts) % num_agents
+                agent_id_str = available_agents[next_index]
+
+                logger.info(f"Round-robin attempt {attempts + 1}: checking agent {agent_id_str} (index {next_index})")
+
+                # Look up user by ID (agent_id is stored as string in Redis)
+                try:
+                    agent_id = int(agent_id_str)
+                    user = User.query.filter_by(id=agent_id).first()
+                except (ValueError, TypeError):
+                    # If not numeric, try lookup by email
+                    user = User.query.filter_by(email=agent_id_str).first()
+
+                if user and user.signalwire_address:
+                    selected_user = user
+                    # Update round-robin index to this agent
+                    redis_client.set(rr_key, next_index)
+                    break
+                else:
+                    logger.warning(f"Agent {agent_id_str} has no signalwire_address, trying next")
+                    attempts += 1
+
+            if selected_user:
+                # Use Call Fabric address (e.g., /private/agent@example.com)
+                transfer_target = selected_user.signalwire_address
+
+                logger.info(f"Routing call {call_id} to agent {selected_user.email} via Call Fabric: {transfer_target}")
 
                 # Dequeue the call for this agent
-                call_data = service.dequeue_call(queue_id, agent_id)
+                dequeued_data = service.dequeue_call(queue_id, str(selected_user.id))
 
-                logger.info(f"Routing call {call_id} to available agent {agent_id}")
+                # Update call record
+                if call:
+                    call.status = 'connecting'
+                    call.handler_type = 'human'
+                    db.session.commit()
 
-                # Return SWML response to transfer the call
+                # Emit WebSocket event for agent notification
+                # Agent joins room str(user_id) during authentication
+                from app import socketio
+                socketio.emit('incoming_call', {
+                    'call_id': call_id,
+                    'call_db_id': call.id if call else None,
+                    'caller_number': caller_number,
+                    'queue_id': queue_id,
+                    'context': context,
+                    'agent_id': selected_user.id,
+                    'agent_name': selected_user.name or selected_user.email
+                }, room=str(selected_user.id))
+                logger.info(f"Emitted incoming_call to agent room {selected_user.id}")
+
+                # Get base URL for callbacks
+                forwarded_host = request.headers.get('X-Forwarded-Host')
+                forwarded_proto = request.headers.get('X-Forwarded-Proto', 'https')
+                if forwarded_host:
+                    base_url = f"{forwarded_proto}://{forwarded_host}"
+                else:
+                    base_url = request.host_url.rstrip('/')
+
+                # Return SWML response to connect via Call Fabric
                 return jsonify({
+                    "version": "1.0.0",
                     "sections": {
-                        "main": [{
-                            "play": {
-                                "url": "say:Connecting you to the next available specialist."
-                            }
-                        }, {
-                            "connect": {
-                                "to": transfer_target,
-                                "headers": {
-                                    "X-Customer-Context": str(context),
-                                    "X-Queue-Wait-Time": str(call_data.get('wait_time_seconds', 0))
+                        "main": [
+                            {
+                                "play": {
+                                    "url": "say:Connecting you to a specialist now."
+                                }
+                            },
+                            {
+                                "connect": {
+                                    "to": transfer_target,
+                                    "timeout": 30,
+                                    "answer_on_bridge": True,
+                                    "ringback": ["ring:us"]
+                                }
+                            },
+                            # If agent doesn't answer, go back to queue
+                            {
+                                "play": {
+                                    "url": "say:The agent was unavailable. Returning you to the queue."
+                                }
+                            },
+                            {
+                                "transfer": {
+                                    "dest": f"{base_url}/api/queues/{queue_id}/route"
                                 }
                             }
-                        }]
+                        ]
                     }
                 })
+            else:
+                # No agents with valid Call Fabric addresses
+                logger.warning(f"No available agents with Call Fabric addresses for queue {queue_id}")
 
-        # No agents available - place in queue with hold music
+        # No agents available - place in queue with hold message
         logger.info(f"Call {call_id} queued at position {queue_result['position']}")
 
-        return jsonify({
-            "sections": {
-                "main": [{
-                    "play": {
-                        "url": f"say:All of our specialists are currently helping other customers. "
-                               f"You are number {queue_result['position']} in the queue. "
-                               f"Your estimated wait time is {queue_result['estimated_wait_seconds'] // 60} minutes."
-                    }
-                }, {
-                    "play": {
-                        "url": "https://cdn.signalwire.com/swml/hold_music.mp3",
-                        "loop": True
-                    }
-                }]
+        # Check how long the caller has been waiting
+        wait_time_seconds = 0
+        if call and call.created_at:
+            wait_time_seconds = (datetime.utcnow() - call.created_at).total_seconds()
+
+        # After 2 minutes, offer to go back to AI
+        MAX_WAIT_BEFORE_AI_OFFER = 120  # 2 minutes
+        offer_ai_fallback = wait_time_seconds > MAX_WAIT_BEFORE_AI_OFFER
+
+        logger.info(f"Call {call_id} wait time: {wait_time_seconds:.0f}s, offer AI: {offer_ai_fallback}")
+
+        # Get base URL for callbacks
+        forwarded_host = request.headers.get('X-Forwarded-Host')
+        forwarded_proto = request.headers.get('X-Forwarded-Proto', 'https')
+        if forwarded_host:
+            base_url = f"{forwarded_proto}://{forwarded_host}"
+        else:
+            base_url = request.host_url.rstrip('/')
+
+        # Build appropriate SWML response based on wait time
+        if offer_ai_fallback:
+            # Offer AI fallback after waiting too long
+            # Map queue_id to appropriate AI agent
+            ai_agent_map = {
+                'sales': 'sales-ai',
+                'support': 'support-ai',
+                'billing': 'support-ai'  # Billing uses support AI
             }
-        })
+            ai_agent = ai_agent_map.get(queue_id, 'receptionist')
+
+            swml_response = {
+                "version": "1.0.0",
+                "sections": {
+                    "main": [
+                        {
+                            "play": {
+                                "url": f"say:We apologize for the extended wait. "
+                                       f"All our specialists are still assisting other customers. "
+                                       f"Let me connect you with our AI assistant who may be able to help you right away."
+                            }
+                        },
+                        # Transfer to AI agent
+                        {
+                            "transfer": {
+                                "dest": f"{base_url}/{ai_agent}"
+                            }
+                        }
+                    ]
+                }
+            }
+            logger.info(f"Transferring call {call_id} to AI fallback: {ai_agent}")
+        else:
+            # Normal hold message
+            swml_response = {
+                "version": "1.0.0",
+                "sections": {
+                    "main": [
+                        {
+                            "play": {
+                                "url": f"say:All of our specialists are currently helping other customers. "
+                                       f"You are number {queue_result['position']} in the queue. "
+                                       f"Please hold and an agent will be with you shortly."
+                            }
+                        },
+                        # Play silence for 30 seconds, then check for agents again
+                        {
+                            "play": {
+                                "url": "silence:30"
+                            }
+                        },
+                        {
+                            "play": {
+                                "url": "say:Thank you for your patience. You are still in the queue."
+                            }
+                        },
+                        # Transfer back to queue check (creates a loop)
+                        {
+                            "transfer": {
+                                "dest": f"{base_url}/api/queues/{queue_id}/route"
+                            }
+                        }
+                    ]
+                }
+            }
+
+        print(f"📤 Returning SWML (no agents, AI fallback={offer_ai_fallback}): {json.dumps(swml_response)}", flush=True)
+        return jsonify(swml_response)
 
     except Exception as e:
         logger.error(f"Error routing call to queue {queue_id}: {str(e)}")
         return jsonify({
+            "version": "1.0.0",
             "sections": {
                 "main": [{
                     "play": {
@@ -185,7 +356,7 @@ def get_next_queued_call(queue_id):
             return jsonify({"message": "No calls in queue"}), 204
 
         # Update call record
-        call = Call.query.filter_by(call_sid=call_data['call_id']).first()
+        call = Call.query.filter_by(signalwire_call_sid=call_data['call_id']).first()
         if call:
             call.status = 'in-progress'
             db.session.commit()
@@ -328,7 +499,7 @@ def transfer_call():
             return jsonify(result), 400
 
         # Update call record
-        call = Call.query.filter_by(call_sid=call_id).first()
+        call = Call.query.filter_by(signalwire_call_sid=call_id).first()
         if call:
             # Store transfer history as JSON string
             import json

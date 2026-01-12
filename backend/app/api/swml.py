@@ -54,18 +54,42 @@ def initial_call():
                 db.session.add(system_user)
                 db.session.flush()  # Get the ID before committing
 
+        # Look up or create contact based on from_number
+        contact = None
+        contact_id = None
+        if from_number:
+            from app.models import Contact
+            contact = Contact.query.filter_by(phone=from_number).first()
+            if not contact:
+                # Create a new contact for unknown caller
+                contact = Contact(
+                    phone=from_number,
+                    display_name=from_number,  # Use phone as display name initially
+                    account_tier='free',
+                    account_status='prospect'
+                )
+                db.session.add(contact)
+                db.session.flush()  # Get the ID
+                logger.info(f"Created new contact for {from_number}: ID {contact.id}")
+            contact_id = contact.id
+
         # Create new call record
+        # Calls coming to /initial-call are INBOUND (SignalWire calling us when someone dials our number)
+        # Also set handler_type to 'ai' since we're transferring to AI agent
         call = Call(
             signalwire_call_sid=call_id,
             user_id=system_user.id,
+            contact_id=contact_id,  # Link to contact
             from_number=from_number,  # Store caller's number
             destination=to_number or 'unknown',
             destination_type='phone' if (to_number and to_number.startswith('+')) else 'sip',
+            direction=direction or 'inbound',  # Use direction from SignalWire, default to inbound
+            handler_type='ai',  # Initial calls go to AI agent
             status=call_state or 'initiated',
             transcription_active=True
         )
         db.session.add(call)
-        logger.info(f"Created new call {call_id} with from_number: {from_number}")
+        logger.info(f"Created new call {call_id} with from_number: {from_number}, contact_id: {contact_id}")
     else:
         # Update existing call
         call.update_status(call_state)
@@ -93,10 +117,13 @@ def initial_call():
     from app import socketio
     call_data = {
         'call_sid': call_id,
+        'signalwire_call_sid': call_id,  # Include for frontend compatibility
         'id': call.id,
+        'contact_id': call.contact_id,  # Link to contact for frontend
         'phoneNumber': from_number or 'unknown',  # Show caller's number
         'from_number': from_number,  # Explicitly include for clarity
         'status': 'ai_active',  # Dashboard status
+        'handler_type': 'ai',  # Explicitly mark as AI call
         'internal_status': 'ai_active',
         'destination': to_number or 'unknown',
         'destination_type': 'phone' if (to_number and to_number.startswith('+')) else 'sip',
@@ -115,8 +142,20 @@ def initial_call():
 
     logger.info(f"✓ Emitted AI call to all agents: {call_id}")
 
-    # Get the base URL for callbacks
-    base_url = request.host_url.rstrip('/')
+    # Get the base URL for callbacks - use external URL from proxy headers
+    # This ensures we return HTTPS URLs that SignalWire can reach
+    forwarded_host = request.headers.get('X-Forwarded-Host')
+    forwarded_proto = request.headers.get('X-Forwarded-Proto', 'https')
+
+    if forwarded_host:
+        # ngrok always uses HTTPS externally even though it forwards HTTP internally
+        if 'ngrok' in forwarded_host:
+            forwarded_proto = 'https'
+        base_url = f"{forwarded_proto}://{forwarded_host}"
+        logger.info(f"Using forwarded URL: {base_url}")
+    else:
+        base_url = request.host_url.rstrip('/')
+        logger.info(f"Using request host URL: {base_url}")
 
     # Note: SignalWire's transfer method doesn't actually send the Authorization header
     # when using username:password@url format, so we've disabled auth on the AI agents.
@@ -126,6 +165,13 @@ def initial_call():
         "version": "1.0.0",
         "sections": {
             "main": [
+                # Set the call state URL to receive hangup notifications
+                {
+                    "set": {
+                        "call_state_url": f"{base_url}/api/webhooks/call-status",
+                        "call_state_events": "created,ringing,answered,ended"
+                    }
+                },
                 "answer",
                 {
                     "record_call": {

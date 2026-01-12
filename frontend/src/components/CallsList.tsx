@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { callsApi, socketService } from '../services/api';
+import { callsApi } from '../services/api';
+import { useSocketContext } from '../contexts/SocketContext';
 import { Call } from '../types';
 import { Phone, Clock, Calendar, ChevronRight, Loader2, Radio } from 'lucide-react';
 import { format, formatDistanceToNow } from 'date-fns';
 
 export default function CallsList() {
   const navigate = useNavigate();
+  const { socket } = useSocketContext();
   const [calls, setCalls] = useState<Call[]>([]);
   const [activeCalls, setActiveCalls] = useState<Call[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -16,10 +18,6 @@ export default function CallsList() {
   useEffect(() => {
     loadCalls();
 
-    // Listen for call status updates
-    const socket = socketService.getSocket();
-    socket.on('call_status', handleCallStatus);
-
     // Refresh calls periodically for active calls
     const interval = setInterval(() => {
       if (calls.some(c => ['created', 'ringing', 'answered'].includes(c.status.toLowerCase()))) {
@@ -28,10 +26,20 @@ export default function CallsList() {
     }, 5000);
 
     return () => {
-      socket.off('call_status', handleCallStatus);
       clearInterval(interval);
     };
   }, [page]);
+
+  // Listen for call status updates via WebSocket
+  useEffect(() => {
+    if (!socket) return;
+
+    socket.on('call_status', handleCallStatus);
+
+    return () => {
+      socket.off('call_status', handleCallStatus);
+    };
+  }, [socket]);
 
   const handleCallStatus = (data: { call_sid: string; status: string }) => {
     setCalls(prev => prev.map(call =>

@@ -16,6 +16,77 @@ load_dotenv()
 # Configuration
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://backend:5000')
 
+def get_base_url_from_global_data(raw_data: dict) -> str:
+    """
+    Get the base URL from global_data (set during initial request).
+    Falls back to environment variable or default.
+    """
+    # Check global_data first (set by dynamic config callback)
+    global_data = raw_data.get('global_data', {})
+    if global_data.get('agent_base_url'):
+        return global_data['agent_base_url']
+
+    # Try environment variable
+    env_url = os.getenv('AGENT_BASE_URL')
+    if env_url and not env_url.startswith('http://ai-agents'):
+        return env_url.rstrip('/')
+
+    # Fallback - this won't work for external transfers
+    print("⚠️ Warning: Could not determine agent base URL", flush=True)
+    return 'http://ai-agents:8080'
+
+
+def capture_base_url(query_params, body_params, headers, agent):
+    """
+    Dynamic config callback - captures the external URL from the incoming request.
+    Also reads customer context from global_data and adds to prompt.
+    Called at the START of each call before SWML is returned.
+    """
+    from urllib.parse import urlparse
+
+    # Read existing global_data (from previous agent transfers)
+    existing_global = body_params.get('global_data', {})
+    new_global = {}
+
+    # Try X-Forwarded-Host first (set by proxies like ngrok/nginx)
+    forwarded_host = headers.get('x-forwarded-host') or headers.get('X-Forwarded-Host')
+    forwarded_proto = headers.get('x-forwarded-proto') or headers.get('X-Forwarded-Proto') or 'https'
+
+    if forwarded_host:
+        # ngrok always uses HTTPS externally even though it forwards HTTP internally
+        if 'ngrok' in forwarded_host:
+            forwarded_proto = 'https'
+        base_url = f"{forwarded_proto}://{forwarded_host}"
+        print(f"🌐 Detected base URL from X-Forwarded-Host: {base_url}", flush=True)
+        new_global['agent_base_url'] = base_url
+    else:
+        # Try regular Host header
+        host = headers.get('host') or headers.get('Host')
+        if host and not host.startswith('ai-agents') and not host.startswith('localhost'):
+            base_url = f"https://{host}"
+            print(f"🌐 Detected base URL from Host header: {base_url}", flush=True)
+            new_global['agent_base_url'] = base_url
+        else:
+            # Check environment variable
+            env_url = os.getenv('AGENT_BASE_URL')
+            if env_url and not env_url.startswith('http://ai-agents'):
+                print(f"🌐 Using AGENT_BASE_URL from environment: {env_url}", flush=True)
+                new_global['agent_base_url'] = env_url.rstrip('/')
+            else:
+                print("⚠️ Could not detect external base URL - multi-agent transfers may fail", flush=True)
+
+    # Log any incoming customer context for debugging
+    customer_name = existing_global.get('customer_name')
+    customer_reason = existing_global.get('reason') or existing_global.get('initial_request')
+    source_agent = existing_global.get('source_agent')
+
+    if customer_name or customer_reason or source_agent:
+        print(f"📋 Customer context received - Name: {customer_name}, Reason: {customer_reason}, From: {source_agent}", flush=True)
+
+    # Set all global data at once (preserving existing + adding base_url)
+    if new_global:
+        agent.set_global_data(new_global)
+
 # The signalwire-agents SDK will automatically handle authentication
 # It checks for SWML_BASIC_AUTH_USER and SWML_BASIC_AUTH_PASSWORD env vars
 # If not set, it will auto-generate credentials and display them
@@ -29,6 +100,9 @@ class BasicReceptionist(AgentBase):
             route="/receptionist",
             auto_answer=True
         )
+
+        # Capture the external URL at the start of each call
+        self.set_dynamic_config_callback(capture_base_url)
 
         # Build the prompt using the POM structure
         self.prompt_add_section(
@@ -73,16 +147,29 @@ class BasicReceptionist(AgentBase):
         reason = args.get("reason", "")
 
         route = '/sales' if 'sales' in department.lower() else '/support'
+        # Get base URL from global_data (set by dynamic config callback at call start)
+        base_url = get_base_url_from_global_data(raw_data)
+        transfer_url = f"{base_url}{route}"
+
+        print(f"🔀 Transferring to {transfer_url}", flush=True)
 
         result = SwaigFunctionResult(
-            f'I understand you need help with {department}. Let me transfer you to our {department} department.'
+            f'Transferring to {department}.'
         )
-        result.add_action('transfer', {'to': route})
-        result.set_global_data({
+        # Use update_global_data to pass context to the next agent
+        result.update_global_data({
             'customer_name': customer_name,
-            'initial_request': reason,
-            'from_receptionist': True
+            'reason': reason,  # Use 'reason' consistently across all agents
+            'from_receptionist': True,
+            'source_agent': 'receptionist'
         })
+        # Use swml_transfer for agent-to-agent transfers (SWML endpoints)
+        # final=True means permanent transfer (won't return to this agent)
+        result.swml_transfer(
+            transfer_url,
+            "Transfer complete. How else can I help?",  # Only used if final=False
+            final=True
+        )
 
         return result
 
@@ -96,6 +183,9 @@ class SalesReceptionist(AgentBase):
             auto_answer=True
         )
 
+        # Capture the external URL at the start of each call
+        self.set_dynamic_config_callback(capture_base_url)
+
         self.prompt_add_section(
             "Role",
             "You are the Sales department receptionist. "
@@ -103,11 +193,21 @@ class SalesReceptionist(AgentBase):
             "and route them to either an AI specialist or human agent."
         )
 
+        # Customer context from previous agent (uses ${global_data.x} template syntax)
+        self.prompt_add_section(
+            "Customer Context",
+            "If available, use this information from the previous agent:\n"
+            "- Customer name: ${global_data.customer_name}\n"
+            "- Reason for call: ${global_data.reason}\n"
+            "If the customer's name is known, address them by name. "
+            "Don't ask for information they've already provided."
+        )
+
         self.prompt_add_section(
             "Process",
             "Follow this process:",
             bullets=[
-                "Welcome the customer to sales",
+                "Welcome the customer to sales (by name if known)",
                 "Ask about their product/service interests",
                 "Gather relevant information",
                 "Ask if they prefer AI or human assistance",
@@ -151,7 +251,8 @@ class SalesReceptionist(AgentBase):
             f'Thank you {customer_name}. I have your information about {interest}. '
             'Would you prefer our AI sales specialist or a human representative?'
         )
-        result.set_global_data({
+        # Use update_global_data to preserve existing data and add new data
+        result.update_global_data({
             'customer_name': customer_name,
             'interest': interest,
             'company': company,
@@ -165,21 +266,41 @@ class SalesReceptionist(AgentBase):
         agent_type = args.get("agent_type", "")
 
         if 'ai' in agent_type.lower() or 'specialist' in agent_type.lower():
+            base_url = get_base_url_from_global_data(raw_data)
+            transfer_url = f"{base_url}/sales-ai"
+            print(f"🔀 Transferring to {transfer_url}", flush=True)
+
             result = SwaigFunctionResult(
                 'Great! Our AI sales specialist has access to all our product information. Connecting you now...'
             )
-            result.add_action('transfer', {'to': '/sales-ai'})
+            result.update_global_data({
+                'source_agent': 'sales_receptionist',
+                'preferred_handling': 'ai'
+            })
+            result.swml_transfer(
+                transfer_url,
+                "How else can I help you today?",
+                final=True
+            )
         else:
-            # Call backend to add to queue
-            try:
-                requests.post(f"{BACKEND_URL}/api/queues/sales/route", json={'priority': 5})
-            except:
-                pass
+            # Transfer to human queue via SWML
+            base_url = get_base_url_from_global_data(raw_data)
+            queue_url = f"{base_url}/api/queues/sales/route"
+            print(f"🔀 Transferring to human queue: {queue_url}", flush=True)
 
             result = SwaigFunctionResult(
-                'I\'ll add you to our queue for the next available human sales representative.'
+                'I\'ll connect you with a human sales representative. One moment please.'
             )
-            result.add_action('queue', {'name': 'sales'})
+            result.update_global_data({
+                'source_agent': 'sales_receptionist',
+                'preferred_handling': 'human',
+                'queue': 'sales'
+            })
+            result.swml_transfer(
+                queue_url,
+                "Thank you for waiting. Goodbye!",
+                final=True
+            )
 
         return result
 
@@ -193,6 +314,9 @@ class SupportReceptionist(AgentBase):
             auto_answer=True
         )
 
+        # Capture the external URL at the start of each call
+        self.set_dynamic_config_callback(capture_base_url)
+
         self.prompt_add_section(
             "Role",
             "You are the Support department receptionist. "
@@ -200,11 +324,21 @@ class SupportReceptionist(AgentBase):
             "determining urgency, and routing to appropriate assistance."
         )
 
+        # Customer context from previous agent (uses ${global_data.x} template syntax)
+        self.prompt_add_section(
+            "Customer Context",
+            "If available, use this information from the previous agent:\n"
+            "- Customer name: ${global_data.customer_name}\n"
+            "- Reason for call: ${global_data.reason}\n"
+            "If the customer's name is known, address them by name. "
+            "Don't ask for information they've already provided."
+        )
+
         self.prompt_add_section(
             "Process",
             "Support process:",
             bullets=[
-                "Welcome the customer to support",
+                "Welcome the customer to support (by name if known)",
                 "Understand the nature of their issue",
                 "Determine urgency level",
                 "Ask if they prefer AI or human support",
@@ -249,7 +383,8 @@ class SupportReceptionist(AgentBase):
             f'I understand you\'re experiencing issues with {issue_description}. '
             'Would you like our AI support specialist or a human agent?'
         )
-        result.set_global_data({
+        # Use update_global_data to preserve existing data and add new data
+        result.update_global_data({
             'issue': issue_description,
             'urgency': urgency,
             'error_message': error_message,
@@ -263,15 +398,41 @@ class SupportReceptionist(AgentBase):
         agent_type = args.get("agent_type", "")
 
         if 'ai' in agent_type.lower() or 'specialist' in agent_type.lower():
+            base_url = get_base_url_from_global_data(raw_data)
+            transfer_url = f"{base_url}/support-ai"
+            print(f"🔀 Transferring to {transfer_url}", flush=True)
+
             result = SwaigFunctionResult(
                 'Our AI support specialist can help troubleshoot right away. Connecting you now...'
             )
-            result.add_action('transfer', {'to': '/support-ai'})
-        else:
-            result = SwaigFunctionResult(
-                'I\'ll connect you with a human support representative.'
+            result.update_global_data({
+                'source_agent': 'support_receptionist',
+                'preferred_handling': 'ai'
+            })
+            result.swml_transfer(
+                transfer_url,
+                "Is there anything else I can help with?",
+                final=True
             )
-            result.add_action('queue', {'name': 'support'})
+        else:
+            # Transfer to human queue via SWML
+            base_url = get_base_url_from_global_data(raw_data)
+            queue_url = f"{base_url}/api/queues/support/route"
+            print(f"🔀 Transferring to human queue: {queue_url}", flush=True)
+
+            result = SwaigFunctionResult(
+                'I\'ll connect you with a human support representative. One moment please.'
+            )
+            result.update_global_data({
+                'source_agent': 'support_receptionist',
+                'preferred_handling': 'human',
+                'queue': 'support'
+            })
+            result.swml_transfer(
+                queue_url,
+                "Thank you for waiting. Goodbye!",
+                final=True
+            )
 
         return result
 
@@ -285,10 +446,24 @@ class SalesAISpecialist(AgentBase):
             auto_answer=True
         )
 
+        # Capture the external URL (in case we need to transfer later)
+        self.set_dynamic_config_callback(capture_base_url)
+
         self.prompt_add_section(
             "Role",
             "You are an AI sales specialist with deep product knowledge. "
             "Help customers understand our offerings and make purchasing decisions."
+        )
+
+        # Customer context from previous agents (uses ${global_data.x} template syntax)
+        self.prompt_add_section(
+            "Customer Context",
+            "Use this information from previous agents:\n"
+            "- Customer name: ${global_data.customer_name}\n"
+            "- Reason for call: ${global_data.reason}\n"
+            "- Interest: ${global_data.interest}\n"
+            "- Company: ${global_data.company}\n"
+            "Address the customer by name and reference their stated interests."
         )
 
         self.prompt_add_section(
@@ -352,11 +527,13 @@ class SalesAISpecialist(AgentBase):
         result = SwaigFunctionResult(
             f'For {reason}, I\'ll connect you with a human sales representative.'
         )
-        result.add_action('queue', {'name': 'sales'})
-        result.set_global_data({
+        result.update_global_data({
             'escalation_reason': reason,
-            'needs_senior_rep': True
+            'needs_senior_rep': True,
+            'escalated_from': 'sales_ai_specialist'
         })
+        # Stop the AI agent - the call should transfer to human queue
+        result.add_action('stop', True)
         return result
 
 class SupportAISpecialist(AgentBase):
@@ -369,10 +546,24 @@ class SupportAISpecialist(AgentBase):
             auto_answer=True
         )
 
+        # Capture the external URL (in case we need to transfer later)
+        self.set_dynamic_config_callback(capture_base_url)
+
         self.prompt_add_section(
             "Role",
             "You are an AI support specialist trained to troubleshoot issues. "
             "Help customers resolve problems efficiently."
+        )
+
+        # Customer context from previous agents (uses ${global_data.x} template syntax)
+        self.prompt_add_section(
+            "Customer Context",
+            "Use this information from previous agents:\n"
+            "- Customer name: ${global_data.customer_name}\n"
+            "- Issue description: ${global_data.issue}\n"
+            "- Urgency: ${global_data.urgency}\n"
+            "- Error message: ${global_data.error_message}\n"
+            "Address the customer by name and reference their reported issue."
         )
 
         self.prompt_add_section(
@@ -443,12 +634,14 @@ class SupportAISpecialist(AgentBase):
         result = SwaigFunctionResult(
             'I\'ll connect you with a human support representative for further assistance.'
         )
-        result.add_action('queue', {'name': 'support'})
-        result.set_global_data({
+        result.update_global_data({
             'escalation_reason': reason,
             'ticket_id': ticket_id,
-            'attempted_solutions': True
+            'attempted_solutions': True,
+            'escalated_from': 'support_ai_specialist'
         })
+        # Stop the AI agent - the call should transfer to human queue
+        result.add_action('stop', True)
         return result
 
 

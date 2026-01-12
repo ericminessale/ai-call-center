@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { callsApi, transcriptionApi, socketService } from '../services/api';
+import { callsApi, transcriptionApi } from '../services/api';
+import { useSocketContext } from '../contexts/SocketContext';
 import { Call, Transcription } from '../types';
 import { ArrowLeft, Phone, Clock, Calendar, Mic, MicOff, FileText, Loader2, Play, Download, AlertCircle } from 'lucide-react';
 import { format } from 'date-fns';
@@ -18,6 +19,7 @@ interface TranscriptionEvent {
 export default function CallDetails() {
   const { callSid } = useParams<{ callSid: string }>();
   const navigate = useNavigate();
+  const { socket } = useSocketContext();
   const [call, setCall] = useState<Call | null>(null);
   const [transcriptions, setTranscriptions] = useState<Transcription[]>([]);
   const [liveTranscript, setLiveTranscript] = useState<string>('');
@@ -25,13 +27,15 @@ export default function CallDetails() {
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [summary, setSummary] = useState<string | null>(null);
 
+  // Load call details
   useEffect(() => {
     if (!callSid) return;
-
     loadCallDetails();
+  }, [callSid]);
 
-    // Connect to WebSocket for live updates
-    const socket = socketService.getSocket();
+  // Socket event listeners
+  useEffect(() => {
+    if (!callSid || !socket) return;
 
     // Join the call-specific room
     socket.emit('join_call', { call_sid: callSid });
@@ -47,7 +51,7 @@ export default function CallDetails() {
       socket.off('summary', handleSummary);
       socket.emit('leave_call', { call_sid: callSid });
     };
-  }, [callSid]);
+  }, [callSid, socket]);
 
   const loadCallDetails = async () => {
     if (!callSid) return;

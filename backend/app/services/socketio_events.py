@@ -104,3 +104,81 @@ def handle_leave_call(data):
 def handle_ping():
     """Handle ping to keep connection alive."""
     emit('pong', {'timestamp': request.sid})
+
+
+@socketio.on('set_agent_status')
+def handle_set_agent_status(data):
+    """Set agent availability status for call routing."""
+    print(f"🎯 SET_AGENT_STATUS received: {data}", flush=True)
+    logger.info(f"set_agent_status received: {data}")
+
+    token = data.get('token')
+    status = data.get('status')  # 'available', 'busy', 'break', 'offline'
+
+    if not token or not status:
+        print(f"❌ Missing token or status in set_agent_status", flush=True)
+        emit('error', {'message': 'Missing token or status'})
+        return
+
+    if status not in ['available', 'busy', 'after-call', 'break', 'offline']:
+        emit('error', {'message': 'Invalid status'})
+        return
+
+    user_id = verify_token(token)
+    if not user_id:
+        emit('error', {'message': 'Invalid or expired token'})
+        return
+
+    # Update Redis with agent status
+    from app.services.queue_service import QueueService
+    from app.services.redis_service import get_redis_client
+
+    redis_client = get_redis_client()
+    if redis_client:
+        queue_service = QueueService(redis_client)
+        queue_service.set_agent_status(str(user_id), status)
+
+        logger.info(f"Agent {user_id} set status to {status}")
+
+        emit('agent_status_updated', {
+            'status': status,
+            'user_id': user_id
+        })
+
+        # Broadcast to all clients that agent status changed
+        socketio.emit('agent_online_status', {
+            'agent_id': user_id,
+            'status': status
+        })
+    else:
+        emit('error', {'message': 'Redis not available'})
+
+
+@socketio.on('get_agent_status')
+def handle_get_agent_status(data):
+    """Get current agent status."""
+    token = data.get('token')
+
+    if not token:
+        emit('error', {'message': 'Missing token'})
+        return
+
+    user_id = verify_token(token)
+    if not user_id:
+        emit('error', {'message': 'Invalid or expired token'})
+        return
+
+    from app.services.queue_service import QueueService
+    from app.services.redis_service import get_redis_client
+
+    redis_client = get_redis_client()
+    if redis_client:
+        queue_service = QueueService(redis_client)
+        status_data = queue_service.get_agent_status(str(user_id))
+
+        emit('agent_status', {
+            'status': status_data.get('status', 'offline') if status_data else 'offline',
+            'user_id': user_id
+        })
+    else:
+        emit('agent_status', {'status': 'offline', 'user_id': user_id})

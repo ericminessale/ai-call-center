@@ -3,19 +3,24 @@ import CallControl from '../components/CallControl';
 import ActiveCall from '../components/ActiveCall';
 import RecentCalls from '../components/RecentCalls';
 import Layout from '../components/Layout';
-import { callsApi, socketService } from '../services/api';
+import { callsApi } from '../services/api';
+import { useSocketContext } from '../contexts/SocketContext';
 import { Call } from '../types';
 
 export default function Dashboard() {
+  const { socket } = useSocketContext();
   const [activeCall, setActiveCall] = useState<Call | null>(null);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [isLoadingActive, setIsLoadingActive] = useState(false);
 
+  // Load initial active call
   useEffect(() => {
-    // Load initial active call
     loadActiveCall();
+  }, []);
 
-    const socket = socketService.getSocket();
+  // Socket event listeners
+  useEffect(() => {
+    if (!socket) return;
 
     // Listen for new calls
     const handleCallInitiated = (data: any) => {
@@ -63,7 +68,7 @@ export default function Dashboard() {
       socket.off('call_initiated', handleCallInitiated);
       socket.off('call_status', handleCallStatus);
     };
-  }, []); // Remove activeCall dependency to prevent re-renders
+  }, [socket]);
 
   const loadActiveCall = async () => {
     // Prevent duplicate requests

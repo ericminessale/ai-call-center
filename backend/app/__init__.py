@@ -62,12 +62,13 @@ def create_app():
         app.logger.warning(f"Initial Redis connection failed: {str(e)} - will retry on demand")
 
     # Register blueprints
-    from app.api import auth_bp, calls_bp, swml_bp, webhooks_bp, admin_bp
+    from app.api import auth_bp, calls_bp, swml_bp, webhooks_bp, admin_bp, contacts_bp
     from app.api.queues import queues_bp
     from app.api.fabric import fabric_bp
     from app.api.ai_control import ai_control_bp
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(calls_bp, url_prefix='/api/calls')
+    app.register_blueprint(contacts_bp, url_prefix='/api/contacts')
     app.register_blueprint(swml_bp, url_prefix='/api/swml')
     app.register_blueprint(webhooks_bp, url_prefix='/api/webhooks')
     app.register_blueprint(queues_bp, url_prefix='/api/queues')

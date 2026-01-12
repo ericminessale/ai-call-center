@@ -336,6 +336,70 @@ export const useCallFabric = () => {
     }
   }, [client, user]);
 
+  // Make call to SWML URL (for takeover calls)
+  const makeCallToSwml = useCallback(async (swmlUrl: string, context?: any) => {
+    if (!client) {
+      setError('Phone system not initialized');
+      return;
+    }
+
+    try {
+      console.log('Making SWML call to:', swmlUrl);
+      setCallState('ringing');
+
+      // When dialing a URL, SignalWire fetches the SWML and executes it
+      const call = await client.dial({
+        to: swmlUrl,
+        rootElement: rootElementRef.current,
+        logLevel: 'debug',
+        debug: { logWsTraffic: true },
+        userVariables: {
+          agent_id: user?.id,
+          agent_name: user?.name,
+          call_type: 'takeover',
+          ...context
+        }
+      });
+
+      call.on('call.state', (state: any) => {
+        console.log('SWML call state:', state);
+        if (state === 'active' || state === 'answered') setCallState('active');
+        else if (state === 'ending' || state === 'ended') setCallState('ending');
+      });
+
+      call.on('destroy', () => {
+        console.log('SWML call destroyed');
+        setActiveCall(null);
+        setCallState('idle');
+      });
+
+      const takeoverCall: ActiveCall = {
+        id: call.id,
+        callerId: 'Takeover Call',
+        direction: 'outbound',
+        status: 'connecting',
+        startTime: new Date(),
+        answer: async () => {},
+        hangup: async () => await call.hangup(),
+        hold: async () => {},
+        unhold: async () => {},
+        mute: async () => await call.audioMute(),
+        unmute: async () => await call.audioUnmute(),
+        sendDigits: async (digits: string) => await call.sendDigits(digits)
+      };
+
+      setActiveCall(takeoverCall);
+      await call.start();
+      console.log('SWML call started');
+      return call;
+
+    } catch (error) {
+      console.error('Failed to make SWML call:', error);
+      setError('Failed to take over call');
+      setCallState('idle');
+    }
+  }, [client, user]);
+
   // Hang up current call
   const hangup = useCallback(async () => {
     if (!activeCall) return;
@@ -412,6 +476,7 @@ export const useCallFabric = () => {
     goOnline,
     goOffline,
     makeCall,
+    makeCallToSwml,
     hangup,
     answerCall,
     requestMicPermission,

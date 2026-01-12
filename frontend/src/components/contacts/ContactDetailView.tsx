@@ -27,11 +27,12 @@ import {
   AlertCircle,
   X,
 } from 'lucide-react';
-import { Contact, Interaction, TranscriptionMessage, Call } from '../../types/callcenter';
+import { Contact, Interaction, TranscriptionMessage, Call, CallLeg } from '../../types/callcenter';
 import { contactsApi } from '../../services/api';
 import api from '../../services/api';
 import { useCallFabric } from '../../hooks/useCallFabric';
 import { useSocketContext } from '../../contexts/SocketContext';
+import { CallTimeline } from './CallTimeline';
 
 interface ContactDetailViewProps {
   contact: Contact;
@@ -76,6 +77,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     callState,
     isMuted,
     makeCall,
+    makeCallToSwml,
     hangup,
     goOnline,
     mute,
@@ -316,6 +318,46 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     loadInteractions();
   };
 
+  // Handle taking over an AI call
+  const handleTakeOver = async () => {
+    const callSid = effectiveCallSid;
+    if (!callSid) {
+      console.error('No call SID available for takeover');
+      return;
+    }
+
+    // Go online if not already
+    if (!isOnline) {
+      await goOnline();
+    }
+
+    try {
+      console.log('📞 [TakeOver] Initiating takeover for call:', callSid);
+
+      // Call the takeover API to get the SWML URL
+      const response = await api.post(`/api/calls/${callSid}/takeover`);
+      const { swml_url, leg_id } = response.data;
+
+      console.log('📞 [TakeOver] Got SWML URL:', swml_url);
+
+      // Dial the SWML URL to bridge into the call
+      await makeCallToSwml(swml_url, {
+        contact_id: contact.id,
+        original_call_sid: callSid,
+        leg_id: leg_id
+      });
+
+      // Update state - no longer an AI call once we've taken over
+      setIsAICall(false);
+      console.log('📞 [TakeOver] Successfully initiated takeover');
+
+    } catch (error: any) {
+      console.error('Failed to take over call:', error);
+      const errorMessage = error.response?.data?.error || 'Failed to take over call';
+      console.error('Error details:', errorMessage);
+    }
+  };
+
   // Handle selecting a call from history
   const handleSelectHistoryCall = (interaction: Interaction) => {
     setSelectedHistoryCall(interaction);
@@ -465,7 +507,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
               {/* Take Over button for AI calls */}
               {(isAICall || isInboundAICall) && (
                 <button
-                  onClick={handleCall}
+                  onClick={handleTakeOver}
                   disabled={isInitializing}
                   className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
                 >
@@ -755,6 +797,57 @@ function InteractionHistory({
     );
   }
 
+  // Helper to render handler chain from legs
+  const renderHandlerChain = (interaction: Interaction) => {
+    const legs = interaction.legs;
+    if (!legs || legs.length === 0) {
+      // Fallback to single handler display
+      if (interaction.handlerType === 'ai') {
+        return (
+          <span className="flex items-center gap-1 px-2 py-0.5 bg-purple-500/20 text-purple-400 text-xs rounded-full">
+            <Bot className="w-3 h-3" />
+            {interaction.aiAgentName || 'AI'}
+          </span>
+        );
+      }
+      return null;
+    }
+
+    // Multiple legs - show chain
+    if (legs.length === 1) {
+      const leg = legs[0];
+      return (
+        <span className={`flex items-center gap-1 px-2 py-0.5 text-xs rounded-full ${
+          leg.legType === 'ai_agent' ? 'bg-purple-500/20 text-purple-400' : 'bg-green-500/20 text-green-400'
+        }`}>
+          {leg.legType === 'ai_agent' ? <Bot className="w-3 h-3" /> : <User className="w-3 h-3" />}
+          {leg.legType === 'ai_agent' ? (leg.aiAgentName || 'AI') : (leg.userName || 'Agent')}
+        </span>
+      );
+    }
+
+    // Multiple handlers - show chain
+    return (
+      <div className="flex items-center gap-1">
+        {legs.map((leg, idx) => (
+          <div key={leg.id} className="flex items-center">
+            <span className={`flex items-center gap-0.5 px-1.5 py-0.5 text-xs rounded ${
+              leg.legType === 'ai_agent' ? 'bg-purple-500/20 text-purple-400' : 'bg-green-500/20 text-green-400'
+            }`}>
+              {leg.legType === 'ai_agent' ? <Bot className="w-3 h-3" /> : <User className="w-3 h-3" />}
+              <span className="hidden sm:inline">
+                {leg.legType === 'ai_agent' ? (leg.aiAgentName || 'AI') : (leg.userName || 'Agent')}
+              </span>
+            </span>
+            {idx < legs.length - 1 && (
+              <span className="text-gray-500 mx-0.5">→</span>
+            )}
+          </div>
+        ))}
+      </div>
+    );
+  };
+
   return (
     <div className="divide-y divide-gray-700">
       {interactions.map((interaction) => (
@@ -779,16 +872,12 @@ function InteractionHistory({
 
             {/* Call Info */}
             <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <span className="font-medium text-white">
                   {interaction.direction === 'inbound' ? 'Inbound' : 'Outbound'} Call
                 </span>
-                {interaction.handlerType === 'ai' && (
-                  <span className="flex items-center gap-1 px-2 py-0.5 bg-purple-500/20 text-purple-400 text-xs rounded-full">
-                    <Bot className="w-3 h-3" />
-                    {interaction.aiAgentName || 'AI'}
-                  </span>
-                )}
+                {/* Handler chain or single handler badge */}
+                {renderHandlerChain(interaction)}
                 <span className={`px-2 py-0.5 text-xs rounded-full ${
                   interaction.status === 'completed' ? 'bg-green-500/20 text-green-400' :
                   interaction.status === 'active' || interaction.status === 'ai_active' ? 'bg-blue-500/20 text-blue-400' :
@@ -810,6 +899,13 @@ function InteractionHistory({
                   <span className="flex items-center gap-1 text-green-400">
                     <Mic className="w-3 h-3" />
                     Transcribed
+                  </span>
+                )}
+                {/* Show handler count if multiple */}
+                {interaction.legs && interaction.legs.length > 1 && (
+                  <span className="flex items-center gap-1 text-orange-400">
+                    <User className="w-3 h-3" />
+                    {interaction.legs.length} handlers
                   </span>
                 )}
               </div>
@@ -1162,12 +1258,13 @@ function CallDetailTab({
   formatDuration: (seconds?: number) => string;
 }) {
   const [transcriptions, setTranscriptions] = useState<{ speaker: string; text: string; timestamp: string }[]>([]);
+  const [legs, setLegs] = useState<CallLeg[]>([]);
   const [isLoadingTranscriptions, setIsLoadingTranscriptions] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Fetch transcriptions for this call
+  // Fetch transcriptions and legs for this call
   useEffect(() => {
-    const fetchTranscriptions = async () => {
+    const fetchCallDetails = async () => {
       setIsLoadingTranscriptions(true);
       try {
         // Use the SignalWire call SID to fetch call details which includes transcriptions
@@ -1178,16 +1275,25 @@ function CallDetailTab({
           text: t.transcript || t.text,
           timestamp: t.createdAt || t.created_at,
         })));
+
+        // Fetch legs separately
+        try {
+          const legsResponse = await api.get(`/api/calls/${interaction.signalwireCallSid}/legs`);
+          setLegs(legsResponse.data.legs || []);
+        } catch (legsError) {
+          console.log('No legs data available for this call');
+          setLegs([]);
+        }
       } catch (error) {
-        console.error('Failed to load transcriptions:', error);
-        // If we can't load transcriptions, show empty state
+        console.error('Failed to load call details:', error);
         setTranscriptions([]);
+        setLegs([]);
       } finally {
         setIsLoadingTranscriptions(false);
       }
     };
 
-    fetchTranscriptions();
+    fetchCallDetails();
   }, [interaction.signalwireCallSid]);
 
   return (
@@ -1246,6 +1352,11 @@ function CallDetailTab({
             <h4 className="text-sm font-medium text-gray-300 mb-1">AI Summary</h4>
             <p className="text-sm text-gray-400">{interaction.summary}</p>
           </div>
+        )}
+
+        {/* Call Journey Timeline */}
+        {legs.length > 0 && (
+          <CallTimeline legs={legs} />
         )}
       </div>
 

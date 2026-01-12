@@ -41,6 +41,22 @@ export interface ContactMinimal {
   activeCall?: Interaction;
 }
 
+export interface CallLeg {
+  id: number;
+  callId: number;
+  userId?: number;
+  legType: 'ai_agent' | 'human_agent' | 'transfer';
+  legNumber: number;
+  aiAgentName?: string;
+  userName?: string;
+  status: 'connecting' | 'active' | 'completed';
+  startedAt: string;
+  endedAt?: string;
+  duration?: number;
+  transitionReason?: string;
+  summary?: string;
+}
+
 export interface Interaction {
   id: number;
   contactId?: number;
@@ -63,6 +79,7 @@ export interface Interaction {
   answeredAt?: string;
   endedAt?: string;
   contact?: ContactMinimal;
+  legs?: CallLeg[];  // Call legs for tracking handler transitions
 }
 
 export interface ContactsListResponse {

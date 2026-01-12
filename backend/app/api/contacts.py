@@ -3,7 +3,7 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
-from app.models import Contact, Call
+from app.models import Contact, Call, CallLeg
 
 contacts_bp = Blueprint('contacts', __name__)
 
@@ -229,18 +229,31 @@ def lookup_or_create_contact():
 @contacts_bp.route('/<int:contact_id>/interactions', methods=['GET'])
 @jwt_required()
 def get_contact_interactions(contact_id):
-    """Get all interactions (calls) for a contact."""
+    """Get all interactions (calls) for a contact, including call legs."""
     contact = Contact.query.get_or_404(contact_id)
 
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
+    include_legs = request.args.get('include_legs', 'true').lower() == 'true'
 
     pagination = contact.calls.order_by(Call.created_at.desc()).paginate(
         page=page, per_page=per_page, error_out=False
     )
 
+    # Build interactions list with optional legs
+    interactions = []
+    for call in pagination.items:
+        call_data = call.to_dict()
+
+        # Include call legs if requested
+        if include_legs:
+            legs = CallLeg.get_legs_for_call(call.id)
+            call_data['legs'] = [leg.to_dict() for leg in legs]
+
+        interactions.append(call_data)
+
     return jsonify({
-        'interactions': [c.to_dict() for c in pagination.items],
+        'interactions': interactions,
         'total': pagination.total,
         'page': pagination.page,
         'pages': pagination.pages,

@@ -54,6 +54,7 @@ interface CallFabricContextType {
   setAgentStatus: (status: AgentStatusType) => Promise<void>;
   initializeClient: () => Promise<void>;
   makeCall: (phoneNumber: string, context?: any) => Promise<any>;
+  makeCallToSwml: (swmlUrl: string, context?: any) => Promise<any>;  // For takeover calls
   hangup: () => Promise<void>;
   answerCall: () => Promise<void>;
   requestMicPermission: () => Promise<boolean>;
@@ -425,6 +426,75 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     }
   }, [client, isClientReady, user]);
 
+  // Make call to SWML URL (for takeover calls)
+  const makeCallToSwml = useCallback(async (swmlUrl: string, context?: any) => {
+    if (!client) {
+      setError('Phone system not initialized');
+      return;
+    }
+
+    if (!isClientReady) {
+      setError('Phone system still initializing, please wait a moment');
+      return;
+    }
+
+    try {
+      console.log('📞 [CallFabric] Making SWML call to:', swmlUrl);
+      setCallState('ringing');
+
+      // When dialing a URL, SignalWire fetches the SWML and executes it
+      const call = await client.dial({
+        to: swmlUrl,
+        rootElement: rootElementRef.current,
+        logLevel: 'debug',
+        debug: { logWsTraffic: true },
+        userVariables: {
+          agent_id: user?.id,
+          agent_name: user?.name,
+          call_type: 'takeover',
+          ...context
+        }
+      });
+
+      call.on('call.state', (state: any) => {
+        console.log('📞 [CallFabric] SWML call state:', state);
+        if (state === 'active' || state === 'answered') setCallState('active');
+        else if (state === 'ending' || state === 'ended') setCallState('ending');
+      });
+
+      call.on('destroy', () => {
+        console.log('📞 [CallFabric] SWML call destroyed');
+        setActiveCall(null);
+        setCallState('idle');
+      });
+
+      const takeoverCall: ActiveCall = {
+        id: call.id,
+        callerId: 'Takeover Call',
+        direction: 'outbound',
+        status: 'connecting',
+        startTime: new Date(),
+        answer: async () => {},
+        hangup: async () => await call.hangup(),
+        hold: async () => {},
+        unhold: async () => {},
+        mute: async () => await call.audioMute(),
+        unmute: async () => await call.audioUnmute(),
+        sendDigits: async (digits: string) => await call.sendDigits(digits)
+      };
+
+      setActiveCall(takeoverCall);
+      await call.start();
+      console.log('✅ [CallFabric] SWML call started');
+      return call;
+
+    } catch (error) {
+      console.error('❌ [CallFabric] Failed to make SWML call:', error);
+      setError('Failed to take over call');
+      setCallState('idle');
+    }
+  }, [client, isClientReady, user]);
+
   // Hang up current call
   const hangup = useCallback(async () => {
     if (!activeCall) return;
@@ -541,6 +611,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     setAgentStatus,
     initializeClient,
     makeCall,
+    makeCallToSwml,
     hangup,
     answerCall,
     requestMicPermission,

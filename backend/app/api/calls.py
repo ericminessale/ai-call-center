@@ -1,10 +1,12 @@
 from flask import request, jsonify
-from app import db, socketio
+from app import db, socketio, redis_client
 from app.api import calls_bp
-from app.models import Call, Transcription
+from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth, validate_json
 import logging
+import secrets
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -443,3 +445,120 @@ def send_ai_message(call_id):
     except Exception as e:
         logger.error(f"Failed to send AI message: {str(e)}")
         return jsonify({'error': f'Failed to send AI message: {str(e)}'}), 500
+
+
+@calls_bp.route('/<call_sid>/takeover', methods=['POST'])
+@require_auth
+def initiate_takeover(call_sid):
+    """Initiate a takeover of an AI-active call by a human agent.
+
+    This endpoint generates a SWML URL that the agent's Call Fabric client
+    will dial to bridge into the existing call.
+
+    Returns:
+    {
+        "swml_url": "https://domain/api/swml/takeover/{token}",
+        "call_sid": "call-xxxxx",
+        "leg_id": 123
+    }
+    """
+    logger.info(f"TAKEOVER REQUEST for call {call_sid} by user {request.current_user.id}")
+
+    try:
+        # Find the call by SignalWire call_sid
+        call = Call.find_by_sid(call_sid)
+        if not call:
+            logger.error(f"Call not found: {call_sid}")
+            return jsonify({'error': 'Call not found'}), 404
+
+        # Validate call is currently AI-handled
+        if call.handler_type != 'ai':
+            logger.warning(f"Call {call_sid} is not AI-handled (handler_type={call.handler_type})")
+            return jsonify({'error': 'Call is not currently handled by AI'}), 400
+
+        # Validate call is active
+        if call.status not in ['ai_active', 'answered', 'ringing']:
+            logger.warning(f"Call {call_sid} is not active (status={call.status})")
+            return jsonify({'error': 'Call is not active'}), 400
+
+        # End current AI leg and create new human leg
+        new_leg = CallLeg.create_next_leg(
+            call=call,
+            leg_type='human_agent',
+            user_id=request.current_user.id
+        )
+        db.session.commit()
+
+        logger.info(f"Created new human leg {new_leg.id} for call {call.id}")
+
+        # Generate secure takeover token
+        token = secrets.token_urlsafe(32)
+
+        # Store takeover info in Redis with 60-second TTL
+        takeover_data = json.dumps({
+            'call_sid': call.signalwire_call_sid,
+            'call_id': call.id,
+            'leg_id': new_leg.id,
+            'user_id': request.current_user.id
+        })
+        redis_client.setex(f'takeover:{token}', 60, takeover_data)
+
+        logger.info(f"Stored takeover token in Redis: {token[:8]}...")
+
+        # Generate SWML URL
+        base_url = request.host_url.rstrip('/')
+        swml_url = f"{base_url}/api/swml/takeover/{token}"
+
+        # Update call handler type to human (takeover in progress)
+        call.handler_type = 'human'
+        call.user_id = request.current_user.id
+        db.session.commit()
+
+        # Emit event to notify UI
+        socketio.emit('call_takeover_initiated', {
+            'call_sid': call.signalwire_call_sid,
+            'call_id': call.id,
+            'agent_id': request.current_user.id,
+            'leg_id': new_leg.id
+        }, room=f'call_{call.signalwire_call_sid}')
+
+        return jsonify({
+            'success': True,
+            'swml_url': swml_url,
+            'call_sid': call.signalwire_call_sid,
+            'leg_id': new_leg.id
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to initiate takeover: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': f'Failed to initiate takeover: {str(e)}'}), 500
+
+
+@calls_bp.route('/<call_id>/legs', methods=['GET'])
+@require_auth
+def get_call_legs(call_id):
+    """Get all legs for a call."""
+    try:
+        # Find call by ID or SID
+        call = None
+        if call_id.isdigit():
+            call = db.session.query(Call).filter_by(id=int(call_id)).first()
+        if not call:
+            call = Call.find_by_sid(call_id)
+        if not call:
+            return jsonify({'error': 'Call not found'}), 404
+
+        # Get all legs
+        legs = CallLeg.get_legs_for_call(call.id)
+
+        return jsonify({
+            'call_id': call.id,
+            'call_sid': call.signalwire_call_sid,
+            'legs': [leg.to_dict() for leg in legs]
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get call legs: {str(e)}")
+        return jsonify({'error': f'Failed to get call legs: {str(e)}'}), 500

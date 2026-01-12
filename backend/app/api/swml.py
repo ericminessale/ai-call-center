@@ -1,7 +1,7 @@
 from flask import request, jsonify
-from app import db
+from app import db, redis_client
 from app.api import swml_bp
-from app.models import Call, WebhookEvent, User
+from app.models import Call, CallLeg, WebhookEvent, User
 import logging
 import json
 
@@ -111,6 +111,16 @@ def initial_call():
     # Immediately mark call as ai_active since we're transferring to AI agent
     # This makes it appear in the Agent Dashboard as "AI Active"
     call.update_status('ai_active')
+
+    # Create initial AI leg for tracking
+    existing_leg = CallLeg.get_active_leg(call.id)
+    if not existing_leg:
+        CallLeg.create_initial_leg(
+            call=call,
+            leg_type='ai_agent',
+            ai_agent_name='Receptionist'  # Initial AI agent
+        )
+
     db.session.commit()
 
     # Emit WebSocket event so frontend sees the active AI call
@@ -341,3 +351,82 @@ def end_call():
             ]
         }
     })
+
+
+@swml_bp.route('/takeover/<token>', methods=['POST'])
+def takeover_swml(token):
+    """Return SWML to bridge an agent into an existing AI call.
+
+    This endpoint is called by SignalWire when an agent dials the takeover URL.
+    It plays a transition message to the customer, then connects the agent
+    to the existing call using `connect: to: call:{call_sid}`.
+    """
+    logger.info(f"TAKEOVER SWML requested with token: {token[:8]}...")
+
+    # Look up the token in Redis
+    takeover_data = redis_client.get(f'takeover:{token}')
+
+    if not takeover_data:
+        logger.error(f"Takeover token not found or expired: {token[:8]}...")
+        # Return SWML that plays an error message
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    "answer",
+                    {
+                        "play": {
+                            "urls": ["say:Sorry, this takeover link has expired. Please try again."]
+                        }
+                    },
+                    "hangup"
+                ]
+            }
+        }), 200  # Still return 200 so SignalWire can play the message
+
+    # Delete the token (one-time use)
+    redis_client.delete(f'takeover:{token}')
+
+    # Parse the takeover data
+    data = json.loads(takeover_data)
+    original_call_sid = data['call_sid']
+    call_id = data['call_id']
+    leg_id = data['leg_id']
+
+    logger.info(f"Takeover: Bridging agent into call {original_call_sid}")
+
+    # Update the leg status to active
+    leg = db.session.query(CallLeg).filter_by(id=leg_id).first()
+    if leg:
+        leg.status = 'active'
+        db.session.commit()
+        logger.info(f"Updated leg {leg_id} status to 'active'")
+
+    # Emit WebSocket event to notify UI that takeover is connecting
+    from app import socketio
+    socketio.emit('call_takeover_connecting', {
+        'call_sid': original_call_sid,
+        'call_id': call_id,
+        'leg_id': leg_id
+    }, room=f'call_{original_call_sid}')
+
+    # Return SWML that plays transition message and connects to the call
+    # The `connect: to: call:{call_sid}` bridges the agent into the existing call
+    swml_response = {
+        "version": "1.0.0",
+        "sections": {
+            "main": [
+                "answer",
+                {
+                    "connect": {
+                        "to": f"call:{original_call_sid}",
+                        "play": "say:Please hold while I connect you with an agent."
+                    }
+                }
+            ]
+        }
+    }
+
+    logger.info(f"TAKEOVER SWML RESPONSE: {json.dumps(swml_response, indent=2)}")
+
+    return jsonify(swml_response)

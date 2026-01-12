@@ -1,7 +1,7 @@
 from flask import request, jsonify
 from app import db, socketio
 from app.api import webhooks_bp
-from app.models import Call, Transcription, WebhookEvent
+from app.models import Call, CallLeg, Transcription, WebhookEvent
 from app.services.redis_service import publish_event
 import logging
 import json
@@ -135,6 +135,13 @@ def call_status():
 
             # Special handling for ended status to reset UI
             if mapped_status == 'ended':
+                # Close any active call legs
+                active_leg = CallLeg.get_active_leg(call.id)
+                if active_leg:
+                    active_leg.end_leg(reason='hangup')
+                    db.session.commit()
+                    logger.info(f"Closed active leg {active_leg.id} for call {call.id}")
+
                 call_ended_data = {
                     'callId': call.id,  # Use database ID
                     'call_sid': call_id,  # Also provide SignalWire ID

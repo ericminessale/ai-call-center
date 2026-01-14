@@ -4,6 +4,8 @@ from app.api import calls_bp
 from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth, validate_json
+from app.utils.url_utils import get_base_url
+from datetime import datetime, timedelta
 import logging
 import secrets
 import json
@@ -33,7 +35,7 @@ def initiate_call():
         sw_api = get_signalwire_api()
 
         # Always use the initial-call SWML which handles everything
-        base_url = request.host_url.rstrip('/')
+        base_url = get_base_url()
         swml_url = f"{base_url}/api/swml/initial-call"
 
         # Use our own webhook endpoint for call state events
@@ -109,7 +111,7 @@ def update_transcription(call_sid):
         sw_api = get_signalwire_api()
 
         # Handle different actions using direct API calls
-        base_url = request.host_url.rstrip('/')
+        base_url = get_base_url()
 
         if action == 'start':
             # Start transcription
@@ -345,11 +347,14 @@ def end_call(call_id):
 
         # Update call status
         call.update_status('completed')
+        call.ended_at = datetime.utcnow()
         db.session.commit()
         logger.info(f"Call status updated to 'completed' in database")
 
-        # Don't emit call_ended here - the webhook will handle it when SignalWire confirms the call ended
-        # This prevents duplicate call_ended events
+        # Emit call update so frontend removes from active list
+        # Don't rely on webhook - it might not fire if call already ended
+        from app.services.callcenter_socketio import emit_call_update
+        emit_call_update(call)
 
         return jsonify({
             'success': True,
@@ -506,7 +511,7 @@ def initiate_takeover(call_sid):
         logger.info(f"Stored takeover token in Redis: {token[:8]}...")
 
         # Generate SWML URL
-        base_url = request.host_url.rstrip('/')
+        base_url = get_base_url()
         swml_url = f"{base_url}/api/swml/takeover/{token}"
 
         # Update call handler type to human (takeover in progress)
@@ -562,3 +567,59 @@ def get_call_legs(call_id):
     except Exception as e:
         logger.error(f"Failed to get call legs: {str(e)}")
         return jsonify({'error': f'Failed to get call legs: {str(e)}'}), 500
+
+
+@calls_bp.route('/cleanup-stale', methods=['POST'])
+@require_auth
+def cleanup_stale_calls():
+    """Clean up stale calls that are stuck in ringing/active status.
+
+    Marks calls as 'ended' if they've been in ringing/active status for too long.
+    This handles cases where webhooks didn't fire properly.
+
+    Query params:
+    - force=true: Clean ALL non-terminal calls regardless of age (for dev)
+    - max_age_minutes=N: Override the default 60 minute threshold
+    """
+    try:
+        force = request.args.get('force', 'false').lower() == 'true'
+        max_age_minutes = request.args.get('max_age_minutes', 60, type=int)
+
+        if force:
+            # Clean ALL non-terminal calls
+            stale_calls = db.session.query(Call).filter(
+                Call.status.in_(['ringing', 'active', 'connecting', 'ai_active'])
+            ).all()
+        else:
+            # Find calls stuck in non-terminal states for more than max_age_minutes
+            cutoff_time = datetime.utcnow() - timedelta(minutes=max_age_minutes)
+            stale_calls = db.session.query(Call).filter(
+                Call.status.in_(['ringing', 'active', 'connecting', 'ai_active']),
+                Call.created_at < cutoff_time
+            ).all()
+
+        cleaned_count = 0
+        for call in stale_calls:
+            logger.info(f"Cleaning up stale call {call.id}: status={call.status}, created={call.created_at}")
+            call.status = 'ended'
+            call.ended_at = datetime.utcnow()
+            cleaned_count += 1
+
+        db.session.commit()
+
+        # Emit updates for cleaned calls
+        from app.services.callcenter_socketio import emit_call_update
+        for call in stale_calls:
+            emit_call_update(call)
+
+        logger.info(f"Cleaned up {cleaned_count} stale calls")
+
+        return jsonify({
+            'success': True,
+            'cleaned_count': cleaned_count,
+            'calls': [{'id': c.id, 'status': c.status} for c in stale_calls]
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to cleanup stale calls: {str(e)}")
+        return jsonify({'error': f'Failed to cleanup stale calls: {str(e)}'}), 500

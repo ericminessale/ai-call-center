@@ -59,6 +59,7 @@ services:
       SIGNALWIRE_PROJECT_ID: ${SIGNALWIRE_PROJECT_ID}
       SIGNALWIRE_API_TOKEN: ${SIGNALWIRE_API_TOKEN}
       SIGNALWIRE_PHONE_NUMBER: ${SIGNALWIRE_PHONE_NUMBER}
+      SIGNALWIRE_FROM_NUMBER: ${SIGNALWIRE_FROM_NUMBER:-${SIGNALWIRE_PHONE_NUMBER}}
 
       # SWML Basic Auth (for AI agents)
       SWML_BASIC_AUTH_USER: ${SWML_BASIC_AUTH_USER}
@@ -68,6 +69,13 @@ services:
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-secret-key-in-production}
       SECRET_KEY: ${SECRET_KEY:-another-secret-key-for-flask}
       SUBSCRIBER_PASSWORD_KEY: ${SUBSCRIBER_PASSWORD_KEY}
+
+      # External URL (for SignalWire callbacks when using ngrok)
+      # Set this to your ngrok URL so SignalWire can reach your local server
+      EXTERNAL_URL: ${EXTERNAL_URL}
+
+      # Call Fabric Resources (set up in SignalWire Dashboard)
+      AGENT_CONFERENCE_RESOURCE: ${AGENT_CONFERENCE_RESOURCE:-/public/agent-conference}
 
       # Application
       FLASK_APP: app

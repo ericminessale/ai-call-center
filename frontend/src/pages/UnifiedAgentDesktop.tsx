@@ -108,23 +108,34 @@ export function UnifiedAgentDesktop() {
         return;
       }
 
-      // Map backend fields and infer handler_type from status if not provided
+      // Map backend fields (backend uses camelCase, frontend uses snake_case)
       const mappedCall: Call = {
         ...call,
         from_number: call.from_number || (call as any).fromNumber,
         handler_type: call.handler_type || (call as any).handlerType || (call.status === 'ai_active' ? 'ai' : 'human'),
         phoneNumber: call.from_number || (call as any).fromNumber || call.phoneNumber || 'Unknown',
-        // CRITICAL: Map signalwire_call_sid from various possible field names
+        // Map contact_id from backend's contactId
+        contact_id: call.contact_id || (call as any).contactId,
+        // Map signalwire_call_sid from various possible field names
         signalwire_call_sid: call.signalwire_call_sid || (call as any).signalwireCallSid || (call as any).signalwire_call_sid,
         call_sid: call.signalwire_call_sid || (call as any).signalwireCallSid || call.call_sid,
+        // Map direction for outbound call detection
+        direction: call.direction || (call as any).direction,
+        // Map destination for outbound calls
+        destination: (call as any).destination,
+        // Map AI context for display in call panel
+        aiContext: (call as any).aiContext || (call as any).ai_context,
       };
 
       console.log('📞 [UNIFIED] Mapped call:', {
         id: mappedCall.id,
         status: mappedCall.status,
         handler_type: mappedCall.handler_type,
+        contact_id: mappedCall.contact_id,
         phoneNumber: mappedCall.phoneNumber,
-        signalwire_call_sid: mappedCall.signalwire_call_sid
+        signalwire_call_sid: mappedCall.signalwire_call_sid,
+        direction: mappedCall.direction,
+        destination: (mappedCall as any).destination
       });
 
       // Check if call is ended/completed - remove from active list
@@ -215,7 +226,8 @@ export function UnifiedAgentDesktop() {
   const loadActiveCalls = useCallback(async () => {
     try {
       console.log('📞 [UNIFIED] Loading active calls...');
-      const response = await callsApi.list({ status: 'active,ai_active' });
+      // Include ringing and connecting status to catch outbound calls and calls in transition
+      const response = await callsApi.list({ status: 'active,ai_active,connecting,ringing' });
       console.log('📞 [UNIFIED] Active calls response:', response.data);
 
       // Map backend fields to frontend format
@@ -227,9 +239,16 @@ export function UnifiedAgentDesktop() {
         handler_type: call.handlerType || call.handler_type || (call.status === 'ai_active' ? 'ai' : 'human'),
         phoneNumber: call.fromNumber || call.from_number || call.destination || 'Unknown',
         status: call.dashboard_status || call.status,
+        // Map contact_id from backend's contactId
+        contact_id: call.contactId || call.contact_id,
         // CRITICAL: Map signalwireCallSid (camelCase from API) to signalwire_call_sid (snake_case expected by frontend)
         signalwire_call_sid: call.signalwireCallSid || call.signalwire_call_sid,
         call_sid: call.signalwireCallSid || call.signalwire_call_sid || call.call_sid,
+        // Map direction and destination for outbound call detection
+        direction: call.direction,
+        destination: call.destination,
+        // Map AI context for display in call panel
+        aiContext: call.aiContext || call.ai_context,
       }));
 
       console.log('📞 [UNIFIED] Mapped active calls:', mappedCalls.map((c: any) => ({
@@ -237,7 +256,10 @@ export function UnifiedAgentDesktop() {
         phoneNumber: c.phoneNumber,
         status: c.status,
         handler_type: c.handler_type,
-        signalwire_call_sid: c.signalwire_call_sid
+        contact_id: c.contact_id,
+        signalwire_call_sid: c.signalwire_call_sid,
+        direction: c.direction,
+        destination: c.destination
       })));
 
       setActiveCalls(mappedCalls);
@@ -527,12 +549,20 @@ export function UnifiedAgentDesktop() {
               contact={selectedContact}
               onContactUpdate={handleContactUpdate}
               onContactDelete={handleContactDelete}
-              activeCallForContact={activeCalls.find(c =>
-                c.contact_id === selectedContact.id ||
-                c.from_number === selectedContact.phone ||
-                (c as any).fromNumber === selectedContact.phone ||
-                c.phoneNumber === selectedContact.phone
-              )}
+              activeCallForContact={activeCalls.find(c => {
+                // First check contact_id match (most reliable)
+                if (c.contact_id === selectedContact.id || (c as any).contactId === selectedContact.id) {
+                  return true;
+                }
+                // For outbound calls, match by destination (customer's number)
+                if (c.direction === 'outbound') {
+                  return (c as any).destination === selectedContact.phone;
+                }
+                // For inbound calls, match by from_number (customer's number)
+                return c.from_number === selectedContact.phone ||
+                       (c as any).fromNumber === selectedContact.phone ||
+                       c.phoneNumber === selectedContact.phone;
+              })}
             />
           ) : (
             <div className="h-full flex items-center justify-center text-gray-500">

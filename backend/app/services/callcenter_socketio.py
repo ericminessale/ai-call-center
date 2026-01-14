@@ -26,6 +26,38 @@ def is_demo_mode():
     # Set DEMO_MODE=false in production
     return os.getenv('DEMO_MODE', 'true').lower() == 'true'
 
+
+def emit_call_update(call):
+    """Emit a call update event to all relevant listeners.
+
+    This notifies the frontend of call status changes so the UI updates in real-time.
+    """
+    if not call:
+        return
+
+    # Convert call to dict for emission
+    call_data = call.to_dict() if hasattr(call, 'to_dict') else {
+        'id': call.id,
+        'status': call.status,
+        'handler_type': call.handler_type,
+        'from_number': call.from_number,
+        'destination': call.destination,
+        'signalwire_call_sid': call.signalwire_call_sid,
+    }
+
+    logger.info(f"Emitting call_update for call {call.id}, status: {call.status}")
+
+    # Emit to the general calls room (for supervisors and dashboards)
+    socketio.emit('call_update', {'call': call_data})
+
+    # If there's an assigned user, also emit to their personal room
+    if call.user_id:
+        socketio.emit('call_update', {'call': call_data}, room=str(call.user_id))
+
+    # Emit to the call-specific room if there's a call SID
+    if call.signalwire_call_sid:
+        socketio.emit('call_update', {'call': call_data}, room=call.signalwire_call_sid)
+
 @socketio.on('agent_status')
 def handle_agent_status_change(data):
     """Handle agent status changes."""

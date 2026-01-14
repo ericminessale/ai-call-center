@@ -6,12 +6,15 @@ Handles call queuing, agent assignment, and queue monitoring
 from flask import Blueprint, jsonify, request, current_app
 from app.services.queue_service import QueueService
 from app.services.redis_service import get_redis_client
+from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth
+from app.utils.url_utils import get_base_url
 from app import db
-from app.models import Call, User
+from app.models import Call, User, Conference, ConferenceParticipant, CallLeg
 from datetime import datetime
 import logging
 import json
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +97,8 @@ def route_call_to_queue(queue_id):
             )
             db.session.add(call)
 
-        call.customer_context = context
-        call.queue_id = queue_id
+        # Store AI context (customer info collected by AI agent)
+        call.ai_context = json.dumps(context) if context else None
         db.session.commit()
 
         # Enqueue the call
@@ -153,11 +156,6 @@ def route_call_to_queue(queue_id):
                     attempts += 1
 
             if selected_user:
-                # Use Call Fabric address (e.g., /private/agent@example.com)
-                transfer_target = selected_user.signalwire_address
-
-                logger.info(f"Routing call {call_id} to agent {selected_user.email} via Call Fabric: {transfer_target}")
-
                 # Dequeue the call for this agent
                 dequeued_data = service.dequeue_call(queue_id, str(selected_user.id))
 
@@ -165,31 +163,112 @@ def route_call_to_queue(queue_id):
                 if call:
                     call.status = 'connecting'
                     call.handler_type = 'human'
-                    db.session.commit()
+                    call.user_id = selected_user.id
+
+                # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
+                base_url = get_base_url()
+
+                # Conference-based routing: customer joins agent's conference (hot seat model)
+                conference_name = f"agent-conf-{selected_user.id}"
+
+                logger.info(f"Routing call {call_id} to agent {selected_user.email} via conference: {conference_name}")
+
+                # Get or create the conference
+                conference = Conference.get_or_create_agent_conference(selected_user.id)
+
+                # Create call leg for human agent
+                if call:
+                    CallLeg.create_next_leg(
+                        call=call,
+                        leg_type='human_agent',
+                        user_id=selected_user.id,
+                        conference_id=conference.id,
+                        conference_name=conference_name,
+                        transition_reason='queue_routing'
+                    )
+
+                db.session.commit()
+
+                # Emit call_update so frontend immediately knows this is now a human-handled call
+                emit_call_update(call)
+                logger.info(f"Emitted call_update for call {call.id} (handler_type={call.handler_type}, status={call.status})")
 
                 # Emit WebSocket event for agent notification
-                # Agent joins room str(user_id) during authentication
+                # Room name must match authenticate handler: str(user_id)
                 from app import socketio
-                socketio.emit('incoming_call', {
+                socketio.emit('customer_routed_to_conference', {
                     'call_id': call_id,
                     'call_db_id': call.id if call else None,
                     'caller_number': caller_number,
                     'queue_id': queue_id,
                     'context': context,
                     'agent_id': selected_user.id,
-                    'agent_name': selected_user.name or selected_user.email
+                    'agent_name': selected_user.name or selected_user.email,
+                    'conference_name': conference_name,
+                    'customer_info': {
+                        'phone': caller_number
+                    }
                 }, room=str(selected_user.id))
-                logger.info(f"Emitted incoming_call to agent room {selected_user.id}")
+                logger.info(f"Emitted customer_routed_to_conference to agent room {selected_user.id}")
 
-                # Get base URL for callbacks
-                forwarded_host = request.headers.get('X-Forwarded-Host')
-                forwarded_proto = request.headers.get('X-Forwarded-Proto', 'https')
-                if forwarded_host:
-                    base_url = f"{forwarded_proto}://{forwarded_host}"
-                else:
-                    base_url = request.host_url.rstrip('/')
+                # Return SWML response to connect customer to agent
+                #
+                # IMPORTANT: Call Fabric addressing for SWML connect
+                # - Phone numbers: "+1234567890"
+                # - SIP endpoints: "sip:user@domain.com"
+                # - SWML/webhook URLs: "https://example.com/swml"
+                #
+                # The /private/email format does NOT work with SWML connect.
+                # Instead, we transfer to a SWML URL that handles the agent connection.
+                # The agent must be dialed via their subscriber's SIP address or
+                # through a conference-based approach.
 
-                # Return SWML response to connect via Call Fabric
+                # Build dial target for the agent
+                # Options (in order of preference):
+                # 1. signalwire_address if it's valid format (no email @)
+                # 2. Derive from user ID: /private/agent-{user_id}
+                # 3. SIP or phone number fallback
+                #
+                # IMPORTANT: Call Fabric addresses must be alphanumeric with hyphens.
+                # Format like "/private/eric.minessale@gmail.com" is INVALID.
+                # Valid format: "/private/agent-4" or "/private/ericminessale"
+
+                transfer_target = None
+
+                # Option 1: Check if signalwire_address is already in valid format
+                if selected_user.signalwire_address:
+                    addr = selected_user.signalwire_address
+                    # Valid if: starts with /private/ or /public/ AND no @ in the name part
+                    # Or is a phone number or SIP URI
+                    if addr.startswith('/private/') or addr.startswith('/public/'):
+                        # Extract the name part and validate
+                        name_part = addr.split('/')[-1]
+                        if '@' not in name_part:
+                            transfer_target = addr
+                            logger.info(f"Using signalwire_address for agent: {transfer_target}")
+                        else:
+                            logger.warning(f"Invalid fabric address format (contains @): {addr}")
+                            # Fix: Use derived address instead
+                            transfer_target = f"/private/agent-{selected_user.id}"
+                            logger.info(f"Using derived fabric address: {transfer_target}")
+                            # Update the user's stored address for future calls
+                            selected_user.signalwire_address = transfer_target
+                            db.session.commit()
+                    elif addr.startswith('+') or addr.startswith('sip:'):
+                        transfer_target = addr
+                        logger.info(f"Using phone/SIP for agent: {transfer_target}")
+
+                # Option 2: Derive from user ID if no valid address
+                if not transfer_target and selected_user.signalwire_subscriber_id:
+                    transfer_target = f"/private/agent-{selected_user.id}"
+                    logger.info(f"Using derived fabric address: {transfer_target}")
+
+                # Conference-based routing: customer joins agent's conference
+                # The agent is already in their conference (hot seat mode)
+                # We route the customer INTO that conference
+                logger.info(f"Routing customer to agent {selected_user.email} conference: {conference_name}")
+
+                # Return SWML that joins the customer to the agent's conference
                 return jsonify({
                     "version": "1.0.0",
                     "sections": {
@@ -200,22 +279,8 @@ def route_call_to_queue(queue_id):
                                 }
                             },
                             {
-                                "connect": {
-                                    "to": transfer_target,
-                                    "timeout": 30,
-                                    "answer_on_bridge": True,
-                                    "ringback": ["ring:us"]
-                                }
-                            },
-                            # If agent doesn't answer, go back to queue
-                            {
-                                "play": {
-                                    "url": "say:The agent was unavailable. Returning you to the queue."
-                                }
-                            },
-                            {
-                                "transfer": {
-                                    "dest": f"{base_url}/api/queues/{queue_id}/route"
+                                "join_conference": {
+                                    "name": conference_name
                                 }
                             }
                         ]
@@ -239,13 +304,8 @@ def route_call_to_queue(queue_id):
 
         logger.info(f"Call {call_id} wait time: {wait_time_seconds:.0f}s, offer AI: {offer_ai_fallback}")
 
-        # Get base URL for callbacks
-        forwarded_host = request.headers.get('X-Forwarded-Host')
-        forwarded_proto = request.headers.get('X-Forwarded-Proto', 'https')
-        if forwarded_host:
-            base_url = f"{forwarded_proto}://{forwarded_host}"
-        else:
-            base_url = request.host_url.rstrip('/')
+        # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
+        base_url = get_base_url()
 
         # Build appropriate SWML response based on wait time
         if offer_ai_fallback:
@@ -330,6 +390,212 @@ def route_call_to_queue(queue_id):
                 }]
             }
         }), 500
+
+
+@queues_bp.route('/<queue_id>/hold-menu', methods=['POST'])
+def queue_hold_menu(queue_id):
+    """
+    Hold menu with DTMF options for callers waiting in queue.
+    Options:
+    - Press 1: Speak with AI specialist
+    - Press 2: Request callback
+    - Press 3: Stay on hold
+    """
+    try:
+        data = request.json or {}
+        call_data = data.get('call', {})
+        call_id = call_data.get('call_id') or data.get('CallSid') or data.get('call_id')
+
+        logger.info(f"Hold menu for call {call_id} in queue {queue_id}")
+
+        # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
+        base_url = get_base_url()
+
+        # Map queue_id to AI agent
+        ai_agent_map = {
+            'sales': 'sales-ai',
+            'support': 'support-ai',
+            'billing': 'support-ai'
+        }
+        ai_agent = ai_agent_map.get(queue_id, 'support-ai')
+
+        # Build DTMF menu with prompt
+        swml_response = {
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {
+                        "prompt": {
+                            "play": f"say:While you wait, you have options. "
+                                   f"Press 1 to speak with our AI specialist who can help right away. "
+                                   f"Press 2 to request a callback when an agent is available. "
+                                   f"Press 3 or stay on the line to continue waiting.",
+                            "speech": {
+                                "timeout": 10,
+                                "end_silence_timeout": 1
+                            },
+                            "digits": {
+                                "max_digits": 1,
+                                "digit_timeout": 10
+                            }
+                        }
+                    },
+                    # Handle the response with switch
+                    {
+                        "switch": {
+                            "variable": "prompt_value",
+                            "case": {
+                                "1": [
+                                    {
+                                        "play": {
+                                            "url": "say:Connecting you with our AI specialist."
+                                        }
+                                    },
+                                    {
+                                        "transfer": {
+                                            "dest": f"{base_url}/{ai_agent}"
+                                        }
+                                    }
+                                ],
+                                "2": [
+                                    {
+                                        "play": {
+                                            "url": "say:We have added you to our callback list. "
+                                                   "An agent will call you back as soon as one becomes available. "
+                                                   "Thank you for calling. Goodbye."
+                                        }
+                                    },
+                                    # TODO: Implement callback registration
+                                    "hangup"
+                                ],
+                                "3": [
+                                    # Stay on hold - go to hold loop
+                                    {
+                                        "transfer": {
+                                            "dest": f"{base_url}/api/queues/{queue_id}/hold-loop"
+                                        }
+                                    }
+                                ]
+                            },
+                            "default": [
+                                # No input or invalid - go to hold loop
+                                {
+                                    "transfer": {
+                                        "dest": f"{base_url}/api/queues/{queue_id}/hold-loop"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+
+        return jsonify(swml_response)
+
+    except Exception as e:
+        logger.error(f"Error in hold menu: {str(e)}")
+        base_url = get_base_url()
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {
+                        "play": {
+                            "url": "say:Please hold while we connect you."
+                        }
+                    },
+                    {
+                        "transfer": {
+                            "dest": f"{base_url}/api/queues/{queue_id}/route"
+                        }
+                    }
+                ]
+            }
+        })
+
+
+@queues_bp.route('/<queue_id>/hold-loop', methods=['POST'])
+def queue_hold_loop(queue_id):
+    """
+    Hold loop - plays hold music/messages and periodically checks for available agents.
+    """
+    try:
+        data = request.json or {}
+        call_data = data.get('call', {})
+        call_id = call_data.get('call_id') or data.get('CallSid') or data.get('call_id')
+
+        logger.info(f"Hold loop for call {call_id} in queue {queue_id}")
+
+        # Get base URL (uses EXTERNAL_URL env var if set)
+        base_url = get_base_url()
+
+        # Check queue position
+        service = get_queue_service()
+        queue_status = service.get_queue_status(queue_id)
+        position = queue_status.get('length', 0)
+
+        # Build hold loop SWML
+        swml_response = {
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {
+                        "play": {
+                            "url": f"say:Thank you for your patience. "
+                                   f"You are currently number {max(position, 1)} in the queue. "
+                                   f"An agent will be with you shortly."
+                        }
+                    },
+                    # Play hold music (using silence for now, could be music URL)
+                    {
+                        "play": {
+                            "url": "silence:20"
+                        }
+                    },
+                    {
+                        "play": {
+                            "url": "say:We appreciate your patience. Please continue to hold."
+                        }
+                    },
+                    # Play more hold time
+                    {
+                        "play": {
+                            "url": "silence:20"
+                        }
+                    },
+                    # Check for agent again by transferring to route
+                    {
+                        "transfer": {
+                            "dest": f"{base_url}/api/queues/{queue_id}/route"
+                        }
+                    }
+                ]
+            }
+        }
+
+        return jsonify(swml_response)
+
+    except Exception as e:
+        logger.error(f"Error in hold loop: {str(e)}")
+        base_url = get_base_url()
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {
+                        "play": {
+                            "url": "silence:30"
+                        }
+                    },
+                    {
+                        "transfer": {
+                            "dest": f"{base_url}/api/queues/{queue_id}/route"
+                        }
+                    }
+                ]
+            }
+        })
 
 
 @queues_bp.route('/<queue_id>/next', methods=['GET'])

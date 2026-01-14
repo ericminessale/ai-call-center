@@ -30,9 +30,14 @@ class CallLeg(db.Model):
     # Summary for this leg (can be AI-generated)
     summary = db.Column(db.Text, nullable=True)
 
+    # Conference tracking
+    conference_id = db.Column(db.Integer, db.ForeignKey('conferences.id'), nullable=True)
+    conference_name = db.Column(db.String(255), nullable=True)
+
     # Relationships
     call = db.relationship('Call', backref=db.backref('legs', lazy='dynamic', order_by='CallLeg.leg_number'))
     user = db.relationship('User', backref=db.backref('call_legs', lazy='dynamic'))
+    conference = db.relationship('Conference', backref=db.backref('call_legs', lazy='dynamic'))
 
     def __repr__(self):
         return f'<CallLeg {self.id} - {self.leg_type} #{self.leg_number}>'
@@ -52,6 +57,8 @@ class CallLeg(db.Model):
             'duration': self.duration,
             'transitionReason': self.transition_reason,
             'summary': self.summary,
+            'conferenceId': self.conference_id,
+            'conferenceName': self.conference_name,
         }
 
         # Include user info if this is a human agent leg
@@ -86,7 +93,8 @@ class CallLeg(db.Model):
         ).order_by(cls.leg_number).all()
 
     @classmethod
-    def create_initial_leg(cls, call, leg_type='ai_agent', ai_agent_name=None, user_id=None):
+    def create_initial_leg(cls, call, leg_type='ai_agent', ai_agent_name=None, user_id=None,
+                          conference_id=None, conference_name=None):
         """Create the first leg for a call."""
         leg = cls(
             call_id=call.id,
@@ -94,20 +102,24 @@ class CallLeg(db.Model):
             leg_number=1,
             ai_agent_name=ai_agent_name,
             user_id=user_id,
-            status='active'
+            status='active',
+            conference_id=conference_id,
+            conference_name=conference_name
         )
         db.session.add(leg)
         return leg
 
     @classmethod
-    def create_next_leg(cls, call, leg_type, user_id=None, ai_agent_name=None):
+    def create_next_leg(cls, call, leg_type, user_id=None, ai_agent_name=None,
+                       conference_id=None, conference_name=None, transition_reason=None):
         """Create the next leg in the chain, ending the current active leg."""
         # End current active leg
         current_leg = cls.get_active_leg(call.id)
         next_leg_number = 1
 
         if current_leg:
-            current_leg.end_leg(reason='takeover' if leg_type == 'human_agent' else 'transfer')
+            reason = transition_reason or ('takeover' if leg_type == 'human_agent' else 'transfer')
+            current_leg.end_leg(reason=reason)
             next_leg_number = current_leg.leg_number + 1
 
         # Create new leg
@@ -117,7 +129,9 @@ class CallLeg(db.Model):
             leg_number=next_leg_number,
             user_id=user_id,
             ai_agent_name=ai_agent_name,
-            status='connecting'  # Will become 'active' when connected
+            status='connecting',  # Will become 'active' when connected
+            conference_id=conference_id,
+            conference_name=conference_name
         )
         db.session.add(new_leg)
         return new_leg

@@ -62,7 +62,7 @@ def create_app():
         app.logger.warning(f"Initial Redis connection failed: {str(e)} - will retry on demand")
 
     # Register blueprints
-    from app.api import auth_bp, calls_bp, swml_bp, webhooks_bp, admin_bp, contacts_bp
+    from app.api import auth_bp, calls_bp, swml_bp, webhooks_bp, admin_bp, contacts_bp, conferences_bp
     from app.api.queues import queues_bp
     from app.api.fabric import fabric_bp
     from app.api.ai_control import ai_control_bp
@@ -75,6 +75,7 @@ def create_app():
     app.register_blueprint(fabric_bp, url_prefix='/api/fabric')
     app.register_blueprint(ai_control_bp, url_prefix='/api/ai')
     app.register_blueprint(admin_bp, url_prefix='/api/admin')
+    app.register_blueprint(conferences_bp, url_prefix='/api/conferences')
 
     # Import WebSocket handlers (must be after socketio.init_app)
     with app.app_context():

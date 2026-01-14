@@ -84,19 +84,33 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     unmute,
   } = useCallFabric();
 
-  // Determine if there's an outbound call in progress (even if activeCall isn't set yet)
-  // callState is set to 'ringing' immediately when makeCall() is called
-  const isOutboundCallInProgress = callState === 'ringing' || callState === 'active' || callState === 'ending';
+  // Determine if there's an outbound call in progress
+  // For browser-initiated calls: callState is set directly
+  // For server-initiated dial-out: status comes from activeCallForContact via socket events
+  const isOutboundCallInProgress =
+    callState === 'ringing' || callState === 'active' || callState === 'ending' ||
+    (activeCallForContact?.direction === 'outbound' &&
+     ['ringing', 'active', 'connecting'].includes(activeCallForContact?.status || ''));
 
   // Any active call: browser outbound, AI outbound, or inbound from parent
   const hasAnyActiveCall = !!(activeCall || currentCallSid || activeCallForContact || isOutboundCallInProgress);
 
-  // Get display status for outbound calls
+  // Get display status for outbound calls (handles both browser and server-initiated)
   const getOutboundCallStatus = () => {
+    // First check browser callState (for browser-initiated calls)
     if (callState === 'ringing' && !activeCall) return 'Calling...';
     if (callState === 'ringing') return 'Ringing...';
     if (callState === 'active') return 'Connected';
     if (callState === 'ending') return 'Ending...';
+
+    // Then check activeCallForContact status (for server-initiated dial-out)
+    if (activeCallForContact?.direction === 'outbound') {
+      const status = activeCallForContact.status;
+      if (status === 'ringing' || status === 'connecting') return 'Ringing...';
+      if (status === 'active') return 'Connected';
+      if (status === 'ended' || status === 'failed') return 'Ended';
+    }
+
     return 'Connected';
   };
 
@@ -246,8 +260,14 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     }
   };
 
+  const [dialError, setDialError] = useState<string | null>(null);
+
   const handleCall = async () => {
+    setDialError(null);
+
+    // If not online, need to go online first (for inbound handling)
     if (!isOnline) {
+      console.log('📞 [ContactDetail] Going online first...');
       await goOnline();
     }
 
@@ -262,11 +282,14 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         company: contact.company,
       };
 
+      console.log('📞 [ContactDetail] Initiating call to:', contact.phone);
       setIsAICall(false);
       setTranscription([]);
-      await makeCall(contact.phone, context);
-    } catch (error) {
-      console.error('Failed to initiate call:', error);
+      const result = await makeCall(contact.phone, context);
+      console.log('📞 [ContactDetail] Call initiated:', result);
+    } catch (error: any) {
+      console.error('❌ [ContactDetail] Failed to initiate call:', error);
+      setDialError(error?.message || 'Failed to initiate call');
     }
   };
 
@@ -306,7 +329,15 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
           await api.post(`/api/calls/${callSid}/end`);
         }
       } else if (activeCall) {
+        // Browser-initiated call
         await hangup();
+      } else if (activeCallForContact) {
+        // Server-initiated outbound call - end via API
+        const callId = activeCallForContact.id || activeCallForContact.signalwire_call_sid || (activeCallForContact as any).signalwireCallSid;
+        if (callId) {
+          console.log('📞 [ContactDetail] Ending server-initiated call:', callId);
+          await api.post(`/api/calls/${callId}/end`);
+        }
       }
     } catch (error) {
       console.error('Failed to end call:', error);
@@ -553,6 +584,13 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
               )}
             </>
           )}
+          {/* Dial Error Display */}
+          {dialError && (
+            <div className="flex items-center gap-2 px-3 py-1 bg-red-600/20 border border-red-600 rounded text-red-400 text-sm">
+              <span>⚠️ {dialError}</span>
+              <button onClick={() => setDialError(null)} className="ml-2 hover:text-white">✕</button>
+            </div>
+          )}
           {/* More Menu */}
           <div className="relative ml-auto" ref={moreMenuRef}>
             <button
@@ -728,6 +766,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
             callDuration={activeCallForContact?.duration || callDuration}
             callState={callState}
             isOutboundCallInProgress={isOutboundCallInProgress}
+            aiContext={(activeCallForContact as any)?.aiContext}
           />
         )}
         {activeTab === 'history' && (
@@ -1018,6 +1057,15 @@ function DetailRow({ label, value }: { label: string; value?: string }) {
   );
 }
 
+interface AIContext {
+  customer_name?: string;
+  account_number?: string;
+  issue_description?: string;
+  priority?: number;
+  ai_summary?: string;
+  global_data?: Record<string, any>;
+}
+
 function LiveCallTab({
   transcription,
   isAICall,
@@ -1025,6 +1073,7 @@ function LiveCallTab({
   callDuration,
   callState,
   isOutboundCallInProgress,
+  aiContext,
 }: {
   transcription: TranscriptionMessage[];
   isAICall: boolean;
@@ -1032,6 +1081,7 @@ function LiveCallTab({
   callDuration?: number;
   callState?: 'idle' | 'ringing' | 'active' | 'ending';
   isOutboundCallInProgress?: boolean;
+  aiContext?: AIContext;
 }) {
   const [systemMessage, setSystemMessage] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -1124,6 +1174,62 @@ function LiveCallTab({
             {status.text}
           </div>
         </div>
+
+        {/* AI Context Panel - Shows data collected by AI agent */}
+        {aiContext && Object.keys(aiContext).length > 0 && (
+          <div className="mb-4 p-3 bg-blue-900/30 border border-blue-500/30 rounded-lg">
+            <h4 className="text-sm font-medium text-blue-400 mb-2 flex items-center gap-2">
+              <Bot className="w-4 h-4" />
+              AI Agent Collected Information
+            </h4>
+            <div className="space-y-2 text-sm">
+              {aiContext.customer_name && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Customer:</span>
+                  <span className="text-white">{aiContext.customer_name}</span>
+                </div>
+              )}
+              {aiContext.account_number && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Account:</span>
+                  <span className="text-white">{aiContext.account_number}</span>
+                </div>
+              )}
+              {aiContext.issue_description && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Issue:</span>
+                  <span className="text-white">{aiContext.issue_description}</span>
+                </div>
+              )}
+              {aiContext.ai_summary && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Summary:</span>
+                  <span className="text-white">{aiContext.ai_summary}</span>
+                </div>
+              )}
+              {aiContext.priority && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Priority:</span>
+                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                    aiContext.priority >= 8 ? 'bg-red-500/30 text-red-400' :
+                    aiContext.priority >= 5 ? 'bg-yellow-500/30 text-yellow-400' :
+                    'bg-green-500/30 text-green-400'
+                  }`}>
+                    {aiContext.priority >= 8 ? 'High' : aiContext.priority >= 5 ? 'Medium' : 'Low'} ({aiContext.priority})
+                  </span>
+                </div>
+              )}
+              {aiContext.global_data && Object.keys(aiContext.global_data).length > 0 && (
+                <div className="mt-2 pt-2 border-t border-blue-500/20">
+                  <span className="text-gray-400 text-xs">Additional data:</span>
+                  <pre className="mt-1 text-xs text-gray-300 bg-gray-800/50 p-2 rounded overflow-x-auto">
+                    {JSON.stringify(aiContext.global_data, null, 2)}
+                  </pre>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         <div className="bg-gray-900 rounded-lg p-4 min-h-[300px] max-h-[400px] overflow-y-auto font-mono text-sm">
           {/* Show calling state UI when outbound call is ringing */}

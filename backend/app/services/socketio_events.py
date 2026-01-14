@@ -182,3 +182,53 @@ def handle_get_agent_status(data):
         })
     else:
         emit('agent_status', {'status': 'offline', 'user_id': user_id})
+
+
+# Conference socket handlers
+@socketio.on('join_conference')
+def handle_join_conference(data):
+    """Join a conference room to receive real-time updates."""
+    conference_name = data.get('conference_name')
+    token = data.get('token')
+
+    if not conference_name or not token:
+        emit('error', {'message': 'Missing conference_name or token'})
+        return
+
+    user_id = verify_token(token)
+    if not user_id:
+        emit('error', {'message': 'Invalid or expired token'})
+        return
+
+    # Join the conference room
+    room_name = f'conference:{conference_name}'
+    join_room(room_name)
+    add_to_set(f"conference:{conference_name}:listeners", request.sid)
+
+    emit('joined_conference', {
+        'message': f'Joined conference room: {conference_name}',
+        'conference_name': conference_name
+    })
+
+    logger.info(f"Client {request.sid} joined conference room: {room_name}")
+
+
+@socketio.on('leave_conference')
+def handle_leave_conference(data):
+    """Leave a conference room."""
+    conference_name = data.get('conference_name')
+
+    if not conference_name:
+        emit('error', {'message': 'Missing conference_name'})
+        return
+
+    room_name = f'conference:{conference_name}'
+    leave_room(room_name)
+    remove_from_set(f"conference:{conference_name}:listeners", request.sid)
+
+    emit('left_conference', {
+        'message': f'Left conference room: {conference_name}',
+        'conference_name': conference_name
+    })
+
+    logger.info(f"Client {request.sid} left conference room: {room_name}")

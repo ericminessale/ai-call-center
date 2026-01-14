@@ -3,6 +3,8 @@ import { motion } from 'framer-motion';
 import { QueueCard } from './QueueCard';
 import { QuickActions } from './QuickActions';
 import { PersonalMetrics } from './PersonalMetrics';
+import { ConferenceStatus } from './ConferenceStatus';
+import { useCallFabricContext } from '../../contexts/CallFabricContext';
 import type { Queue, AgentStatus, PerformanceMetrics } from '../../types/callcenter';
 
 interface ControlPanelProps {
@@ -20,6 +22,13 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onTakeCall,
   metrics
 }) => {
+  // Conference state for hot seat mode
+  const {
+    isInConference,
+    agentConference,
+    conferenceParticipants
+  } = useCallFabricContext();
+
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
@@ -41,6 +50,13 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
               onTakeCall(queueWithCalls.id);
             }
           }}
+        />
+
+        {/* Conference Status (Hot Seat Mode) */}
+        <ConferenceStatus
+          isInConference={isInConference}
+          conference={agentConference}
+          participants={conferenceParticipants}
         />
 
         {/* Queue Cards */}

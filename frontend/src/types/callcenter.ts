@@ -55,6 +55,43 @@ export interface CallLeg {
   duration?: number;
   transitionReason?: string;
   summary?: string;
+  // Conference tracking
+  conferenceId?: number;
+  conferenceName?: string;
+}
+
+// Conference types for conference-based routing
+export type ConferenceType = 'agent' | 'ai' | 'hold';
+export type ParticipantType = 'customer' | 'agent' | 'ai' | 'supervisor';
+export type ParticipantStatus = 'joining' | 'active' | 'left' | 'muted';
+
+export interface Conference {
+  id: number;
+  conferenceName: string;
+  conferenceType: ConferenceType;
+  ownerUserId?: number;
+  ownerAiAgent?: string;
+  queueId?: string;
+  status: 'active' | 'ended';
+  createdAt: string;
+  endedAt?: string;
+  participants?: ConferenceParticipant[];
+}
+
+export interface ConferenceParticipant {
+  id: number;
+  conferenceId: number;
+  callId?: number;
+  participantType: ParticipantType;
+  participantId: string;
+  callSid?: string;
+  direction?: 'inbound' | 'outbound';  // For reporting/debugging
+  status: ParticipantStatus;
+  joinedAt: string;
+  leftAt?: string;
+  duration?: number;
+  isMuted: boolean;
+  isDeaf: boolean;
 }
 
 export interface Interaction {

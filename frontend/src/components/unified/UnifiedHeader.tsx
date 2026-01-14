@@ -9,6 +9,7 @@ import {
   PhoneCall,
   Settings,
   Circle,
+  AlertTriangle,
 } from 'lucide-react';
 import { ViewMode, AgentStatus } from '../../pages/UnifiedAgentDesktop';
 import { QuickDialDropdown } from './QuickDialDropdown';
@@ -73,7 +74,7 @@ export function UnifiedHeader({
         {/* Center - Agent Status and Stats */}
         <div className="flex items-center gap-6">
           {/* Agent Status Dropdown */}
-          <div className="relative">
+          <div className="relative flex items-center gap-2">
             <button
               onClick={() => setShowStatusDropdown(!showStatusDropdown)}
               className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 rounded-lg hover:bg-gray-600 transition-colors"
@@ -84,6 +85,25 @@ export function UnifiedHeader({
               </span>
               <ChevronDown className="w-4 h-4 text-gray-400" />
             </button>
+
+            {/* Conference Error Indicator */}
+            {callFabric.conferenceJoinError && (
+              <div
+                className="flex items-center gap-1 px-2 py-1 bg-red-900/50 border border-red-700 rounded-lg cursor-help"
+                title={callFabric.conferenceJoinError}
+              >
+                <AlertTriangle className="w-4 h-4 text-red-400" />
+                <span className="text-xs text-red-400">Conference Error</span>
+              </div>
+            )}
+
+            {/* Connecting indicator */}
+            {callFabric.isChangingStatus && (
+              <div className="flex items-center gap-1 px-2 py-1 bg-blue-900/50 border border-blue-700 rounded-lg">
+                <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+                <span className="text-xs text-blue-400">Connecting...</span>
+              </div>
+            )}
 
             {showStatusDropdown && (
               <div className="absolute top-full left-0 mt-1 w-40 bg-gray-700 rounded-lg shadow-lg border border-gray-600 py-1 z-50">

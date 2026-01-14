@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { useSocket } from '../hooks/useSocket';
 import { useAuthStore } from '../stores/authStore';
+import { useCallFabricContext } from '../contexts/CallFabricContext';
 import { GlobalNav } from '../components/callcenter/GlobalNav';
 import { ControlPanel } from '../components/callcenter/ControlPanel';
 import { Workspace } from '../components/callcenter/Workspace';
@@ -13,9 +14,30 @@ import { AIInterventionPanel } from '../components/supervisor/AIInterventionPane
 import type { Call, Queue, AgentStatus, CustomerContext } from '../types/callcenter';
 
 export const CallCenterDashboard: React.FC = () => {
-  // Agent State
-  const [agentStatus, setAgentStatus] = useState<AgentStatus>('offline');
+  // Agent State - use context's status which persists across refreshes
+  const {
+    agentStatus: contextAgentStatus,
+    setAgentStatus: setContextAgentStatus,
+    joinAgentConference,
+    leaveAgentConference,
+    isInConference,
+    agentConference
+  } = useCallFabricContext();
+
+  // Local wrapper state that syncs with context
+  const [agentStatus, setAgentStatusLocal] = useState<AgentStatus>(contextAgentStatus);
   const [statusStartTime, setStatusStartTime] = useState<Date>(new Date());
+
+  // Sync local state when context changes (e.g., on restore from localStorage)
+  useEffect(() => {
+    setAgentStatusLocal(contextAgentStatus);
+  }, [contextAgentStatus]);
+
+  // Wrapper that updates both local and context
+  const setAgentStatus = (newStatus: AgentStatus) => {
+    setAgentStatusLocal(newStatus);
+    // Context handles persistence and Call Fabric
+  };
 
   // Call State
   const [activeCall, setActiveCall] = useState<Call | null>(null);
@@ -147,19 +169,15 @@ export const CallCenterDashboard: React.FC = () => {
     };
   }, [socket, activeCall, customerContext]);
 
-  // Status change handler
+  // Status change handler - delegates to context which handles:
+  // - localStorage persistence
+  // - Redis sync via socket
+  // - Call Fabric online/offline
+  // - Conference join/leave
   const handleStatusChange = async (newStatus: AgentStatus) => {
-    setAgentStatus(newStatus);
     setStatusStartTime(new Date());
-
-    // Notify backend with token
-    const token = localStorage.getItem('access_token');
-    socket?.emit('agent_status', { status: newStatus, token });
-
-    // Auto-fetch next call if becoming available
-    if (newStatus === 'available' && !activeCall) {
-      socket?.emit('request_next_call', { token });
-    }
+    // Use context's setAgentStatus which handles everything
+    await setContextAgentStatus(newStatus);
   };
 
   // Take call from queue

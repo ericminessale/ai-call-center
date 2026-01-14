@@ -420,6 +420,200 @@ class SignalWireAPI:
             logger.error(f"Failed to end call: {str(e)}")
             raise
 
+    # ==================== Conference Management Methods ====================
+
+    def add_participant_to_conference(self, conference_name, call_id):
+        """Add a call to a conference.
+
+        Uses the calling.conference command to add an existing call to a conference.
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': self.auth_header
+            }
+
+            data = {
+                "id": call_id,
+                "command": "calling.conference",
+                "params": {
+                    "name": conference_name,
+                    "join": True
+                }
+            }
+
+            logger.info("="*50)
+            logger.info(f"SIGNALWIRE API: Adding call {call_id} to conference {conference_name}")
+            logger.info(f"JSON BODY: {json.dumps(data, indent=2)}")
+            logger.info("="*50)
+
+            response = requests.post(
+                self.api_url,
+                json=data,
+                headers=headers
+            )
+
+            logger.info(f"SIGNALWIRE API RESPONSE: Status {response.status_code}")
+            if response.text:
+                try:
+                    logger.info(f"JSON RESPONSE: {json.dumps(response.json(), indent=2)}")
+                except:
+                    logger.info(f"RAW RESPONSE: {response.text}")
+
+            if response.status_code >= 200 and response.status_code < 300:
+                logger.info(f"Call {call_id} added to conference {conference_name}")
+                return response.json()
+            else:
+                logger.error(f"Failed to add to conference: {response.status_code} - {response.text}")
+                raise Exception(f"Failed to add to conference: {response.status_code}")
+
+        except Exception as e:
+            logger.error(f"Failed to add to conference: {str(e)}")
+            raise
+
+    def remove_participant_from_conference(self, conference_name, call_id):
+        """Remove a participant from a conference.
+
+        Uses the calling.conference command with leave=True.
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': self.auth_header
+            }
+
+            data = {
+                "id": call_id,
+                "command": "calling.conference",
+                "params": {
+                    "name": conference_name,
+                    "leave": True
+                }
+            }
+
+            logger.info("="*50)
+            logger.info(f"SIGNALWIRE API: Removing call {call_id} from conference {conference_name}")
+            logger.info(f"JSON BODY: {json.dumps(data, indent=2)}")
+            logger.info("="*50)
+
+            response = requests.post(
+                self.api_url,
+                json=data,
+                headers=headers
+            )
+
+            logger.info(f"SIGNALWIRE API RESPONSE: Status {response.status_code}")
+            if response.text:
+                try:
+                    logger.info(f"JSON RESPONSE: {json.dumps(response.json(), indent=2)}")
+                except:
+                    logger.info(f"RAW RESPONSE: {response.text}")
+
+            if response.status_code >= 200 and response.status_code < 300:
+                logger.info(f"Call {call_id} removed from conference {conference_name}")
+                return response.json()
+            else:
+                logger.error(f"Failed to remove from conference: {response.status_code} - {response.text}")
+                raise Exception(f"Failed to remove from conference: {response.status_code}")
+
+        except Exception as e:
+            logger.error(f"Failed to remove from conference: {str(e)}")
+            raise
+
+    def mute_participant(self, conference_name, call_id, muted=True):
+        """Mute or unmute a conference participant.
+
+        Uses the calling.conference command with mute parameter.
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': self.auth_header
+            }
+
+            data = {
+                "id": call_id,
+                "command": "calling.conference",
+                "params": {
+                    "name": conference_name,
+                    "mute": muted
+                }
+            }
+
+            action = "Muting" if muted else "Unmuting"
+            logger.info("="*50)
+            logger.info(f"SIGNALWIRE API: {action} call {call_id} in conference {conference_name}")
+            logger.info(f"JSON BODY: {json.dumps(data, indent=2)}")
+            logger.info("="*50)
+
+            response = requests.post(
+                self.api_url,
+                json=data,
+                headers=headers
+            )
+
+            logger.info(f"SIGNALWIRE API RESPONSE: Status {response.status_code}")
+            if response.text:
+                try:
+                    logger.info(f"JSON RESPONSE: {json.dumps(response.json(), indent=2)}")
+                except:
+                    logger.info(f"RAW RESPONSE: {response.text}")
+
+            if response.status_code >= 200 and response.status_code < 300:
+                logger.info(f"Call {call_id} {'muted' if muted else 'unmuted'} in conference {conference_name}")
+                return response.json()
+            else:
+                logger.error(f"Failed to mute participant: {response.status_code} - {response.text}")
+                raise Exception(f"Failed to mute participant: {response.status_code}")
+
+        except Exception as e:
+            logger.error(f"Failed to mute participant: {str(e)}")
+            raise
+
+    def end_conference(self, conference_name):
+        """End a conference and disconnect all participants.
+
+        Note: This typically requires ending all participant calls.
+        SignalWire conferences end automatically when all participants leave.
+        """
+        try:
+            # For now, log that we're attempting to end the conference
+            # The actual implementation may need to iterate through participants
+            logger.info(f"Request to end conference: {conference_name}")
+            logger.info("Note: Conference will end when all participants leave")
+
+            # Return success - the conference endpoints will handle actual cleanup
+            return {"status": "conference_ending", "conference_name": conference_name}
+
+        except Exception as e:
+            logger.error(f"Failed to end conference: {str(e)}")
+            raise
+
+    def move_participant(self, from_conference, to_conference, call_id):
+        """Move a participant from one conference to another.
+
+        This is a convenience method that removes from one conference
+        and adds to another.
+        """
+        try:
+            logger.info(f"Moving call {call_id} from {from_conference} to {to_conference}")
+
+            # First remove from source conference
+            self.remove_participant_from_conference(from_conference, call_id)
+
+            # Then add to destination conference
+            result = self.add_participant_to_conference(to_conference, call_id)
+
+            logger.info(f"Successfully moved call {call_id} to {to_conference}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to move participant: {str(e)}")
+            raise
+
 
 # Singleton instance
 _signalwire_api = None

@@ -148,11 +148,19 @@ def _create_permanent_subscriber(user):
         logger.error(f"Could not determine username from subscriber data: {subscriber_data}")
         raise Exception("Subscriber data missing username/email field")
 
+    # Build the fabric address
+    # IMPORTANT: Call Fabric addresses must be alphanumeric with hyphens.
+    # Email format like "/private/eric.minessale@gmail.com" is INVALID.
+    # Use a sanitized format: "agent-{user_id}"
+    fabric_address_name = f"agent-{user.id}"
+
     user.signalwire_subscriber_id = subscriber_data.get('id')
-    user.signalwire_username = username
+    user.signalwire_username = username  # Keep original for token generation
     user.set_subscriber_password(password)  # Encrypted storage
-    user.signalwire_address = f"/private/{username}"
+    user.signalwire_address = f"/private/{fabric_address_name}"
     user.fabric_subscriber_created_at = datetime.utcnow()
+
+    logger.info(f"Subscriber fabric address: {user.signalwire_address} (token ref: {username})")
 
     from app import db
     db.session.commit()

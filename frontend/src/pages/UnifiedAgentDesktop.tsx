@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
-import { useCallFabricContext } from '../contexts/CallFabricContext';
+import { useCallFabricContext, ConnectedCustomer } from '../contexts/CallFabricContext';
 import { useSocket } from '../hooks/useSocket';
 import { UnifiedHeader } from '../components/unified/UnifiedHeader';
 import { LeftPanel } from '../components/unified/LeftPanel';
@@ -10,6 +10,7 @@ import { ContactDetailView } from '../components/contacts/ContactDetailView';
 import { contactsApi, callsApi } from '../services/api';
 import { Contact, ContactMinimal, Call } from '../types/callcenter';
 import { Users } from 'lucide-react';
+import toast from 'react-hot-toast';
 
 // View modes for the unified interface
 export type ViewMode = 'contacts' | 'calls' | 'queue' | 'supervisor';
@@ -82,6 +83,7 @@ export function UnifiedAgentDesktop() {
     socket.off('call_update');
     socket.off('call_assigned');
     socket.off('call_ended');
+    socket.off('contact_update');
     socket.off('agent_stats');
     socket.off('authenticated');
     socket.off('connect');
@@ -178,6 +180,23 @@ export function UnifiedAgentDesktop() {
       updateCallCounts();
     });
 
+    // Contact updated (e.g., when AI agent collects customer name)
+    socket.on('contact_update', (data: { contact: any }) => {
+      console.log('👤 [UNIFIED] Received contact_update:', data);
+      const updatedContact = data.contact;
+      if (!updatedContact) return;
+
+      // Update in contacts list
+      setContacts(prev => prev.map(c =>
+        c.id === updatedContact.id ? { ...c, ...updatedContact } : c
+      ));
+
+      // Update selected contact if it matches
+      if (selectedContact?.id === updatedContact.id) {
+        setSelectedContact(prev => prev ? { ...prev, ...updatedContact } : null);
+      }
+    });
+
     // Agent stats update
     socket.on('agent_stats', (newStats: typeof stats) => {
       console.log('📊 [UNIFIED] Received agent_stats:', newStats);
@@ -189,6 +208,7 @@ export function UnifiedAgentDesktop() {
       socket.off('call_update');
       socket.off('call_assigned');
       socket.off('call_ended');
+      socket.off('contact_update');
       socket.off('agent_stats');
       socket.off('authenticated');
       socket.off('connect');
@@ -302,6 +322,75 @@ export function UnifiedAgentDesktop() {
     loadQueuedCalls();
     updateCallCounts();
   }, []);
+
+  // Handle customer connected to agent's conference (auto-navigation)
+  useEffect(() => {
+    const handleCustomerConnected = async (customer: ConnectedCustomer) => {
+      console.log('📞 [UNIFIED] Customer connected to conference:', customer);
+      console.log('📞 [UNIFIED] Customer info:', customer.customerInfo);
+      console.log('📞 [UNIFIED] AI context:', customer.aiContext);
+
+      // Show toast notification
+      const customerName = customer.aiContext?.customer_name ||
+                          customer.customerInfo.name ||
+                          customer.callerNumber;
+      toast.success(`Customer connected: ${customerName}`, {
+        duration: 5000,
+        icon: '📞',
+      });
+
+      // Reload active calls to get the new call
+      await loadActiveCalls();
+
+      // Use contact_id from the event if backend already created/updated the contact
+      // This is more efficient than making another API call
+      if (customer.customerInfo.contact_id) {
+        console.log('📞 [UNIFIED] Using contact_id from event:', customer.customerInfo.contact_id);
+        setViewMode('contacts');
+        navigate(`/contacts/${customer.customerInfo.contact_id}`);
+        loadContactDetail(customer.customerInfo.contact_id);
+        // Also reload contacts list to reflect any updates
+        loadContacts();
+        console.log('📍 [UNIFIED] Navigated to contact:', customer.customerInfo.contact_id);
+        return;
+      }
+
+      // Fallback: If no contact_id in event, try to find or create the contact
+      try {
+        const response = await contactsApi.lookupOrCreate({
+          phone: customer.callerNumber,
+          displayName: customer.aiContext?.customer_name || customer.customerInfo.name,
+          company: customer.aiContext?.company,
+        });
+
+        const contact = response.data.contact;
+
+        // Navigate to the contact detail view
+        setViewMode('contacts');
+        navigate(`/contacts/${contact.id}`);
+
+        // Load full contact details
+        loadContactDetail(contact.id);
+        // Reload contacts list
+        loadContacts();
+
+        console.log('📍 [UNIFIED] Navigated to contact:', contact.id);
+      } catch (error) {
+        console.error('Failed to lookup/create contact:', error);
+        // Still navigate to calls view as fallback
+        setViewMode('calls');
+        navigate('/calls');
+      }
+    };
+
+    // Register the callback
+    callFabric.setOnCustomerConnected(handleCustomerConnected);
+
+    // Cleanup
+    return () => {
+      callFabric.setOnCustomerConnected(undefined);
+    };
+  }, [callFabric, navigate, loadActiveCalls, loadContactDetail, loadContacts]);
 
   // Reload contacts on search change (debounced)
   useEffect(() => {

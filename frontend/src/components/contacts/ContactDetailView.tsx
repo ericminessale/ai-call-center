@@ -82,6 +82,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     goOnline,
     mute,
     unmute,
+    connectedCustomer,
   } = useCallFabric();
 
   // Determine if there's an outbound call in progress
@@ -766,7 +767,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
             callDuration={activeCallForContact?.duration || callDuration}
             callState={callState}
             isOutboundCallInProgress={isOutboundCallInProgress}
-            aiContext={(activeCallForContact as any)?.aiContext}
+            aiContext={connectedCustomer?.aiContext || (activeCallForContact as any)?.aiContext}
           />
         )}
         {activeTab === 'history' && (
@@ -1058,11 +1059,34 @@ function DetailRow({ label, value }: { label: string; value?: string }) {
 }
 
 interface AIContext {
+  // Customer identification
   customer_name?: string;
   account_number?: string;
-  issue_description?: string;
-  priority?: number;
+
+  // Issue/Request details
+  reason?: string;           // General reason for call
+  issue?: string;           // Support issue description
+  issue_description?: string; // Legacy field
+  urgency?: string;         // low/medium/high
+  priority?: number;        // Numeric priority (1-10)
+  department?: string;      // sales/support/billing
+
+  // Sales-specific
+  interest?: string;        // Product interest
+  company?: string;         // Company name
+  budget?: string;          // Budget range
+
+  // Support-specific
+  error_message?: string;   // Error message if applicable
+  additional_info?: string; // Additional details collected by AI
+
+  // AI summary and metadata
   ai_summary?: string;
+  source_agent?: string;    // Which AI agent collected this
+  preferred_handling?: 'ai' | 'human';
+  queue?: string;           // Which queue they came from
+
+  // Raw data fallback
   global_data?: Record<string, any>;
 }
 
@@ -1163,6 +1187,99 @@ function LiveCallTab({
 
   return (
     <div className="h-full flex flex-col">
+      {/* AI Context Panel - Shows data collected by AI agent (ABOVE transcription) */}
+      {aiContext && Object.keys(aiContext).length > 0 && (
+        <div className="p-4 pb-0">
+          <div className="p-3 bg-blue-900/30 border border-blue-500/30 rounded-lg">
+            <h4 className="text-sm font-medium text-blue-400 mb-2 flex items-center gap-2">
+              <Bot className="w-4 h-4" />
+              AI Agent Collected Information
+              {aiContext.source_agent && (
+                <span className="text-xs text-gray-500 font-normal">
+                  (via {aiContext.source_agent.replace(/_/g, ' ')})
+                </span>
+              )}
+            </h4>
+            <div className="space-y-2 text-sm">
+              {/* Customer Info */}
+              {aiContext.customer_name && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Customer:</span>
+                  <span className="text-white">{aiContext.customer_name}</span>
+                </div>
+              )}
+              {aiContext.company && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Company:</span>
+                  <span className="text-white">{aiContext.company}</span>
+                </div>
+              )}
+              {aiContext.account_number && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Account:</span>
+                  <span className="text-white">{aiContext.account_number}</span>
+                </div>
+              )}
+
+              {/* Request/Issue Details */}
+              {(aiContext.reason || aiContext.issue || aiContext.issue_description || aiContext.additional_info) && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Issue/Request:</span>
+                  <span className="text-white">
+                    {aiContext.issue || aiContext.issue_description || aiContext.reason || aiContext.additional_info}
+                  </span>
+                </div>
+              )}
+              {aiContext.interest && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Interest:</span>
+                  <span className="text-white">{aiContext.interest}</span>
+                </div>
+              )}
+              {aiContext.budget && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Budget:</span>
+                  <span className="text-white">{aiContext.budget}</span>
+                </div>
+              )}
+              {aiContext.error_message && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Error:</span>
+                  <span className="text-red-400 font-mono text-xs">{aiContext.error_message}</span>
+                </div>
+              )}
+              {aiContext.department && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Department:</span>
+                  <span className="text-white capitalize">{aiContext.department}</span>
+                </div>
+              )}
+
+              {/* Priority/Urgency */}
+              {(aiContext.urgency || aiContext.priority) && (
+                <div className="flex items-start gap-2">
+                  <span className="text-gray-400 min-w-[100px]">Priority:</span>
+                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                    (aiContext.urgency === 'high' || (aiContext.priority && aiContext.priority <= 3))
+                      ? 'bg-red-500/30 text-red-400'
+                      : (aiContext.urgency === 'medium' || (aiContext.priority && aiContext.priority <= 6))
+                      ? 'bg-yellow-500/30 text-yellow-400'
+                      : 'bg-green-500/30 text-green-400'
+                  }`}>
+                    {aiContext.urgency
+                      ? aiContext.urgency.charAt(0).toUpperCase() + aiContext.urgency.slice(1)
+                      : (aiContext.priority && aiContext.priority <= 3) ? 'High'
+                      : (aiContext.priority && aiContext.priority <= 6) ? 'Medium'
+                      : 'Low'}
+                    {aiContext.priority && ` (${aiContext.priority})`}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Live Transcription */}
       <div className="flex-1 p-4 overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
@@ -1174,62 +1291,6 @@ function LiveCallTab({
             {status.text}
           </div>
         </div>
-
-        {/* AI Context Panel - Shows data collected by AI agent */}
-        {aiContext && Object.keys(aiContext).length > 0 && (
-          <div className="mb-4 p-3 bg-blue-900/30 border border-blue-500/30 rounded-lg">
-            <h4 className="text-sm font-medium text-blue-400 mb-2 flex items-center gap-2">
-              <Bot className="w-4 h-4" />
-              AI Agent Collected Information
-            </h4>
-            <div className="space-y-2 text-sm">
-              {aiContext.customer_name && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Customer:</span>
-                  <span className="text-white">{aiContext.customer_name}</span>
-                </div>
-              )}
-              {aiContext.account_number && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Account:</span>
-                  <span className="text-white">{aiContext.account_number}</span>
-                </div>
-              )}
-              {aiContext.issue_description && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Issue:</span>
-                  <span className="text-white">{aiContext.issue_description}</span>
-                </div>
-              )}
-              {aiContext.ai_summary && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Summary:</span>
-                  <span className="text-white">{aiContext.ai_summary}</span>
-                </div>
-              )}
-              {aiContext.priority && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Priority:</span>
-                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-                    aiContext.priority >= 8 ? 'bg-red-500/30 text-red-400' :
-                    aiContext.priority >= 5 ? 'bg-yellow-500/30 text-yellow-400' :
-                    'bg-green-500/30 text-green-400'
-                  }`}>
-                    {aiContext.priority >= 8 ? 'High' : aiContext.priority >= 5 ? 'Medium' : 'Low'} ({aiContext.priority})
-                  </span>
-                </div>
-              )}
-              {aiContext.global_data && Object.keys(aiContext.global_data).length > 0 && (
-                <div className="mt-2 pt-2 border-t border-blue-500/20">
-                  <span className="text-gray-400 text-xs">Additional data:</span>
-                  <pre className="mt-1 text-xs text-gray-300 bg-gray-800/50 p-2 rounded overflow-x-auto">
-                    {JSON.stringify(aiContext.global_data, null, 2)}
-                  </pre>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
 
         <div className="bg-gray-900 rounded-lg p-4 min-h-[300px] max-h-[400px] overflow-y-auto font-mono text-sm">
           {/* Show calling state UI when outbound call is ringing */}

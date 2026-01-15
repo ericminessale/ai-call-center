@@ -32,6 +32,8 @@ export const useCallFabric = () => {
     agentConference: context.agentConference,
     agentStatus: context.agentStatus,
     isClientReady: context.isClientReady,
+    connectedCustomer: context.connectedCustomer,
+    clearConnectedCustomer: context.clearConnectedCustomer,
 
     // Actions
     initializeClient: context.initializeClient,

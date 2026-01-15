@@ -391,6 +391,108 @@ def summary():
         return jsonify({'error': str(e)}), 500
 
 
+@webhooks_bp.route('/post-prompt', methods=['POST'])
+def post_prompt():
+    """
+    Handle post_prompt webhook from SignalWire AI agents.
+    This receives structured data after a call ends including:
+    - post_prompt_data: The AI's analysis/summary of the conversation
+    - global_data: Data collected during the call
+    - caller info: phone number, name, etc.
+    """
+    try:
+        data = request.get_json() if request.is_json else request.form.to_dict()
+
+        # Log the complete JSON received
+        logger.info("="*50)
+        logger.info("WEBHOOK: /api/webhooks/post-prompt")
+        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("="*50)
+
+        # Extract key fields from the post_prompt payload
+        app_name = data.get('app_name')
+        call_id = data.get('call_id')
+        ai_session_id = data.get('ai_session_id')
+        caller_id_name = data.get('caller_id_name')
+        caller_id_num = data.get('caller_id_num')
+
+        # Post prompt data (the AI's structured response)
+        post_prompt_data = data.get('post_prompt_data', {})
+        raw_summary = post_prompt_data.get('raw')
+        parsed_summary = post_prompt_data.get('parsed', [])
+
+        # Global data collected during the call
+        global_data = data.get('global_data', {})
+
+        logger.info(f"Post-prompt received from {app_name} for call {call_id}")
+        logger.info(f"Caller: {caller_id_name} ({caller_id_num})")
+        logger.info(f"Global data keys: {list(global_data.keys())}")
+
+        # Find the call in database
+        call = Call.find_by_sid(call_id) if call_id else None
+
+        if call:
+            # Update call with post_prompt data
+            # Merge global_data into ai_context
+            existing_context = json.loads(call.ai_context) if call.ai_context else {}
+            merged_context = {**existing_context, **global_data}
+
+            # Add parsed summary if available
+            if parsed_summary and len(parsed_summary) > 0:
+                merged_context['parsed_summary'] = parsed_summary[0]
+
+            call.ai_context = json.dumps(merged_context)
+
+            # If we have a raw summary and no existing summary, use it
+            if raw_summary and not call.summary:
+                call.summary = raw_summary
+
+            db.session.commit()
+            logger.info(f"✓ Updated call {call.id} with post_prompt data")
+
+            # Log the webhook event
+            WebhookEvent.log_event(
+                event_type="post_prompt_received",
+                payload=data,
+                call_id=call.id
+            )
+
+            # Emit update via WebSocket for real-time UI update
+            socketio.emit('call_update', {
+                'call': {
+                    'id': call.id,
+                    'call_sid': call_id,
+                    'aiContext': merged_context,
+                    'summary': call.summary
+                }
+            }, room=str(call.user_id))
+
+            # Also emit to call room
+            socketio.emit('post_prompt_received', {
+                'call_id': call.id,
+                'call_sid': call_id,
+                'ai_context': merged_context,
+                'summary': call.summary
+            }, room=call_id)
+
+        else:
+            logger.warning(f"Call not found for post_prompt: {call_id}")
+            # Log anyway for debugging
+            WebhookEvent.log_event(
+                event_type="post_prompt_orphaned",
+                payload=data,
+                call_id=None
+            )
+
+        return jsonify({'status': 'ok'}), 200
+
+    except Exception as e:
+        logger.error(f"Error processing post_prompt webhook: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
+
+
 @webhooks_bp.route('/recording', methods=['POST'])
 def recording():
     """Handle recording webhook from SignalWire."""

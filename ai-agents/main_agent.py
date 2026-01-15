@@ -1,443 +1,312 @@
 #!/usr/bin/env python3
 """
 SignalWire Call Center AI Agents
-Based on the multi-agent server example from signalwire-agents
+Refactored to use contexts/steps for structured flow
 """
 
 from signalwire_agents import AgentBase, AgentServer
 from signalwire_agents.core.function_result import SwaigFunctionResult
 import os
 from dotenv import load_dotenv
-import requests
-from typing import Dict, Any, Optional
 
 load_dotenv()
 
 # Configuration
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://backend:5000')
 
+
 def get_base_url_from_global_data(raw_data: dict) -> str:
-    """
-    Get the base URL from global_data (set during initial request).
-    Falls back to environment variable or default.
-    """
-    # Check global_data first (set by dynamic config callback)
+    """Get the base URL from global_data (set during initial request)."""
     global_data = raw_data.get('global_data', {})
     if global_data.get('agent_base_url'):
         return global_data['agent_base_url']
 
-    # Try environment variable
     env_url = os.getenv('AGENT_BASE_URL')
     if env_url and not env_url.startswith('http://ai-agents'):
         return env_url.rstrip('/')
 
-    # Fallback - this won't work for external transfers
-    print("⚠️ Warning: Could not determine agent base URL", flush=True)
+    print("Warning: Could not determine agent base URL", flush=True)
     return 'http://ai-agents:8080'
 
 
 def capture_base_url(query_params, body_params, headers, agent):
-    """
-    Dynamic config callback - captures the external URL from the incoming request.
-    Also reads customer context from global_data and adds to prompt.
-    Called at the START of each call before SWML is returned.
-    """
+    """Dynamic config callback - captures external URL and sets post_prompt_url."""
     from urllib.parse import urlparse
 
-    # Read existing global_data (from previous agent transfers)
     existing_global = body_params.get('global_data', {})
     new_global = {}
+    base_url = None
 
-    # Try X-Forwarded-Host first (set by proxies like ngrok/nginx)
     forwarded_host = headers.get('x-forwarded-host') or headers.get('X-Forwarded-Host')
     forwarded_proto = headers.get('x-forwarded-proto') or headers.get('X-Forwarded-Proto') or 'https'
 
     if forwarded_host:
-        # ngrok always uses HTTPS externally even though it forwards HTTP internally
         if 'ngrok' in forwarded_host:
             forwarded_proto = 'https'
         base_url = f"{forwarded_proto}://{forwarded_host}"
-        print(f"🌐 Detected base URL from X-Forwarded-Host: {base_url}", flush=True)
+        print(f"Detected base URL: {base_url}", flush=True)
         new_global['agent_base_url'] = base_url
     else:
-        # Try regular Host header
         host = headers.get('host') or headers.get('Host')
         if host and not host.startswith('ai-agents') and not host.startswith('localhost'):
             base_url = f"https://{host}"
-            print(f"🌐 Detected base URL from Host header: {base_url}", flush=True)
             new_global['agent_base_url'] = base_url
         else:
-            # Check environment variable
             env_url = os.getenv('AGENT_BASE_URL')
             if env_url and not env_url.startswith('http://ai-agents'):
-                print(f"🌐 Using AGENT_BASE_URL from environment: {env_url}", flush=True)
-                new_global['agent_base_url'] = env_url.rstrip('/')
-            else:
-                print("⚠️ Could not detect external base URL - multi-agent transfers may fail", flush=True)
+                base_url = env_url.rstrip('/')
+                new_global['agent_base_url'] = base_url
 
-    # Log any incoming customer context for debugging
-    customer_name = existing_global.get('customer_name')
-    customer_reason = existing_global.get('reason') or existing_global.get('initial_request')
-    source_agent = existing_global.get('source_agent')
+    if base_url:
+        post_prompt_url = f"{base_url}/api/webhooks/post-prompt"
+        agent.set_post_prompt_url(post_prompt_url)
 
-    if customer_name or customer_reason or source_agent:
-        print(f"📋 Customer context received - Name: {customer_name}, Reason: {customer_reason}, From: {source_agent}", flush=True)
-
-    # Set all global data at once (preserving existing + adding base_url)
     if new_global:
         agent.set_global_data(new_global)
 
-# The signalwire-agents SDK will automatically handle authentication
-# It checks for SWML_BASIC_AUTH_USER and SWML_BASIC_AUTH_PASSWORD env vars
-# If not set, it will auto-generate credentials and display them
 
-class BasicReceptionist(AgentBase):
-    """Main receptionist - determines department routing"""
+class CallCenterAgent(AgentBase):
+    """
+    Main Call Center Agent using contexts/steps for structured flow.
+
+    Flow:
+    1. Default context: Greet, get name, determine sales vs support
+    2. Sales context: Brief intake, offer human or AI choice
+    3. Support context: Brief intake, offer human or AI choice
+
+    Then routes to specialist agents or human queue.
+    """
 
     def __init__(self):
         super().__init__(
-            name="BasicReceptionist",
+            name="CallCenterAgent",
             route="/receptionist",
             auto_answer=True
         )
 
-        # Capture the external URL at the start of each call
         self.set_dynamic_config_callback(capture_base_url)
 
-        # Build the prompt using the POM structure
+        # Base prompt that applies globally
         self.prompt_add_section(
-            "Role",
-            "You are the main receptionist for our call center. "
-            "Your job is to greet callers warmly, understand their needs, "
-            "and route them to the appropriate department (Sales or Support)."
+            "Base Instructions",
+            "You are Sarah, a friendly customer service representative. "
+            "Follow the structured workflow to help customers efficiently."
         )
 
-        self.prompt_add_section(
-            "Guidelines",
-            "Follow these guidelines:",
-            bullets=[
-                "Greet callers warmly and professionally",
-                "Ask how you can help them today",
-                "Determine if they need Sales or Support",
-                "Transfer them to the appropriate department",
-                "If unclear, ask clarifying questions"
-            ]
-        )
+        # Configure post_prompt for call summaries
+        self.set_post_prompt("""
+Summarize this call and return a JSON object with:
+{
+    "customer_name": "Name if provided, or null",
+    "department": "sales/support/unknown",
+    "reason": "Brief reason for their call",
+    "outcome": "transferred_to_human/transferred_to_ai/abandoned",
+    "notes": "Any important details"
+}
+""")
 
-        # Define tools using define_tool method
+        # Define the contexts and steps
+        contexts = self.define_contexts()
+
+        # ============================================================
+        # DEFAULT CONTEXT - Initial greeting and triage
+        # ============================================================
+        default_ctx = contexts.add_context("default")
+
+        # Step 1: Greeting and name collection
+        default_ctx.add_step("greeting") \
+            .add_section("Current Task", "Greet the caller warmly and get their name") \
+            .add_bullets("What to do", [
+                "Say: 'Hi, thank you for calling! I'm Sarah, how can I help you today?'",
+                "If they explain their issue first, acknowledge it then ask for their name",
+                "Get their name before moving on - this is required"
+            ]) \
+            .set_step_criteria("Customer has provided their name") \
+            .set_valid_steps(["determine_need"])
+
+        # Step 2: Determine if sales or support
+        default_ctx.add_step("determine_need") \
+            .add_section("Current Task", "Understand what they need help with") \
+            .add_bullets("Listen for clues", [
+                "SALES: buying, pricing, products, interested in, purchase, plans, features",
+                "SUPPORT: problem, issue, not working, error, help with, broken, trouble"
+            ]) \
+            .add_section("Navigation",
+                "Once you understand their need:\n"
+                "- If SALES related: change_context to 'sales'\n"
+                "- If SUPPORT related: change_context to 'support'\n\n"
+                "Do NOT announce the change - just continue naturally.") \
+            .set_step_criteria("Customer's need (sales or support) has been identified") \
+            .set_valid_contexts(["sales", "support"])
+
+        # ============================================================
+        # SALES CONTEXT - Sales-specific intake
+        # ============================================================
+        sales_ctx = contexts.add_context("sales") \
+            .set_isolated(True)
+
+        # Sales context prompt (applies to all steps in this context)
+        sales_ctx.add_section("Role",
+            "You are continuing the conversation as Sarah. The customer needs sales help. "
+            "Do NOT re-introduce yourself. Use their name from the conversation.")
+
+        # Sales Step 1: Brief detail gathering
+        sales_ctx.add_step("gather_details") \
+            .add_section("Current Task", "Quickly gather 1-2 relevant details") \
+            .add_bullets("Ask about", [
+                "What product or service interests them",
+                "Company name if relevant (B2B)"
+            ]) \
+            .add_section("Important", "Keep this brief - just 1-2 questions max, then move to offer_choice. Remember what they tell you for the transfer.") \
+            .set_step_criteria("Basic sales details gathered") \
+            .set_valid_steps(["offer_choice"])
+
+        # Sales Step 2: Offer the choice
+        sales_ctx.add_step("offer_choice") \
+            .add_section("CRITICAL TASK",
+                "You MUST ask this question - do not skip it:\n\n"
+                "'Would you like to speak with one of our sales representatives, "
+                "or would you like me to assist you?'") \
+            .add_section("After they answer",
+                "- If they want human/representative: use transfer_to_human tool\n"
+                "- If they want you/AI to help: use transfer_to_ai_specialist tool\n\n"
+                "Include all collected info: customer_name, reason, department='sales', urgency, additional_info") \
+            .set_step_criteria("Customer has chosen human or AI assistance")
+
+        # ============================================================
+        # SUPPORT CONTEXT - Support-specific intake
+        # ============================================================
+        support_ctx = contexts.add_context("support") \
+            .set_isolated(True)
+
+        # Support context prompt
+        support_ctx.add_section("Role",
+            "You are continuing the conversation as Sarah. The customer needs technical support. "
+            "Do NOT re-introduce yourself. Use their name from the conversation.")
+
+        # Support Step 1: Brief detail gathering
+        support_ctx.add_step("gather_details") \
+            .add_section("Current Task", "Quickly gather 1-2 relevant details about the issue") \
+            .add_bullets("Ask about", [
+                "Any error messages they're seeing",
+                "How urgent/critical is this issue (high/medium/low)"
+            ]) \
+            .add_section("Important", "Keep this brief - just 1-2 questions max, then move to offer_choice. Remember what they tell you for the transfer.") \
+            .set_step_criteria("Basic issue details gathered") \
+            .set_valid_steps(["offer_choice"])
+
+        # Support Step 2: Offer the choice
+        support_ctx.add_step("offer_choice") \
+            .add_section("CRITICAL TASK",
+                "You MUST ask this question - do not skip it:\n\n"
+                "'Would you like to speak with a support specialist, "
+                "or would you like me to help you troubleshoot?'") \
+            .add_section("After they answer",
+                "- If they want human/specialist: use transfer_to_human tool\n"
+                "- If they want you/AI to help: use transfer_to_ai_specialist tool\n\n"
+                "Include all collected info: customer_name, reason, department='support', urgency, additional_info (like error messages)") \
+            .set_step_criteria("Customer has chosen human or AI assistance")
+
+        # ============================================================
+        # TOOLS - Only for final transfer (context switching is automatic)
+        # ============================================================
+
+        # Tool to transfer to human queue or AI specialist
         self.define_tool(
-            name="transfer_to_department",
-            description="Transfer call to Sales or Support department",
+            name="transfer_to_human",
+            description="Transfer customer to a human representative. Call this when they choose to speak with a human.",
             parameters={
-                "department": {"type": "string", "description": "Department name (sales or support)"},
-                "customer_name": {"type": "string", "description": "Customer's name if provided"},
-                "reason": {"type": "string", "description": "Reason for the call"}
+                "customer_name": {"type": "string", "description": "Customer's name"},
+                "reason": {"type": "string", "description": "What they need help with"},
+                "department": {"type": "string", "description": "'sales' or 'support'"},
+                "urgency": {"type": "string", "description": "How urgent (high/medium/low)"},
+                "additional_info": {"type": "string", "description": "Any other relevant details (error message, product interest, etc.)"}
             },
-            handler=self.transfer_to_department
+            handler=self.transfer_to_human
+        )
+
+        # Tool to transfer to AI specialist
+        self.define_tool(
+            name="transfer_to_ai_specialist",
+            description="Transfer customer to AI specialist for further assistance. Call this when they choose AI help.",
+            parameters={
+                "customer_name": {"type": "string", "description": "Customer's name"},
+                "reason": {"type": "string", "description": "What they need help with"},
+                "department": {"type": "string", "description": "'sales' or 'support'"},
+                "urgency": {"type": "string", "description": "How urgent (high/medium/low)"},
+                "additional_info": {"type": "string", "description": "Any other relevant details (error message, product interest, etc.)"}
+            },
+            handler=self.transfer_to_ai_specialist
         )
 
     def _check_basic_auth(self, request) -> bool:
-        """Override to disable authentication - agents are behind nginx"""
+        """Override to disable auth - agents are behind nginx"""
         return True
 
-    def transfer_to_department(self, args, raw_data):
-        """Transfer call to Sales or Support department"""
-        department = args.get("department", "")
+    def transfer_to_human(self, args, raw_data):
+        """Transfer to human representative queue"""
         customer_name = args.get("customer_name", "")
         reason = args.get("reason", "")
-
-        route = '/sales' if 'sales' in department.lower() else '/support'
-        # Get base URL from global_data (set by dynamic config callback at call start)
-        base_url = get_base_url_from_global_data(raw_data)
-        transfer_url = f"{base_url}{route}"
-
-        print(f"🔀 Transferring to {transfer_url}", flush=True)
-
-        result = SwaigFunctionResult(
-            f'Transferring to {department}.'
-        )
-        # Use update_global_data to pass context to the next agent
-        result.update_global_data({
-            'customer_name': customer_name,
-            'reason': reason,  # Use 'reason' consistently across all agents
-            'from_receptionist': True,
-            'source_agent': 'receptionist'
-        })
-        # Use swml_transfer for agent-to-agent transfers (SWML endpoints)
-        # final=True means permanent transfer (won't return to this agent)
-        result.swml_transfer(
-            transfer_url,
-            "Transfer complete. How else can I help?",  # Only used if final=False
-            final=True
-        )
-
-        return result
-
-class SalesReceptionist(AgentBase):
-    """Sales department receptionist"""
-
-    def __init__(self):
-        super().__init__(
-            name="SalesReceptionist",
-            route="/sales",
-            auto_answer=True
-        )
-
-        # Capture the external URL at the start of each call
-        self.set_dynamic_config_callback(capture_base_url)
-
-        self.prompt_add_section(
-            "Role",
-            "You are the Sales department receptionist. "
-            "Welcome customers, gather information about their interests, "
-            "and route them to either an AI specialist or human agent."
-        )
-
-        # Customer context from previous agent (uses ${global_data.x} template syntax)
-        self.prompt_add_section(
-            "Customer Context",
-            "If available, use this information from the previous agent:\n"
-            "- Customer name: ${global_data.customer_name}\n"
-            "- Reason for call: ${global_data.reason}\n"
-            "If the customer's name is known, address them by name. "
-            "Don't ask for information they've already provided."
-        )
-
-        self.prompt_add_section(
-            "Process",
-            "Follow this process:",
-            bullets=[
-                "Welcome the customer to sales (by name if known)",
-                "Ask about their product/service interests",
-                "Gather relevant information",
-                "Ask if they prefer AI or human assistance",
-                "Route them appropriately"
-            ]
-        )
-
-        self.define_tool(
-            name="save_sales_info",
-            description="Save sales inquiry information",
-            parameters={
-                "customer_name": {"type": "string", "description": "Customer name"},
-                "interest": {"type": "string", "description": "What they're interested in"},
-                "company": {"type": "string", "description": "Company name (optional)"},
-                "budget": {"type": "string", "description": "Budget range (optional)"}
-            },
-            handler=self.save_sales_info
-        )
-
-        self.define_tool(
-            name="route_to_agent",
-            description="Route to AI specialist or human queue",
-            parameters={
-                "agent_type": {"type": "string", "description": "Type of agent (ai or human)"}
-            },
-            handler=self.route_to_agent
-        )
-
-    def _check_basic_auth(self, request) -> bool:
-        """Override to disable authentication - agents are behind nginx"""
-        return True
-
-    def save_sales_info(self, args, raw_data):
-        """Save sales inquiry information"""
-        customer_name = args.get("customer_name", "")
-        interest = args.get("interest", "")
-        company = args.get("company", "")
-        budget = args.get("budget", "")
-
-        result = SwaigFunctionResult(
-            f'Thank you {customer_name}. I have your information about {interest}. '
-            'Would you prefer our AI sales specialist or a human representative?'
-        )
-        # Use update_global_data to preserve existing data and add new data
-        result.update_global_data({
-            'customer_name': customer_name,
-            'interest': interest,
-            'company': company,
-            'budget': budget,
-            'department': 'sales'
-        })
-        return result
-
-    def route_to_agent(self, args, raw_data):
-        """Route to AI specialist or human queue"""
-        agent_type = args.get("agent_type", "")
-
-        if 'ai' in agent_type.lower() or 'specialist' in agent_type.lower():
-            base_url = get_base_url_from_global_data(raw_data)
-            transfer_url = f"{base_url}/sales-ai"
-            print(f"🔀 Transferring to {transfer_url}", flush=True)
-
-            result = SwaigFunctionResult(
-                'Great! Our AI sales specialist has access to all our product information. Connecting you now...'
-            )
-            result.update_global_data({
-                'source_agent': 'sales_receptionist',
-                'preferred_handling': 'ai'
-            })
-            result.swml_transfer(
-                transfer_url,
-                "How else can I help you today?",
-                final=True
-            )
-        else:
-            # Transfer to human queue via SWML
-            base_url = get_base_url_from_global_data(raw_data)
-            queue_url = f"{base_url}/api/queues/sales/route"
-            print(f"🔀 Transferring to human queue: {queue_url}", flush=True)
-
-            result = SwaigFunctionResult(
-                'I\'ll connect you with a human sales representative. One moment please.'
-            )
-            result.update_global_data({
-                'source_agent': 'sales_receptionist',
-                'preferred_handling': 'human',
-                'queue': 'sales'
-            })
-            result.swml_transfer(
-                queue_url,
-                "Thank you for waiting. Goodbye!",
-                final=True
-            )
-
-        return result
-
-class SupportReceptionist(AgentBase):
-    """Support department receptionist"""
-
-    def __init__(self):
-        super().__init__(
-            name="SupportReceptionist",
-            route="/support",
-            auto_answer=True
-        )
-
-        # Capture the external URL at the start of each call
-        self.set_dynamic_config_callback(capture_base_url)
-
-        self.prompt_add_section(
-            "Role",
-            "You are the Support department receptionist. "
-            "Help customers by understanding their issues, "
-            "determining urgency, and routing to appropriate assistance."
-        )
-
-        # Customer context from previous agent (uses ${global_data.x} template syntax)
-        self.prompt_add_section(
-            "Customer Context",
-            "If available, use this information from the previous agent:\n"
-            "- Customer name: ${global_data.customer_name}\n"
-            "- Reason for call: ${global_data.reason}\n"
-            "If the customer's name is known, address them by name. "
-            "Don't ask for information they've already provided."
-        )
-
-        self.prompt_add_section(
-            "Process",
-            "Support process:",
-            bullets=[
-                "Welcome the customer to support (by name if known)",
-                "Understand the nature of their issue",
-                "Determine urgency level",
-                "Ask if they prefer AI or human support",
-                "Route them appropriately"
-            ]
-        )
-
-        self.define_tool(
-            name="save_support_info",
-            description="Save support issue information",
-            parameters={
-                "issue_description": {"type": "string", "description": "Description of the issue"},
-                "urgency": {"type": "string", "description": "Urgency level (low/medium/high)"},
-                "error_message": {"type": "string", "description": "Any error messages (optional)"}
-            },
-            handler=self.save_support_info
-        )
-
-        self.define_tool(
-            name="route_to_agent",
-            description="Route to AI specialist or human queue",
-            parameters={
-                "agent_type": {"type": "string", "description": "Type of agent (ai or human)"}
-            },
-            handler=self.route_to_agent
-        )
-
-    def _check_basic_auth(self, request) -> bool:
-        """Override to disable authentication - agents are behind nginx"""
-        return True
-
-    def save_support_info(self, args, raw_data):
-        """Save support issue information"""
-        issue_description = args.get("issue_description", "")
+        department = args.get("department", "support").lower()
         urgency = args.get("urgency", "medium")
-        error_message = args.get("error_message", "")
+        additional_info = args.get("additional_info", "")
 
-        urgency_map = {'low': 10, 'medium': 5, 'high': 1}
+        base_url = get_base_url_from_global_data(raw_data)
+        queue_url = f"{base_url}/api/queues/{department}/route"
+
+        print(f"Transferring {customer_name} to human queue: {queue_url}", flush=True)
+
+        # Map urgency to priority
+        urgency_map = {'high': 2, 'medium': 5, 'low': 8}
         priority = urgency_map.get(urgency.lower(), 5)
 
         result = SwaigFunctionResult(
-            f'I understand you\'re experiencing issues with {issue_description}. '
-            'Would you like our AI support specialist or a human agent?'
+            "I'll connect you with a representative right now."
         )
-        # Use update_global_data to preserve existing data and add new data
         result.update_global_data({
-            'issue': issue_description,
+            'customer_name': customer_name,
+            'reason': reason,
+            'department': department,
             'urgency': urgency,
-            'error_message': error_message,
             'priority': priority,
-            'department': 'support'
+            'additional_info': additional_info,
+            'preferred_handling': 'human'
         })
-        return result
-
-    def route_to_agent(self, args, raw_data):
-        """Route to AI specialist or human queue"""
-        agent_type = args.get("agent_type", "")
-
-        if 'ai' in agent_type.lower() or 'specialist' in agent_type.lower():
-            base_url = get_base_url_from_global_data(raw_data)
-            transfer_url = f"{base_url}/support-ai"
-            print(f"🔀 Transferring to {transfer_url}", flush=True)
-
-            result = SwaigFunctionResult(
-                'Our AI support specialist can help troubleshoot right away. Connecting you now...'
-            )
-            result.update_global_data({
-                'source_agent': 'support_receptionist',
-                'preferred_handling': 'ai'
-            })
-            result.swml_transfer(
-                transfer_url,
-                "Is there anything else I can help with?",
-                final=True
-            )
-        else:
-            # Transfer to human queue via SWML
-            base_url = get_base_url_from_global_data(raw_data)
-            queue_url = f"{base_url}/api/queues/support/route"
-            print(f"🔀 Transferring to human queue: {queue_url}", flush=True)
-
-            result = SwaigFunctionResult(
-                'I\'ll connect you with a human support representative. One moment please.'
-            )
-            result.update_global_data({
-                'source_agent': 'support_receptionist',
-                'preferred_handling': 'human',
-                'queue': 'support'
-            })
-            result.swml_transfer(
-                queue_url,
-                "Thank you for waiting. Goodbye!",
-                final=True
-            )
+        result.swml_transfer(queue_url, "", final=True)
 
         return result
+
+    def transfer_to_ai_specialist(self, args, raw_data):
+        """Transfer to AI specialist agent"""
+        customer_name = args.get("customer_name", "")
+        reason = args.get("reason", "")
+        department = args.get("department", "support").lower()
+        urgency = args.get("urgency", "medium")
+        additional_info = args.get("additional_info", "")
+
+        base_url = get_base_url_from_global_data(raw_data)
+        specialist_route = f"/{department}-ai"
+        transfer_url = f"{base_url}{specialist_route}"
+
+        print(f"Transferring {customer_name} to AI specialist: {transfer_url}", flush=True)
+
+        result = SwaigFunctionResult('')  # Silent transfer
+        result.update_global_data({
+            'customer_name': customer_name,
+            'reason': reason,
+            'department': department,
+            'urgency': urgency,
+            'additional_info': additional_info,
+            'preferred_handling': 'ai',
+            'source_agent': 'call_center_triage'
+        })
+        result.swml_transfer(transfer_url, "", final=True)
+
+        return result
+
 
 class SalesAISpecialist(AgentBase):
-    """AI Sales Specialist"""
+    """AI Sales Specialist - handles actual sales conversations"""
 
     def __init__(self):
         super().__init__(
@@ -446,61 +315,55 @@ class SalesAISpecialist(AgentBase):
             auto_answer=True
         )
 
-        # Capture the external URL (in case we need to transfer later)
+        # Speak first after transfer
+        self.set_params({
+            "wait_for_user": False,
+            "end_of_speech_timeout": 1000
+        })
+
         self.set_dynamic_config_callback(capture_base_url)
+
+        self.set_post_prompt("""
+Summarize this sales consultation and return a JSON object with:
+{
+    "customer_name": "Name if provided, or null",
+    "company": "Company name if provided, or null",
+    "products_discussed": ["List of products/services discussed"],
+    "recommendations_made": ["Products/solutions recommended"],
+    "next_steps": "Recommended next steps",
+    "lead_score": "1-10 (1=hot, 10=cold)",
+    "outcome": "sale/quote_requested/follow_up_needed/lost"
+}
+""")
 
         self.prompt_add_section(
             "Role",
-            "You are an AI sales specialist with deep product knowledge. "
-            "Help customers understand our offerings and make purchasing decisions."
+            "You are an AI sales specialist continuing the conversation. "
+            "The customer chose to get AI assistance for their sales inquiry."
         )
 
-        # Customer context from previous agents (uses ${global_data.x} template syntax)
         self.prompt_add_section(
             "Customer Context",
-            "Use this information from previous agents:\n"
-            "- Customer name: ${global_data.customer_name}\n"
-            "- Reason for call: ${global_data.reason}\n"
-            "- Interest: ${global_data.interest}\n"
-            "- Company: ${global_data.company}\n"
-            "Address the customer by name and reference their stated interests."
+            "Customer name: ${global_data.customer_name}\n"
+            "Interest: ${global_data.reason}\n"
+            "Company: ${global_data.company}\n\n"
+            "Address them by name and help with their inquiry."
         )
 
         self.prompt_add_section(
-            "Capabilities",
-            "You can:",
+            "Your Job",
+            "Help the customer with their sales questions:",
             bullets=[
-                "Answer detailed product questions",
+                "Answer product and pricing questions",
                 "Explain features and benefits",
-                "Discuss pricing options",
-                "Compare different solutions",
-                "Help choose the right product"
+                "Make recommendations based on their needs",
+                "If they need something you can't help with, offer to connect to human"
             ]
-        )
-
-        self.prompt_add_section(
-            "Escalation",
-            "Escalate to human for:",
-            bullets=[
-                "Contract negotiation",
-                "Custom enterprise pricing",
-                "Complex technical requirements",
-                "Special arrangements"
-            ]
-        )
-
-        self.define_tool(
-            name="search_products",
-            description="Search product knowledge base",
-            parameters={
-                "query": {"type": "string", "description": "Search query"}
-            },
-            handler=self.search_products
         )
 
         self.define_tool(
             name="escalate_to_human",
-            description="Escalate to human sales representative",
+            description="Escalate to human sales rep if needed",
             parameters={
                 "reason": {"type": "string", "description": "Reason for escalation"}
             },
@@ -508,36 +371,27 @@ class SalesAISpecialist(AgentBase):
         )
 
     def _check_basic_auth(self, request) -> bool:
-        """Override to disable authentication - agents are behind nginx"""
         return True
 
-    def search_products(self, args, raw_data):
-        """Search product knowledge base"""
-        query = args.get("query", "")
-
-        # In production, this would query a real knowledge base
-        return SwaigFunctionResult(
-            f'I found information about {query}. [Product details would appear here]'
-        )
-
     def escalate_to_human(self, args, raw_data):
-        """Escalate complex sales to human"""
+        """Escalate to human sales"""
         reason = args.get("reason", "")
+        base_url = get_base_url_from_global_data(raw_data)
+        queue_url = f"{base_url}/api/queues/sales/route"
 
         result = SwaigFunctionResult(
-            f'For {reason}, I\'ll connect you with a human sales representative.'
+            "I'll connect you with a sales representative who can help with that."
         )
         result.update_global_data({
             'escalation_reason': reason,
-            'needs_senior_rep': True,
             'escalated_from': 'sales_ai_specialist'
         })
-        # Stop the AI agent - the call should transfer to human queue
-        result.add_action('stop', True)
+        result.swml_transfer(queue_url, "", final=True)
         return result
 
+
 class SupportAISpecialist(AgentBase):
-    """AI Support Specialist"""
+    """AI Support Specialist - handles actual troubleshooting"""
 
     def __init__(self):
         super().__init__(
@@ -546,145 +400,115 @@ class SupportAISpecialist(AgentBase):
             auto_answer=True
         )
 
-        # Capture the external URL (in case we need to transfer later)
+        # Speak first after transfer
+        self.set_params({
+            "wait_for_user": False,
+            "end_of_speech_timeout": 1000
+        })
+
         self.set_dynamic_config_callback(capture_base_url)
+
+        self.set_post_prompt("""
+Summarize this support consultation and return a JSON object with:
+{
+    "customer_name": "Name if provided, or null",
+    "issue_summary": "Brief description of the issue",
+    "troubleshooting_steps": ["Steps attempted during the call"],
+    "resolution": "How resolved, or null if unresolved",
+    "resolved": true/false,
+    "escalation_reason": "Why escalated, or null",
+    "customer_satisfaction": "1-5 based on conversation"
+}
+""")
 
         self.prompt_add_section(
             "Role",
-            "You are an AI support specialist trained to troubleshoot issues. "
-            "Help customers resolve problems efficiently."
+            "You are an AI support specialist continuing the conversation. "
+            "The customer chose to get AI assistance for troubleshooting."
         )
 
-        # Customer context from previous agents (uses ${global_data.x} template syntax)
         self.prompt_add_section(
             "Customer Context",
-            "Use this information from previous agents:\n"
-            "- Customer name: ${global_data.customer_name}\n"
-            "- Issue description: ${global_data.issue}\n"
-            "- Urgency: ${global_data.urgency}\n"
-            "- Error message: ${global_data.error_message}\n"
-            "Address the customer by name and reference their reported issue."
+            "Customer name: ${global_data.customer_name}\n"
+            "Issue: ${global_data.reason}\n"
+            "Error message: ${global_data.error_message}\n"
+            "Urgency: ${global_data.urgency}\n\n"
+            "Address them by name and help resolve their issue."
         )
 
         self.prompt_add_section(
-            "Capabilities",
-            "Support capabilities:",
+            "Your Job",
+            "Help troubleshoot and resolve their issue:",
             bullets=[
-                "Diagnose common problems",
+                "Diagnose the problem systematically",
                 "Walk through troubleshooting steps",
-                "Check system status",
-                "Provide workarounds",
-                "Access documentation"
+                "Provide clear instructions",
+                "If you can't resolve it, offer to connect to human specialist"
             ]
         )
 
         self.define_tool(
-            name="check_system_status",
-            description="Check service status",
-            parameters={
-                "service": {"type": "string", "description": "Service name"}
-            },
-            handler=self.check_system_status
-        )
-
-        self.define_tool(
-            name="search_knowledge_base",
-            description="Search support knowledge base",
-            parameters={
-                "query": {"type": "string", "description": "Search query"}
-            },
-            handler=self.search_knowledge_base
-        )
-
-        self.define_tool(
             name="escalate_to_human",
-            description="Escalate to human support",
+            description="Escalate to human support if needed",
             parameters={
-                "reason": {"type": "string", "description": "Reason for escalation"},
-                "ticket_id": {"type": "string", "description": "Ticket ID (optional)"}
+                "reason": {"type": "string", "description": "Reason for escalation"}
             },
             handler=self.escalate_to_human
         )
 
     def _check_basic_auth(self, request) -> bool:
-        """Override to disable authentication - agents are behind nginx"""
         return True
 
-    def check_system_status(self, args, raw_data):
-        """Check status of a service"""
-        service = args.get("service", "")
-
-        return SwaigFunctionResult(
-            f'The {service} service is currently operational with no known issues.'
-        )
-
-    def search_knowledge_base(self, args, raw_data):
-        """Search support knowledge base"""
-        query = args.get("query", "")
-
-        return SwaigFunctionResult(
-            f'I found articles about {query}. Let me walk you through the solution...'
-        )
-
     def escalate_to_human(self, args, raw_data):
-        """Escalate unresolved issues to human support"""
+        """Escalate to human support"""
         reason = args.get("reason", "")
-        ticket_id = args.get("ticket_id", None)
+        base_url = get_base_url_from_global_data(raw_data)
+        queue_url = f"{base_url}/api/queues/support/route"
 
         result = SwaigFunctionResult(
-            'I\'ll connect you with a human support representative for further assistance.'
+            "I'll connect you with a support specialist who can help with that."
         )
         result.update_global_data({
             'escalation_reason': reason,
-            'ticket_id': ticket_id,
-            'attempted_solutions': True,
             'escalated_from': 'support_ai_specialist'
         })
-        # Stop the AI agent - the call should transfer to human queue
-        result.add_action('stop', True)
+        result.swml_transfer(queue_url, "", final=True)
         return result
 
 
 if __name__ == '__main__':
-    print('='*60)
-    print('SignalWire AI Call Center - Starting')
-    print('='*60)
+    print('=' * 60)
+    print('SignalWire AI Call Center - Contexts/Steps Architecture')
+    print('=' * 60)
 
-    # Create the AgentServer (authentication via env vars SWML_BASIC_AUTH_USER/PASSWORD)
     server = AgentServer(host='0.0.0.0', port=8080)
 
-    # Initialize and register all agents
-    receptionist = BasicReceptionist()
-    sales = SalesReceptionist()
-    support = SupportReceptionist()
+    # Main agent with contexts/steps
+    call_center = CallCenterAgent()
+
+    # Specialist agents (only reached after customer chooses AI)
     sales_ai = SalesAISpecialist()
     support_ai = SupportAISpecialist()
 
-    # Register agents with the server
-    server.register(receptionist, '/receptionist')
-    server.register(sales, '/sales')
-    server.register(support, '/support')
+    # Register agents
+    server.register(call_center, '/receptionist')
     server.register(sales_ai, '/sales-ai')
     server.register(support_ai, '/support-ai')
 
-    # Get auth credentials from the first agent
-    username, password = receptionist.get_basic_auth_credentials()
+    username, password = call_center.get_basic_auth_credentials()
 
-    print('\n📡 Authentication Credentials:')
+    print('\nAuthentication Credentials:')
     print(f'  Username: {username}')
     print(f'  Password: {password}')
-    print('\n🔗 SignalWire Webhook URL format:')
-    print(f'  https://{username}:{password}@your-ngrok-url.ngrok.io/receptionist')
-
-    print('\n📍 Registered Routes:')
-    print('  - /receptionist: Main receptionist')
-    print('  - /sales       : Sales department')
-    print('  - /support     : Support department')
-    print('  - /sales-ai    : AI Sales specialist')
-    print('  - /support-ai  : AI Support specialist')
-    print('\n🔧 Backend URL:', BACKEND_URL)
-    print('🌐 Server Address: http://0.0.0.0:8080')
+    print('\nRegistered Routes:')
+    print('  - /receptionist : Main agent (contexts: default, sales, support)')
+    print('  - /sales-ai     : AI Sales specialist')
+    print('  - /support-ai   : AI Support specialist')
+    print('\nFlow:')
+    print('  1. /receptionist handles greeting + triage')
+    print('  2. Context switches to sales or support')
+    print('  3. Customer chooses human or AI')
+    print('  4. Routes to queue or specialist agent')
     print('\nStarting server...\n')
 
-    # Start the server using the SDK's proper method
     server.run()

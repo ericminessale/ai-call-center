@@ -10,7 +10,7 @@ from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth
 from app.utils.url_utils import get_base_url
 from app import db
-from app.models import Call, User, Conference, ConferenceParticipant, CallLeg
+from app.models import Call, User, Conference, ConferenceParticipant, CallLeg, Contact
 from datetime import datetime
 import logging
 import json
@@ -43,8 +43,10 @@ def route_call_to_queue(queue_id):
     try:
         print(f"🎯 QUEUE ROUTE HIT: /api/queues/{queue_id}/route", flush=True)
         data = request.json or {}
-        logger.info(f"Queue route received data: {json.dumps(data, default=str)[:500]}")
-        print(f"📥 Queue route data: {json.dumps(data, default=str)[:300]}", flush=True)
+
+        # Debug: Print full request data
+        print(f"📥 FULL REQUEST DATA: {json.dumps(data, default=str)}", flush=True)
+        logger.info(f"Queue route received data: {json.dumps(data, default=str)[:1000]}")
 
         # Extract call information from SignalWire webhook
         # SignalWire sends call info nested under 'call' key
@@ -53,17 +55,47 @@ def route_call_to_queue(queue_id):
         caller_number = call_data.get('from_number') or data.get('From') or data.get('caller_number')
 
         # Get context from AI agent (passed via headers or body)
+        # The AI agents pass data in global_data with fields like:
+        # - customer_name, reason, issue, urgency, priority, department
+        # - interest, company, budget (sales)
+        # - error_message (support)
+        global_data = data.get('global_data', {})
+
+        # Debug logging to see what we're receiving
+        logger.info(f"=== QUEUE ROUTE DEBUG ===")
+        logger.info(f"Received data keys: {list(data.keys())}")
+        logger.info(f"global_data: {json.dumps(global_data, indent=2)}")
+        logger.info(f"caller_number: {caller_number}, call_id: {call_id}")
+
         context = {
-            'customer_name': data.get('customer_name'),
-            'account_number': data.get('account_number'),
-            'issue_description': data.get('issue_description'),
-            'priority': data.get('priority', 5),
-            'ai_summary': data.get('ai_summary'),
-            'global_data': data.get('global_data', {})
+            # Direct fields (legacy support)
+            'customer_name': data.get('customer_name') or global_data.get('customer_name'),
+            'account_number': data.get('account_number') or global_data.get('account_number'),
+            'issue_description': data.get('issue_description') or global_data.get('issue') or global_data.get('reason'),
+            'priority': data.get('priority') or global_data.get('priority', 5),
+            'ai_summary': data.get('ai_summary') or global_data.get('ai_summary'),
+            # Fields from AI agents
+            'reason': global_data.get('reason'),
+            'issue': global_data.get('issue'),
+            'urgency': global_data.get('urgency'),
+            'department': global_data.get('department'),
+            'interest': global_data.get('interest'),
+            'company': global_data.get('company'),
+            'budget': global_data.get('budget'),
+            'error_message': global_data.get('error_message'),
+            'source_agent': global_data.get('source_agent'),
+            # Keep full global_data as fallback
+            'global_data': global_data
         }
 
         # Clean up None values
         context = {k: v for k, v in context.items() if v is not None}
+
+        # Map urgency to priority if urgency is set but priority isn't
+        urgency = context.get('urgency', '').lower()
+        if urgency and context.get('priority', 5) == 5:  # Only if priority is default
+            urgency_map = {'high': 2, 'medium': 5, 'low': 8}
+            context['priority'] = urgency_map.get(urgency, 5)
 
         # Get priority from context or default
         priority = context.get('priority', 5)
@@ -99,6 +131,78 @@ def route_call_to_queue(queue_id):
 
         # Store AI context (customer info collected by AI agent)
         call.ai_context = json.dumps(context) if context else None
+
+        # Update Contact record with AI-collected information
+        contact_id = None
+        if caller_number:
+            try:
+                contact = Contact.find_or_create_by_phone(caller_number)
+                contact_id = contact.id
+                contact_updated = False
+
+                # Parse customer_name into first/last name
+                customer_name = context.get('customer_name')
+                if customer_name:
+                    # Update display_name if not set OR if it's just a phone number
+                    current_display = contact.display_name or ''
+                    is_phone_display = current_display.startswith('+') or current_display.isdigit()
+                    if not contact.display_name or is_phone_display:
+                        contact.display_name = customer_name
+                        contact_updated = True
+                        logger.info(f"Updated contact display_name to: {customer_name}")
+
+                    # Try to parse into first/last name if not already set OR if display was phone
+                    if not contact.first_name or is_phone_display:
+                        name_parts = customer_name.strip().split(' ', 1)
+                        if len(name_parts) >= 1:
+                            contact.first_name = name_parts[0]
+                            contact_updated = True
+                            logger.info(f"Updated contact first_name to: {name_parts[0]}")
+                        if len(name_parts) >= 2:
+                            contact.last_name = name_parts[1]
+                            contact_updated = True
+                            logger.info(f"Updated contact last_name to: {name_parts[1]}")
+
+                # Update company if AI collected it and contact doesn't have one
+                company = context.get('company')
+                if company and not contact.company:
+                    contact.company = company
+                    contact_updated = True
+
+                # Update last interaction timestamp
+                contact.last_interaction_at = datetime.utcnow()
+                contact.total_calls = (contact.total_calls or 0) + 1
+                contact_updated = True
+
+                # Store additional AI context in custom_fields
+                extra_fields = {}
+                for field in ['department', 'interest', 'budget', 'urgency']:
+                    if context.get(field):
+                        extra_fields[field] = context[field]
+
+                if extra_fields:
+                    existing_custom = contact.custom_fields_dict or {}
+                    existing_custom.update(extra_fields)
+                    contact.custom_fields_dict = existing_custom
+                    contact_updated = True
+
+                # Link call to contact
+                if call:
+                    call.contact_id = contact.id
+
+                if contact_updated:
+                    logger.info(f"Updated contact {contact.id} ({contact.phone}) with AI-collected data")
+                    # Emit contact update via WebSocket so frontend can refresh
+                    from app import socketio
+                    socketio.emit('contact_update', {
+                        'contact': contact.to_dict_minimal()
+                    })
+                    logger.info(f"Emitted contact_update for contact {contact.id}")
+
+            except Exception as e:
+                logger.error(f"Error updating contact with AI data: {str(e)}")
+                # Don't fail the queue routing if contact update fails
+
         db.session.commit()
 
         # Enqueue the call
@@ -206,7 +310,9 @@ def route_call_to_queue(queue_id):
                     'agent_name': selected_user.name or selected_user.email,
                     'conference_name': conference_name,
                     'customer_info': {
-                        'phone': caller_number
+                        'phone': caller_number,
+                        'name': context.get('customer_name'),
+                        'contact_id': contact_id
                     }
                 }, room=str(selected_user.id))
                 logger.info(f"Emitted customer_routed_to_conference to agent room {selected_user.id}")

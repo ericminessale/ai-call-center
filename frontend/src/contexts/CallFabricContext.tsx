@@ -3,6 +3,41 @@ import { useAuthStore } from '../stores/authStore';
 import { useSocketContext } from './SocketContext';
 import type { Conference, ConferenceParticipant } from '../types/callcenter';
 
+// AI-collected context from the AI agent conversation
+export interface AICollectedContext {
+  customer_name?: string;
+  reason?: string;  // General reason for call
+  issue?: string;   // Support issue description
+  urgency?: string;
+  priority?: number;
+  department?: string;
+  interest?: string;  // Sales interest
+  company?: string;
+  budget?: string;
+  error_message?: string;
+  ai_summary?: string;
+  source_agent?: string;
+  preferred_handling?: 'ai' | 'human';
+  queue?: string;
+  global_data?: Record<string, any>;  // Raw global_data from AI
+}
+
+// Customer connected to agent's conference
+export interface ConnectedCustomer {
+  callId: string;
+  callDbId?: number;
+  callerNumber: string;
+  queueId: string;
+  conferenceName: string;
+  customerInfo: {
+    phone: string;
+    name?: string;
+    contact_id?: number;  // snake_case to match backend socket data
+  };
+  aiContext: AICollectedContext;
+  connectedAt: Date;
+}
+
 declare global {
   interface Window {
     SignalWire: any;
@@ -56,6 +91,12 @@ interface CallFabricContextType {
   agentConference: Conference | null;
   conferenceParticipants: ConferenceParticipant[];
   isInConference: boolean;
+
+  // Connected customer (when customer joins agent's conference)
+  connectedCustomer: ConnectedCustomer | null;
+  onCustomerConnected?: (customer: ConnectedCustomer) => void;
+  setOnCustomerConnected: (callback: ((customer: ConnectedCustomer) => void) | undefined) => void;
+  clearConnectedCustomer: () => void;
 
   // Actions
   setAgentStatus: (status: AgentStatusType) => Promise<void>;
@@ -120,6 +161,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   const [conferenceParticipants, setConferenceParticipants] = useState<ConferenceParticipant[]>([]);
   const [isInConference, setIsInConference] = useState(false);
   const conferenceCallRef = useRef<any>(null);
+
+  // Connected customer state (when customer joins agent's conference)
+  const [connectedCustomer, setConnectedCustomer] = useState<ConnectedCustomer | null>(null);
+  const onCustomerConnectedRef = useRef<((customer: ConnectedCustomer) => void) | undefined>(undefined);
 
   // Refs for conference functions to avoid circular dependency in setAgentStatus
   const joinAgentConferenceRef = useRef<() => Promise<void>>(() => Promise.resolve());
@@ -969,8 +1014,8 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     }) => {
       console.log('📥 [CallFabric] Participant joined:', data);
 
-      // Only update if this is our conference
-      if (agentConference?.conferenceName === data.conference_name) {
+      // Use ref to avoid stale closure
+      if (agentConferenceRef.current?.conferenceName === data.conference_name) {
         setConferenceParticipants(prev => {
           // Avoid duplicates
           const exists = prev.some(p => p.participantId === data.participant.participantId);
@@ -991,7 +1036,8 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     }) => {
       console.log('📥 [CallFabric] Participant left:', data);
 
-      if (agentConference?.conferenceName === data.conference_name) {
+      // Use ref to avoid stale closure
+      if (agentConferenceRef.current?.conferenceName === data.conference_name) {
         setConferenceParticipants(prev =>
           prev.map(p =>
             p.participantId === data.participant_id
@@ -1004,22 +1050,32 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
     // Handle customer routed to conference
     const handleCustomerRouted = (data: {
+      call_id: string;
+      call_db_id?: number;
+      caller_number: string;
+      queue_id: string;
+      context: AICollectedContext;
+      agent_id: number;
+      agent_name: string;
       conference_name: string;
       customer_info: {
         phone: string;
         name?: string;
         contact_id?: number;
       };
-      call_id: number;
     }) => {
       console.log('📥 [CallFabric] Customer routed to conference:', data);
+      console.log('📥 [CallFabric] Current agent conference (ref):', agentConferenceRef.current?.conferenceName);
 
-      if (agentConference?.conferenceName === data.conference_name) {
+      // Use ref to get current value (avoid stale closure)
+      const currentConference = agentConferenceRef.current;
+
+      if (currentConference?.conferenceName === data.conference_name) {
         // Add the customer as a new participant
         const customerParticipant: ConferenceParticipant = {
           id: Date.now(), // Temporary ID
-          conferenceId: agentConference.id,
-          callId: data.call_id,
+          conferenceId: currentConference.id,
+          callId: data.call_db_id,
           participantType: 'customer',
           participantId: data.customer_info.phone,
           status: 'joining',
@@ -1030,8 +1086,37 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
         setConferenceParticipants(prev => [...prev, customerParticipant]);
 
-        // Play notification sound or show toast if available
+        // Extract AI context from the data
+        const aiContext: AICollectedContext = {
+          ...data.context,
+          // Also check global_data for additional fields
+          ...(data.context?.global_data || {})
+        };
+
+        // Create the connected customer object
+        const customer: ConnectedCustomer = {
+          callId: data.call_id,
+          callDbId: data.call_db_id,
+          callerNumber: data.caller_number,
+          queueId: data.queue_id,
+          conferenceName: data.conference_name,
+          customerInfo: data.customer_info,
+          aiContext,
+          connectedAt: new Date()
+        };
+
+        // Store the connected customer
+        setConnectedCustomer(customer);
+
+        // Call the callback if set (for navigation)
+        if (onCustomerConnectedRef.current) {
+          onCustomerConnectedRef.current(customer);
+        }
+
         console.log('🔔 Customer connected:', data.customer_info.name || data.customer_info.phone);
+        console.log('📋 AI Context:', aiContext);
+      } else {
+        console.log('⚠️ [CallFabric] Conference name mismatch or no conference. Expected:', currentConference?.conferenceName, 'Got:', data.conference_name);
       }
     };
 
@@ -1044,12 +1129,14 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     }) => {
       console.log('📥 [CallFabric] Conference update:', data);
 
-      if (agentConference?.conferenceName === data.conference_name) {
-        const updated = agentConference ? {
-          ...agentConference,
+      // Use ref to avoid stale closure
+      const currentConference = agentConferenceRef.current;
+      if (currentConference?.conferenceName === data.conference_name) {
+        const updated = {
+          ...currentConference,
           id: data.conference_id,
           status: data.status
-        } : null;
+        };
         agentConferenceRef.current = updated;
         setAgentConference(updated);
       }
@@ -1066,7 +1153,9 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       socket.off('customer_routed_to_conference', handleCustomerRouted);
       socket.off('conference_update', handleConferenceUpdate);
     };
-  }, [socket, agentConference]);
+  // Note: We use refs (agentConferenceRef) inside handlers to avoid stale closures,
+  // so we only need socket in dependencies
+  }, [socket]);
 
   // Execute pending status change when client becomes ready
   useEffect(() => {
@@ -1101,6 +1190,15 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     };
   }, [user]);
 
+  // Helper functions for connected customer
+  const setOnCustomerConnected = useCallback((callback: ((customer: ConnectedCustomer) => void) | undefined) => {
+    onCustomerConnectedRef.current = callback;
+  }, []);
+
+  const clearConnectedCustomer = useCallback(() => {
+    setConnectedCustomer(null);
+  }, []);
+
   const value: CallFabricContextType = {
     client,
     activeCall,
@@ -1118,6 +1216,11 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     agentConference,
     conferenceParticipants,
     isInConference,
+    // Connected customer state
+    connectedCustomer,
+    onCustomerConnected: onCustomerConnectedRef.current,
+    setOnCustomerConnected,
+    clearConnectedCustomer,
     // Actions
     setAgentStatus,
     initializeClient,

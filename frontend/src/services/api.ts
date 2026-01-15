@@ -22,16 +22,8 @@ api.interceptors.request.use((config) => {
     config.headers.Authorization = `Bearer ${token}`;
   }
 
-  // Debug: Log complete config
-  console.log('Axios Request Config:', {
-    url: config.url,
-    baseURL: config.baseURL,
-    method: config.method,
-  });
-
   // Force remove any baseURL that might have been set
   if (config.baseURL) {
-    console.warn('Removing baseURL:', config.baseURL);
     delete config.baseURL;
   }
 

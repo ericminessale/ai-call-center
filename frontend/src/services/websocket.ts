@@ -17,11 +17,11 @@ class WebSocketService {
     });
 
     this.socket.on('connect', () => {
-      console.log('WebSocket connected');
+      // WebSocket connected
     });
 
     this.socket.on('disconnect', () => {
-      console.log('WebSocket disconnected');
+      // WebSocket disconnected
     });
 
     // Re-emit all registered events

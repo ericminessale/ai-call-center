@@ -333,42 +333,9 @@ def list_subscribers():
 def transfer_call():
     """
     Transfer an active call to another agent or queue.
-    This would be called from the frontend when an agent wants to transfer.
+    TODO: Implement using conference-based transfers.
     """
-    try:
-        data = request.get_json()
-        call_id = data.get('call_id')
-        target = data.get('target')  # Can be /private/agent-x or /public/queue-y
-        transfer_type = data.get('type', 'blind')  # blind or attended
-
-        # Use SignalWire API to modify the active call
-        from app.services.signalwire_client import SignalWireClient
-        sw_client = SignalWireClient()
-
-        if transfer_type == 'blind':
-            # Immediate transfer
-            result = sw_client.transfer_call(
-                call_id=call_id,
-                to=target
-            )
-        else:
-            # Attended transfer - more complex, needs conference bridge
-            # This is a simplified version
-            result = sw_client.create_attended_transfer(
-                call_id=call_id,
-                to=target,
-                agent_id=get_jwt_identity()
-            )
-
-        return jsonify({
-            'success': True,
-            'transfer_id': result.get('transfer_id'),
-            'message': f'Call transferred to {target}'
-        })
-
-    except Exception as e:
-        logger.error(f"Error transferring call: {e}")
-        return jsonify({'error': str(e)}), 500
+    return jsonify({'error': 'Transfer not yet implemented. Use conference-based routing instead.'}), 501
 
 
 @fabric_bp.route('/call/record', methods=['POST'])
@@ -376,35 +343,9 @@ def transfer_call():
 def toggle_recording():
     """
     Start or stop recording for an active call.
+    TODO: Implement using SignalWire REST API.
     """
-    try:
-        data = request.get_json()
-        call_id = data.get('call_id')
-        action = data.get('action', 'start')  # start, stop, pause, resume
-
-        from app.services.signalwire_client import SignalWireClient
-        sw_client = SignalWireClient()
-
-        if action == 'start':
-            result = sw_client.start_recording(call_id)
-        elif action == 'stop':
-            result = sw_client.stop_recording(call_id)
-        elif action == 'pause':
-            result = sw_client.pause_recording(call_id)
-        elif action == 'resume':
-            result = sw_client.resume_recording(call_id)
-        else:
-            return jsonify({'error': 'Invalid action'}), 400
-
-        return jsonify({
-            'success': True,
-            'recording_id': result.get('recording_id'),
-            'status': result.get('status')
-        })
-
-    except Exception as e:
-        logger.error(f"Error controlling recording: {e}")
-        return jsonify({'error': str(e)}), 500
+    return jsonify({'error': 'Recording control not yet implemented.'}), 501
 
 
 @fabric_bp.route('/resources', methods=['GET'])

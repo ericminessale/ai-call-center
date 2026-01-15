@@ -5,10 +5,6 @@ import { useAuthStore } from './stores/authStore';
 import { SocketProvider } from './contexts/SocketContext';
 import { CallFabricProvider } from './contexts/CallFabricContext';
 import { UnifiedAgentDesktop } from './pages/UnifiedAgentDesktop';
-import { AgentDashboard } from './pages/AgentDashboard';
-import { SupervisorDashboard } from './pages/SupervisorDashboard';
-import { CallCenterDashboard } from './pages/CallCenterDashboard';
-import Dashboard from './pages/Dashboard';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import CallDetails from './components/CallDetails';
@@ -94,56 +90,6 @@ function App() {
             element={
               <ProtectedRoute>
                 <UnifiedAgentDesktop />
-              </ProtectedRoute>
-            }
-          />
-
-          {/* === LEGACY ROUTES (for reference/transition) === */}
-
-          {/* Legacy Agent Dashboard */}
-          <Route
-            path="/legacy-dashboard"
-            element={
-              <ProtectedRoute>
-                <AgentDashboard />
-              </ProtectedRoute>
-            }
-          />
-          <Route
-            path="/legacy-dashboard/:callId"
-            element={
-              <ProtectedRoute>
-                <AgentDashboard />
-              </ProtectedRoute>
-            }
-          />
-
-          {/* Legacy Supervisor Dashboard */}
-          <Route
-            path="/legacy-supervisor"
-            element={
-              <ProtectedRoute>
-                <SupervisorDashboard />
-              </ProtectedRoute>
-            }
-          />
-
-          {/* Old 3-Zone Dashboard (Legacy) */}
-          <Route
-            path="/old-dashboard"
-            element={
-              <ProtectedRoute>
-                <CallCenterDashboard />
-              </ProtectedRoute>
-            }
-          />
-
-          {/* Original Transcribe App Dashboard */}
-          <Route
-            path="/transcribe"
-            element={
-              <ProtectedRoute>
-                <Dashboard />
               </ProtectedRoute>
             }
           />

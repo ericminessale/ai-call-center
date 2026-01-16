@@ -8,6 +8,8 @@ import {
   Star,
   PhoneIncoming,
   Bot,
+  UserCheck,
+  Loader2,
 } from 'lucide-react';
 import { Call } from '../../types/callcenter';
 
@@ -40,9 +42,10 @@ export function QueueList({ calls, onSelectCall, onTakeCall }: QueueListProps) {
     return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
   });
 
-  // Separate urgent and regular
-  const urgentCalls = sortedCalls.filter((c) => c.is_urgent);
-  const regularCalls = sortedCalls.filter((c) => !c.is_urgent);
+  // Separate urgent, waiting, and assigned calls
+  const urgentCalls = sortedCalls.filter((c) => c.is_urgent || c.queue_status === 'urgent');
+  const waitingCalls = sortedCalls.filter((c) => !c.is_urgent && c.queue_status !== 'urgent' && c.status === 'waiting');
+  const assignedCalls = sortedCalls.filter((c) => !c.is_urgent && c.queue_status !== 'urgent' && c.status === 'assigned');
 
   return (
     <div className="h-full flex flex-col">
@@ -78,12 +81,12 @@ export function QueueList({ calls, onSelectCall, onTakeCall }: QueueListProps) {
           </div>
         ) : (
           <>
-            {/* Urgent/Priority Calls */}
+            {/* Urgent/Priority Calls - needs immediate attention */}
             {urgentCalls.length > 0 && (
               <div className="mb-2">
                 <div className="px-3 py-2 text-xs font-semibold text-red-400 uppercase tracking-wider bg-red-900/20 flex items-center gap-2">
                   <AlertTriangle className="w-3 h-3" />
-                  Priority ({urgentCalls.length})
+                  Urgent ({urgentCalls.length})
                 </div>
                 {urgentCalls.map((call) => (
                   <QueueCard
@@ -96,13 +99,32 @@ export function QueueList({ calls, onSelectCall, onTakeCall }: QueueListProps) {
               </div>
             )}
 
-            {/* Regular Queue */}
-            {regularCalls.length > 0 && (
-              <div>
-                <div className="px-3 py-2 text-xs font-semibold text-gray-400 uppercase tracking-wider bg-gray-800/50">
-                  Queue ({regularCalls.length})
+            {/* Waiting Calls - no agent assigned yet */}
+            {waitingCalls.length > 0 && (
+              <div className="mb-2">
+                <div className="px-3 py-2 text-xs font-semibold text-yellow-400 uppercase tracking-wider bg-yellow-900/20 flex items-center gap-2">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  Waiting ({waitingCalls.length})
                 </div>
-                {regularCalls.map((call) => (
+                {waitingCalls.map((call) => (
+                  <QueueCard
+                    key={call.id}
+                    call={call}
+                    onSelect={() => onSelectCall(call)}
+                    onTake={() => onTakeCall(call)}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Assigned Calls - agent notified, waiting for them to accept */}
+            {assignedCalls.length > 0 && (
+              <div>
+                <div className="px-3 py-2 text-xs font-semibold text-blue-400 uppercase tracking-wider bg-blue-900/20 flex items-center gap-2">
+                  <UserCheck className="w-3 h-3" />
+                  Assigned ({assignedCalls.length})
+                </div>
+                {assignedCalls.map((call) => (
                   <QueueCard
                     key={call.id}
                     call={call}
@@ -191,12 +213,18 @@ function QueueCard({
             </div>
           )}
 
-          {/* Queue info */}
-          {call.queue_id && (
-            <div className="mt-1 text-xs text-gray-500">
-              Queue: {call.queue_id}
-            </div>
-          )}
+          {/* Queue info and assigned agent */}
+          <div className="mt-1 flex items-center gap-2 text-xs text-gray-500">
+            {call.queue_id && (
+              <span>Queue: {call.queue_id}</span>
+            )}
+            {call.status === 'assigned' && call.assigned_agent_id && (
+              <span className="text-blue-400 flex items-center gap-1">
+                <UserCheck className="w-3 h-3" />
+                Assigned to agent
+              </span>
+            )}
+          </div>
         </div>
 
         {/* Take Call Button */}

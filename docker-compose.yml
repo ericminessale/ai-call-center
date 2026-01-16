@@ -74,9 +74,6 @@ services:
       # Set this to your ngrok URL so SignalWire can reach your local server
       EXTERNAL_URL: ${EXTERNAL_URL}
 
-      # Call Fabric Resources (set up in SignalWire Dashboard)
-      AGENT_CONFERENCE_RESOURCE: ${AGENT_CONFERENCE_RESOURCE:-/public/agent-conference}
-
       # Application
       FLASK_APP: app
       FLASK_ENV: ${FLASK_ENV:-production}

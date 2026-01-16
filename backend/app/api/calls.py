@@ -541,6 +541,151 @@ def initiate_takeover(call_sid):
         return jsonify({'error': f'Failed to initiate takeover: {str(e)}'}), 500
 
 
+@calls_bp.route('/<call_id>/take', methods=['POST'])
+@require_auth
+def take_queued_call(call_id):
+    """Take a queued call.
+
+    This endpoint allows an agent to take a call from the queue.
+    If the call is already assigned to this agent, it returns success.
+    If the call is waiting, it assigns it to this agent.
+
+    Returns the conference info so the agent can dial in.
+    """
+    logger.info(f"TAKE CALL REQUEST for call {call_id} by user {request.current_user.id}")
+
+    try:
+        # Find call by ID
+        call = None
+        if str(call_id).isdigit():
+            call = db.session.query(Call).filter_by(id=int(call_id)).first()
+        if not call:
+            call = Call.find_by_sid(call_id)
+        if not call:
+            logger.error(f"Call not found: {call_id}")
+            return jsonify({'error': 'Call not found'}), 404
+
+        # Check if call is in a takeable state
+        if call.status not in ['waiting', 'assigned', 'queued']:
+            logger.warning(f"Call {call_id} cannot be taken (status={call.status})")
+            return jsonify({'error': f'Call cannot be taken (status: {call.status})'}), 400
+
+        # Check if already assigned to another agent
+        if call.status == 'assigned' and call.assigned_agent_id and call.assigned_agent_id != request.current_user.id:
+            logger.warning(f"Call {call_id} is assigned to another agent ({call.assigned_agent_id})")
+            return jsonify({'error': 'Call is assigned to another agent'}), 409
+
+        # Assign to this agent if not already
+        if call.assigned_agent_id != request.current_user.id:
+            call.assigned_agent_id = request.current_user.id
+            call.assigned_at = datetime.utcnow()
+
+        call.status = 'assigned'
+        call.handler_type = 'human'
+        call.user_id = request.current_user.id
+
+        # Ensure conference name is set
+        if not call.conference_name:
+            call.conference_name = f"interaction-{call.signalwire_call_sid}"
+
+        db.session.commit()
+
+        logger.info(f"Call {call_id} taken by agent {request.current_user.id}, conference: {call.conference_name}")
+
+        # Emit queue update to remove from other agents' queue displays
+        from app import socketio
+        socketio.emit('queue_update', {
+            'call': call.to_dict(include_contact=True),
+            'queue_id': call.queue_id,
+            'action': 'taken',
+            'taken_by_agent_id': request.current_user.id
+        })
+
+        return jsonify({
+            'success': True,
+            'call_id': call.id,
+            'call_sid': call.signalwire_call_sid,
+            'conference_name': call.conference_name,
+            'message': 'Call assigned successfully'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to take call: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': f'Failed to take call: {str(e)}'}), 500
+
+
+@calls_bp.route('/<call_id>/status', methods=['PUT'])
+@require_auth
+def update_call_status(call_id):
+    """Update call status.
+
+    Called by the frontend when agent joins/leaves the conference.
+    This keeps the call status in sync with the actual call state.
+    """
+    logger.info(f"STATUS UPDATE for call {call_id} by user {request.current_user.id}")
+
+    try:
+        data = request.get_json() or {}
+        new_status = data.get('status')
+
+        if not new_status:
+            return jsonify({'error': 'status is required'}), 400
+
+        # Validate status
+        valid_statuses = ['active', 'on_hold', 'ended', 'waiting', 'assigned']
+        if new_status not in valid_statuses:
+            return jsonify({'error': f'Invalid status: {new_status}'}), 400
+
+        # Find call by ID
+        call = None
+        if str(call_id).isdigit():
+            call = db.session.query(Call).filter_by(id=int(call_id)).first()
+        if not call:
+            call = Call.find_by_sid(call_id)
+        if not call:
+            logger.error(f"Call not found: {call_id}")
+            return jsonify({'error': 'Call not found'}), 404
+
+        old_status = call.status
+
+        # Update status
+        call.status = new_status
+        call.handler_type = 'human'  # Agent is now handling
+
+        # If becoming active, mark answered time
+        if new_status == 'active' and not call.answered_at:
+            call.answered_at = datetime.utcnow()
+
+        # If ended, mark ended time
+        if new_status == 'ended' and not call.ended_at:
+            call.ended_at = datetime.utcnow()
+            if call.answered_at:
+                call.duration = int((call.ended_at - call.answered_at).total_seconds())
+
+        db.session.commit()
+        logger.info(f"Call {call_id} status updated: {old_status} -> {new_status}")
+
+        # Emit update to other clients
+        from app import socketio
+        socketio.emit('call_update', {
+            'call': call.to_dict(include_contact=True)
+        })
+
+        return jsonify({
+            'success': True,
+            'call_id': call.id,
+            'status': call.status
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to update call status: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': f'Failed to update call status: {str(e)}'}), 500
+
+
 @calls_bp.route('/<call_id>/legs', methods=['GET'])
 @require_auth
 def get_call_legs(call_id):

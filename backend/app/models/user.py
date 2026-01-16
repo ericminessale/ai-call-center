@@ -27,7 +27,12 @@ class User(db.Model):
     fabric_subscriber_created_at = db.Column(db.DateTime, nullable=True)
 
     # Relationships
-    calls = db.relationship('Call', backref='user', lazy='dynamic', cascade='all, delete-orphan')
+    # Calls owned by this user (user_id foreign key)
+    calls = db.relationship('Call', backref='user', lazy='dynamic', cascade='all, delete-orphan',
+                           foreign_keys='Call.user_id')
+    # Calls assigned to this user as an agent (assigned_agent_id foreign key)
+    assigned_calls = db.relationship('Call', backref='assigned_agent', lazy='dynamic',
+                                     foreign_keys='Call.assigned_agent_id')
 
     def __repr__(self):
         return f'<User {self.email}>'

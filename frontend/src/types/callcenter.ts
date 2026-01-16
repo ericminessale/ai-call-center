@@ -185,12 +185,13 @@ export interface Call {
   startTime?: string | Date;  // ISO string or Date object
   created_at?: string;  // Backend timestamp
   duration?: number;
-  status: 'waiting' | 'connecting' | 'active' | 'ai_active' | 'on_hold' | 'ended' | 'completed';
+  status: 'waiting' | 'assigned' | 'connecting' | 'active' | 'ai_active' | 'on_hold' | 'ended' | 'completed';
   isOnHold?: boolean;
   queueId?: string;
   queue_id?: string;  // Backend snake_case
   priority?: CallPriority;
-  is_urgent?: boolean;  // For priority calls
+  is_urgent?: boolean;  // For priority calls (timeout exceeded)
+  queue_status?: 'waiting' | 'assigned' | 'urgent' | 'active';  // Computed queue status with urgency
   transcription?: TranscriptionMessage[];
   recordingUrl?: string;
   transferHistory?: Transfer[];
@@ -211,6 +212,12 @@ export interface Call {
   // SignalWire identifiers
   signalwire_call_sid?: string;
   call_sid?: string;
+
+  // Queue tracking
+  assigned_agent_id?: number;  // Agent assigned to handle this call
+  assigned_at?: string;  // When agent was notified
+  conference_name?: string;  // Interaction conference name
+  wait_time_seconds?: number;  // How long caller has been waiting
 }
 
 export interface TranscriptionMessage {

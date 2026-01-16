@@ -15,6 +15,7 @@ from datetime import datetime
 import logging
 import json
 import os
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +55,31 @@ def route_call_to_queue(queue_id):
         call_id = call_data.get('call_id') or data.get('CallSid') or data.get('call_id')
         caller_number = call_data.get('from_number') or data.get('From') or data.get('caller_number')
 
-        # Get context from AI agent (passed via headers or body)
-        # The AI agents pass data in global_data with fields like:
-        # - customer_name, reason, issue, urgency, priority, department
-        # - interest, company, budget (sales)
-        # - error_message (support)
+        # PRIORITY 1: Check for base64-encoded context in URL query param (most reliable)
+        # AI agents encode context as ?ctx=<base64> in the transfer URL
+        ctx_param = request.args.get('ctx')
+        url_context = {}
+        if ctx_param:
+            try:
+                ctx_json = base64.urlsafe_b64decode(ctx_param.encode()).decode()
+                url_context = json.loads(ctx_json)
+                print(f"📦 DECODED URL CONTEXT: {json.dumps(url_context, default=str)}", flush=True)
+                logger.info(f"Decoded URL context: {json.dumps(url_context)}")
+            except Exception as e:
+                logger.warning(f"Failed to decode ctx param: {e}")
+
+        # PRIORITY 2: Get context from request body global_data (backup)
+        # The AI agents also set global_data which SignalWire may or may not forward
         global_data = data.get('global_data', {})
+        print(f"📦 BODY GLOBAL_DATA: {json.dumps(global_data, default=str)}", flush=True)
+
+        # Merge: URL context takes priority over body global_data
+        # This ensures we get the data even if SignalWire doesn't forward global_data
+        merged_global_data = {**global_data, **url_context}
+        global_data = merged_global_data
+
+        print(f"📦 MERGED CONTEXT: {json.dumps(global_data, default=str)}", flush=True)
+        logger.info(f"Merged context data: {json.dumps(global_data)}")
 
         # Debug logging to see what we're receiving
         logger.info(f"=== QUEUE ROUTE DEBUG ===")
@@ -122,15 +142,21 @@ def route_call_to_queue(queue_id):
                 user_id=system_user.id,
                 from_number=caller_number,
                 destination=call_data.get('to_number') or data.get('To'),
-                status='queued',
+                status='waiting',  # Start as 'waiting' in queue
                 destination_type='phone',
                 handler_type='human',
-                created_at=datetime.utcnow()
+                created_at=datetime.utcnow(),
+                queue_id=queue_id  # Track which queue they're in
             )
             db.session.add(call)
 
         # Store AI context (customer info collected by AI agent)
         call.ai_context = json.dumps(context) if context else None
+
+        # Ensure call is marked as 'waiting' in queue
+        if call.status not in ['waiting', 'assigned', 'active', 'ended']:
+            call.status = 'waiting'
+        call.queue_id = queue_id
 
         # Update Contact record with AI-collected information
         contact_id = None
@@ -205,6 +231,15 @@ def route_call_to_queue(queue_id):
 
         db.session.commit()
 
+        # Emit queue_update so frontend shows the call immediately with 'waiting' status
+        from app import socketio
+        logger.info(f"Emitting queue_update for call {call.id} with status 'waiting' in queue '{queue_id}'")
+        socketio.emit('queue_update', {
+            'call': call.to_dict(include_contact=True),
+            'queue_id': queue_id,
+            'action': 'added'
+        })
+
         # Enqueue the call
         service = get_queue_service()
         queue_result = service.enqueue_call(
@@ -250,35 +285,70 @@ def route_call_to_queue(queue_id):
                     # If not numeric, try lookup by email
                     user = User.query.filter_by(email=agent_id_str).first()
 
-                if user and user.signalwire_address:
-                    selected_user = user
-                    # Update round-robin index to this agent
-                    redis_client.set(rr_key, next_index)
-                    break
-                else:
+                if not user:
+                    logger.warning(f"Agent {agent_id_str} not found in database, trying next")
+                    attempts += 1
+                    continue
+
+                if not user.signalwire_address:
                     logger.warning(f"Agent {agent_id_str} has no signalwire_address, trying next")
                     attempts += 1
+                    continue
+
+                # CRITICAL: Double-check agent is actually available in Redis
+                # This catches cases where the set wasn't properly cleaned up
+                agent_status = service.get_agent_status(str(user.id))
+                actual_status = agent_status.get('status') if agent_status else None
+                logger.info(f"Agent {user.id} ({user.email}): Redis status = {actual_status}")
+
+                if actual_status != 'available':
+                    logger.warning(f"Agent {user.id} is in available set but actual status is '{actual_status}', removing from set and trying next")
+                    # Clean up the stale entry
+                    redis_client.srem('agents:available', str(user.id))
+                    attempts += 1
+                    continue
+
+                # Agent is valid and actually available
+                selected_user = user
+                # Update round-robin index to this agent
+                redis_client.set(rr_key, next_index)
+                break
 
             if selected_user:
                 # Dequeue the call for this agent
                 dequeued_data = service.dequeue_call(queue_id, str(selected_user.id))
 
-                # Update call record
+                # Update call record to 'assigned' status
+                # Status flow: waiting → assigned → active → ended
+                # The call will show in queue with 'assigned' until agent accepts
                 if call:
-                    call.status = 'connecting'
+                    call.status = 'assigned'  # Changed from 'connecting'
                     call.handler_type = 'human'
                     call.user_id = selected_user.id
+                    call.assigned_agent_id = selected_user.id
+                    call.assigned_at = datetime.utcnow()
 
                 # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
                 base_url = get_base_url()
 
-                # Conference-based routing: customer joins agent's conference (hot seat model)
-                conference_name = f"agent-conf-{selected_user.id}"
+                # NEW: Per-interaction conference model
+                # Instead of agents sitting idle in their personal conferences,
+                # we create a conference for each customer interaction.
+                # Customer joins first, then agent is notified to dial in.
+                conference_name = f"interaction-{call_id}"
 
-                logger.info(f"Routing call {call_id} to agent {selected_user.email} via conference: {conference_name}")
+                # Track conference on call record
+                if call:
+                    call.conference_name = conference_name
 
-                # Get or create the conference
-                conference = Conference.get_or_create_agent_conference(selected_user.id)
+                logger.info(f"Creating interaction conference {conference_name} for call {call_id} -> agent {selected_user.email}")
+
+                # Create the interaction conference
+                conference = Conference.create_interaction_conference(
+                    call_id=call_id,
+                    queue_id=queue_id,
+                    agent_user_id=selected_user.id
+                )
 
                 # Create call leg for human agent
                 if call:
@@ -293,14 +363,72 @@ def route_call_to_queue(queue_id):
 
                 db.session.commit()
 
-                # Emit call_update so frontend immediately knows this is now a human-handled call
+                # Emit queue_update so frontend shows the call as 'assigned' in the queue
+                # The call stays in the queue list but with 'assigned' status until agent accepts
+                socketio.emit('queue_update', {
+                    'call': call.to_dict(include_contact=True),
+                    'queue_id': queue_id,
+                    'action': 'assigned',
+                    'assigned_agent_id': selected_user.id,
+                    'assigned_agent_name': selected_user.name or selected_user.email
+                })
+                logger.info(f"Emitted queue_update for call {call.id} with status 'assigned' to agent {selected_user.id}")
+
+                # Also emit call_update so frontend immediately knows this is now a human-handled call
                 emit_call_update(call)
                 logger.info(f"Emitted call_update for call {call.id} (handler_type={call.handler_type}, status={call.status})")
 
-                # Emit WebSocket event for agent notification
-                # Room name must match authenticate handler: str(user_id)
+                # SERVER-INITIATED CALL PATTERN
+                # Instead of agent dialing a resource, the backend CALLS the agent.
+                # This removes the need for any SignalWire Dashboard resource setup.
+                #
+                # Flow:
+                # 1. Backend calls agent's subscriber address via REST API
+                # 2. Agent's browser (online via Call Fabric SDK) receives inbound call
+                # 3. Agent answers -> SWML joins them to conference
+                # 4. Customer also joins same conference
+                # 5. Both parties connected
                 from app import socketio
-                socketio.emit('customer_routed_to_conference', {
+                from app.services.signalwire_api import SignalWireAPI
+
+                # Build agent's dial target (their subscriber address)
+                agent_address = None
+                if selected_user.signalwire_address:
+                    addr = selected_user.signalwire_address
+                    # Valid fabric addresses start with /private/ or /public/ without @
+                    if addr.startswith('/private/') or addr.startswith('/public/'):
+                        name_part = addr.split('/')[-1]
+                        if '@' not in name_part:
+                            agent_address = addr
+                        else:
+                            # Fix invalid address format
+                            agent_address = f"/private/agent-{selected_user.id}"
+                            selected_user.signalwire_address = agent_address
+                            db.session.commit()
+                    elif addr.startswith('+') or addr.startswith('sip:'):
+                        agent_address = addr
+
+                if not agent_address and selected_user.signalwire_subscriber_id:
+                    agent_address = f"/private/agent-{selected_user.id}"
+
+                # SOCKET NOTIFICATION + AGENT DIAL-OUT FLOW:
+                # We DON'T call the agent via REST API anymore. Instead:
+                # 1. Send socket notification to agent with conference info
+                # 2. Agent sees "incoming call" UI and clicks Accept
+                # 3. Agent's browser dials OUT to join the conference
+                # 4. Both parties connected in conference
+                #
+                # Why not call the agent directly?
+                # The SignalWire SDK has a bug where connection pooling breaks inbound call
+                # answering (verto.answer never gets sent). Outbound calls work fine.
+                # So we let the agent dial out instead of receiving an inbound call.
+
+                print(f"📞 Notifying agent {selected_user.id} about call assignment", flush=True)
+                print(f"📞 Conference: {conference_name}", flush=True)
+
+                # Emit notification so frontend shows the incoming call UI
+                # Agent will dial out to join the conference when they click Accept
+                socketio.emit('call_assignment', {
                     'call_id': call_id,
                     'call_db_id': call.id if call else None,
                     'caller_number': caller_number,
@@ -309,70 +437,15 @@ def route_call_to_queue(queue_id):
                     'agent_id': selected_user.id,
                     'agent_name': selected_user.name or selected_user.email,
                     'conference_name': conference_name,
+                    'agent_call_sid': None,  # No server-initiated call anymore
                     'customer_info': {
                         'phone': caller_number,
                         'name': context.get('customer_name'),
                         'contact_id': contact_id
                     }
                 }, room=str(selected_user.id))
-                logger.info(f"Emitted customer_routed_to_conference to agent room {selected_user.id}")
-
-                # Return SWML response to connect customer to agent
-                #
-                # IMPORTANT: Call Fabric addressing for SWML connect
-                # - Phone numbers: "+1234567890"
-                # - SIP endpoints: "sip:user@domain.com"
-                # - SWML/webhook URLs: "https://example.com/swml"
-                #
-                # The /private/email format does NOT work with SWML connect.
-                # Instead, we transfer to a SWML URL that handles the agent connection.
-                # The agent must be dialed via their subscriber's SIP address or
-                # through a conference-based approach.
-
-                # Build dial target for the agent
-                # Options (in order of preference):
-                # 1. signalwire_address if it's valid format (no email @)
-                # 2. Derive from user ID: /private/agent-{user_id}
-                # 3. SIP or phone number fallback
-                #
-                # IMPORTANT: Call Fabric addresses must be alphanumeric with hyphens.
-                # Format like "/private/eric.minessale@gmail.com" is INVALID.
-                # Valid format: "/private/agent-4" or "/private/ericminessale"
-
-                transfer_target = None
-
-                # Option 1: Check if signalwire_address is already in valid format
-                if selected_user.signalwire_address:
-                    addr = selected_user.signalwire_address
-                    # Valid if: starts with /private/ or /public/ AND no @ in the name part
-                    # Or is a phone number or SIP URI
-                    if addr.startswith('/private/') or addr.startswith('/public/'):
-                        # Extract the name part and validate
-                        name_part = addr.split('/')[-1]
-                        if '@' not in name_part:
-                            transfer_target = addr
-                            logger.info(f"Using signalwire_address for agent: {transfer_target}")
-                        else:
-                            logger.warning(f"Invalid fabric address format (contains @): {addr}")
-                            # Fix: Use derived address instead
-                            transfer_target = f"/private/agent-{selected_user.id}"
-                            logger.info(f"Using derived fabric address: {transfer_target}")
-                            # Update the user's stored address for future calls
-                            selected_user.signalwire_address = transfer_target
-                            db.session.commit()
-                    elif addr.startswith('+') or addr.startswith('sip:'):
-                        transfer_target = addr
-                        logger.info(f"Using phone/SIP for agent: {transfer_target}")
-
-                # Option 2: Derive from user ID if no valid address
-                if not transfer_target and selected_user.signalwire_subscriber_id:
-                    transfer_target = f"/private/agent-{selected_user.id}"
-                    logger.info(f"Using derived fabric address: {transfer_target}")
-
-                # Conference-based routing: customer joins agent's conference
-                # The agent is already in their conference (hot seat mode)
-                # We route the customer INTO that conference
-                logger.info(f"Routing customer to agent {selected_user.email} conference: {conference_name}")
+                logger.info(f"Emitted call_assignment to agent room {selected_user.id}")
+                logger.info(f"Customer will join interaction conference: {conference_name}")
 
                 # Return SWML that joins the customer to the agent's conference
                 return jsonify({
@@ -942,6 +1015,47 @@ def get_all_queues_status():
     except Exception as e:
         logger.error(f"Error getting all queues status: {str(e)}")
         return jsonify({"error": "Failed to get queues status"}), 500
+
+
+@queues_bp.route('/all/calls', methods=['GET'])
+@require_auth
+def get_all_queued_calls():
+    """
+    Get all calls currently in queue (waiting, assigned, or urgent)
+    Returns calls sorted by urgency (urgent first, then waiting, then assigned)
+    """
+    try:
+        # Query calls that are in queue states
+        # Status can be: waiting, assigned
+        # urgent is computed dynamically via the is_urgent property
+        queued_calls = Call.query.filter(
+            Call.status.in_(['waiting', 'assigned'])
+        ).order_by(Call.created_at.asc()).all()
+
+        # Convert to dicts and sort by urgency
+        calls_data = []
+        for call in queued_calls:
+            call_dict = call.to_dict(include_contact=True)
+            calls_data.append(call_dict)
+
+        # Sort by urgency: urgent first, then by wait time
+        # queue_status will be 'urgent', 'waiting', or 'assigned'
+        urgency_order = {'urgent': 0, 'waiting': 1, 'assigned': 2}
+        calls_data.sort(key=lambda c: (
+            urgency_order.get(c.get('queue_status', 'assigned'), 3),
+            -c.get('wait_time_seconds', 0)  # Longer wait = higher priority
+        ))
+
+        logger.info(f"Returning {len(calls_data)} queued calls")
+
+        return jsonify({
+            'calls': calls_data,
+            'total': len(calls_data)
+        })
+
+    except Exception as e:
+        logger.error(f"Error getting queued calls: {str(e)}")
+        return jsonify({"error": "Failed to get queued calls"}), 500
 
 
 @queues_bp.route('/mock/clear', methods=['POST'])

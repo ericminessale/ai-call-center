@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
 SignalWire Call Center AI Agents
-Refactored to use contexts/steps for structured flow
+Triage agent using contexts/steps - NO problem solving, info gathering only.
+AI Specialists (separate agents) are the ONLY ones that solve problems.
 """
 
 from signalwire_agents import AgentBase, AgentServer
 from signalwire_agents.core.function_result import SwaigFunctionResult
 import os
+import json
+import base64
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,8 +34,6 @@ def get_base_url_from_global_data(raw_data: dict) -> str:
 
 def capture_base_url(query_params, body_params, headers, agent):
     """Dynamic config callback - captures external URL and sets post_prompt_url."""
-    from urllib.parse import urlparse
-
     existing_global = body_params.get('global_data', {})
     new_global = {}
     base_url = None
@@ -65,32 +66,57 @@ def capture_base_url(query_params, body_params, headers, agent):
         agent.set_global_data(new_global)
 
 
-class CallCenterAgent(AgentBase):
+class CallCenterTriageAgent(AgentBase):
     """
-    Main Call Center Agent using contexts/steps for structured flow.
+    Call Center TRIAGE Agent - Information gathering ONLY.
 
-    Flow:
-    1. Default context: Greet, get name, determine sales vs support
-    2. Sales context: Brief intake, offer human or AI choice
-    3. Support context: Brief intake, offer human or AI choice
+    This agent does NOT solve problems. It ONLY:
+    1. Collects the customer's name
+    2. Identifies if they need sales or support
+    3. Gathers basic context info
+    4. Transfers to human queue OR AI specialist
 
-    Then routes to specialist agents or human queue.
+    The AI Specialists (SalesAISpecialist, SupportAISpecialist) are the ONLY
+    agents that actually help solve problems or answer questions.
     """
 
     def __init__(self):
         super().__init__(
-            name="CallCenterAgent",
+            name="CallCenterTriageAgent",
             route="/receptionist",
             auto_answer=True
         )
 
         self.set_dynamic_config_callback(capture_base_url)
 
-        # Base prompt that applies globally
+        # ============================================================
+        # GLOBAL PROMPT - Applies to ALL contexts
+        # Just defines personality - NO problem solving instructions
+        # ============================================================
         self.prompt_add_section(
-            "Base Instructions",
-            "You are Sarah, a friendly customer service representative. "
-            "Follow the structured workflow to help customers efficiently."
+            "Identity",
+            "You are Sarah, a friendly and efficient customer service representative. "
+            "Your ONLY job is to gather information and route calls appropriately."
+        )
+
+        self.prompt_add_section(
+            "CRITICAL RESTRICTIONS",
+            "You are a TRIAGE agent. You must NEVER:",
+            bullets=[
+                "Attempt to solve, troubleshoot, or fix any problem",
+                "Provide technical advice or suggestions",
+                "Answer product questions or provide pricing",
+                "Diagnose issues or suggest solutions",
+                "Say things like 'did you try...' or 'have you checked...'",
+                "Offer workarounds or temporary fixes"
+            ]
+        )
+
+        self.prompt_add_section(
+            "Your Job",
+            "You ONLY gather information and transfer calls. That's it. "
+            "If someone describes a problem, acknowledge it and move to getting their transfer preference. "
+            "Do NOT engage with the problem itself."
         )
 
         # Configure post_prompt for call summaries
@@ -109,132 +135,162 @@ Summarize this call and return a JSON object with:
         contexts = self.define_contexts()
 
         # ============================================================
-        # DEFAULT CONTEXT - Initial greeting and triage
+        # TRIAGE CONTEXT (default) - Initial greeting and routing
         # ============================================================
-        default_ctx = contexts.add_context("default")
+        triage_ctx = contexts.add_context("default")
 
-        # Step 1: Greeting and name collection
-        default_ctx.add_step("greeting") \
-            .add_section("Current Task", "Greet the caller warmly and get their name") \
-            .add_bullets("What to do", [
-                "Say: 'Hi, thank you for calling! I'm Sarah, how can I help you today?'",
-                "If they explain their issue first, acknowledge it then ask for their name",
-                "Get their name before moving on - this is required"
-            ]) \
-            .set_step_criteria("Customer has provided their name") \
-            .set_valid_steps(["determine_need"])
+        # Step 1: Greeting and NAME collection (REQUIRED before proceeding)
+        triage_ctx.add_step("get_name") \
+            .add_section("Your Task", "Greet the caller and get their name.") \
+            .add_section("What to Say",
+                "'Hi, thank you for calling! I'm Sarah. May I have your name please?'") \
+            .add_section("IMPORTANT",
+                "You MUST get their name before moving on. If they start explaining "
+                "their issue, say 'I'd be happy to help with that - may I first get your name?'") \
+            .set_step_criteria("Customer has clearly stated their name") \
+            .set_valid_steps(["get_purpose"])
 
-        # Step 2: Determine if sales or support
-        default_ctx.add_step("determine_need") \
-            .add_section("Current Task", "Understand what they need help with") \
-            .add_bullets("Listen for clues", [
-                "SALES: buying, pricing, products, interested in, purchase, plans, features",
-                "SUPPORT: problem, issue, not working, error, help with, broken, trouble"
-            ]) \
-            .add_section("Navigation",
-                "Once you understand their need:\n"
-                "- If SALES related: change_context to 'sales'\n"
-                "- If SUPPORT related: change_context to 'support'\n\n"
-                "Do NOT announce the change - just continue naturally.") \
-            .set_step_criteria("Customer's need (sales or support) has been identified") \
+        # Step 2: Get PURPOSE (REQUIRED before routing)
+        triage_ctx.add_step("get_purpose") \
+            .add_section("Your Task", "Find out what they're calling about.") \
+            .add_section("What to Say",
+                "'Thanks [name]! Are you calling about a purchase or product inquiry, "
+                "or do you need help with an existing issue?'") \
+            .add_section("Listen For",
+                "SALES: buying, pricing, products, interested in, purchase, plans, features, quote\n"
+                "SUPPORT: problem, issue, not working, error, help with, broken, trouble, fix") \
+            .add_section("Then Route",
+                "Once clear:\n"
+                "- Sales-related: change_context to 'sales'\n"
+                "- Support-related: change_context to 'support'\n"
+                "Do NOT announce the change.") \
+            .set_step_criteria("Customer's need (sales or support) has been clearly identified") \
             .set_valid_contexts(["sales", "support"])
 
         # ============================================================
-        # SALES CONTEXT - Sales-specific intake
+        # SALES CONTEXT - Sales info gathering (NO selling)
         # ============================================================
         sales_ctx = contexts.add_context("sales") \
             .set_isolated(True)
 
-        # Sales context prompt (applies to all steps in this context)
+        # Sales context prompt
         sales_ctx.add_section("Role",
-            "You are continuing the conversation as Sarah. The customer needs sales help. "
-            "Do NOT re-introduce yourself. Use their name from the conversation.")
+            "Continue as Sarah. Customer needs sales help. Use their name.")
 
-        # Sales Step 1: Brief detail gathering
-        sales_ctx.add_step("gather_details") \
-            .add_section("Current Task", "Quickly gather 1-2 relevant details") \
-            .add_bullets("Ask about", [
-                "What product or service interests them",
-                "Company name if relevant (B2B)"
+        sales_ctx.add_section("REMEMBER",
+            "You are TRIAGE only. Do NOT answer product questions, provide pricing, "
+            "or make recommendations. Just gather info for the transfer.")
+
+        # Sales Step 1: Brief info gathering
+        sales_ctx.add_step("gather_info") \
+            .add_section("Your Task", "Collect basic info for the sales team.") \
+            .add_bullets("Ask These Questions (one at a time)", [
+                "What product or service are you interested in?",
+                "Is this for yourself or a business?"
             ]) \
-            .add_section("Important", "Keep this brief - just 1-2 questions max, then move to offer_choice. Remember what they tell you for the transfer.") \
-            .set_step_criteria("Basic sales details gathered") \
-            .set_valid_steps(["offer_choice"])
+            .add_section("CRITICAL",
+                "Do NOT answer their questions. If they ask about features/pricing, say: "
+                "'Great question - let me connect you with someone who can give you detailed information on that.'") \
+            .set_step_criteria("Basic sales context collected (product interest, personal/business)") \
+            .set_valid_steps(["transfer_choice"])
 
-        # Sales Step 2: Offer the choice
-        sales_ctx.add_step("offer_choice") \
-            .add_section("CRITICAL TASK",
-                "You MUST ask this question - do not skip it:\n\n"
-                "'Would you like to speak with one of our sales representatives, "
-                "or would you like me to assist you?'") \
-            .add_section("After they answer",
-                "- If they want human/representative: use transfer_to_human tool\n"
-                "- If they want you/AI to help: use transfer_to_ai_specialist tool\n\n"
-                "Include all collected info: customer_name, reason, department='sales', urgency, additional_info") \
+        # Sales Step 2: Transfer choice
+        sales_ctx.add_step("transfer_choice") \
+            .add_section("Your Task", "Ask how they'd like to proceed.") \
+            .add_section("What to Say",
+                "'I can connect you with one of our sales representatives, "
+                "or if you prefer, our AI sales assistant can help you right now. "
+                "Which would you prefer?'") \
+            .add_section("After They Answer",
+                "- Want human/representative/person: use transfer_to_human tool\n"
+                "- Want AI/you/assistant: use transfer_to_ai_specialist tool\n\n"
+                "Include: customer_name, reason (product interest), department='sales', "
+                "urgency='medium', additional_info (business/personal)") \
             .set_step_criteria("Customer has chosen human or AI assistance")
 
         # ============================================================
-        # SUPPORT CONTEXT - Support-specific intake
+        # SUPPORT CONTEXT - Support info gathering (NO troubleshooting)
         # ============================================================
         support_ctx = contexts.add_context("support") \
             .set_isolated(True)
 
         # Support context prompt
         support_ctx.add_section("Role",
-            "You are continuing the conversation as Sarah. The customer needs technical support. "
-            "Do NOT re-introduce yourself. Use their name from the conversation.")
+            "Continue as Sarah. Customer needs support. Use their name.")
 
-        # Support Step 1: Brief detail gathering
-        support_ctx.add_step("gather_details") \
-            .add_section("Current Task", "Quickly gather 1-2 relevant details about the issue") \
-            .add_bullets("Ask about", [
-                "Any error messages they're seeing",
-                "How urgent/critical is this issue (high/medium/low)"
-            ]) \
-            .add_section("Important", "Keep this brief - just 1-2 questions max, then move to offer_choice. Remember what they tell you for the transfer.") \
-            .set_step_criteria("Basic issue details gathered") \
-            .set_valid_steps(["offer_choice"])
+        support_ctx.add_section("CRITICAL - NO TROUBLESHOOTING",
+            "You are TRIAGE only. You must NOT:\n"
+            "- Ask diagnostic questions (did you try X? is Y plugged in?)\n"
+            "- Suggest any fixes or workarounds\n"
+            "- Attempt to solve or diagnose the problem\n\n"
+            "Follow the steps IN ORDER. Do not skip steps.")
 
-        # Support Step 2: Offer the choice
-        support_ctx.add_step("offer_choice") \
-            .add_section("CRITICAL TASK",
-                "You MUST ask this question - do not skip it:\n\n"
-                "'Would you like to speak with a support specialist, "
-                "or would you like me to help you troubleshoot?'") \
-            .add_section("After they answer",
-                "- If they want human/specialist: use transfer_to_human tool\n"
-                "- If they want you/AI to help: use transfer_to_ai_specialist tool\n\n"
-                "Include all collected info: customer_name, reason, department='support', urgency, additional_info (like error messages)") \
-            .set_step_criteria("Customer has chosen human or AI assistance")
+        # Support Step 1: Acknowledge and confirm issue
+        # Even if they already described it, we acknowledge and confirm
+        support_ctx.add_step("acknowledge_issue") \
+            .add_section("Your Task", "Acknowledge what they've told you and confirm you understand.") \
+            .add_section("What to Say",
+                "Acknowledge their issue with empathy:\n"
+                "'I understand, [brief restatement of their issue]. That sounds frustrating. "
+                "Let me get you connected with someone who can help.'") \
+            .add_section("IMPORTANT",
+                "Do NOT ask diagnostic questions. Do NOT offer solutions.\n"
+                "Just acknowledge and move to the next step.") \
+            .set_step_criteria("Agent has acknowledged the customer's issue") \
+            .set_valid_steps(["get_urgency"])
+
+        # Support Step 2: Urgency (simple question)
+        support_ctx.add_step("get_urgency") \
+            .add_section("Your Task", "Ask ONE question about urgency.") \
+            .add_section("What to Say",
+                "'Is this urgent - like it's blocking your work - or is it something "
+                "that can wait a bit?'") \
+            .add_section("Map Their Response",
+                "Blocking/urgent/critical/ASAP = 'high'\n"
+                "Normal/whenever/not urgent = 'medium'\n"
+                "Low priority/no rush = 'low'") \
+            .set_step_criteria("Customer has indicated urgency level") \
+            .set_valid_steps(["transfer_choice"])
+
+        # Support Step 3: Transfer choice - ALWAYS ask this
+        support_ctx.add_step("transfer_choice") \
+            .add_section("Your Task", "Ask how they'd like to proceed. This is REQUIRED.") \
+            .add_section("What to Say",
+                "'I can connect you with one of our support specialists, "
+                "or if you prefer, our AI support assistant can help you right now. "
+                "Which would you prefer?'") \
+            .add_section("After They Answer",
+                "- Want human/specialist/person: use transfer_to_human tool\n"
+                "- Want AI/you/assistant: use transfer_to_ai_specialist tool\n\n"
+                "Include: customer_name, reason (issue description), department='support', "
+                "urgency (high/medium/low), additional_info") \
+            .set_step_criteria("Customer has explicitly chosen human or AI assistance")
 
         # ============================================================
-        # TOOLS - Only for final transfer (context switching is automatic)
+        # TOOLS - Transfer functions only
         # ============================================================
-
-        # Tool to transfer to human queue or AI specialist
         self.define_tool(
             name="transfer_to_human",
-            description="Transfer customer to a human representative. Call this when they choose to speak with a human.",
+            description="Transfer customer to a human representative. Use when they choose to speak with a human.",
             parameters={
                 "customer_name": {"type": "string", "description": "Customer's name"},
-                "reason": {"type": "string", "description": "What they need help with"},
+                "reason": {"type": "string", "description": "Brief description of what they need"},
                 "department": {"type": "string", "description": "'sales' or 'support'"},
-                "urgency": {"type": "string", "description": "How urgent (high/medium/low)"},
-                "additional_info": {"type": "string", "description": "Any other relevant details (error message, product interest, etc.)"}
+                "urgency": {"type": "string", "description": "'high', 'medium', or 'low'"},
+                "additional_info": {"type": "string", "description": "Any other relevant context"}
             },
             handler=self.transfer_to_human
         )
 
-        # Tool to transfer to AI specialist
         self.define_tool(
             name="transfer_to_ai_specialist",
-            description="Transfer customer to AI specialist for further assistance. Call this when they choose AI help.",
+            description="Transfer customer to AI specialist. Use when they choose AI assistance.",
             parameters={
                 "customer_name": {"type": "string", "description": "Customer's name"},
-                "reason": {"type": "string", "description": "What they need help with"},
+                "reason": {"type": "string", "description": "Brief description of what they need"},
                 "department": {"type": "string", "description": "'sales' or 'support'"},
-                "urgency": {"type": "string", "description": "How urgent (high/medium/low)"},
-                "additional_info": {"type": "string", "description": "Any other relevant details (error message, product interest, etc.)"}
+                "urgency": {"type": "string", "description": "'high', 'medium', or 'low'"},
+                "additional_info": {"type": "string", "description": "Any other relevant context"}
             },
             handler=self.transfer_to_ai_specialist
         )
@@ -252,28 +308,35 @@ Summarize this call and return a JSON object with:
         additional_info = args.get("additional_info", "")
 
         base_url = get_base_url_from_global_data(raw_data)
-        queue_url = f"{base_url}/api/queues/{department}/route"
-
-        print(f"Transferring {customer_name} to human queue: {queue_url}", flush=True)
 
         # Map urgency to priority
         urgency_map = {'high': 2, 'medium': 5, 'low': 8}
         priority = urgency_map.get(urgency.lower(), 5)
 
-        result = SwaigFunctionResult(
-            "I'll connect you with a representative right now."
-        )
-        result.update_global_data({
+        context_data = {
             'customer_name': customer_name,
             'reason': reason,
             'department': department,
             'urgency': urgency,
             'priority': priority,
             'additional_info': additional_info,
-            'preferred_handling': 'human'
-        })
-        result.swml_transfer(queue_url, "", final=True)
+            'preferred_handling': 'human',
+            'source_agent': 'call_center_triage'
+        }
 
+        # Encode context as base64 JSON for URL
+        context_json = json.dumps(context_data)
+        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
+        queue_url = f"{base_url}/api/queues/{department}/route?ctx={context_b64}"
+
+        print(f"Transferring {customer_name} to human queue: {queue_url}", flush=True)
+        print(f"Context data: {context_data}", flush=True)
+
+        result = SwaigFunctionResult(
+            "I'll connect you with a representative right now."
+        )
+        result.update_global_data(context_data)
+        result.swml_transfer(queue_url, "", final=True)
         return result
 
     def transfer_to_ai_specialist(self, args, raw_data):
@@ -301,12 +364,14 @@ Summarize this call and return a JSON object with:
             'source_agent': 'call_center_triage'
         })
         result.swml_transfer(transfer_url, "", final=True)
-
         return result
 
 
 class SalesAISpecialist(AgentBase):
-    """AI Sales Specialist - handles actual sales conversations"""
+    """
+    AI Sales Specialist - This agent DOES help with sales inquiries.
+    Only reached after customer explicitly chooses AI assistance.
+    """
 
     def __init__(self):
         super().__init__(
@@ -315,7 +380,6 @@ class SalesAISpecialist(AgentBase):
             auto_answer=True
         )
 
-        # Speak first after transfer
         self.set_params({
             "wait_for_user": False,
             "end_of_speech_timeout": 1000
@@ -338,32 +402,39 @@ Summarize this sales consultation and return a JSON object with:
 
         self.prompt_add_section(
             "Role",
-            "You are an AI sales specialist continuing the conversation. "
-            "The customer chose to get AI assistance for their sales inquiry."
+            "You are Alex, an AI sales specialist. The customer chose to speak with an AI assistant "
+            "for help with their sales inquiry."
         )
 
         self.prompt_add_section(
             "Customer Context",
             "Customer name: ${global_data.customer_name}\n"
             "Interest: ${global_data.reason}\n"
-            "Company: ${global_data.company}\n\n"
-            "Address them by name and help with their inquiry."
+            "Additional info: ${global_data.additional_info}\n\n"
+            "Greet them by name and continue the conversation."
         )
 
         self.prompt_add_section(
-            "Your Job",
-            "Help the customer with their sales questions:",
+            "What You CAN Do",
+            "You are empowered to help with:",
             bullets=[
-                "Answer product and pricing questions",
-                "Explain features and benefits",
+                "Answer questions about products and services",
+                "Explain features, benefits, and use cases",
+                "Provide general pricing guidance",
                 "Make recommendations based on their needs",
-                "If they need something you can't help with, offer to connect to human"
+                "Help them understand which solution fits best"
             ]
+        )
+
+        self.prompt_add_section(
+            "Escalation",
+            "If they want to proceed with a purchase, get a custom quote, "
+            "or speak with a human, use the escalate_to_human tool."
         )
 
         self.define_tool(
             name="escalate_to_human",
-            description="Escalate to human sales rep if needed",
+            description="Connect to human sales rep for purchases, quotes, or complex needs",
             parameters={
                 "reason": {"type": "string", "description": "Reason for escalation"}
             },
@@ -377,21 +448,40 @@ Summarize this sales consultation and return a JSON object with:
         """Escalate to human sales"""
         reason = args.get("reason", "")
         base_url = get_base_url_from_global_data(raw_data)
-        queue_url = f"{base_url}/api/queues/sales/route"
+        global_data = raw_data.get('global_data', {})
+
+        context_data = {
+            'customer_name': global_data.get('customer_name', ''),
+            'reason': global_data.get('reason', ''),
+            'department': 'sales',
+            'urgency': global_data.get('urgency', 'medium'),
+            'priority': global_data.get('priority', 5),
+            'additional_info': global_data.get('additional_info', ''),
+            'escalation_reason': reason,
+            'escalated_from': 'sales_ai_specialist',
+            'preferred_handling': 'human',
+            'source_agent': 'sales_ai_specialist'
+        }
+
+        context_json = json.dumps(context_data)
+        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
+        queue_url = f"{base_url}/api/queues/sales/route?ctx={context_b64}"
+
+        print(f"Escalating to human sales: {queue_url}", flush=True)
 
         result = SwaigFunctionResult(
             "I'll connect you with a sales representative who can help with that."
         )
-        result.update_global_data({
-            'escalation_reason': reason,
-            'escalated_from': 'sales_ai_specialist'
-        })
+        result.update_global_data(context_data)
         result.swml_transfer(queue_url, "", final=True)
         return result
 
 
 class SupportAISpecialist(AgentBase):
-    """AI Support Specialist - handles actual troubleshooting"""
+    """
+    AI Support Specialist - This agent DOES troubleshoot and solve problems.
+    Only reached after customer explicitly chooses AI assistance.
+    """
 
     def __init__(self):
         super().__init__(
@@ -400,7 +490,6 @@ class SupportAISpecialist(AgentBase):
             auto_answer=True
         )
 
-        # Speak first after transfer
         self.set_params({
             "wait_for_user": False,
             "end_of_speech_timeout": 1000
@@ -423,33 +512,53 @@ Summarize this support consultation and return a JSON object with:
 
         self.prompt_add_section(
             "Role",
-            "You are an AI support specialist continuing the conversation. "
-            "The customer chose to get AI assistance for troubleshooting."
+            "You are Jordan, an AI support specialist. The customer chose to speak with an AI assistant "
+            "to help troubleshoot their issue."
         )
 
         self.prompt_add_section(
             "Customer Context",
             "Customer name: ${global_data.customer_name}\n"
             "Issue: ${global_data.reason}\n"
-            "Error message: ${global_data.error_message}\n"
-            "Urgency: ${global_data.urgency}\n\n"
-            "Address them by name and help resolve their issue."
+            "Urgency: ${global_data.urgency}\n"
+            "Additional info: ${global_data.additional_info}\n\n"
+            "Greet them by name and let them know you're here to help solve their problem."
         )
 
         self.prompt_add_section(
-            "Your Job",
-            "Help troubleshoot and resolve their issue:",
+            "What You CAN Do",
+            "You are empowered to:",
             bullets=[
-                "Diagnose the problem systematically",
-                "Walk through troubleshooting steps",
-                "Provide clear instructions",
-                "If you can't resolve it, offer to connect to human specialist"
+                "Ask diagnostic questions to understand the problem",
+                "Walk through troubleshooting steps systematically",
+                "Suggest solutions and workarounds",
+                "Provide technical guidance and instructions",
+                "Help them resolve the issue"
             ]
+        )
+
+        self.prompt_add_section(
+            "Troubleshooting Approach",
+            "Start with the basics and work up:",
+            bullets=[
+                "Confirm you understand the issue",
+                "Ask clarifying questions if needed",
+                "Start with simple/common fixes first",
+                "Walk through steps clearly, one at a time",
+                "Confirm each step works before moving on",
+                "If stuck after 3-4 attempts, offer human escalation"
+            ]
+        )
+
+        self.prompt_add_section(
+            "Escalation",
+            "If you can't resolve the issue after reasonable troubleshooting, "
+            "or if they request a human, use the escalate_to_human tool."
         )
 
         self.define_tool(
             name="escalate_to_human",
-            description="Escalate to human support if needed",
+            description="Connect to human support for complex issues or by request",
             parameters={
                 "reason": {"type": "string", "description": "Reason for escalation"}
             },
@@ -463,52 +572,68 @@ Summarize this support consultation and return a JSON object with:
         """Escalate to human support"""
         reason = args.get("reason", "")
         base_url = get_base_url_from_global_data(raw_data)
-        queue_url = f"{base_url}/api/queues/support/route"
+        global_data = raw_data.get('global_data', {})
+
+        context_data = {
+            'customer_name': global_data.get('customer_name', ''),
+            'reason': global_data.get('reason', ''),
+            'department': 'support',
+            'urgency': global_data.get('urgency', 'medium'),
+            'priority': global_data.get('priority', 5),
+            'additional_info': global_data.get('additional_info', ''),
+            'escalation_reason': reason,
+            'escalated_from': 'support_ai_specialist',
+            'preferred_handling': 'human',
+            'source_agent': 'support_ai_specialist'
+        }
+
+        context_json = json.dumps(context_data)
+        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
+        queue_url = f"{base_url}/api/queues/support/route?ctx={context_b64}"
+
+        print(f"Escalating to human support: {queue_url}", flush=True)
 
         result = SwaigFunctionResult(
             "I'll connect you with a support specialist who can help with that."
         )
-        result.update_global_data({
-            'escalation_reason': reason,
-            'escalated_from': 'support_ai_specialist'
-        })
+        result.update_global_data(context_data)
         result.swml_transfer(queue_url, "", final=True)
         return result
 
 
 if __name__ == '__main__':
     print('=' * 60)
-    print('SignalWire AI Call Center - Contexts/Steps Architecture')
+    print('SignalWire AI Call Center - Triage + Specialists')
     print('=' * 60)
 
     server = AgentServer(host='0.0.0.0', port=8080)
 
-    # Main agent with contexts/steps
-    call_center = CallCenterAgent()
+    # Triage agent - info gathering ONLY
+    triage = CallCenterTriageAgent()
 
-    # Specialist agents (only reached after customer chooses AI)
+    # Specialist agents - these actually solve problems
     sales_ai = SalesAISpecialist()
     support_ai = SupportAISpecialist()
 
     # Register agents
-    server.register(call_center, '/receptionist')
+    server.register(triage, '/receptionist')
     server.register(sales_ai, '/sales-ai')
     server.register(support_ai, '/support-ai')
 
-    username, password = call_center.get_basic_auth_credentials()
+    username, password = triage.get_basic_auth_credentials()
 
-    print('\nAuthentication Credentials:')
+    print('\nAuthentication:')
     print(f'  Username: {username}')
     print(f'  Password: {password}')
-    print('\nRegistered Routes:')
-    print('  - /receptionist : Main agent (contexts: default, sales, support)')
-    print('  - /sales-ai     : AI Sales specialist')
-    print('  - /support-ai   : AI Support specialist')
+    print('\nRoutes:')
+    print('  /receptionist : Triage agent (NO problem solving)')
+    print('  /sales-ai     : Sales specialist (helps with sales)')
+    print('  /support-ai   : Support specialist (troubleshoots issues)')
     print('\nFlow:')
-    print('  1. /receptionist handles greeting + triage')
-    print('  2. Context switches to sales or support')
-    print('  3. Customer chooses human or AI')
-    print('  4. Routes to queue or specialist agent')
+    print('  1. /receptionist gets name, purpose, brief context')
+    print('  2. Customer chooses human or AI')
+    print('  3. Human -> queue, AI -> specialist agent')
+    print('  4. ONLY specialist agents solve problems')
     print('\nStarting server...\n')
 
     server.run()

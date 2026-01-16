@@ -9,10 +9,38 @@ logger = logging.getLogger(__name__)
 
 
 @socketio.on('connect')
-def handle_connect():
-    """Handle client connection."""
+def handle_connect(auth=None):
+    """Handle client connection.
+
+    Auto-authenticates using the token from connection auth if provided.
+    This ensures the user joins their room even if the separate 'authenticate' event fails.
+    """
     client_id = request.sid
     logger.info(f"Client connected: {client_id}")
+    print(f"🔌 SOCKET CONNECT: {client_id}, auth={auth}", flush=True)
+
+    # Try to auto-authenticate from connection auth
+    token = None
+    if auth and isinstance(auth, dict):
+        token = auth.get('token')
+
+    if token:
+        user_id = verify_token(token)
+        if user_id:
+            # Join user's room automatically
+            join_room(str(user_id))
+            add_to_set(f"user:{user_id}:clients", request.sid)
+            logger.info(f"Auto-authenticated on connect: {client_id} -> User: {user_id}, joined room '{str(user_id)}'")
+            print(f"✅ SOCKET AUTO-AUTH: {client_id} -> User {user_id}, joined room '{user_id}'", flush=True)
+            emit('authenticated', {
+                'message': 'Authentication successful',
+                'user_id': user_id
+            })
+        else:
+            print(f"⚠️ SOCKET: Invalid token on connect", flush=True)
+    else:
+        print(f"⚠️ SOCKET: No auth token on connect", flush=True)
+
     emit('connected', {'message': 'Connected to SignalWire Transcription Service'})
 
 
@@ -232,3 +260,52 @@ def handle_leave_conference(data):
     })
 
     logger.info(f"Client {request.sid} left conference room: {room_name}")
+
+
+@socketio.on('agent_answered')
+def handle_agent_answered(data):
+    """Handle agent answering a server-initiated call.
+
+    When an agent answers a call from the backend, they need to be joined
+    to the interaction conference via REST API. This is needed because
+    Call Fabric subscribers don't support SWML url callbacks like phone calls do.
+    """
+    print(f"📞 AGENT_ANSWERED received: {data}", flush=True)
+
+    call_id = data.get('call_id')
+    conference_name = data.get('conference_name')
+    agent_id = data.get('agent_id')
+    token = data.get('token')
+
+    if not all([call_id, conference_name, token]):
+        print(f"❌ Missing required fields in agent_answered", flush=True)
+        emit('error', {'message': 'Missing call_id, conference_name, or token'})
+        return
+
+    user_id = verify_token(token)
+    if not user_id:
+        emit('error', {'message': 'Invalid or expired token'})
+        return
+
+    try:
+        from app.services.signalwire_api import SignalWireAPI
+        sw_api = SignalWireAPI()
+
+        print(f"📞 Joining agent call {call_id} to conference {conference_name}", flush=True)
+
+        # Join the agent's call to the conference
+        result = sw_api.add_participant_to_conference(conference_name, call_id)
+
+        print(f"✅ Agent joined conference: {result}", flush=True)
+
+        emit('agent_joined_conference', {
+            'conference_name': conference_name,
+            'call_id': call_id,
+            'success': True
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to join agent to conference: {str(e)}", flush=True)
+        import traceback
+        print(traceback.format_exc(), flush=True)
+        emit('error', {'message': f'Failed to join conference: {str(e)}'})

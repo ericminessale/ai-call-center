@@ -111,7 +111,11 @@ export const callsApi = {
     api.post<{ success: boolean; call_sid: string; message: string }>(`/api/calls/${call_sid}/end`),
 
   take: (call_id: number | string) =>
-    api.post<{ success: boolean; call_id: number; message: string }>(`/api/calls/${call_id}/take`),
+    api.post<{ success: boolean; call_id: number; message: string; conference_name?: string }>(`/api/calls/${call_id}/take`),
+
+  // Update call status (called when agent joins/leaves conference)
+  updateStatus: (call_id: number | string, status: string) =>
+    api.put<{ success: boolean; call_id: number; status: string }>(`/api/calls/${call_id}/status`, { status }),
 
   updateTranscription: (call_sid: string, action: 'start' | 'stop' | 'summarize') =>
     api.put<{ success: boolean; call_sid: string; action: string; message: string }>(
@@ -122,6 +126,20 @@ export const callsApi = {
   getTranscript: (call_sid: string) =>
     api.get<{ call_sid: string; transcript: string; summary?: any }>(
       `/api/calls/${call_sid}/transcript`
+    ),
+
+  // Get all queued calls (waiting, assigned, urgent) sorted by urgency
+  getQueuedCalls: () =>
+    api.get<{ calls: Call[]; total: number }>('/api/queues/all/calls'),
+};
+
+export const conferencesApi = {
+  // Prepare a conference join - stores params in Redis and returns a token
+  // This is called BEFORE dialing to ensure params are reliably passed
+  prepareJoin: (params: { agent_id: number; conference_name: string; call_id?: number | string }) =>
+    api.post<{ token: string; dial_address: string; conference_name: string }>(
+      '/api/conferences/prepare-join',
+      params
     ),
 };
 

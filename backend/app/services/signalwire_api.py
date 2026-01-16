@@ -615,6 +615,85 @@ class SignalWireAPI:
             raise
 
 
+    def dial_to_conference(self, to_address, conference_name, swml_url, status_callback=None):
+        """Dial an address (agent, phone, etc.) and connect them to a conference.
+
+        This is used to dial an agent into an interaction conference.
+        The swml_url should point to an endpoint that returns SWML/CXML
+        joining the caller to the specified conference.
+
+        Args:
+            to_address: The address to dial (e.g., /private/agent-4, +1234567890)
+            conference_name: The conference they'll join (for tracking)
+            swml_url: URL that returns SWML to join the conference
+            status_callback: Optional callback for call state events
+
+        Returns:
+            Call object with sid and status
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': self.auth_header
+            }
+
+            params = {
+                "from": self.from_number,
+                "to": to_address,
+                "url": swml_url
+            }
+
+            if status_callback:
+                params["call_state_events"] = ["created", "ringing", "answered", "ended"]
+                params["call_state_url"] = status_callback
+
+            data = {
+                "command": "dial",
+                "params": params
+            }
+
+            logger.info("="*50)
+            logger.info(f"SIGNALWIRE API: Dialing {to_address} to conference {conference_name}")
+            logger.info(f"SWML URL: {swml_url}")
+            logger.info(f"JSON BODY: {json.dumps(data, indent=2)}")
+            logger.info("="*50)
+
+            response = requests.post(
+                self.api_url,
+                json=data,
+                headers=headers
+            )
+
+            logger.info(f"SIGNALWIRE API RESPONSE: Status {response.status_code}")
+            if response.text:
+                try:
+                    logger.info(f"JSON RESPONSE: {json.dumps(response.json(), indent=2)}")
+                except:
+                    logger.info(f"RAW RESPONSE: {response.text}")
+
+            if response.status_code >= 200 and response.status_code < 300:
+                result = response.json()
+                call_id = result.get('call_id', result.get('id'))
+                logger.info(f"Dial to conference successful: {call_id} -> {conference_name}")
+
+                return type('Call', (), {
+                    'sid': call_id,
+                    'to': to_address,
+                    'from_': self.from_number,
+                    'status': 'initiated',
+                    'conference_name': conference_name,
+                    'raw_response': result
+                })()
+            else:
+                logger.error(f"Failed to dial to conference: {response.status_code} - {response.text}")
+                raise Exception(f"Failed to dial to conference: {response.status_code}")
+
+        except Exception as e:
+            logger.error(f"Failed to dial to conference: {str(e)}")
+            raise
+
+
 # Singleton instance
 _signalwire_api = None
 

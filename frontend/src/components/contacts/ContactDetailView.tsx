@@ -26,11 +26,14 @@ import {
   Send,
   AlertCircle,
   X,
+  PhoneCall,
+  Users,
 } from 'lucide-react';
 import { Contact, Interaction, TranscriptionMessage, Call, CallLeg } from '../../types/callcenter';
-import { contactsApi } from '../../services/api';
+import { contactsApi, callsApi } from '../../services/api';
 import api from '../../services/api';
 import { useCallFabric } from '../../hooks/useCallFabric';
+import { useCallFabricContext } from '../../contexts/CallFabricContext';
 import { useSocketContext } from '../../contexts/SocketContext';
 import { CallTimeline } from './CallTimeline';
 
@@ -85,19 +88,97 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     connectedCustomer,
   } = useCallFabric();
 
-  // Determine if there's an outbound call in progress
-  // For browser-initiated calls: callState is set directly
-  // For server-initiated dial-out: status comes from activeCallForContact via socket events
-  const isOutboundCallInProgress =
-    callState === 'ringing' || callState === 'active' || callState === 'ending' ||
-    (activeCallForContact?.direction === 'outbound' &&
-     ['ringing', 'active', 'connecting'].includes(activeCallForContact?.status || ''));
+  // Call Fabric context for taking queued calls
+  const { acceptCallAssignmentWithData, isClientReady, isInConference } = useCallFabricContext();
 
-  // Any active call: browser outbound, AI outbound, or inbound from parent
-  const hasAnyActiveCall = !!(activeCall || currentCallSid || activeCallForContact || isOutboundCallInProgress);
+  // State for taking queued calls
+  const [isTakingCall, setIsTakingCall] = useState(false);
+  const [takeCallError, setTakeCallError] = useState<string | null>(null);
 
-  // Get display status for outbound calls (handles both browser and server-initiated)
+  // Check if this contact has a call in the queue (waiting, assigned, queued, or urgent)
+  // BUT not if the agent is already in conference (connected to the call)
+  const queueStatuses = ['waiting', 'assigned', 'queued', 'urgent'];
+  const isCallInQueue = activeCallForContact &&
+    queueStatuses.includes(activeCallForContact.status || '') &&
+    !isInConference;  // Don't show queue banner when agent is connected
+  const queueStatus = activeCallForContact?.queue_status || activeCallForContact?.status;
+  const isUrgent = activeCallForContact?.is_urgent || queueStatus === 'urgent';
+  const waitTime = activeCallForContact?.wait_time_seconds;
+
+  // Handle taking a queued call
+  const handleTakeQueuedCall = async () => {
+    if (!activeCallForContact) return;
+
+    setIsTakingCall(true);
+    setTakeCallError(null);
+
+    try {
+      // Call the take API to assign the call to this agent
+      const response = await callsApi.take(activeCallForContact.id);
+      const conferenceName = response.data.conference_name || activeCallForContact.conference_name;
+
+      if (!conferenceName) {
+        throw new Error('No conference name returned - call may have ended');
+      }
+
+      // Dial into the conference
+      // Pass AI context from the call so it's available for display
+      const aiContext = (activeCallForContact as any).aiContext || {};
+      console.log('📋 [ContactDetail] Passing AI context to call:', aiContext);
+
+      await acceptCallAssignmentWithData({
+        callId: String(activeCallForContact.signalwire_call_sid || activeCallForContact.call_sid || activeCallForContact.id),
+        callDbId: Number(activeCallForContact.id),
+        callerNumber: activeCallForContact.from_number || activeCallForContact.phoneNumber || '',
+        queueId: activeCallForContact.queue_id || activeCallForContact.queueId || '',
+        conferenceName: conferenceName,
+        customerInfo: {
+          phone: activeCallForContact.from_number || activeCallForContact.phoneNumber || '',
+          name: activeCallForContact.customerName || contact.displayName,
+          contact_id: contact.id,
+        },
+        context: aiContext,
+      });
+
+      console.log('✅ [ContactDetail] Successfully took queued call');
+    } catch (error: any) {
+      console.error('❌ [ContactDetail] Failed to take call:', error);
+      setTakeCallError(error?.response?.data?.error || error?.message || 'Failed to take call');
+    } finally {
+      setIsTakingCall(false);
+    }
+  };
+
+  // Format wait time display
+  const formatWaitTime = (seconds?: number) => {
+    if (!seconds) return '';
+    if (seconds < 60) return `${seconds}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}m ${secs}s`;
+  };
+
+  // Determine if the agent is connected to a call (via conference or direct)
+  // When agent is in conference, treat it as "connected" not "outbound calling"
+  const isAgentConnected = isInConference && (callState === 'active' || callState === 'ringing');
+
+  // Determine if there's a TRUE outbound call in progress (agent calling out to customer)
+  // NOT including conference joins for inbound calls
+  const isTrueOutboundCall = activeCallForContact?.direction === 'outbound' &&
+    ['ringing', 'active', 'connecting'].includes(activeCallForContact?.status || '');
+
+  // Show "ringing/calling" only for true outbound calls, not conference joins
+  const isOutboundCallInProgress = isTrueOutboundCall ||
+    (callState !== 'idle' && !isInConference);  // Only show ringing if NOT already in conference
+
+  // Any active call: browser outbound, AI outbound, inbound conference, or inbound from parent
+  const hasAnyActiveCall = !!(activeCall || currentCallSid || activeCallForContact || isOutboundCallInProgress || isInConference);
+
+  // Get display status for calls
   const getOutboundCallStatus = () => {
+    // If agent is in conference (connected to inbound call), show Connected
+    if (isAgentConnected) return 'Connected';
+
     // First check browser callState (for browser-initiated calls)
     if (callState === 'ringing' && !activeCall) return 'Calling...';
     if (callState === 'ringing') return 'Ringing...';
@@ -490,6 +571,67 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
             <Edit2 className="w-5 h-5" />
           </button>
         </div>
+
+        {/* Queue Status Banner - Shows when contact has a call waiting in queue */}
+        {isCallInQueue && (
+          <div className={`mt-4 p-3 rounded-lg border ${
+            isUrgent
+              ? 'bg-red-900/30 border-red-500/50'
+              : queueStatus === 'assigned'
+              ? 'bg-blue-900/30 border-blue-500/50'
+              : 'bg-orange-900/30 border-orange-500/50'
+          }`}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className={`w-10 h-10 rounded-full flex items-center justify-center ${
+                  isUrgent ? 'bg-red-500/20' : 'bg-orange-500/20'
+                }`}>
+                  <Users className={`w-5 h-5 ${isUrgent ? 'text-red-400' : 'text-orange-400'}`} />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className={`font-medium ${isUrgent ? 'text-red-400' : 'text-orange-400'}`}>
+                      {isUrgent ? '⚠️ Urgent - ' : ''}
+                      {queueStatus === 'assigned' ? 'Assigned to you' : 'In Queue'}
+                    </span>
+                    {activeCallForContact?.queue_id && (
+                      <span className="px-2 py-0.5 bg-gray-700 text-gray-300 text-xs rounded">
+                        {activeCallForContact.queue_id}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-3 text-sm text-gray-400">
+                    {waitTime !== undefined && waitTime > 0 && (
+                      <span className="flex items-center gap-1">
+                        <Clock className="w-3 h-3" />
+                        Waiting {formatWaitTime(waitTime)}
+                      </span>
+                    )}
+                    <span className="capitalize">{queueStatus}</span>
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={handleTakeQueuedCall}
+                disabled={isTakingCall || !isClientReady}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors font-medium ${
+                  isUrgent
+                    ? 'bg-red-600 hover:bg-red-700 disabled:bg-gray-600'
+                    : 'bg-green-600 hover:bg-green-700 disabled:bg-gray-600'
+                } text-white`}
+              >
+                <PhoneCall className="w-4 h-4" />
+                {isTakingCall ? 'Connecting...' : 'Take Call'}
+              </button>
+            </div>
+            {takeCallError && (
+              <div className="mt-2 p-2 bg-red-500/20 border border-red-500/50 rounded text-red-400 text-sm flex items-center gap-2">
+                <AlertCircle className="w-4 h-4" />
+                {takeCallError}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Action Buttons / Call Controls */}
         <div className="flex items-center gap-2 mt-4">

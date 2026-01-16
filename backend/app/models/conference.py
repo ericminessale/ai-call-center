@@ -15,6 +15,7 @@ class Conference(db.Model):
     owner_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)  # For agent conferences
     owner_ai_agent = db.Column(db.String(100), nullable=True)  # For AI conferences (e.g., 'receptionist')
     queue_id = db.Column(db.String(50), nullable=True)  # For hold conferences
+    call_id = db.Column(db.String(255), nullable=True, index=True)  # For interaction conferences - the call that created it
 
     # Status
     status = db.Column(db.String(50), default='active')  # 'active', 'ended'
@@ -138,5 +139,50 @@ class Conference(db.Model):
         """Get the agent participant if one exists."""
         return self.participants.filter_by(
             participant_type='agent',
+            status='active'
+        ).first()
+
+    @classmethod
+    def create_interaction_conference(cls, call_id, queue_id=None, agent_user_id=None):
+        """
+        Create a conference for a specific customer interaction.
+
+        This is the new per-interaction model where conferences are created
+        on-demand when a customer is routed to an agent, rather than agents
+        sitting idle in persistent conferences.
+
+        Args:
+            call_id: The SignalWire call ID for this interaction
+            queue_id: Optional queue the call came from (sales, support, etc.)
+            agent_user_id: Optional agent being assigned to this interaction
+
+        Returns:
+            Conference: The newly created interaction conference
+        """
+        conference_name = f'interaction-{call_id}'
+
+        # Check if one already exists (shouldn't, but be safe)
+        existing = cls.get_active_by_name(conference_name)
+        if existing:
+            return existing
+
+        conference = cls(
+            conference_name=conference_name,
+            conference_type='interaction',
+            call_id=call_id,
+            queue_id=queue_id,
+            owner_user_id=agent_user_id,
+            status='active'
+        )
+        db.session.add(conference)
+        db.session.flush()  # Get the ID
+
+        return conference
+
+    @classmethod
+    def get_by_call_id(cls, call_id):
+        """Get an active interaction conference by call ID."""
+        return db.session.query(cls).filter_by(
+            call_id=call_id,
             status='active'
         ).first()

@@ -29,6 +29,12 @@ class Call(db.Model):
     answered_at = db.Column(db.DateTime)
     ended_at = db.Column(db.DateTime)
 
+    # Queue tracking fields
+    queue_id = db.Column(db.String(50), nullable=True, index=True)  # Which queue (sales, support, etc.)
+    assigned_agent_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)  # Agent assigned to handle
+    assigned_at = db.Column(db.DateTime, nullable=True)  # When agent was notified
+    conference_name = db.Column(db.String(255), nullable=True)  # Interaction conference name
+
     # Relationships
     transcriptions = db.relationship('Transcription', backref='call', lazy='dynamic', cascade='all, delete-orphan')
     webhook_events = db.relationship('WebhookEvent', backref='call', lazy='dynamic', cascade='all, delete-orphan')
@@ -51,6 +57,39 @@ class Call(db.Model):
         """Set AI context from a dict."""
         self.ai_context = json.dumps(value) if value else None
 
+    # Urgency timeout in seconds - if assigned but not accepted within this time, mark as urgent
+    URGENCY_TIMEOUT_SECONDS = 30
+
+    @property
+    def is_urgent(self):
+        """Check if call needs urgent attention.
+
+        A call is urgent if:
+        - Status is 'assigned' and agent hasn't accepted within URGENCY_TIMEOUT_SECONDS
+        - Or status is explicitly 'urgent'
+        """
+        if self.status == 'urgent':
+            return True
+        if self.status == 'assigned' and self.assigned_at:
+            elapsed = (datetime.utcnow() - self.assigned_at).total_seconds()
+            return elapsed > self.URGENCY_TIMEOUT_SECONDS
+        return False
+
+    @property
+    def wait_time_seconds(self):
+        """Calculate how long the caller has been waiting."""
+        if not self.created_at:
+            return 0
+        return int((datetime.utcnow() - self.created_at).total_seconds())
+
+    @property
+    def queue_status(self):
+        """Get the effective queue status (accounts for urgency timeout)."""
+        if self.status in ('waiting', 'assigned'):
+            if self.is_urgent:
+                return 'urgent'
+        return self.status
+
     def to_dict(self, include_contact=False):
         """Convert call to dictionary."""
         data = {
@@ -65,6 +104,8 @@ class Call(db.Model):
             'handlerType': self.handler_type,
             'aiAgentName': self.ai_agent_name,
             'status': self.status,
+            'queue_status': self.queue_status,  # Effective status with urgency
+            'is_urgent': self.is_urgent,
             'transcriptionActive': self.transcription_active,
             'recordingUrl': self.recording_url,
             'summary': self.summary,
@@ -74,6 +115,12 @@ class Call(db.Model):
             'createdAt': self.created_at.isoformat() if self.created_at else None,
             'answeredAt': self.answered_at.isoformat() if self.answered_at else None,
             'endedAt': self.ended_at.isoformat() if self.ended_at else None,
+            # Queue tracking
+            'queue_id': self.queue_id,
+            'assigned_agent_id': self.assigned_agent_id,
+            'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None,
+            'conference_name': self.conference_name,
+            'wait_time_seconds': self.wait_time_seconds,
         }
 
         if include_contact and self.contact:

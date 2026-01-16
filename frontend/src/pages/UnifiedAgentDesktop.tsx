@@ -87,6 +87,7 @@ export function UnifiedAgentDesktop() {
     socket.off('agent_stats');
     socket.off('authenticated');
     socket.off('connect');
+    socket.off('queue_update');
 
     // Handle socket connect/reconnect - reload data when connected
     socket.on('connect', () => {
@@ -203,6 +204,67 @@ export function UnifiedAgentDesktop() {
       setStats(newStats);
     });
 
+    // Queue update - call added, assigned, or removed from queue
+    socket.on('queue_update', (data: { call: Call; queue_id: string; action: string; assigned_agent_id?: number; assigned_agent_name?: string }) => {
+      console.log('📋 [UNIFIED] Received queue_update:', data);
+      const { call, action } = data;
+
+      if (!call) {
+        console.log('❌ [UNIFIED] No call in queue_update event');
+        return;
+      }
+
+      // Map backend fields to frontend format
+      const mappedCall: Call = {
+        ...call,
+        from_number: call.from_number || (call as any).fromNumber,
+        handler_type: call.handler_type || (call as any).handlerType,
+        phoneNumber: call.from_number || (call as any).fromNumber || call.phoneNumber || 'Unknown',
+        queue_id: call.queue_id || (call as any).queueId,
+        is_urgent: call.is_urgent || (call as any).isUrgent,
+        queue_status: call.queue_status || (call as any).queueStatus,
+        assigned_agent_id: call.assigned_agent_id || (call as any).assignedAgentId,
+        assigned_at: call.assigned_at || (call as any).assignedAt,
+        contact_id: call.contact_id || (call as any).contactId,
+      };
+
+      setQueuedCalls(prev => {
+        // Handle different actions
+        switch (action) {
+          case 'added':
+            // New call added to queue
+            if (!prev.find(c => c.id === mappedCall.id)) {
+              console.log('➕ [UNIFIED] Adding call to queue:', mappedCall.id);
+              return [...prev, mappedCall];
+            }
+            return prev;
+
+          case 'assigned':
+            // Call assigned to an agent (status changed)
+            console.log('✏️ [UNIFIED] Updating call status to assigned:', mappedCall.id);
+            return prev.map(c => c.id === mappedCall.id ? mappedCall : c);
+
+          case 'removed':
+          case 'active':
+          case 'ended':
+            // Call removed from queue (agent accepted or call ended)
+            console.log('🗑️ [UNIFIED] Removing call from queue:', mappedCall.id);
+            return prev.filter(c => c.id !== mappedCall.id);
+
+          default:
+            // Generic update
+            const exists = prev.find(c => c.id === mappedCall.id);
+            if (exists) {
+              return prev.map(c => c.id === mappedCall.id ? mappedCall : c);
+            }
+            return [...prev, mappedCall];
+        }
+      });
+
+      // Update call counts
+      updateCallCounts();
+    });
+
     return () => {
       console.log('🧹 [UNIFIED] Cleaning up WebSocket listeners');
       socket.off('call_update');
@@ -212,6 +274,7 @@ export function UnifiedAgentDesktop() {
       socket.off('agent_stats');
       socket.off('authenticated');
       socket.off('connect');
+      socket.off('queue_update');
     };
   }, [socket]);
 
@@ -288,13 +351,39 @@ export function UnifiedAgentDesktop() {
     }
   }, []);
 
-  // Load queued calls
+  // Load queued calls - includes 'waiting', 'assigned', and computed 'urgent' status
   const loadQueuedCalls = useCallback(async () => {
     try {
-      const response = await callsApi.list({ status: 'waiting' });
-      setQueuedCalls(response.data.calls || []);
+      // Use the dedicated queue endpoint that returns calls sorted by urgency
+      const response = await callsApi.getQueuedCalls();
+      console.log('📋 [UNIFIED] Loaded queued calls:', response.data);
+
+      // Map backend fields to frontend format
+      const mappedCalls = (response.data.calls || []).map((call: any) => ({
+        ...call,
+        from_number: call.fromNumber || call.from_number,
+        handler_type: call.handlerType || call.handler_type,
+        phoneNumber: call.fromNumber || call.from_number || call.destination || 'Unknown',
+        queue_id: call.queue_id || call.queueId,
+        is_urgent: call.is_urgent || call.isUrgent,
+        queue_status: call.queue_status || call.queueStatus,
+        assigned_agent_id: call.assigned_agent_id || call.assignedAgentId,
+        assigned_at: call.assigned_at || call.assignedAt,
+        conference_name: call.conference_name || call.conferenceName,
+        wait_time_seconds: call.wait_time_seconds || call.waitTimeSeconds,
+        contact_id: call.contactId || call.contact_id,
+      }));
+
+      setQueuedCalls(mappedCalls);
     } catch (error) {
       console.error('Failed to load queued calls:', error);
+      // Fallback to old endpoint if new one doesn't exist
+      try {
+        const response = await callsApi.list({ status: 'waiting,assigned' });
+        setQueuedCalls(response.data.calls || []);
+      } catch (fallbackError) {
+        console.error('Fallback also failed:', fallbackError);
+      }
     }
   }, []);
 
@@ -303,7 +392,8 @@ export function UnifiedAgentDesktop() {
     try {
       const [activeRes, queueRes] = await Promise.all([
         callsApi.list({ status: 'active,ai_active', per_page: 1 }),
-        callsApi.list({ status: 'waiting', per_page: 1 }),
+        // Include both waiting and assigned calls in queue count
+        callsApi.list({ status: 'waiting,assigned', per_page: 1 }),
       ]);
       setCallCounts({
         active: activeRes.data.total || 0,
@@ -530,11 +620,42 @@ export function UnifiedAgentDesktop() {
   // Handle take call from queue
   const handleTakeCall = async (call: Call) => {
     try {
-      await callsApi.take(call.id);
-      // Call will be assigned via WebSocket
+      console.log('📞 [UNIFIED] Taking call from queue:', call.id);
+
+      // Call API to take/assign the call
+      const response = await callsApi.take(call.id);
+      console.log('📞 [UNIFIED] Take call response:', response.data);
+
+      const conferenceName = response.data.conference_name || call.conference_name;
+
+      if (conferenceName) {
+        // Set up the pending call assignment so acceptCallAssignment can use it
+        // This simulates receiving a call_assignment socket event
+        const callAssignment = {
+          callId: call.signalwire_call_sid || String(call.id),
+          callDbId: Number(call.id),
+          conferenceName: conferenceName,
+          queueId: call.queue_id || '',
+          callerNumber: call.from_number || call.phoneNumber || '',
+          customerInfo: {
+            phone: call.from_number || call.phoneNumber || '',
+            name: call.contact?.displayName || call.customerName,
+            contact_id: call.contact_id,
+          },
+          context: (call as any).aiContext || {},
+        };
+
+        console.log('📞 [UNIFIED] Triggering acceptCallAssignment with:', callAssignment);
+
+        // Use callFabric to dial out and join the conference
+        await callFabric.acceptCallAssignmentWithData(callAssignment);
+      }
+
+      // Navigate to the contact view
       handleCallSelect(call);
     } catch (error) {
       console.error('Failed to take call:', error);
+      toast.error('Failed to take call');
     }
   };
 
@@ -586,14 +707,44 @@ export function UnifiedAgentDesktop() {
     }
   };
 
+  // Handle accepting call assignment from banner
+  const handleAcceptAssignment = async () => {
+    if (callFabric.pendingCallAssignment) {
+      try {
+        await callFabric.acceptCallAssignment();
+        // Navigate to contact if available
+        const contactId = callFabric.pendingCallAssignment.customerInfo?.contact_id ||
+                         callFabric.pendingCallAssignment.customerInfo?.contactId;
+        if (contactId) {
+          navigate(`/contacts/${contactId}`);
+          setViewMode('contacts');
+        }
+      } catch (error) {
+        console.error('Failed to accept call assignment:', error);
+        toast.error('Failed to accept call');
+      }
+    }
+  };
+
   return (
     <div className="h-screen flex flex-col bg-gray-900">
-      {/* Incoming Call Banner - only show for inbound calls */}
+      {/* Incoming Call Banner - show for inbound calls */}
       {callFabric.callState === 'ringing' && callFabric.activeCall && callFabric.activeCall.direction === 'inbound' && (
         <IncomingCallBanner
           phoneNumber={callFabric.activeCall.callerId || 'Unknown'}
           onAnswer={() => handleAnswerIncoming(callFabric.activeCall?.callerId || '')}
           onDecline={handleDeclineIncoming}
+        />
+      )}
+
+      {/* Call Assignment Banner - show when customer routed from queue */}
+      {callFabric.pendingCallAssignment && !callFabric.isInConference && (
+        <IncomingCallBanner
+          phoneNumber={callFabric.pendingCallAssignment.callerNumber || callFabric.pendingCallAssignment.customerInfo?.phone || 'Unknown'}
+          callerName={callFabric.pendingCallAssignment.customerInfo?.name}
+          queueId={callFabric.pendingCallAssignment.queueId}
+          onAnswer={handleAcceptAssignment}
+          onDecline={callFabric.rejectCallAssignment}
         />
       )}
 
@@ -638,20 +789,23 @@ export function UnifiedAgentDesktop() {
               contact={selectedContact}
               onContactUpdate={handleContactUpdate}
               onContactDelete={handleContactDelete}
-              activeCallForContact={activeCalls.find(c => {
-                // First check contact_id match (most reliable)
-                if (c.contact_id === selectedContact.id || (c as any).contactId === selectedContact.id) {
-                  return true;
-                }
-                // For outbound calls, match by destination (customer's number)
-                if (c.direction === 'outbound') {
-                  return (c as any).destination === selectedContact.phone;
-                }
-                // For inbound calls, match by from_number (customer's number)
-                return c.from_number === selectedContact.phone ||
-                       (c as any).fromNumber === selectedContact.phone ||
-                       c.phoneNumber === selectedContact.phone;
-              })}
+              activeCallForContact={
+                // Check both active calls AND queued calls for this contact
+                [...activeCalls, ...queuedCalls].find(c => {
+                  // First check contact_id match (most reliable)
+                  if (c.contact_id === selectedContact.id || (c as any).contactId === selectedContact.id) {
+                    return true;
+                  }
+                  // For outbound calls, match by destination (customer's number)
+                  if (c.direction === 'outbound') {
+                    return (c as any).destination === selectedContact.phone;
+                  }
+                  // For inbound calls, match by from_number (customer's number)
+                  return c.from_number === selectedContact.phone ||
+                         (c as any).fromNumber === selectedContact.phone ||
+                         c.phoneNumber === selectedContact.phone;
+                })
+              }
             />
           ) : (
             <div className="h-full flex items-center justify-center text-gray-500">

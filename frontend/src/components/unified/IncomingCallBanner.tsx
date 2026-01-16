@@ -4,6 +4,8 @@ import { contactsApi } from '../../services/api';
 
 interface IncomingCallBannerProps {
   phoneNumber: string;
+  callerName?: string;  // Pre-resolved caller name (from call assignment)
+  queueId?: string;     // Queue the call came from
   aiContext?: {
     agentName?: string;
     reason?: string;
@@ -22,15 +24,22 @@ interface ContactInfo {
 
 export function IncomingCallBanner({
   phoneNumber,
+  callerName,
+  queueId,
   aiContext,
   onAnswer,
   onDecline,
 }: IncomingCallBannerProps) {
   const [contactInfo, setContactInfo] = useState<ContactInfo | null>(null);
-  const [isLookingUp, setIsLookingUp] = useState(true);
+  const [isLookingUp, setIsLookingUp] = useState(!callerName);  // Skip lookup if name provided
 
-  // Lookup contact by phone number
+  // Lookup contact by phone number (skip if callerName already provided)
   useEffect(() => {
+    if (callerName) {
+      setIsLookingUp(false);
+      return;
+    }
+
     const lookupContact = async () => {
       try {
         const response = await contactsApi.lookup(phoneNumber);
@@ -51,11 +60,12 @@ export function IncomingCallBanner({
     };
 
     lookupContact();
-  }, [phoneNumber]);
+  }, [phoneNumber, callerName]);
 
-  const displayName = contactInfo?.displayName || 'Unknown Caller';
-  const isKnown = !!contactInfo;
+  const displayName = callerName || contactInfo?.displayName || 'Unknown Caller';
+  const isKnown = !!contactInfo || !!callerName;
   const wasAI = !!aiContext?.agentName;
+  const isFromQueue = !!queueId;
 
   // Format phone number for display
   const formatPhone = (phone: string) => {
@@ -115,6 +125,14 @@ export function IncomingCallBanner({
                     </>
                   )}
                 </div>
+
+                {/* Queue Context (if routed from queue) */}
+                {isFromQueue && (
+                  <div className="flex items-center gap-2 mt-1 text-xs text-white/70">
+                    <Phone className="w-3 h-3" />
+                    <span>From {queueId} queue</span>
+                  </div>
+                )}
 
                 {/* AI Context (if escalated from AI) */}
                 {wasAI && (

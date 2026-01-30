@@ -135,12 +135,19 @@ def call_status():
 
             # Special handling for ended status to reset UI
             if mapped_status == 'ended':
-                # Close any active call legs
+                # Close any active or connecting call legs
                 active_leg = CallLeg.get_active_leg(call.id)
+                if not active_leg:
+                    # Also check for legs stuck in 'connecting' (e.g., takeover legs
+                    # that were created but the agent hadn't fully connected yet)
+                    active_leg = db.session.query(CallLeg).filter_by(
+                        call_id=call.id,
+                        status='connecting'
+                    ).first()
                 if active_leg:
                     active_leg.end_leg(reason='hangup')
                     db.session.commit()
-                    logger.info(f"Closed active leg {active_leg.id} for call {call.id}")
+                    logger.info(f"Closed leg {active_leg.id} (was {active_leg.status}) for call {call.id}")
 
                 call_ended_data = {
                     'callId': call.id,  # Use database ID

@@ -28,8 +28,10 @@ def create_app():
     db.init_app(app)
     migrate.init_app(app, db)
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+    redis_url = os.getenv('REDIS_URL', 'redis://redis:6379/0')
     socketio.init_app(app,
                      cors_allowed_origins="*",
+                     message_queue=redis_url,
                      async_mode='threading',
                      ping_timeout=60,
                      ping_interval=25)

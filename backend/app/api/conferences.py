@@ -217,6 +217,108 @@ def agent_conference_webhook():
             except json.JSONDecodeError:
                 logger.error(f"Failed to parse Redis data for token {join_token}")
 
+    # ---------------------------------------------------------------
+    # TAKEOVER MODE: If the token was a takeover request, return SWML
+    # that connects the agent directly to the customer's existing call
+    # using connect verb with call:{sid}
+    # ---------------------------------------------------------------
+    if parsed_params.get('type') == 'takeover':
+        call_sid = parsed_params.get('call_sid')
+        call_id = parsed_params.get('call_id')
+        leg_id = parsed_params.get('leg_id')
+        takeover_user_id = parsed_params.get('user_id')
+
+        logger.info(f"TAKEOVER MODE: Agent {takeover_user_id} taking over call {call_id} (SID: {call_sid})")
+
+        if not call_sid:
+            logger.error("Takeover token missing call_sid")
+            return jsonify({
+                "version": "1.0.0",
+                "sections": {
+                    "main": [
+                        {"play": {"url": "say:Takeover data is invalid. Please try again."}},
+                        "hangup"
+                    ]
+                }
+            })
+
+        # Find and end the AI leg via execute_rpc
+        ai_call_sid = None
+        if call_id:
+            ai_leg = CallLeg.query.filter_by(
+                call_id=call_id,
+                leg_type='ai_agent',
+                status='active'
+            ).first()
+            if ai_leg:
+                ai_call_sid = getattr(ai_leg, 'signalwire_sid', None)
+                ai_leg.end_leg(reason='agent_takeover')
+                logger.info(f"Ended AI leg {ai_leg.id} (signalwire_sid: {ai_call_sid})")
+
+            # Activate the human agent leg (created in initiate_takeover as 'connecting')
+            if leg_id:
+                human_leg = CallLeg.query.get(leg_id)
+                if human_leg and human_leg.status == 'connecting':
+                    human_leg.status = 'active'
+                    human_leg.started_at = datetime.utcnow()
+                    logger.info(f"Activated human leg {human_leg.id} for takeover")
+
+            db.session.commit()
+
+        # Build SWML: answer, end AI, announce to customer, connect agent, hangup
+        swml_main = ["answer"]
+
+        # End the AI leg
+        if ai_call_sid:
+            swml_main.append({
+                "execute_rpc": {
+                    "method": "end",
+                    "call_id": ai_call_sid,
+                    "params": {
+                        "reason": "agent_takeover"
+                    }
+                }
+            })
+
+        # Play announcement to customer so they know a human is joining
+        swml_main.append({
+            "execute_rpc": {
+                "method": "play",
+                "call_id": call_sid,
+                "params": {
+                    "play": [
+                        {
+                            "type": "tts",
+                            "params": {
+                                "text": "A live agent is now joining the call."
+                            }
+                        }
+                    ]
+                }
+            }
+        })
+
+        # Bridge agent to the customer's call
+        swml_main.append({
+            "connect": {
+                "to": f"call:{call_sid}"
+            }
+        })
+
+        # Explicit hangup after connect ends (customer hung up)
+        # ensures the Call Fabric WebRTC session tears down cleanly
+        swml_main.append("hangup")
+
+        swml = {
+            "version": "1.0.0",
+            "sections": {
+                "main": swml_main
+            }
+        }
+
+        logger.info(f"TAKEOVER SWML: {json.dumps(swml, indent=2)}")
+        return jsonify(swml)
+
     # Get conference name - if provided, use per-interaction mode
     conference_name = request.args.get('conf') or parsed_params.get('conf')
 
@@ -603,11 +705,138 @@ def ai_join_conference(ai_agent_name):
     return jsonify(swml_response)
 
 
+def handle_call_conference_status(conference_name, event_type, participant_call_sid, data):
+    """Handle status events for call-conf-{id} conferences.
+
+    These are per-call conferences used in the all-conference architecture.
+    Customer enters conference first, then AI is dialed in.
+    When AI transfers to human, human joins same conference.
+
+    Args:
+        conference_name: e.g., "call-conf-123"
+        event_type: start, end, join, leave
+        participant_call_sid: The call ID of the participant
+        data: Full webhook data
+    """
+    from app import socketio
+
+    # Extract call_id from conference name
+    try:
+        call_id = int(conference_name.replace('call-conf-', ''))
+    except ValueError:
+        logger.error(f"Invalid call conference name: {conference_name}")
+        return jsonify({'status': 'invalid_conference_name'}), 200
+
+    call = Call.query.get(call_id)
+    if not call:
+        logger.error(f"Call not found for conference {conference_name}")
+        return jsonify({'status': 'call_not_found'}), 200
+
+    logger.info(f"Call conference {conference_name} event: {event_type}")
+
+    if event_type in ['start', 'conference-start']:
+        # Conference started - customer is in, now dial AI
+        logger.info(f"Call conference {conference_name} started - dialing AI agent")
+
+        # Dial AI into the conference
+        try:
+            from app.services.signalwire_api import SignalWireAPI
+            sw_api = SignalWireAPI()
+            base_url = get_base_url()
+
+            # SWML URL that joins AI to this conference
+            ai_swml_url = f"{base_url}/api/swml/ai-conference-join?conf={conference_name}&call_id={call_id}"
+
+            logger.info(f"Dialing AI into conference via: {ai_swml_url}")
+
+            # Create call to the AI SWML endpoint
+            result = sw_api.create_call(
+                to=ai_swml_url,
+                swml_url=ai_swml_url,
+                status_callback=f"{base_url}/api/webhooks/call-status"
+            )
+
+            ai_call_sid = result.sid if hasattr(result, 'sid') else result.get('call_id')
+            logger.info(f"AI call created: {ai_call_sid}")
+
+            # Create AI leg record (for tracking, not for hangup management)
+            # AI will self-terminate via SWAIG response or timeout
+            ai_leg = CallLeg(
+                call_id=call.id,
+                leg_type='ai_agent',
+                ai_agent_name='Receptionist',
+                status='active',
+                conference_name=conference_name,
+                signalwire_sid=ai_call_sid
+            )
+            db.session.add(ai_leg)
+            db.session.commit()
+
+        except Exception as e:
+            logger.error(f"Failed to dial AI into conference: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    elif event_type in ['join', 'participant-join']:
+        # Someone joined the conference
+        logger.info(f"Participant {participant_call_sid} joined call conference {conference_name}")
+
+        # Emit socket event for UI updates
+        socketio.emit('call_conference_participant_joined', {
+            'conference_name': conference_name,
+            'call_id': call_id,
+            'participant_call_sid': participant_call_sid
+        })
+
+    elif event_type in ['leave', 'participant-leave']:
+        # Someone left the conference
+        logger.info(f"Participant {participant_call_sid} left call conference {conference_name}")
+
+        # Check if this was the AI leaving - update leg status in database
+        ai_leg = CallLeg.query.filter_by(
+            call_id=call_id,
+            signalwire_sid=participant_call_sid,
+            leg_type='ai_agent'
+        ).first()
+        if ai_leg:
+            logger.info(f"AI agent left conference {conference_name}")
+            ai_leg.status = 'ended'
+            db.session.commit()
+
+        # Emit socket event
+        socketio.emit('call_conference_participant_left', {
+            'conference_name': conference_name,
+            'call_id': call_id,
+            'participant_call_sid': participant_call_sid
+        })
+
+    elif event_type in ['end', 'conference-end']:
+        # Conference ended - call is done
+        logger.info(f"Call conference {conference_name} ended")
+
+        # Update call status
+        if call.status not in ['ended', 'completed']:
+            call.status = 'ended'
+            call.ended_at = datetime.utcnow()
+            db.session.commit()
+
+            # Emit call update
+            from app.services.callcenter_socketio import emit_call_update
+            emit_call_update(call)
+
+    return jsonify({'status': 'ok'})
+
+
 @conferences_bp.route('/<conference_name>/status', methods=['POST'])
 def conference_status_callback(conference_name):
     """Handle SignalWire conference status callbacks.
 
-    Events: join, leave, speak-start, speak-stop
+    Events: start, end, join, leave, speak-start, speak-stop
+
+    For call-conf-{id} conferences (all-conference architecture):
+    - On 'start': Dial AI agent into the conference
+    - On 'join': Track participants
+    - On 'leave': Handle cleanup, check if AI should be hung up
     """
     data = request.get_json() if request.is_json else request.form.to_dict()
 
@@ -615,6 +844,10 @@ def conference_status_callback(conference_name):
 
     event_type = data.get('event_type', data.get('StatusCallbackEvent'))
     participant_call_sid = data.get('call_id', data.get('CallSid'))
+
+    # Handle call-conf-{id} conferences (customer call conferences)
+    if conference_name.startswith('call-conf-'):
+        return handle_call_conference_status(conference_name, event_type, participant_call_sid, data)
 
     conference = Conference.get_active_by_name(conference_name)
     if not conference:
@@ -960,14 +1193,26 @@ def dial_out_to_conference(conference_name):
     if not phone_number:
         return jsonify({'error': 'phone_number is required'}), 400
 
-    # Validate conference exists
+    current_user_id = request.current_user.id
+
+    # Get or create conference record
+    # For outbound calls, the conference may have been created on-the-fly
+    # by the agent's Call Fabric client before this dial-out request
     conference = Conference.get_active_by_name(conference_name)
     if not conference:
-        return jsonify({'error': 'Conference not found'}), 404
+        # Create the conference record for this outbound interaction
+        conference = Conference(
+            conference_name=conference_name,
+            conference_type='interaction',
+            owner_user_id=current_user_id,
+            status='active',
+            created_at=datetime.utcnow()
+        )
+        db.session.add(conference)
+        db.session.commit()
+        logger.info(f"Created conference record for outbound dial: {conference_name}")
 
     # Verify the requesting user owns this conference
-    # Use request.current_user set by @require_auth decorator
-    current_user_id = request.current_user.id
     if conference.owner_user_id != current_user_id:
         return jsonify({'error': 'You do not own this conference'}), 403
 
@@ -1005,6 +1250,7 @@ def dial_out_to_conference(conference_name):
             direction='outbound',
             handler_type='human',
             status='ringing',
+            conference_name=conference_name,
             created_at=datetime.utcnow()
         )
         db.session.add(call)

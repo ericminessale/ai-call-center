@@ -447,14 +447,15 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     try {
       console.log('📞 [TakeOver] Initiating takeover for call:', callSid);
 
-      // Call the takeover API to get the SWML URL
+      // Call the takeover API to get the resource dial address (includes token)
       const response = await api.post(`/api/calls/${callSid}/takeover`);
-      const { swml_url, leg_id } = response.data;
+      const { dial_address, leg_id } = response.data;
 
-      console.log('📞 [TakeOver] Got SWML URL:', swml_url);
+      console.log('📞 [TakeOver] Got dial address:', dial_address);
 
-      // Dial the SWML URL to bridge into the call
-      await makeCallToSwml(swml_url, {
+      // Dial the resource address - token is embedded in the URL
+      // Same pattern as conference join (prepare-join → /public/resource?token=xxx)
+      await makeCallToSwml(dial_address, {
         contact_id: contact.id,
         original_call_sid: callSid,
         leg_id: leg_id

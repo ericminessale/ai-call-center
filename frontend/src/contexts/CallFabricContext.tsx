@@ -77,7 +77,7 @@ interface CallFabricContextType {
   activeCall: ActiveCall | null;
   isOnline: boolean;
   isInitializing: boolean;
-  isClientReady: boolean; // True when ICE gathering is complete and client is usable
+  isClientReady: boolean; // True when client is initialized and usable
   error: string | null;
   callState: 'idle' | 'ringing' | 'active' | 'ending';
   isMuted: boolean;
@@ -197,8 +197,14 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   const [pendingCallAssignment, setPendingCallAssignment] = useState<CallAssignment | null>(null);
   const pendingCallAssignmentRef = useRef<CallAssignment | null>(null);
 
+  // Ref for client to avoid stale closures in makeCall
+  const clientRef = useRef<CallFabricClient | null>(null);
+
   // Ref for activeCall to avoid stale closures in answerCall
   const activeCallRef = useRef<ActiveCall | null>(null);
+
+  // Ref to track the original call SID during a takeover (for socket-based cleanup)
+  const takeoverCallSidRef = useRef<string | null>(null);
 
   // Ref for leaveConference to avoid circular dependency in setAgentStatus
   const leaveAgentConferenceRef = useRef<() => Promise<void>>(() => Promise.resolve());
@@ -207,14 +213,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   const isInConferenceRef = useRef<boolean>(false);
   const setAgentStatusRef = useRef<(status: AgentStatusType) => Promise<void>>(() => Promise.resolve());
   const agentStatusRef = useRef<AgentStatusType>(getInitialStatus()); // Match initial state
-  const isClientReadyRef = useRef<boolean>(false);
   const agentConferenceRef = useRef<Conference | null>(null);
 
-  // ICE gathering readiness - client exists but may not be usable until ICE completes (~10s)
+  // Client readiness - set to true once client is initialized
   const [isClientReady, setIsClientReady] = useState(false);
-  const pendingStatusRef = useRef<AgentStatusType | null>(null);
-  const iceReadyTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const pendingAutoRejoinRef = useRef<boolean>(false);  // Track if we need to auto-rejoin when client is ready
   const hasAttemptedAutoRejoinRef = useRef<boolean>(false);  // Ensure auto-rejoin only runs once per session
 
   const { user } = useAuthStore();
@@ -336,17 +338,8 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       });
 
       setClient(swClient);
-      console.log('✅ [CallFabric] Client initialized');
-
-      // ICE gathering takes ~10 seconds before pooled connections are available
-      // Wait before marking client as ready to prevent "No valid pooled connections available" errors
-      // Note: This is a workaround - ideally the SDK would provide a "ready" event
-      const ICE_READY_DELAY = 11000; // 11 seconds to be safe
-      console.log(`⏳ [CallFabric] Waiting ${ICE_READY_DELAY/1000}s for ICE gathering...`);
-      iceReadyTimerRef.current = setTimeout(() => {
-        console.log('✅ [CallFabric] ICE gathering complete, client is now ready');
-        setIsClientReady(true);
-      }, ICE_READY_DELAY);
+      setIsClientReady(true);
+      console.log('✅ [CallFabric] Client initialized and ready');
 
     } catch (error) {
       console.error('❌ [CallFabric] Failed to initialize:', error);
@@ -514,23 +507,20 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // UNIFIED: Set agent status (controls both Call Fabric and Redis)
   const setAgentStatus = useCallback(async (newStatus: AgentStatusType) => {
     console.log('🔄 [CallFabric] setAgentStatus called:', newStatus);
-    console.log('  - client:', !!client, 'isClientReady:', isClientReady, 'isOnline:', isOnline);
+    console.log('  - client:', !!client, 'isOnline:', isOnline);
     console.log('  - socket:', !!socket, 'connected:', connectionStatus);
 
-    // If client isn't ready yet (ICE gathering in progress), queue the status change
-    if (!client || !isClientReady) {
+    // If client isn't initialized yet, handle gracefully
+    if (!client) {
       if (newStatus === 'available') {
-        console.log('⏳ [CallFabric] Client not ready, queuing status change:', newStatus);
-        pendingStatusRef.current = newStatus;
-        setIsChangingStatus(true); // Show "connecting" state in UI
-        setError(null);
+        console.log('⏳ [CallFabric] Client not initialized, cannot go available yet');
+        setError('Phone system not initialized yet - please wait');
         return;
       } else {
         // For offline/break, just update Redis without Call Fabric
         console.log('📤 [CallFabric] Client not ready, updating Redis only for:', newStatus);
         updateRedisStatus(newStatus);
         setAgentStatusState(newStatus);
-        pendingStatusRef.current = null; // Clear any pending "available" request
         return;
       }
     }
@@ -595,7 +585,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     } finally {
       setIsChangingStatus(false);
     }
-  }, [client, isClientReady, isOnline, isInConference, socket, connectionStatus, goOnline, goOffline, updateRedisStatus]);
+  }, [client, isOnline, isInConference, socket, connectionStatus, goOnline, goOffline, updateRedisStatus]);
 
   // Request microphone permission
   const requestMicPermission = useCallback(async (): Promise<boolean> => {
@@ -654,16 +644,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       return data;
     };
 
-    // Helper to wait for client readiness (ICE gathering)
-    const waitForClientReady = async (maxWaitMs: number = 15000): Promise<boolean> => {
-      const startTime = Date.now();
-      while (!isClientReadyRef.current && (Date.now() - startTime) < maxWaitMs) {
-        console.log('⏳ [CallFabric] Waiting for client to be ready...');
-        await new Promise(r => setTimeout(r, 500));
-      }
-      return isClientReadyRef.current;
-    };
-
     try {
       // Use refs for current state values (avoids stale closures)
       const currentIsInConference = isInConferenceRef.current;
@@ -674,16 +654,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         phoneNumber,
         currentIsInConference,
         currentAgentStatus,
-        currentAgentConference: currentAgentConference?.conferenceName,
-        isClientReady: isClientReadyRef.current
+        currentAgentConference: currentAgentConference?.conferenceName
       });
 
-      // Case 1: Agent has a conference (available status) - use server-side dial-out
-      // Note: We check agentConference, not isInConference, because the dial-out API
-      // doesn't require the browser WebRTC connection to be active - it just needs
-      // the conference name to exist on the server side.
-      if (currentAgentConference && (currentAgentStatus === 'available' || currentIsInConference)) {
-        console.log('📞 [CallFabric] Case 1: Agent has conference, using dial-out API');
+      // Case 1: Agent already in a conference - dial out directly
+      if (currentAgentConference && currentIsInConference) {
+        console.log('📞 [CallFabric] Case 1: Already in conference, using dial-out API');
         const result = await dialOutToConference(
           currentAgentConference.conferenceName,
           context?.contact_id
@@ -691,45 +667,153 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         return result;
       }
 
-      // Case 2: Agent is offline - auto-go-available first, then dial-out
-      if (currentAgentStatus === 'offline') {
-        console.log('📞 [CallFabric] Case 2: Agent offline, auto-switching to available...');
+      // Case 2: Agent is available (or offline) but not in a conference
+      // Create an outbound conference on-the-fly, join it, then dial out
+      if (currentAgentStatus === 'available' || currentAgentStatus === 'offline') {
+        console.log(`📞 [CallFabric] Case 2: Agent ${currentAgentStatus}, creating outbound conference...`);
         setIsChangingStatus(true);
 
         try {
-          // If client isn't ready yet (ICE gathering), wait for it first
-          if (!isClientReadyRef.current) {
-            console.log('⏳ [CallFabric] Client not ready, waiting for ICE gathering...');
-            const clientReady = await waitForClientReady(15000);
-            if (!clientReady) {
-              throw new Error('Phone system still initializing - please wait and try again');
-            }
-            console.log('✅ [CallFabric] Client is now ready');
+          // If offline, go available first
+          if (currentAgentStatus === 'offline') {
+            console.log('📞 [CallFabric] Going available...');
+            await setAgentStatusRef.current('available');
           }
 
-          // Now go available (this will join the conference)
-          console.log('📞 [CallFabric] Calling setAgentStatus(available)...');
-          await setAgentStatusRef.current('available');
+          // Create an outbound conference name
+          const confName = `outbound-${user?.id}-${Date.now()}`;
+          console.log('📞 [CallFabric] Creating outbound conference:', confName);
 
-          // Wait for conference join to complete (poll isInConference)
+          // Prepare the conference join (stores params in Redis, returns dial address)
+          const prepareResponse = await conferencesApi.prepareJoin({
+            agent_id: user?.id,
+            conference_name: confName
+          });
+          const dialAddress = prepareResponse.data.dial_address;
+          console.log('📞 [CallFabric] Got dial address:', dialAddress);
+
+          // Dial the conference resource (agent joins conference)
+          const currentClient = clientRef.current;
+          if (!currentClient) {
+            throw new Error('Phone system not initialized');
+          }
+          const call = await currentClient.dial({
+            to: dialAddress,
+            rootElement: rootElementRef.current,
+            audio: true,
+            video: false,
+            logLevel: 'debug',
+            debug: { logWsTraffic: true },
+            userVariables: {
+              agent_id: user?.id,
+              call_type: 'outbound_conference',
+              conference_name: confName,
+              token: prepareResponse.data.token
+            }
+          });
+
+          // Set up call event handlers
+          let hasMarkedActive = false;
+          const markActive = () => {
+            if (hasMarkedActive) return;
+            hasMarkedActive = true;
+            console.log('✅ [CallFabric] Outbound conference ACTIVE');
+            setCallState('active');
+            setIsInConference(true);
+            isInConferenceRef.current = true;
+          };
+
+          const connectedStates = ['active', 'answered', 'answering', 'early', 'trying'];
+
+          call.on('call.state', (state: any) => {
+            console.log('📞 [CallFabric] Outbound conf call state:', state);
+            if (connectedStates.includes(state)) markActive();
+            else if (state === 'ended' || state === 'hangup' || state === 'destroy') {
+              setCallState('idle');
+              setActiveCall(null);
+              activeCallRef.current = null;
+              setIsInConference(false);
+              isInConferenceRef.current = false;
+              setAgentConference(null);
+              agentConferenceRef.current = null;
+              setConnectedCustomer(null);
+            }
+          });
+
+          call.on('call.joined', () => markActive());
+          call.on('call.updated', (params: any) => {
+            if (params?.state === 'active' || params?.node_id) markActive();
+          });
+
+          call.on('destroy', () => {
+            console.log('📞 [CallFabric] Outbound conference call destroyed');
+            setCallState('idle');
+            setActiveCall(null);
+            activeCallRef.current = null;
+            setIsInConference(false);
+            isInConferenceRef.current = false;
+            setAgentConference(null);
+            agentConferenceRef.current = null;
+            setConnectedCustomer(null);
+          });
+
+          // Track the call
+          const outboundCall: ActiveCall = {
+            id: call.id,
+            callerId: phoneNumber,
+            direction: 'outbound',
+            status: 'connecting',
+            startTime: new Date(),
+            answer: async () => {},
+            hangup: async () => await call.hangup(),
+            hold: async () => {},
+            unhold: async () => {},
+            mute: async () => await call.audioMute(),
+            unmute: async () => await call.audioUnmute(),
+            sendDigits: async (digits: string) => await call.sendDigits(digits)
+          };
+
+          setActiveCall(outboundCall);
+          activeCallRef.current = outboundCall;
+          conferenceCallRef.current = call;
+
+          // Set conference info
+          const conferenceInfo: Conference = {
+            id: 0,
+            conferenceName: confName,
+            conferenceType: 'interaction',
+            ownerUserId: user?.id || 0,
+            status: 'active',
+            createdAt: new Date().toISOString()
+          };
+          setAgentConference(conferenceInfo);
+          agentConferenceRef.current = conferenceInfo;
+          setCallState('ringing');
+
+          // Start the call
+          await call.start();
+
+          // Fallback: mark active after start
+          setTimeout(() => {
+            if (!hasMarkedActive) {
+              console.log('📞 [CallFabric] Fallback: marking outbound conf active');
+              markActive();
+            }
+          }, 1000);
+
+          // Wait for conference join to complete
           let attempts = 0;
-          const maxAttempts = 40; // 20 seconds max (conference join can take time with retries)
+          const maxAttempts = 20; // 10 seconds
           while (!isInConferenceRef.current && attempts < maxAttempts) {
             await new Promise(r => setTimeout(r, 500));
             attempts++;
-            if (attempts % 10 === 0) {
-              console.log(`⏳ [CallFabric] Still waiting for conference join... (${attempts * 500 / 1000}s)`);
-            }
           }
 
           if (!isInConferenceRef.current) {
             throw new Error('Failed to join conference - please try again');
           }
 
-          console.log('✅ [CallFabric] Now in conference, dialing out...');
-
-          // Now dial out - use the conference name from ref (should be set by now)
-          const confName = agentConferenceRef.current?.conferenceName || `agent-conf-${user?.id}`;
+          console.log('✅ [CallFabric] In conference, dialing out...');
           const result = await dialOutToConference(confName, context?.contact_id);
           return result;
 
@@ -739,7 +823,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       }
 
       // Case 3: Agent is in some other state (busy, break, after-call)
-      // This is an error state - should not make outbound calls in this mode
       console.error('❌ [CallFabric] Case 3: Invalid state for outbound call:', {
         status: currentAgentStatus,
         isInConference: currentIsInConference,
@@ -764,14 +847,16 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       return;
     }
 
-    if (!isClientReady) {
-      setError('Phone system still initializing, please wait a moment');
-      return;
-    }
-
     try {
       console.log('📞 [CallFabric] Making SWML call to:', swmlUrl);
       setCallState('ringing');
+
+      // Track the original call SID for socket-based cleanup
+      // When the backend detects the original call ended, we use this to clean up
+      if (context?.original_call_sid) {
+        takeoverCallSidRef.current = context.original_call_sid;
+        console.log('📞 [CallFabric] Tracking takeover for call SID:', context.original_call_sid);
+      }
 
       // When dialing a URL, SignalWire fetches the SWML and executes it
       const call = await client.dial({
@@ -789,16 +874,52 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         }
       });
 
+      // Helper to mark call as active (avoid duplicate transitions)
+      let hasMarkedActive = false;
+      const markCallActive = () => {
+        if (hasMarkedActive) return;
+        hasMarkedActive = true;
+        console.log('✅ [CallFabric] Takeover call ACTIVE');
+        setCallState('active');
+      };
+
+      // Cleanup helper for when call ends
+      const cleanupCall = () => {
+        console.log('📞 [CallFabric] SWML call cleanup');
+        setActiveCall(null);
+        activeCallRef.current = null;
+        setCallState('idle');
+        takeoverCallSidRef.current = null;
+      };
+
+      // Match the same connected states as conference join for robustness
+      const connectedStates = ['active', 'answered', 'answering', 'early', 'trying'];
+
       call.on('call.state', (state: any) => {
         console.log('📞 [CallFabric] SWML call state:', state);
-        if (state === 'active' || state === 'answered') setCallState('active');
-        else if (state === 'ending' || state === 'ended') setCallState('ending');
+        if (connectedStates.includes(state)) {
+          markCallActive();
+        } else if (state === 'ended' || state === 'hangup' || state === 'destroy') {
+          cleanupCall();
+        }
+      });
+
+      // Additional events that indicate connection (same as conference join)
+      call.on('call.joined', () => {
+        console.log('📞 [CallFabric] SWML call joined event');
+        markCallActive();
+      });
+
+      call.on('call.updated', (params: any) => {
+        console.log('📞 [CallFabric] SWML call updated:', params);
+        if (params?.state === 'active' || params?.node_id) {
+          markCallActive();
+        }
       });
 
       call.on('destroy', () => {
         console.log('📞 [CallFabric] SWML call destroyed');
-        setActiveCall(null);
-        setCallState('idle');
+        cleanupCall();
       });
 
       const takeoverCall: ActiveCall = {
@@ -817,16 +938,28 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       };
 
       setActiveCall(takeoverCall);
+      activeCallRef.current = takeoverCall;
       await call.start();
       console.log('✅ [CallFabric] SWML call started');
+
+      // Fallback: mark as active after start() if no state event fired
+      // (same pattern as conference join)
+      setTimeout(() => {
+        if (!hasMarkedActive) {
+          console.log('📞 [CallFabric] Fallback: marking takeover call active after start()');
+          markCallActive();
+        }
+      }, 1000);
+
       return call;
 
     } catch (error) {
       console.error('❌ [CallFabric] Failed to make SWML call:', error);
       setError('Failed to take over call');
       setCallState('idle');
+      takeoverCallSidRef.current = null;
     }
-  }, [client, isClientReady, user]);
+  }, [client, user]);
 
   // Hang up current call
   const hangup = useCallback(async () => {
@@ -1449,12 +1582,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   }, [agentStatus]);
 
   useEffect(() => {
-    isClientReadyRef.current = isClientReady;
-  }, [isClientReady]);
-
-  useEffect(() => {
     pendingCallAssignmentRef.current = pendingCallAssignment;
   }, [pendingCallAssignment]);
+
+  useEffect(() => {
+    clientRef.current = client;
+  }, [client]);
 
   useEffect(() => {
     activeCallRef.current = activeCall;
@@ -1476,29 +1609,21 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     setAgentConference(value);
   };
 
-  // Handle auto-restore when client becomes ready (after ICE gathering completes)
+  // Handle auto-restore when client is initialized
   // This handles page refresh: if agent was 'available', restore their online status
   // In per-interaction model, we just go online - no conference join until call assignment
   useEffect(() => {
-    // Only run once when client becomes ready
     if (!client || !isClientReady || hasAttemptedAutoRejoinRef.current) {
       return;
     }
 
-    // Check if we should auto-restore: persisted 'available' status
-    const shouldRestore = pendingAutoRejoinRef.current || agentStatus === 'available';
-
-    if (!shouldRestore) {
-      console.log('📦 [CallFabric] Client ready, no auto-restore needed');
-      console.log('  - agentStatus:', agentStatus);
+    if (agentStatus !== 'available') {
+      console.log('📦 [CallFabric] Client ready, no auto-restore needed (status:', agentStatus, ')');
       return;
     }
 
     console.log('🔄 [CallFabric] Client ready, auto-restoring available status...');
-    console.log('  - pendingAutoRejoinRef:', pendingAutoRejoinRef.current);
-    console.log('  - agentStatus:', agentStatus);
     hasAttemptedAutoRejoinRef.current = true;
-    pendingAutoRejoinRef.current = false;
 
     // Perform the auto-restore (just go online, no conference join)
     const doRestore = async () => {
@@ -1771,18 +1896,81 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // so we only need socket in dependencies
   }, [socket]);
 
-  // Execute pending status change when client becomes ready
+  // Socket-based cleanup for calls where the Call Fabric SDK doesn't fire 'destroy'
+  // This handles two scenarios:
+  // 1. Takeover calls: SWML connect verb doesn't fire destroy when customer hangs up
+  // 2. Outbound conference calls: customer hangs up their phone but agent's SDK leg stays open
   useEffect(() => {
-    if (isClientReady && pendingStatusRef.current) {
-      const pendingStatus = pendingStatusRef.current;
-      console.log('📱 [CallFabric] Client ready, executing pending status:', pendingStatus);
-      pendingStatusRef.current = null;
+    if (!socket) return;
 
-      // Execute the pending status change - use setAgentStatus to get full behavior
-      // including conference join
-      setAgentStatus(pendingStatus);
-    }
-  }, [isClientReady, setAgentStatus]);
+    // Shared cleanup: hang up SDK call, reset all call/conference state
+    const cleanupSdkState = (reason: string) => {
+      console.log(`📞 [CallFabric] Socket cleanup (${reason}): resetting SDK state`);
+
+      // Try to hang up the Call Fabric SDK call gracefully
+      const currentCall = activeCallRef.current;
+      if (currentCall) {
+        try { currentCall.hangup(); } catch (e) { /* already ended */ }
+      }
+
+      // Reset call state
+      setCallState('idle');
+      setActiveCall(null);
+      activeCallRef.current = null;
+      takeoverCallSidRef.current = null;
+
+      // Reset conference state (for outbound conference calls)
+      setIsInConference(false);
+      isInConferenceRef.current = false;
+      setAgentConference(null);
+      agentConferenceRef.current = null;
+      setConnectedCustomer(null);
+      conferenceCallRef.current = null;
+    };
+
+    const handleCallEnded = (data: { callId: number; call_sid?: string }) => {
+      // Match takeover calls by SID
+      if (takeoverCallSidRef.current && data.call_sid === takeoverCallSidRef.current) {
+        cleanupSdkState('takeover call ended');
+      }
+    };
+
+    const handleCallUpdate = (data: { call: any }) => {
+      const call = data.call;
+      if (!call) return;
+
+      const isEnded = ['ended', 'completed'].includes(call.status);
+      if (!isEnded) return;
+
+      // Don't clean up if we don't have an active call in the SDK
+      if (!activeCallRef.current) return;
+
+      // Match 1: Takeover calls by call SID
+      if (takeoverCallSidRef.current) {
+        const callSid = call.call_sid || call.signalwire_call_sid;
+        if (callSid === takeoverCallSidRef.current) {
+          cleanupSdkState('takeover call_update ended');
+          return;
+        }
+      }
+
+      // Match 2: Conference calls by conference name (outbound calls, queue calls)
+      // When the customer's call ends, its conference_name matches our active conference
+      const currentConf = agentConferenceRef.current;
+      if (currentConf && call.conference_name === currentConf.conferenceName) {
+        cleanupSdkState(`conference call ended: ${currentConf.conferenceName}`);
+        return;
+      }
+    };
+
+    socket.on('call_ended', handleCallEnded);
+    socket.on('call_update', handleCallUpdate);
+
+    return () => {
+      socket.off('call_ended', handleCallEnded);
+      socket.off('call_update', handleCallUpdate);
+    };
+  }, [socket]);
 
   // Note: We intentionally do NOT auto-restore 'available' status on page load
   // Agent must explicitly go available when ready to take calls
@@ -1796,10 +1984,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     return () => {
       if (rootElementRef.current) {
         rootElementRef.current.remove();
-      }
-      // Clean up ICE ready timer
-      if (iceReadyTimerRef.current) {
-        clearTimeout(iceReadyTimerRef.current);
       }
     };
   }, [user]);

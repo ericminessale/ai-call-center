@@ -165,10 +165,8 @@ def initial_call():
     base_url = get_base_url()
     logger.info(f"Using base URL: {base_url}")
 
-    # Note: SignalWire's transfer method doesn't actually send the Authorization header
-    # when using username:password@url format, so we've disabled auth on the AI agents.
-    # They are protected by being behind nginx and only accessible through our infrastructure.
-
+    # WORKING APPROACH: Transfer directly to AI agent
+    # Conference is only used when AI transfers to human agent
     swml_response = {
         "version": "1.0.0",
         "sections": {
@@ -202,6 +200,7 @@ def initial_call():
                         }
                     }
                 },
+                # Transfer directly to AI agent
                 {
                     "transfer": {
                         "dest": f"{base_url}/receptionist"
@@ -355,11 +354,12 @@ def end_call():
 def takeover_swml(token):
     """Return SWML to bridge an agent into an existing AI call.
 
-    This endpoint is called by SignalWire when an agent dials the takeover URL.
-    It plays a transition message to the customer, then connects the agent
-    to the existing call using either:
-    - Conference-based routing: Customer moves to agent's conference
-    - Legacy routing: Agent bridges into call using `connect: to: call:{call_sid}`
+    DIRECT CONNECT APPROACH:
+    Uses SWML connect verb with call:{call_sid} to bridge the agent
+    directly to the customer's existing call. The AI leg is ended via
+    execute_rpc in the SWML before connecting.
+
+    This is simpler than conferences - agent connects directly to customer.
     """
     logger.info(f"TAKEOVER SWML requested with token: {token[:8]}...")
 
@@ -368,7 +368,6 @@ def takeover_swml(token):
 
     if not takeover_data:
         logger.error(f"Takeover token not found or expired: {token[:8]}...")
-        # Return SWML that plays an error message
         return jsonify({
             "version": "1.0.0",
             "sections": {
@@ -382,7 +381,7 @@ def takeover_swml(token):
                     "hangup"
                 ]
             }
-        }), 200  # Still return 200 so SignalWire can play the message
+        }), 200
 
     # Delete the token (one-time use)
     redis_client.delete(f'takeover:{token}')
@@ -394,17 +393,46 @@ def takeover_swml(token):
     leg_id = data['leg_id']
     user_id = data.get('user_id')
 
-    logger.info(f"Takeover: Agent {user_id} taking over call {original_call_sid}")
+    logger.info(f"Takeover: Agent {user_id} taking over call {call_id} (SID: {original_call_sid})")
 
-    # Update the leg status to active
+    # Get the call
+    call = Call.query.filter_by(id=call_id).first()
+    if not call:
+        logger.error(f"Call not found: {call_id}")
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"urls": ["say:Call not found. Please try again."]}},
+                    "hangup"
+                ]
+            }
+        }), 200
+
+    # Update the human leg status
     leg = db.session.query(CallLeg).filter_by(id=leg_id).first()
     if leg:
         leg.status = 'active'
 
-    # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
-    base_url = get_base_url()
+    # Update call handler type
+    call.handler_type = 'human'
+    call.user_id = user_id
+    db.session.commit()
 
-    # Emit WebSocket event to notify UI that takeover is connecting
+    # Find the AI leg to end it via execute_rpc
+    ai_leg = CallLeg.query.filter_by(
+        call_id=call_id,
+        leg_type='ai_agent',
+        status='active'
+    ).first()
+
+    ai_call_sid = ai_leg.signalwire_sid if ai_leg else None
+    if ai_leg:
+        ai_leg.status = 'ended'
+        db.session.commit()
+        logger.info(f"Will end AI leg via execute_rpc: {ai_call_sid}")
+
+    # Emit WebSocket event
     from app import socketio
     socketio.emit('call_takeover_connecting', {
         'call_sid': original_call_sid,
@@ -412,106 +440,40 @@ def takeover_swml(token):
         'leg_id': leg_id
     }, room=f'call_{original_call_sid}')
 
-    if user_id:
-        # Conference-based takeover: Agent joins their conference,
-        # customer gets moved from AI conference to agent's conference
-        conference_name = f"agent-conf-{user_id}"
+    # Build SWML response:
+    # 1. Answer the agent's call
+    # 2. End the AI leg via execute_rpc (if we have its SID)
+    # 3. Connect agent directly to the customer's call
+    swml_main = ["answer"]
 
-        # Get or create the agent's conference
-        conference = Conference.get_or_create_agent_conference(user_id)
-
-        # Update leg with conference info
-        if leg:
-            leg.conference_id = conference.id
-            leg.conference_name = conference_name
-
-        db.session.commit()
-
-        logger.info(f"Takeover via conference: Agent {user_id} in {conference_name}")
-
-        # Note: For conference-based takeover, we need to:
-        # 1. Agent is already in their conference (dialed in when going available)
-        # 2. Move customer from AI conference to agent conference using SignalWire API
-        # 3. Return SWML that puts agent in conference (or just acknowledges)
-
-        # For now, we use the connect approach as the customer movement
-        # happens server-side via the SignalWire API
-        # The agent's call goes into their conference
-        swml_response = {
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    "answer",
-                    {
-                        "conference": {
-                            "name": conference_name,
-                            "status_url": f"{base_url}/api/conferences/{conference_name}/status",
-                            "status_events": ["join", "leave"],
-                            "join_options": {
-                                "muted": False,
-                                "deaf": False,
-                                "start_on_enter": True,
-                                "end_on_exit": False
-                            }
-                        }
-                    }
-                ]
-            }
-        }
-
-        # Also trigger moving the customer to this conference
-        # This is done asynchronously via the API
-        try:
-            # Get the call to find current AI conference
-            call = Call.query.filter_by(id=call_id).first()
-            if call:
-                current_leg = CallLeg.get_active_leg(call.id)
-                if current_leg and current_leg.conference_name:
-                    from app.services.signalwire_api import SignalWireAPI
-                    sw_api = SignalWireAPI()
-                    sw_api.move_participant(
-                        from_conference=current_leg.conference_name,
-                        to_conference=conference_name,
-                        call_id=original_call_sid
-                    )
-                    logger.info(f"Moved customer from {current_leg.conference_name} to {conference_name}")
-        except Exception as e:
-            logger.error(f"Failed to move customer to agent conference: {e}")
-            # Fall back to legacy connect approach
-            swml_response = {
-                "version": "1.0.0",
-                "sections": {
-                    "main": [
-                        "answer",
-                        {
-                            "connect": {
-                                "to": f"call:{original_call_sid}",
-                                "play": "say:Please hold while I connect you with an agent."
-                            }
-                        }
-                    ]
+    # End the AI leg if we have its call SID
+    if ai_call_sid:
+        swml_main.append({
+            "execute_rpc": {
+                "method": "end",
+                "call_id": ai_call_sid,
+                "params": {
+                    "reason": "agent_takeover"
                 }
             }
-    else:
-        # Fallback: No user_id available, use direct connect
-        logger.warning("Takeover without user_id - falling back to direct connect")
-        db.session.commit()
+        })
 
-        swml_response = {
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    "answer",
-                    {
-                        "connect": {
-                            "to": f"call:{original_call_sid}",
-                            "play": "say:Please hold while I connect you with an agent."
-                        }
-                    }
-                ]
-            }
+    # Connect to the customer's call
+    swml_main.append({
+        "connect": {
+            "to": f"call:{original_call_sid}"
         }
+    })
+
+    swml_response = {
+        "version": "1.0.0",
+        "sections": {
+            "main": swml_main
+        }
+    }
 
     logger.info(f"TAKEOVER SWML RESPONSE: {json.dumps(swml_response, indent=2)}")
 
     return jsonify(swml_response)
+
+

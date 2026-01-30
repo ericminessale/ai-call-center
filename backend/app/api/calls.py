@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import logging
 import secrets
 import json
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -499,20 +500,25 @@ def initiate_takeover(call_sid):
         # Generate secure takeover token
         token = secrets.token_urlsafe(32)
 
-        # Store takeover info in Redis with 60-second TTL
+        # Store takeover info in Redis using the same key pattern as conference join
+        # The agent_conference_webhook will check for type='takeover' and return
+        # the appropriate SWML (connect to existing call instead of join conference)
         takeover_data = json.dumps({
+            'type': 'takeover',
+            'agent_id': request.current_user.id,
             'call_sid': call.signalwire_call_sid,
             'call_id': call.id,
             'leg_id': new_leg.id,
             'user_id': request.current_user.id
         })
-        redis_client.setex(f'takeover:{token}', 60, takeover_data)
+        redis_client.setex(f'conference_join:{token}', 120, takeover_data)
 
         logger.info(f"Stored takeover token in Redis: {token[:8]}...")
 
-        # Generate SWML URL
-        base_url = get_base_url()
-        swml_url = f"{base_url}/api/swml/takeover/{token}"
+        # Build dial address with token in URL - same pattern as conference join
+        # (prepare-join stores in Redis, returns /public/resource?token=xxx)
+        resource_address = os.getenv('AGENT_CONFERENCE_RESOURCE', '/public/agent-conference-swml')
+        dial_address = f"{resource_address}?token={token}"
 
         # Update call handler type to human (takeover in progress)
         call.handler_type = 'human'
@@ -529,8 +535,9 @@ def initiate_takeover(call_sid):
 
         return jsonify({
             'success': True,
-            'swml_url': swml_url,
+            'dial_address': dial_address,
             'call_sid': call.signalwire_call_sid,
+            'call_id': call.id,
             'leg_id': new_leg.id
         }), 200
 

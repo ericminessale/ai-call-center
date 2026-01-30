@@ -331,19 +331,12 @@ def route_call_to_queue(queue_id):
                 # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
                 base_url = get_base_url()
 
-                # NEW: Per-interaction conference model
-                # Instead of agents sitting idle in their personal conferences,
-                # we create a conference for each customer interaction.
-                # Customer joins first, then agent is notified to dial in.
+                # Create interaction conference for agent-customer call
+                # Customer will be transferred to this conference, agent joins it
                 conference_name = f"interaction-{call_id}"
-
-                # Track conference on call record
                 if call:
                     call.conference_name = conference_name
-
                 logger.info(f"Creating interaction conference {conference_name} for call {call_id} -> agent {selected_user.email}")
-
-                # Create the interaction conference
                 conference = Conference.create_interaction_conference(
                     call_id=call_id,
                     queue_id=queue_id,
@@ -447,23 +440,22 @@ def route_call_to_queue(queue_id):
                 logger.info(f"Emitted call_assignment to agent room {selected_user.id}")
                 logger.info(f"Customer will join interaction conference: {conference_name}")
 
-                # Return SWML that joins the customer to the agent's conference
+                # Return SWAIG response that transfers customer to the interaction conference
+                # where they'll wait for the agent to join
                 return jsonify({
-                    "version": "1.0.0",
-                    "sections": {
-                        "main": [
-                            {
-                                "play": {
-                                    "url": "say:Connecting you to a specialist now."
-                                }
-                            },
-                            {
-                                "join_conference": {
-                                    "name": conference_name
+                    "response": "I'm connecting you to a specialist now.",
+                    "action": [
+                        {
+                            "SWML": {
+                                "version": "1.0.0",
+                                "sections": {
+                                    "main": [
+                                        {"join_conference": {"name": conference_name}}
+                                    ]
                                 }
                             }
-                        ]
-                    }
+                        }
+                    ]
                 })
             else:
                 # No agents with valid Call Fabric addresses

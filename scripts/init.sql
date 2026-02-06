@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS calls (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id),
     signalwire_call_sid VARCHAR(255),
+    from_number VARCHAR(255),
     destination VARCHAR(255) NOT NULL,
     destination_type VARCHAR(20) NOT NULL,
     status VARCHAR(50) DEFAULT 'initiated',

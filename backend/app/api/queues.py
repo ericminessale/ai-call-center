@@ -440,23 +440,24 @@ def route_call_to_queue(queue_id):
                 logger.info(f"Emitted call_assignment to agent room {selected_user.id}")
                 logger.info(f"Customer will join interaction conference: {conference_name}")
 
-                # Return SWAIG response that transfers customer to the interaction conference
-                # where they'll wait for the agent to join
-                return jsonify({
-                    "response": "I'm connecting you to a specialist now.",
-                    "action": [
-                        {
-                            "SWML": {
-                                "version": "1.0.0",
-                                "sections": {
-                                    "main": [
-                                        {"join_conference": {"name": conference_name}}
-                                    ]
+                # Return raw SWML to put the caller into the interaction conference
+                # (This is fetched via SWML transfer, NOT a SWAIG function call,
+                # so it must be a top-level SWML document, not a SWAIG response wrapper)
+                swml_response = {
+                    "version": "1.0.0",
+                    "sections": {
+                        "main": [
+                            {
+                                "play": {
+                                    "url": "say:I'm connecting you to a specialist now. Please hold."
                                 }
-                            }
-                        }
-                    ]
-                })
+                            },
+                            {"join_conference": {"name": conference_name}}
+                        ]
+                    }
+                }
+                print(f"📤 Returning SWML (agent found, conference={conference_name}): {json.dumps(swml_response)}", flush=True)
+                return jsonify(swml_response)
             else:
                 # No agents with valid Call Fabric addresses
                 logger.warning(f"No available agents with Call Fabric addresses for queue {queue_id}")

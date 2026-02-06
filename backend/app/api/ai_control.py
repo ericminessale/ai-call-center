@@ -8,12 +8,50 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 import requests
 import os
 import logging
+import json
+import base64
 from datetime import datetime
 from base64 import b64encode
 
 logger = logging.getLogger(__name__)
 
 ai_control_bp = Blueprint('ai_control', __name__)
+
+# Available AI agents - must match routes in ai-agents/main_agent.py
+AI_AGENTS = [
+    {
+        'id': 'outbound-sales',
+        'name': 'Outbound Sales Agent',
+        'route': '/outbound-sales',
+        'description': 'Proactive sales outreach with customer context'
+    },
+    {
+        'id': 'outbound-support',
+        'name': 'Outbound Support Agent',
+        'route': '/outbound-support',
+        'description': 'Proactive support follow-up with customer context'
+    },
+    {
+        'id': 'sales-ai',
+        'name': 'Sales AI Specialist',
+        'route': '/sales-ai',
+        'description': 'General sales help (designed for inbound transfers)'
+    },
+    {
+        'id': 'support-ai',
+        'name': 'Support AI Specialist',
+        'route': '/support-ai',
+        'description': 'General support help (designed for inbound transfers)'
+    },
+    {
+        'id': 'receptionist',
+        'name': 'Receptionist / Triage',
+        'route': '/receptionist',
+        'description': 'Call triage and routing (designed for inbound)'
+    },
+]
+
+AGENT_ROUTE_MAP = {a['id']: a['route'] for a in AI_AGENTS}
 
 # SignalWire configuration
 SIGNALWIRE_SPACE = os.getenv('SIGNALWIRE_SPACE')
@@ -353,6 +391,84 @@ def get_message_templates():
     })
 
 
+@ai_control_bp.route('/agents', methods=['GET'])
+@jwt_required()
+def list_ai_agents():
+    """Return the list of available AI agents."""
+    return jsonify({'agents': AI_AGENTS})
+
+
+@ai_control_bp.route('/outbound-swml/<int:call_id>', methods=['POST', 'GET'])
+def outbound_ai_swml(call_id):
+    """SWML webhook called by SignalWire when the outbound call is answered.
+
+    Looks up the Call record to determine which AI agent to transfer to and
+    what context to pass along, then returns SWML that transfers the call
+    to the appropriate AI agent URL with encoded context.
+    """
+    from app import db
+    from app.models import Call
+    from app.utils.url_utils import get_base_url
+
+    logger.info(f"Outbound AI SWML webhook called for call_id={call_id}")
+
+    call = db.session.get(Call, call_id)
+    if not call:
+        logger.error(f"Call {call_id} not found for outbound SWML")
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": "say:Sorry, an error occurred. Please try again later."}},
+                    "hangup"
+                ]
+            }
+        })
+
+    agent_type = call.ai_agent_name or 'receptionist'
+    agent_route = AGENT_ROUTE_MAP.get(agent_type, f'/{agent_type}')
+    context = call.ai_context_dict
+
+    # Build the external agent URL
+    base_url = get_base_url()
+    # AI agents are exposed on port 8080 behind the same proxy/ngrok,
+    # but on a different path from the backend. The agent routes are at the root.
+    # Use EXTERNAL_URL for the agent host since nginx routes /receptionist, /sales-ai, etc. to ai-agents.
+    agent_url = f"{base_url}{agent_route}"
+
+    # Encode context as base64 query param (same pattern as queue routing)
+    if context:
+        context_json = json.dumps(context)
+        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
+        agent_url = f"{agent_url}?ctx={context_b64}"
+
+    status_callback = f"{base_url}/api/webhooks/call-status"
+
+    logger.info(f"Outbound AI SWML: transferring to {agent_url}")
+
+    swml = {
+        "version": "1.0.0",
+        "sections": {
+            "main": [
+                {
+                    "set": {
+                        "call_state_url": status_callback,
+                        "call_state_events": "created,ringing,answered,ended"
+                    }
+                },
+                "answer",
+                {
+                    "transfer": {
+                        "dest": agent_url
+                    }
+                }
+            ]
+        }
+    }
+
+    return jsonify(swml)
+
+
 @ai_control_bp.route('/outbound-call', methods=['POST'])
 @jwt_required()
 def initiate_outbound_ai_call():
@@ -363,7 +479,7 @@ def initiate_outbound_ai_call():
     {
         "phone": "+1234567890",
         "contact_id": 123,
-        "agent_type": "sales",  // sales, support, or custom agent name
+        "agent_type": "sales",
         "context": {
             "contact_name": "John Doe",
             "account_tier": "enterprise",
@@ -372,6 +488,11 @@ def initiate_outbound_ai_call():
     }
     """
     try:
+        from app import db
+        from app.models import Call
+        from app.services.signalwire_api import get_signalwire_api
+        from app.utils.url_utils import get_base_url
+
         user_id = get_jwt_identity()
         data = request.get_json()
 
@@ -383,82 +504,48 @@ def initiate_outbound_ai_call():
         if not phone:
             return jsonify({'error': 'phone is required'}), 400
 
+        if agent_type not in AGENT_ROUTE_MAP:
+            return jsonify({'error': f'Unknown agent type: {agent_type}'}), 400
+
         logger.info(f"User {user_id} initiating outbound AI call to {phone} with agent {agent_type}")
 
-        # Determine which AI agent to use based on type
-        # This should match your AI agent routes
-        agent_routes = {
-            'sales': '/public/ai-sales',
-            'support': '/public/ai-support',
-            'receptionist': '/public/receptionist',
-        }
-
-        agent_address = agent_routes.get(agent_type, f'/public/ai-{agent_type}')
-
-        # Get our phone number for outbound calls
-        from_number = os.getenv('SIGNALWIRE_PHONE_NUMBER')
-
-        if not from_number:
-            return jsonify({'error': 'No outbound phone number configured'}), 500
-
-        # Create the outbound call via SignalWire API
-        url = f"https://{SIGNALWIRE_SPACE}/api/calling/calls"
-
-        # Build global_data to pass customer context to the AI agent
-        global_data = {
-            'contact_id': contact_id,
-            'initiated_by': user_id,
-            'call_type': 'outbound_ai',
-            **context  # Include contact name, tier, etc.
-        }
-
-        payload = {
-            'from': from_number,
-            'to': phone,
-            'ai': {
-                'url': f"{os.getenv('AI_AGENTS_URL', 'http://ai-agents:8080')}{agent_address}",
-                'post_prompt_url': f"{os.getenv('BACKEND_URL', 'http://backend:5000')}/api/webhooks/ai-summary",
-            },
-            'global_data': global_data
-        }
-
-        response = requests.post(
-            url,
-            json=payload,
-            headers=get_signalwire_auth_headers()
-        )
-
-        if response.status_code not in [200, 201]:
-            logger.error(f"Failed to initiate outbound AI call: {response.text}")
-            return jsonify({
-                'error': 'Failed to initiate call',
-                'details': response.text
-            }), 500
-
-        call_data = response.json()
-        call_sid = call_data.get('id') or call_data.get('call_id')
-
-        # Store the call in our database
-        from app import db
-        from app.models import Call
+        # Create Call record FIRST — we need its ID for the SWML webhook URL
+        context['contact_id'] = contact_id
+        context['initiated_by'] = user_id
+        context['call_type'] = 'outbound_ai'
 
         call = Call(
-            signalwire_call_sid=call_sid,
             user_id=user_id,
-            from_number=from_number,
+            from_number=os.getenv('SIGNALWIRE_PHONE_NUMBER', os.getenv('SIGNALWIRE_FROM_NUMBER')),
             destination=phone,
             destination_type='phone',
-            status='ai_active',
+            status='initiated',
             direction='outbound',
             handler_type='ai',
             ai_agent_name=agent_type,
             contact_id=contact_id,
-            ai_context=context
         )
+        call.ai_context_dict = context
         db.session.add(call)
         db.session.commit()
 
-        logger.info(f"Outbound AI call initiated: {call_sid}")
+        # Build the SWML webhook URL that SignalWire will fetch when the call is answered
+        base_url = get_base_url()
+        swml_url = f"{base_url}/api/ai/outbound-swml/{call.id}"
+        status_callback = f"{base_url}/api/webhooks/call-status"
+
+        logger.info(f"SWML URL for outbound AI call: {swml_url}")
+
+        # Dial the customer using SignalWireAPI (correct command/params format)
+        sw_api = get_signalwire_api()
+        result = sw_api.create_call(phone, swml_url, status_callback=status_callback)
+
+        call_sid = result.sid
+        call.signalwire_call_sid = call_sid
+        call.status = 'ai_active'
+        db.session.commit()
+
+        logger.info(f"Outbound AI call initiated: {call_sid} (db id: {call.id})")
 
         return jsonify({
             'success': True,
@@ -470,7 +557,7 @@ def initiate_outbound_ai_call():
         })
 
     except Exception as e:
-        logger.error(f"Error initiating outbound AI call: {e}")
+        logger.error(f"Error initiating outbound AI call: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 

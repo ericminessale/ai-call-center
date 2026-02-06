@@ -28,6 +28,7 @@ import {
   X,
   PhoneCall,
   Users,
+  Loader2,
 } from 'lucide-react';
 import { Contact, Interaction, TranscriptionMessage, Call, CallLeg } from '../../types/callcenter';
 import { contactsApi, callsApi } from '../../services/api';
@@ -94,6 +95,20 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   // State for taking queued calls
   const [isTakingCall, setIsTakingCall] = useState(false);
   const [takeCallError, setTakeCallError] = useState<string | null>(null);
+
+  // AI Agent form state
+  const [showAIForm, setShowAIForm] = useState(false);
+  const [availableAgents, setAvailableAgents] = useState<{ id: string; name: string; route: string; description: string }[]>([]);
+  const [aiFormData, setAiFormData] = useState({
+    agentType: 'outbound-sales',
+    contactName: '',
+    company: '',
+    accountTier: '',
+    isVip: false,
+    additionalContext: '',
+  });
+  const [isSubmittingAI, setIsSubmittingAI] = useState(false);
+  const [aiFormError, setAiFormError] = useState<string | null>(null);
 
   // Check if this contact has a call in the queue (waiting, assigned, queued, or urgent)
   // BUT not if the agent is already in conference (connected to the call)
@@ -312,6 +327,18 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  // Fetch available AI agents on mount
+  useEffect(() => {
+    api.get('/api/ai/agents')
+      .then(res => {
+        setAvailableAgents(res.data.agents);
+        if (res.data.agents.length > 0) {
+          setAiFormData(prev => ({ ...prev, agentType: res.data.agents[0].id }));
+        }
+      })
+      .catch(err => console.error('Failed to fetch AI agents:', err));
+  }, []);
+
   const handleDeleteContact = async () => {
     if (!confirm(`Delete ${contact.displayName}? This will also delete all call history for this contact.`)) {
       return;
@@ -375,20 +402,37 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     }
   };
 
-  const handleSendAI = async () => {
+  const handleSendAI = () => {
+    // Pre-fill form fields from contact data
+    setAiFormData(prev => ({
+      ...prev,
+      contactName: contact.displayName || '',
+      company: contact.company || '',
+      accountTier: contact.accountTier || 'free',
+      isVip: contact.isVip || false,
+      additionalContext: '',
+    }));
+    setShowAIForm(true);
+    setAiFormError(null);
+  };
+
+  const handleSubmitAIForm = async () => {
+    setIsSubmittingAI(true);
+    setAiFormError(null);
+
     try {
-      // Call backend to initiate outbound AI call
       const response = await api.post('/api/ai/outbound-call', {
         phone: contact.phone,
         contact_id: contact.id,
-        agent_type: 'sales', // or let user choose
+        agent_type: aiFormData.agentType,
         context: {
-          contact_name: contact.displayName,
-          account_tier: contact.accountTier,
-          is_vip: contact.isVip,
-          company: contact.company,
+          contact_name: aiFormData.contactName,
+          account_tier: aiFormData.accountTier,
+          is_vip: aiFormData.isVip,
+          company: aiFormData.company || undefined,
           total_calls: contact.totalCalls,
           notes: contact.notes,
+          additional_context: aiFormData.additionalContext || undefined,
         }
       });
 
@@ -396,9 +440,13 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         setIsAICall(true);
         setCurrentCallSid(response.data.call_sid);
         setTranscription([]);
+        setShowAIForm(false);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to send AI agent:', error);
+      setAiFormError(error?.response?.data?.error || error?.message || 'Failed to initiate AI call');
+    } finally {
+      setIsSubmittingAI(false);
     }
   };
 
@@ -763,6 +811,139 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
           <div className="mt-2 p-2 bg-red-500/20 border border-red-500 rounded-lg text-red-400 text-sm flex items-center gap-2">
             <AlertCircle className="w-4 h-4" />
             {callError}
+          </div>
+        )}
+
+        {/* AI Agent Configuration Form */}
+        {showAIForm && !hasAnyActiveCall && (
+          <div className="mt-4 p-4 bg-purple-900/20 border border-purple-500/30 rounded-lg">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-purple-300 flex items-center gap-2">
+                <Bot className="w-4 h-4" />
+                Configure AI Agent Call
+              </h3>
+              <button
+                onClick={() => setShowAIForm(false)}
+                className="p-1 text-gray-400 hover:text-white rounded"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Agent Selection */}
+            <div className="mb-3">
+              <label className="block text-xs text-gray-400 mb-1">AI Agent</label>
+              <select
+                value={aiFormData.agentType}
+                onChange={(e) => setAiFormData({ ...aiFormData, agentType: e.target.value })}
+                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-purple-500"
+              >
+                {availableAgents.map(agent => (
+                  <option key={agent.id} value={agent.id}>
+                    {agent.name}
+                  </option>
+                ))}
+              </select>
+              {availableAgents.find(a => a.id === aiFormData.agentType)?.description && (
+                <p className="text-xs text-gray-500 mt-1">
+                  {availableAgents.find(a => a.id === aiFormData.agentType)?.description}
+                </p>
+              )}
+            </div>
+
+            {/* Editable Context Fields */}
+            <div className="mb-3 space-y-2">
+              <label className="block text-xs text-gray-400">Context sent to AI agent</label>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-0.5">Name</label>
+                  <input
+                    type="text"
+                    value={aiFormData.contactName}
+                    onChange={(e) => setAiFormData({ ...aiFormData, contactName: e.target.value })}
+                    className="w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-purple-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-0.5">Company</label>
+                  <input
+                    type="text"
+                    value={aiFormData.company}
+                    onChange={(e) => setAiFormData({ ...aiFormData, company: e.target.value })}
+                    className="w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-purple-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-0.5">Account Tier</label>
+                  <select
+                    value={aiFormData.accountTier}
+                    onChange={(e) => setAiFormData({ ...aiFormData, accountTier: e.target.value })}
+                    className="w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-purple-500"
+                  >
+                    <option value="prospect">Prospect</option>
+                    <option value="free">Free</option>
+                    <option value="pro">Pro</option>
+                    <option value="enterprise">Enterprise</option>
+                  </select>
+                </div>
+                <div className="flex items-end pb-1">
+                  <label className="flex items-center gap-2 cursor-pointer text-sm">
+                    <input
+                      type="checkbox"
+                      checked={aiFormData.isVip}
+                      onChange={(e) => setAiFormData({ ...aiFormData, isVip: e.target.checked })}
+                      className="w-4 h-4 rounded bg-gray-700 border-gray-600"
+                    />
+                    <span className={aiFormData.isVip ? 'text-yellow-400' : 'text-gray-300'}>
+                      <Star className="w-3 h-3 inline mr-1" />
+                      VIP
+                    </span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            {/* Additional Context */}
+            <div className="mb-3">
+              <label className="block text-xs text-gray-400 mb-1">Additional Context (optional)</label>
+              <textarea
+                value={aiFormData.additionalContext}
+                onChange={(e) => setAiFormData({ ...aiFormData, additionalContext: e.target.value })}
+                placeholder="e.g., Follow up on previous quote, ask about renewal..."
+                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm placeholder-gray-500 resize-none focus:outline-none focus:border-purple-500"
+                rows={2}
+              />
+            </div>
+
+            {/* Error */}
+            {aiFormError && (
+              <div className="mb-3 p-2 bg-red-500/20 border border-red-500/50 rounded text-red-400 text-xs flex items-center gap-2">
+                <AlertCircle className="w-3 h-3" />
+                {aiFormError}
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="flex gap-2">
+              <button
+                onClick={handleSubmitAIForm}
+                disabled={isSubmittingAI}
+                className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-white rounded-lg text-sm transition-colors"
+              >
+                {isSubmittingAI ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Bot className="w-4 h-4" />
+                )}
+                {isSubmittingAI ? 'Sending...' : 'Send Agent'}
+              </button>
+              <button
+                onClick={() => setShowAIForm(false)}
+                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         )}
 

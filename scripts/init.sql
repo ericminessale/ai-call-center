@@ -22,6 +22,10 @@ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'callcenter')\gexec
 GRANT ALL PRIVILEGES ON DATABASE callcenter TO ccuser;
 GRANT ALL ON SCHEMA public TO ccuser;
 
+-- Enable extensions for RAG/vector search
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 -- Create users table first (required by calls foreign key)
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
@@ -94,6 +98,43 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- System configuration (key-value store for admin settings)
+CREATE TABLE IF NOT EXISTS system_config (
+    key VARCHAR(100) PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_by INTEGER REFERENCES users(id)
+);
+
+-- Document collections for RAG knowledge bases
+CREATE TABLE IF NOT EXISTS document_collections (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) UNIQUE NOT NULL,
+    display_name VARCHAR(200) NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Documents within collections
+CREATE TABLE IF NOT EXISTS documents (
+    id SERIAL PRIMARY KEY,
+    collection_id INTEGER NOT NULL REFERENCES document_collections(id) ON DELETE CASCADE,
+    title VARCHAR(300) NOT NULL,
+    content TEXT NOT NULL,
+    is_published BOOLEAN DEFAULT false,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Agent-to-collection assignments
+CREATE TABLE IF NOT EXISTS agent_collection_assignments (
+    id SERIAL PRIMARY KEY,
+    agent_id VARCHAR(50) NOT NULL,
+    collection_id INTEGER NOT NULL REFERENCES document_collections(id) ON DELETE CASCADE,
+    UNIQUE(agent_id, collection_id)
+);
+
 -- Grant permissions on tables
 GRANT ALL ON ALL TABLES IN SCHEMA public TO ccuser;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO ccuser;
@@ -125,3 +166,27 @@ VALUES (
     'agent',
     true
 ) ON CONFLICT (email) DO NOTHING;
+
+-- Insert default routing config
+INSERT INTO system_config (key, value) VALUES
+    ('route.initial_handler', '/receptionist'),
+    ('route.sales_specialist', '/sales-ai'),
+    ('route.support_specialist', '/support-ai')
+ON CONFLICT (key) DO NOTHING;
+
+-- Insert default document collections
+INSERT INTO document_collections (name, display_name, description) VALUES
+    ('sales_knowledge', 'Sales Knowledge Base', 'Product info, pricing, sales scripts'),
+    ('support_knowledge', 'Support Knowledge Base', 'Troubleshooting guides, FAQs, diagnostics')
+ON CONFLICT (name) DO NOTHING;
+
+-- Insert default agent-collection assignments
+INSERT INTO agent_collection_assignments (agent_id, collection_id)
+SELECT agent_id, collection_id FROM (VALUES
+    ('sales-ai', 1),
+    ('outbound-sales', 1),
+    ('support-ai', 2),
+    ('outbound-support', 2)
+) AS defaults(agent_id, collection_id)
+WHERE EXISTS (SELECT 1 FROM document_collections WHERE id = collection_id)
+ON CONFLICT (agent_id, collection_id) DO NOTHING;

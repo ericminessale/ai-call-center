@@ -5,6 +5,7 @@ import { useAuthStore } from './stores/authStore';
 import { SocketProvider } from './contexts/SocketContext';
 import { CallFabricProvider } from './contexts/CallFabricContext';
 import { UnifiedAgentDesktop } from './pages/UnifiedAgentDesktop';
+import Admin from './pages/Admin';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import CallDetails from './components/CallDetails';
@@ -90,6 +91,16 @@ function App() {
             element={
               <ProtectedRoute>
                 <UnifiedAgentDesktop />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Admin Settings */}
+          <Route
+            path="/admin"
+            element={
+              <ProtectedRoute>
+                <Admin />
               </ProtectedRoute>
             }
           />

@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  # PostgreSQL Database
+  # PostgreSQL Database (with pgvector for RAG)
   postgres:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:0.8.0-pg15
     container_name: callcenter-postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-callcenter}
@@ -119,12 +119,18 @@ services:
       dockerfile: Dockerfile
     container_name: callcenter-agents
     depends_on:
-      - backend
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
     environment:
       # SignalWire Configuration
       SIGNALWIRE_SPACE: ${SIGNALWIRE_SPACE}
       SIGNALWIRE_PROJECT_ID: ${SIGNALWIRE_PROJECT_ID}
       SIGNALWIRE_API_TOKEN: ${SIGNALWIRE_API_TOKEN}
+
+      # Database (shared with backend, for pgvector RAG)
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ccuser}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-callcenter}
 
       # Backend Integration
       BACKEND_URL: http://backend:5000
@@ -146,6 +152,7 @@ services:
       - ./ai-agents:/app
     ports:
       - "8080:8080"
+      - "8081:8081"
     command: python main_agent.py
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

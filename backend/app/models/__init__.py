@@ -6,6 +6,8 @@ from .transcription import Transcription
 from .webhook_event import WebhookEvent
 from .conference import Conference
 from .conference_participant import ConferenceParticipant
+from .system_config import SystemConfig
+from .document import DocumentCollection, Document, AgentCollectionAssignment
 
 __all__ = [
     'User',
@@ -15,5 +17,9 @@ __all__ = [
     'Transcription',
     'WebhookEvent',
     'Conference',
-    'ConferenceParticipant'
+    'ConferenceParticipant',
+    'SystemConfig',
+    'DocumentCollection',
+    'Document',
+    'AgentCollectionAssignment',
 ]

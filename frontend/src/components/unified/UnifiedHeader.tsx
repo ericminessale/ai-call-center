@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Users,
   Phone,
@@ -56,6 +57,7 @@ export function UnifiedHeader({
   callFabric,
   onOutboundCallStarted,
 }: UnifiedHeaderProps) {
+  const navigate = useNavigate();
   const [showStatusDropdown, setShowStatusDropdown] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showQuickDial, setShowQuickDial] = useState(false);
@@ -189,11 +191,14 @@ export function UnifiedHeader({
             {showUserMenu && (
               <div className="absolute top-full right-0 mt-1 w-48 bg-gray-700 rounded-lg shadow-lg border border-gray-600 py-1 z-50">
                 <button
-                  onClick={() => setShowUserMenu(false)}
+                  onClick={() => {
+                    setShowUserMenu(false);
+                    navigate('/admin');
+                  }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-left text-gray-300 hover:bg-gray-600"
                 >
                   <Settings className="w-4 h-4" />
-                  <span className="text-sm">Settings</span>
+                  <span className="text-sm">Admin Settings</span>
                 </button>
                 <hr className="border-gray-600 my-1" />
                 <button

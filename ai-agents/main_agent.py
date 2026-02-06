@@ -3,6 +3,7 @@
 SignalWire Call Center AI Agents
 Triage agent using contexts/steps - NO problem solving, info gathering only.
 AI Specialists (separate agents) are the ONLY ones that solve problems.
+Includes RAG knowledge base search via pgvector.
 """
 
 from signalwire_agents import AgentBase, AgentServer
@@ -10,12 +11,246 @@ from signalwire_agents.core.function_result import SwaigFunctionResult
 import os
 import json
 import base64
+import re
+import threading
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # Configuration
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://backend:5000')
+DATABASE_URL = os.getenv('DATABASE_URL', '')
+EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
+EMBEDDING_DIM = 384
+
+# Global embedding model (loaded lazily)
+_embedding_model = None
+
+
+def get_embedding_model():
+    """Lazily load the sentence-transformers embedding model."""
+    global _embedding_model
+    if _embedding_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            print(f"Loading embedding model: {EMBEDDING_MODEL_NAME}...", flush=True)
+            _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            print("Embedding model loaded successfully.", flush=True)
+        except ImportError:
+            print("Warning: sentence-transformers not installed. Reindex will not work.", flush=True)
+            return None
+    return _embedding_model
+
+
+def chunk_text(text, max_sentences=5):
+    """Split text into chunks of max_sentences sentences."""
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks = []
+    for i in range(0, len(sentences), max_sentences):
+        chunk = ' '.join(sentences[i:i + max_sentences])
+        if chunk.strip():
+            chunks.append(chunk.strip())
+    if not chunks and text.strip():
+        chunks = [text.strip()]
+    return chunks
+
+
+def do_reindex(collection_name, documents, connection_string):
+    """Reindex documents into pgvector.
+
+    Creates/updates the chunks_{collection_name} table with embeddings.
+    """
+    import psycopg2
+    from psycopg2.extras import execute_values
+
+    model = get_embedding_model()
+    if model is None:
+        raise RuntimeError("Embedding model not available")
+
+    conn = psycopg2.connect(connection_string)
+    cur = conn.cursor()
+
+    table_name = f"chunks_{collection_name}"
+
+    # Ensure pgvector extension is enabled
+    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+    # Create chunks table if needed
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id SERIAL PRIMARY KEY,
+            content TEXT NOT NULL,
+            processed_content TEXT,
+            embedding vector({EMBEDDING_DIM}),
+            filename TEXT,
+            section TEXT,
+            tags JSONB DEFAULT '[]'::jsonb,
+            metadata JSONB DEFAULT '{{}}'::jsonb,
+            metadata_text TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+    # Create collection_config table if needed
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS collection_config (
+            collection_name TEXT PRIMARY KEY,
+            model_name TEXT,
+            embedding_dimensions INTEGER,
+            chunking_strategy TEXT,
+            languages JSONB,
+            created_at TIMESTAMP DEFAULT NOW(),
+            metadata JSONB DEFAULT '{}'::jsonb
+        )
+    """)
+
+    # Clear existing chunks for this collection
+    cur.execute(f"DELETE FROM {table_name}")
+
+    # Process each document
+    total_chunks = 0
+    for doc in documents:
+        chunks = chunk_text(doc['content'])
+        if not chunks:
+            continue
+
+        # Generate embeddings for all chunks at once
+        embeddings = model.encode(chunks)
+
+        # Prepare values for bulk insert
+        values = []
+        for chunk_content, embedding in zip(chunks, embeddings):
+            values.append((
+                chunk_content,
+                chunk_content.lower(),
+                embedding.tolist(),
+                doc['title'],
+                doc['title'],
+                json.dumps([]),
+                json.dumps({'title': doc['title']}),
+                doc['title'].lower(),
+            ))
+
+        execute_values(cur, f"""
+            INSERT INTO {table_name}
+            (content, processed_content, embedding, filename, section, tags, metadata, metadata_text)
+            VALUES %s
+        """, values, template="(%s, %s, %s::vector, %s, %s, %s::jsonb, %s::jsonb, %s)")
+
+        total_chunks += len(chunks)
+
+    # Update collection config
+    cur.execute("""
+        INSERT INTO collection_config (collection_name, model_name, embedding_dimensions, chunking_strategy)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (collection_name) DO UPDATE SET
+            model_name = EXCLUDED.model_name,
+            embedding_dimensions = EXCLUDED.embedding_dimensions,
+            chunking_strategy = EXCLUDED.chunking_strategy
+    """, (collection_name, EMBEDDING_MODEL_NAME, EMBEDDING_DIM, 'sentence'))
+
+    # Create text search index if not exists
+    try:
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_{collection_name}_content_trgm
+            ON {table_name} USING gin (content gin_trgm_ops)
+        """)
+    except Exception:
+        pass
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(f"Reindexed {total_chunks} chunks for collection '{collection_name}'", flush=True)
+    return total_chunks
+
+
+def get_assigned_collection(agent_id):
+    """Query backend for this agent's assigned collection name."""
+    import requests
+    try:
+        resp = requests.get(
+            f"{BACKEND_URL}/api/admin/agent-assignments",
+            params={'agent_id': agent_id},
+            timeout=5,
+        )
+        if resp.ok:
+            assignments = resp.json().get('assignments', [])
+            if assignments:
+                return assignments[0].get('collection_name')
+    except Exception as e:
+        print(f"Warning: Could not fetch collection assignment for {agent_id}: {e}", flush=True)
+    return None
+
+
+def add_knowledge_search(agent, agent_id, fallback_collection=None):
+    """Add native_vector_search skill to an agent if a collection is assigned."""
+    if not DATABASE_URL:
+        print(f"Warning: DATABASE_URL not set, skipping knowledge search for {agent_id}", flush=True)
+        return
+
+    collection = get_assigned_collection(agent_id) or fallback_collection
+    if not collection:
+        print(f"No collection assigned to {agent_id}, skipping knowledge search", flush=True)
+        return
+
+    try:
+        agent.add_skill("native_vector_search", {
+            "tool_name": "search_knowledge",
+            "backend": "pgvector",
+            "connection_string": DATABASE_URL,
+            "collection_name": collection,
+            "description": f"Search the knowledge base for relevant information. Use this when the customer asks questions about products, services, troubleshooting, or anything you need to look up.",
+            "count": 5,
+            "build_index": False,
+        })
+        print(f"Added knowledge search for {agent_id} -> collection '{collection}'", flush=True)
+    except Exception as e:
+        print(f"Warning: Failed to add knowledge search for {agent_id}: {e}", flush=True)
+
+
+def start_admin_api():
+    """Start a lightweight FastAPI server for admin operations (reindex)."""
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+    import uvicorn
+
+    admin_app = FastAPI(title="AI Agents Admin API")
+
+    @admin_app.post("/reindex")
+    async def reindex(request: Request):
+        try:
+            data = await request.json()
+            collection_name = data.get('collection_name')
+            documents = data.get('documents', [])
+
+            if not collection_name:
+                return JSONResponse({'error': 'collection_name is required'}, status_code=400)
+            if not documents:
+                return JSONResponse({'error': 'No documents provided'}, status_code=400)
+            if not DATABASE_URL:
+                return JSONResponse({'error': 'DATABASE_URL not configured'}, status_code=500)
+
+            chunks_indexed = do_reindex(collection_name, documents, DATABASE_URL)
+
+            return JSONResponse({
+                'success': True,
+                'collection_name': collection_name,
+                'documents_processed': len(documents),
+                'chunks_indexed': chunks_indexed,
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({'error': str(e)}, status_code=500)
+
+    @admin_app.get("/admin/health")
+    async def admin_health():
+        return {"status": "healthy", "service": "ai-agents-admin"}
+
+    uvicorn.run(admin_app, host="0.0.0.0", port=8081, log_level="info")
 
 
 def get_base_url_from_global_data(raw_data: dict) -> str:
@@ -33,7 +268,11 @@ def get_base_url_from_global_data(raw_data: dict) -> str:
 
 
 def capture_base_url(query_params, body_params, headers, agent):
-    """Dynamic config callback - captures external URL and sets post_prompt_url."""
+    """Dynamic config callback - captures external URL and sets post_prompt_url.
+
+    Also reads 'ctx' query param (base64-encoded JSON) to inject customer context
+    as global_data for outbound AI calls.
+    """
     existing_global = body_params.get('global_data', {})
     new_global = {}
     base_url = None
@@ -61,6 +300,16 @@ def capture_base_url(query_params, body_params, headers, agent):
     if base_url:
         post_prompt_url = f"{base_url}/api/webhooks/post-prompt"
         agent.set_post_prompt_url(post_prompt_url)
+
+    # Read context from query params (for outbound AI calls)
+    ctx_param = query_params.get('ctx')
+    if ctx_param:
+        try:
+            ctx_data = json.loads(base64.urlsafe_b64decode(ctx_param).decode())
+            print(f"Received outbound context: {ctx_data}", flush=True)
+            new_global.update(ctx_data)
+        except Exception as e:
+            print(f"Warning: Failed to decode ctx param: {e}", flush=True)
 
     if new_global:
         agent.set_global_data(new_global)
@@ -371,6 +620,7 @@ class SalesAISpecialist(AgentBase):
     """
     AI Sales Specialist - This agent DOES help with sales inquiries.
     Only reached after customer explicitly chooses AI assistance.
+    Has RAG knowledge base search via pgvector.
     """
 
     def __init__(self):
@@ -386,6 +636,9 @@ class SalesAISpecialist(AgentBase):
         })
 
         self.set_dynamic_config_callback(capture_base_url)
+
+        # Add knowledge base search (pgvector RAG)
+        add_knowledge_search(self, 'sales-ai', fallback_collection='sales_knowledge')
 
         self.set_post_prompt("""
 Summarize this sales consultation and return a JSON object with:
@@ -481,6 +734,7 @@ class SupportAISpecialist(AgentBase):
     """
     AI Support Specialist - This agent DOES troubleshoot and solve problems.
     Only reached after customer explicitly chooses AI assistance.
+    Has RAG knowledge base search via pgvector.
     """
 
     def __init__(self):
@@ -496,6 +750,9 @@ class SupportAISpecialist(AgentBase):
         })
 
         self.set_dynamic_config_callback(capture_base_url)
+
+        # Add knowledge base search (pgvector RAG)
+        add_knowledge_search(self, 'support-ai', fallback_collection='support_knowledge')
 
         self.set_post_prompt("""
 Summarize this support consultation and return a JSON object with:
@@ -601,39 +858,322 @@ Summarize this support consultation and return a JSON object with:
         return result
 
 
+# ============================================================
+# OUTBOUND AI AGENTS
+# Used when an agent sends an AI agent to call a customer.
+# These receive CRM context (name, company, tier, notes) via
+# global_data, set from the ?ctx= query param.
+# ============================================================
+
+class OutboundSalesAgent(AgentBase):
+    """
+    Outbound AI Sales Agent - proactively calls customers for sales outreach.
+    Receives customer context from the call center dashboard.
+    Has RAG knowledge base search via pgvector.
+    """
+
+    def __init__(self):
+        super().__init__(
+            name="OutboundSalesAgent",
+            route="/outbound-sales",
+            auto_answer=True
+        )
+
+        self.set_params({
+            "wait_for_user": False,
+            "end_of_speech_timeout": 1000
+        })
+
+        self.set_dynamic_config_callback(capture_base_url)
+
+        # Add knowledge base search (pgvector RAG)
+        add_knowledge_search(self, 'outbound-sales', fallback_collection='sales_knowledge')
+
+        self.set_post_prompt("""
+Summarize this outbound sales call and return a JSON object with:
+{
+    "customer_name": "Name of customer called",
+    "company": "Company name if known",
+    "products_discussed": ["List of products/services discussed"],
+    "customer_interest_level": "high/medium/low/none",
+    "next_steps": "Recommended follow-up actions",
+    "outcome": "interested/callback_requested/not_interested/no_answer/voicemail"
+}
+""")
+
+        self.prompt_add_section(
+            "Role",
+            "You are Alex, a friendly and professional AI sales representative making an outbound call. "
+            "You are calling on behalf of the company to connect with this customer."
+        )
+
+        self.prompt_add_section(
+            "Customer Information",
+            "Customer name: ${global_data.contact_name}\n"
+            "Company: ${global_data.company}\n"
+            "Account tier: ${global_data.account_tier}\n"
+            "VIP customer: ${global_data.is_vip}\n"
+            "Previous interactions: ${global_data.total_calls} calls\n"
+            "Notes: ${global_data.notes}\n"
+            "Special instructions: ${global_data.additional_context}"
+        )
+
+        self.prompt_add_section(
+            "Call Approach",
+            "You are making a proactive outbound call. Guidelines:",
+            bullets=[
+                "Introduce yourself and the company right away",
+                "Address the customer by name",
+                "If there are special instructions, follow them",
+                "Be respectful of their time — ask if now is a good moment",
+                "If they're a VIP or enterprise customer, acknowledge their importance",
+                "Tailor your pitch based on their account tier and history",
+                "If they have notes from previous interactions, reference them naturally"
+            ]
+        )
+
+        self.prompt_add_section(
+            "What You CAN Do",
+            "You are empowered to:",
+            bullets=[
+                "Discuss products, services, features, and pricing",
+                "Make personalized recommendations",
+                "Schedule follow-up calls or demos",
+                "Answer questions about the company's offerings",
+                "Offer promotional deals if appropriate"
+            ]
+        )
+
+        self.prompt_add_section(
+            "Escalation",
+            "If they want to speak with a human representative, "
+            "or need help beyond sales, use the transfer_to_human tool."
+        )
+
+        self.define_tool(
+            name="transfer_to_human",
+            description="Connect to a human sales representative when the customer requests it",
+            parameters={
+                "reason": {"type": "string", "description": "Reason for transfer"}
+            },
+            handler=self.transfer_to_human
+        )
+
+    def _check_basic_auth(self, request) -> bool:
+        return True
+
+    def transfer_to_human(self, args, raw_data):
+        """Transfer to human sales rep"""
+        reason = args.get("reason", "")
+        base_url = get_base_url_from_global_data(raw_data)
+        global_data = raw_data.get('global_data', {})
+
+        context_data = {
+            'customer_name': global_data.get('contact_name', ''),
+            'company': global_data.get('company', ''),
+            'department': 'sales',
+            'reason': reason,
+            'urgency': 'medium',
+            'priority': 5,
+            'additional_info': global_data.get('additional_context', ''),
+            'escalated_from': 'outbound_sales_agent',
+            'preferred_handling': 'human',
+            'source_agent': 'outbound_sales_agent'
+        }
+
+        context_json = json.dumps(context_data)
+        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
+        queue_url = f"{base_url}/api/queues/sales/route?ctx={context_b64}"
+
+        print(f"Outbound sales transferring to human: {queue_url}", flush=True)
+
+        result = SwaigFunctionResult(
+            "I'll connect you with a sales representative right away."
+        )
+        result.update_global_data(context_data)
+        result.swml_transfer(queue_url, "", final=True)
+        return result
+
+
+class OutboundSupportAgent(AgentBase):
+    """
+    Outbound AI Support Agent - proactively calls customers for support follow-ups.
+    Receives customer context from the call center dashboard.
+    Has RAG knowledge base search via pgvector.
+    """
+
+    def __init__(self):
+        super().__init__(
+            name="OutboundSupportAgent",
+            route="/outbound-support",
+            auto_answer=True
+        )
+
+        self.set_params({
+            "wait_for_user": False,
+            "end_of_speech_timeout": 1000
+        })
+
+        self.set_dynamic_config_callback(capture_base_url)
+
+        # Add knowledge base search (pgvector RAG)
+        add_knowledge_search(self, 'outbound-support', fallback_collection='support_knowledge')
+
+        self.set_post_prompt("""
+Summarize this outbound support call and return a JSON object with:
+{
+    "customer_name": "Name of customer called",
+    "company": "Company name if known",
+    "issue_discussed": "What was discussed",
+    "resolution": "How it was resolved, or null",
+    "resolved": true/false,
+    "follow_up_needed": true/false,
+    "outcome": "resolved/escalated/callback_requested/no_answer/voicemail"
+}
+""")
+
+        self.prompt_add_section(
+            "Role",
+            "You are Jordan, a friendly and professional AI support specialist making an outbound call. "
+            "You are proactively reaching out to help this customer."
+        )
+
+        self.prompt_add_section(
+            "Customer Information",
+            "Customer name: ${global_data.contact_name}\n"
+            "Company: ${global_data.company}\n"
+            "Account tier: ${global_data.account_tier}\n"
+            "VIP customer: ${global_data.is_vip}\n"
+            "Previous interactions: ${global_data.total_calls} calls\n"
+            "Notes: ${global_data.notes}\n"
+            "Special instructions: ${global_data.additional_context}"
+        )
+
+        self.prompt_add_section(
+            "Call Approach",
+            "You are making a proactive outbound support call. Guidelines:",
+            bullets=[
+                "Introduce yourself and explain why you're calling",
+                "Address the customer by name",
+                "If there are special instructions, follow them",
+                "Be respectful of their time — ask if now is a good moment",
+                "If they're a VIP or enterprise customer, prioritize their experience",
+                "Reference their history and any notes from previous interactions",
+                "Be empathetic and solution-oriented"
+            ]
+        )
+
+        self.prompt_add_section(
+            "What You CAN Do",
+            "You are empowered to:",
+            bullets=[
+                "Troubleshoot and diagnose technical issues",
+                "Walk through solutions step by step",
+                "Provide product guidance and best practices",
+                "Schedule follow-up calls if more time is needed",
+                "Escalate to human support for complex issues"
+            ]
+        )
+
+        self.prompt_add_section(
+            "Escalation",
+            "If you can't resolve their issue, or they want to speak with a human, "
+            "use the transfer_to_human tool."
+        )
+
+        self.define_tool(
+            name="transfer_to_human",
+            description="Connect to a human support specialist when needed",
+            parameters={
+                "reason": {"type": "string", "description": "Reason for transfer"}
+            },
+            handler=self.transfer_to_human
+        )
+
+    def _check_basic_auth(self, request) -> bool:
+        return True
+
+    def transfer_to_human(self, args, raw_data):
+        """Transfer to human support"""
+        reason = args.get("reason", "")
+        base_url = get_base_url_from_global_data(raw_data)
+        global_data = raw_data.get('global_data', {})
+
+        context_data = {
+            'customer_name': global_data.get('contact_name', ''),
+            'company': global_data.get('company', ''),
+            'department': 'support',
+            'reason': reason,
+            'urgency': 'medium',
+            'priority': 5,
+            'additional_info': global_data.get('additional_context', ''),
+            'escalated_from': 'outbound_support_agent',
+            'preferred_handling': 'human',
+            'source_agent': 'outbound_support_agent'
+        }
+
+        context_json = json.dumps(context_data)
+        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
+        queue_url = f"{base_url}/api/queues/support/route?ctx={context_b64}"
+
+        print(f"Outbound support transferring to human: {queue_url}", flush=True)
+
+        result = SwaigFunctionResult(
+            "I'll connect you with a support specialist right away."
+        )
+        result.update_global_data(context_data)
+        result.swml_transfer(queue_url, "", final=True)
+        return result
+
+
 if __name__ == '__main__':
     print('=' * 60)
-    print('SignalWire AI Call Center - Triage + Specialists')
+    print('SignalWire AI Call Center - Triage + Specialists + Outbound')
+    print('  with RAG Knowledge Base (pgvector)')
     print('=' * 60)
+
+    # Start admin API server (reindex endpoint) in background thread
+    print('\nStarting admin API on port 8081...', flush=True)
+    admin_thread = threading.Thread(target=start_admin_api, daemon=True)
+    admin_thread.start()
 
     server = AgentServer(host='0.0.0.0', port=8080)
 
     # Triage agent - info gathering ONLY
     triage = CallCenterTriageAgent()
 
-    # Specialist agents - these actually solve problems
+    # Specialist agents - these actually solve problems (inbound transfer targets)
+    # Each gets RAG knowledge search from their assigned pgvector collection
     sales_ai = SalesAISpecialist()
     support_ai = SupportAISpecialist()
+
+    # Outbound agents - proactive calls with CRM context
+    # Also get RAG knowledge search
+    outbound_sales = OutboundSalesAgent()
+    outbound_support = OutboundSupportAgent()
 
     # Register agents
     server.register(triage, '/receptionist')
     server.register(sales_ai, '/sales-ai')
     server.register(support_ai, '/support-ai')
+    server.register(outbound_sales, '/outbound-sales')
+    server.register(outbound_support, '/outbound-support')
 
     username, password = triage.get_basic_auth_credentials()
 
     print('\nAuthentication:')
     print(f'  Username: {username}')
     print(f'  Password: {password}')
-    print('\nRoutes:')
+    print('\nRoutes (Inbound):')
     print('  /receptionist : Triage agent (NO problem solving)')
-    print('  /sales-ai     : Sales specialist (helps with sales)')
-    print('  /support-ai   : Support specialist (troubleshoots issues)')
-    print('\nFlow:')
-    print('  1. /receptionist gets name, purpose, brief context')
-    print('  2. Customer chooses human or AI')
-    print('  3. Human -> queue, AI -> specialist agent')
-    print('  4. ONLY specialist agents solve problems')
-    print('\nStarting server...\n')
+    print('  /sales-ai     : Sales specialist (helps with sales + RAG)')
+    print('  /support-ai   : Support specialist (troubleshoots + RAG)')
+    print('\nRoutes (Outbound):')
+    print('  /outbound-sales   : Outbound sales (proactive + RAG)')
+    print('  /outbound-support : Outbound support (proactive + RAG)')
+    print('\nAdmin API:')
+    print('  POST /reindex : Reindex documents into pgvector (port 8081)')
+    print(f'\nDatabase: {DATABASE_URL[:50]}...' if DATABASE_URL else '\nDatabase: NOT CONFIGURED')
+    print('\nStarting agent server on port 8080...\n')
 
     server.run()

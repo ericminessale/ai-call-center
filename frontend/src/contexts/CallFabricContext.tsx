@@ -1609,6 +1609,18 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     setAgentConference(value);
   };
 
+  // Auto-transition agent status based on call lifecycle
+  // available → busy when call connects, busy → after-call when call ends
+  useEffect(() => {
+    if (callState === 'active' && agentStatus === 'available') {
+      console.log('🔄 [CallFabric] Auto-transition: available → busy (call active)');
+      setAgentStatus('busy');
+    } else if (callState === 'idle' && agentStatus === 'busy') {
+      console.log('🔄 [CallFabric] Auto-transition: busy → after-call (call ended)');
+      setAgentStatus('after-call');
+    }
+  }, [callState, agentStatus]);
+
   // Handle auto-restore when client is initialized
   // This handles page refresh: if agent was 'available', restore their online status
   // In per-interaction model, we just go online - no conference join until call assignment

@@ -3,3 +3,7 @@ fastapi
 uvicorn[standard]
 python-dotenv
 requests
+psycopg2-binary
+pgvector
+sentence-transformers
+nltk

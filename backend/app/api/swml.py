@@ -2,6 +2,7 @@ from flask import request, jsonify
 from app import db, redis_client
 from app.api import swml_bp
 from app.models import Call, CallLeg, WebhookEvent, User, Conference, ConferenceParticipant
+from app.models.system_config import SystemConfig
 from app.utils.url_utils import get_base_url
 import logging
 import json
@@ -165,8 +166,12 @@ def initial_call():
     base_url = get_base_url()
     logger.info(f"Using base URL: {base_url}")
 
-    # WORKING APPROACH: Transfer directly to AI agent
-    # Conference is only used when AI transfers to human agent
+    # Read routing config from database (admin-configurable)
+    initial_handler = SystemConfig.get('route.initial_handler', '/receptionist')
+    sales_specialist = SystemConfig.get('route.sales_specialist', '/sales-ai')
+    support_specialist = SystemConfig.get('route.support_specialist', '/support-ai')
+
+    # Transfer to configurable AI agent with routing config in global_data
     swml_response = {
         "version": "1.0.0",
         "sections": {
@@ -200,10 +205,10 @@ def initial_call():
                         }
                     }
                 },
-                # Transfer directly to AI agent
+                # Transfer to admin-configured AI agent
                 {
                     "transfer": {
-                        "dest": f"{base_url}/receptionist"
+                        "dest": f"{base_url}{initial_handler}"
                     }
                 }
             ]

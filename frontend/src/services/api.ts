@@ -200,6 +200,43 @@ export const contactsApi = {
     api.get<{ contacts: ContactMinimal[] }>('/api/contacts/active'),
 };
 
+// Admin API
+export const adminApi = {
+  // Agent routing config
+  getAgentConfig: () =>
+    api.get('/api/admin/agent-config'),
+  updateAgentConfig: (config: Record<string, string>) =>
+    api.put('/api/admin/agent-config', config),
+
+  // Document collections
+  getCollections: () =>
+    api.get('/api/admin/collections'),
+  createCollection: (data: { name: string; display_name: string; description?: string }) =>
+    api.post('/api/admin/collections', data),
+  updateCollection: (id: number, data: { display_name?: string; description?: string }) =>
+    api.put(`/api/admin/collections/${id}`, data),
+  deleteCollection: (id: number) =>
+    api.delete(`/api/admin/collections/${id}`),
+
+  // Documents
+  getDocuments: (collectionId: number) =>
+    api.get(`/api/admin/collections/${collectionId}/documents`),
+  createDocument: (collectionId: number, data: { title: string; content: string }) =>
+    api.post(`/api/admin/collections/${collectionId}/documents`, data),
+  updateDocument: (id: number, data: { title?: string; content?: string }) =>
+    api.put(`/api/admin/documents/${id}`, data),
+  deleteDocument: (id: number) =>
+    api.delete(`/api/admin/documents/${id}`),
+  reindexCollection: (id: number) =>
+    api.post(`/api/admin/collections/${id}/reindex`),
+
+  // Agent-collection assignments
+  getAgentAssignments: () =>
+    api.get('/api/admin/agent-assignments'),
+  updateAgentAssignments: (assignments: { assignments: Array<{ agent_id: string; collection_id: number }> }) =>
+    api.put('/api/admin/agent-assignments', assignments),
+};
+
 // WebSocket service - now uses a shared socket from SocketContext
 // This is a legacy compatibility layer. Prefer using useSocketContext() in components.
 class SocketService {

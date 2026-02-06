@@ -1305,7 +1305,7 @@ def outbound_answer_webhook(conference_name):
                     "join_conference": {
                         "name": conference_name,
                         "start_on_enter": False,  # Agent should already be there
-                        "end_on_exit": False,     # Don't end conf when customer leaves
+                        "end_on_exit": True,      # End conference when customer hangs up
                         "beep": "onEnter",        # Beep when customer joins
                         "status_callback": status_callback,
                         "status_callback_event": "join leave"

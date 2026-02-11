@@ -545,6 +545,10 @@ def initiate_outbound_ai_call():
         call.status = 'ai_active'
         db.session.commit()
 
+        # Emit socket event so the dashboard sees this call immediately
+        from app.services.callcenter_socketio import emit_call_update
+        emit_call_update(call)
+
         logger.info(f"Outbound AI call initiated: {call_sid} (db id: {call.id})")
 
         return jsonify({

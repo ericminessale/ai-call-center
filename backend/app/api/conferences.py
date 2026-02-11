@@ -1374,4 +1374,16 @@ def call_state_webhook(conference_name):
         # Emit update to frontend
         emit_call_update(call)
 
+        # Emit call_ended for terminal states (matches webhooks.py pattern)
+        if new_status in ['ended', 'failed', 'completed']:
+            from app import socketio
+            call_ended_data = {
+                'callId': call.id,
+                'call_sid': call.signalwire_call_sid,
+                'reset_ui': True
+            }
+            if call.user_id:
+                socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
+            socketio.emit('call_ended', call_ended_data)
+
     return jsonify({'status': 'ok'})

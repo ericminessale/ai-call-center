@@ -230,6 +230,39 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     return () => clearInterval(interval);
   }, [activeCall]);
 
+  // Listen for call end events via WebSocket (clears local call state when remote party hangs up)
+  useEffect(() => {
+    if (!socket || !currentCallSid) return;
+
+    const handleCallUpdate = (data: { call: any }) => {
+      const call = data.call;
+      if (!call) return;
+      const callSid = call.call_sid || call.signalwire_call_sid || call.signalwireCallSid;
+      if (callSid === currentCallSid && ['ended', 'completed', 'failed'].includes(call.status)) {
+        console.log('📞 [ContactDetail] Call ended via socket event, clearing local state');
+        setCurrentCallSid(null);
+        setIsAICall(false);
+        loadInteractions();
+      }
+    };
+
+    const handleCallEnded = (data: { call_sid?: string; callId?: number }) => {
+      if (data.call_sid === currentCallSid) {
+        console.log('📞 [ContactDetail] call_ended event received, clearing local state');
+        setCurrentCallSid(null);
+        setIsAICall(false);
+        loadInteractions();
+      }
+    };
+
+    socket.on('call_update', handleCallUpdate);
+    socket.on('call_ended', handleCallEnded);
+    return () => {
+      socket.off('call_update', handleCallUpdate);
+      socket.off('call_ended', handleCallEnded);
+    };
+  }, [socket, currentCallSid]);
+
   // Listen for transcription updates via WebSocket
   useEffect(() => {
     if (!effectiveCallSid || !socket) return;

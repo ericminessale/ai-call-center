@@ -3,6 +3,7 @@ from app import db, socketio
 from app.api import webhooks_bp
 from app.models import Call, CallLeg, Transcription, WebhookEvent
 from app.services.redis_service import publish_event
+from datetime import datetime
 import logging
 import json
 
@@ -454,8 +455,16 @@ def post_prompt():
             if raw_summary and not call.summary:
                 call.summary = raw_summary
 
+            # post_prompt fires when the AI conversation ends — mark the call as ended
+            # so the frontend can clean up, even if the call-status webhook is delayed
+            if call.status not in ('ended', 'completed'):
+                call.status = 'completed'
+                call.ended_at = call.ended_at or datetime.utcnow()
+                if call.answered_at:
+                    call.duration = int((call.ended_at - call.answered_at).total_seconds())
+
             db.session.commit()
-            logger.info(f"✓ Updated call {call.id} with post_prompt data")
+            logger.info(f"✓ Updated call {call.id} with post_prompt data (status: {call.status})")
 
             # Log the webhook event
             WebhookEvent.log_event(
@@ -464,15 +473,19 @@ def post_prompt():
                 call_id=call.id
             )
 
-            # Emit update via WebSocket for real-time UI update
-            socketio.emit('call_update', {
-                'call': {
-                    'id': call.id,
-                    'call_sid': call_id,
-                    'aiContext': merged_context,
-                    'summary': call.summary
-                }
-            }, room=str(call.user_id))
+            # Emit full call_update so frontend can remove from active calls
+            from app.services.callcenter_socketio import emit_call_update
+            emit_call_update(call)
+
+            # Emit call_ended for UI cleanup (matches the pattern in call-status webhook)
+            call_ended_data = {
+                'callId': call.id,
+                'call_sid': call_id,
+                'reset_ui': True
+            }
+            if call.user_id:
+                socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
+            socketio.emit('call_ended', call_ended_data)
 
             # Also emit to call room
             socketio.emit('post_prompt_received', {

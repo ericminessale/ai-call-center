@@ -206,6 +206,9 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // Ref to track the original call SID during a takeover (for socket-based cleanup)
   const takeoverCallSidRef = useRef<string | null>(null);
 
+  // Ref to track the outbound dialed call's DB ID (for cleanup when SDK fires destroy)
+  const outboundDialCallIdRef = useRef<number | null>(null);
+
   // Ref for leaveConference to avoid circular dependency in setAgentStatus
   const leaveAgentConferenceRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
@@ -635,6 +638,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const data = await response.json();
       console.log('✅ [CallFabric] Dial-out initiated:', data);
 
+      // Track the outbound call DB ID for cleanup (in case SDK destroy fires
+      // before the backend's call_state_webhook delivers the 'ended' event)
+      if (data.call_id) {
+        outboundDialCallIdRef.current = data.call_id;
+      }
+
       // The call is being placed by the server, not the browser
       // The agent is already in the conference and will hear the call when answered
       // Set callState to 'ringing' for immediate UI feedback
@@ -713,6 +722,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           });
 
           // Set up call event handlers
+          let outboundCallDbId: number | null = null; // Populated after dial-out, used in destroy handler
           let hasMarkedActive = false;
           const markActive = () => {
             if (hasMarkedActive) return;
@@ -737,6 +747,13 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
               setAgentConference(null);
               agentConferenceRef.current = null;
               setConnectedCustomer(null);
+
+              // Ensure backend marks the outbound call as ended
+              const callId = outboundCallDbId || outboundDialCallIdRef.current;
+              if (callId) {
+                console.log('📞 [CallFabric] Marking outbound call as ended in backend:', callId);
+                callsApi.updateStatus(callId, 'ended').catch(() => {});
+              }
             }
           });
 
@@ -755,6 +772,15 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
             setAgentConference(null);
             agentConferenceRef.current = null;
             setConnectedCustomer(null);
+
+            // Ensure backend marks the outbound call as ended so the socket
+            // event fires and activeCalls gets cleaned up in the UI.
+            // The call_state_webhook from SignalWire may be delayed or not arrive.
+            const callId = outboundCallDbId || outboundDialCallIdRef.current;
+            if (callId) {
+              console.log('📞 [CallFabric] Marking outbound call as ended in backend:', callId);
+              callsApi.updateStatus(callId, 'ended').catch(() => {});
+            }
           });
 
           // Track the call
@@ -815,6 +841,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
           console.log('✅ [CallFabric] In conference, dialing out...');
           const result = await dialOutToConference(confName, context?.contact_id);
+          outboundCallDbId = result.call_id; // Store for cleanup in destroy handler
           return result;
 
         } finally {
@@ -1908,6 +1935,18 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // so we only need socket in dependencies
   }, [socket]);
 
+  // When the agent leaves a conference, ensure any tracked outbound dial call
+  // is marked as ended in the backend. This handles all conference types (Case 1
+  // where agent was already in conference, Case 2 outbound conference, queue calls, etc.)
+  useEffect(() => {
+    if (!isInConference && outboundDialCallIdRef.current) {
+      const callId = outboundDialCallIdRef.current;
+      console.log('📞 [CallFabric] Conference ended, marking outbound dial call as ended:', callId);
+      callsApi.updateStatus(callId, 'ended').catch(() => {});
+      outboundDialCallIdRef.current = null;
+    }
+  }, [isInConference]);
+
   // Socket-based cleanup for calls where the Call Fabric SDK doesn't fire 'destroy'
   // This handles two scenarios:
   // 1. Takeover calls: SWML connect verb doesn't fire destroy when customer hangs up
@@ -1930,6 +1969,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       setActiveCall(null);
       activeCallRef.current = null;
       takeoverCallSidRef.current = null;
+      outboundDialCallIdRef.current = null;
 
       // Reset conference state (for outbound conference calls)
       setIsInConference(false);
@@ -1945,6 +1985,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       if (takeoverCallSidRef.current && data.call_sid === takeoverCallSidRef.current) {
         cleanupSdkState('takeover call ended');
       }
+      // Match outbound dialed calls by DB ID
+      if (outboundDialCallIdRef.current && data.callId === outboundDialCallIdRef.current) {
+        cleanupSdkState('outbound dial call ended');
+      }
     };
 
     const handleCallUpdate = (data: { call: any }) => {
@@ -1953,9 +1997,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
       const isEnded = ['ended', 'completed'].includes(call.status);
       if (!isEnded) return;
-
-      // Don't clean up if we don't have an active call in the SDK
-      if (!activeCallRef.current) return;
 
       // Match 1: Takeover calls by call SID
       if (takeoverCallSidRef.current) {
@@ -1971,6 +2012,14 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const currentConf = agentConferenceRef.current;
       if (currentConf && call.conference_name === currentConf.conferenceName) {
         cleanupSdkState(`conference call ended: ${currentConf.conferenceName}`);
+        return;
+      }
+
+      // Match 3: Outbound dialed call by DB ID
+      // This handles the case where the SDK already fired 'destroy' (clearing
+      // activeCallRef and agentConferenceRef) before the socket event arrives
+      if (outboundDialCallIdRef.current && call.id === outboundDialCallIdRef.current) {
+        cleanupSdkState(`outbound dial call_update ended: ${call.id}`);
         return;
       }
     };

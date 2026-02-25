@@ -1,18 +1,34 @@
 from flask import request, jsonify
 from app import db
 from app.api import admin_bp
-from app.models import Call, Transcription
+from app.models import Call, Transcription, User
 from app.models.system_config import SystemConfig
 from app.models.document import DocumentCollection, Document, AgentCollectionAssignment
 from app.utils.decorators import require_auth
 import logging
 import requests as http_requests
 import os
+from base64 import b64encode
 
 logger = logging.getLogger(__name__)
 
 # AI agents URL for internal communication (port 8081 for admin/reindex API)
 AI_AGENTS_ADMIN_URL = os.getenv('AI_AGENTS_ADMIN_URL', 'http://ai-agents:8081')
+
+# SignalWire API credentials for subscriber management
+SIGNALWIRE_SPACE = os.getenv('SIGNALWIRE_SPACE')
+SIGNALWIRE_PROJECT_KEY = os.getenv('SIGNALWIRE_PROJECT_ID')
+SIGNALWIRE_TOKEN = os.getenv('SIGNALWIRE_API_TOKEN')
+
+
+def _get_sw_auth_headers():
+    """Get authentication headers for SignalWire API."""
+    credentials = f"{SIGNALWIRE_PROJECT_KEY}:{SIGNALWIRE_TOKEN}"
+    auth = b64encode(credentials.encode()).decode('ascii')
+    return {
+        'Content-Type': 'application/json',
+        'Authorization': f'Basic {auth}'
+    }
 
 
 # =============================================================================
@@ -454,3 +470,83 @@ def update_agent_assignments():
         db.session.rollback()
         logger.error(f"Failed to update agent assignments: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# User Management
+# =============================================================================
+
+@admin_bp.route('/users', methods=['GET'])
+@require_auth
+def list_users():
+    """List all users for admin management."""
+    try:
+        users = User.query.order_by(User.created_at.desc()).all()
+        return jsonify({
+            'users': [u.to_dict() for u in users]
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to list users: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/users/<int:user_id>', methods=['DELETE'])
+@require_auth
+def delete_user(user_id):
+    """Delete a user, their SignalWire subscriber, and clean up FK references."""
+    try:
+        # Prevent self-deletion
+        if request.current_user.id == user_id:
+            return jsonify({'error': 'Cannot delete your own account'}), 400
+
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        user_email = user.email
+
+        # Step 1: Delete SignalWire Call Fabric subscriber if one exists
+        sw_delete_error = None
+        if user.signalwire_subscriber_id and SIGNALWIRE_SPACE:
+            try:
+                url = f"https://{SIGNALWIRE_SPACE}/api/fabric/subscribers/{user.signalwire_subscriber_id}"
+                resp = http_requests.delete(url, headers=_get_sw_auth_headers(), timeout=10)
+                if resp.status_code in [200, 204, 404]:
+                    logger.info(f"SignalWire subscriber {user.signalwire_subscriber_id} deleted (status {resp.status_code})")
+                else:
+                    sw_delete_error = f"SignalWire subscriber delete returned {resp.status_code}"
+                    logger.warning(sw_delete_error)
+            except Exception as e:
+                sw_delete_error = f"Failed to reach SignalWire: {str(e)}"
+                logger.warning(sw_delete_error)
+            # Continue with local deletion regardless
+
+        # Step 2: Nullify FK references that would break on delete
+        from app.models.call_leg import CallLeg
+        from app.models.conference import Conference
+
+        Call.query.filter_by(assigned_agent_id=user_id).update({'assigned_agent_id': None})
+        CallLeg.query.filter_by(user_id=user_id).update({'user_id': None})
+        Conference.query.filter_by(owner_user_id=user_id).update({'owner_user_id': None})
+        SystemConfig.query.filter_by(updated_by=user_id).update({'updated_by': None})
+
+        # Step 3: Delete the user (cascade handles calls via user_id FK)
+        db.session.delete(user)
+        db.session.commit()
+
+        result = {
+            'success': True,
+            'message': f'User "{user_email}" deleted'
+        }
+        if sw_delete_error:
+            result['sw_warning'] = sw_delete_error
+
+        logger.info(f"User {user_id} ({user_email}) deleted by admin {request.current_user.id}")
+        return jsonify(result), 200
+
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to delete user {user_id}: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': f'Failed to delete user: {str(e)}'}), 500

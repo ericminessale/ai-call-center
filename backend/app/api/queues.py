@@ -42,11 +42,8 @@ def route_call_to_queue(queue_id):
     Returns SWML to place caller on hold while waiting for agent
     """
     try:
-        print(f"🎯 QUEUE ROUTE HIT: /api/queues/{queue_id}/route", flush=True)
+        logger.info(f"Queue route hit: /api/queues/{queue_id}/route")
         data = request.json or {}
-
-        # Debug: Print full request data
-        print(f"📥 FULL REQUEST DATA: {json.dumps(data, default=str)}", flush=True)
         logger.info(f"Queue route received data: {json.dumps(data, default=str)[:1000]}")
 
         # Extract call information from SignalWire webhook
@@ -63,7 +60,6 @@ def route_call_to_queue(queue_id):
             try:
                 ctx_json = base64.urlsafe_b64decode(ctx_param.encode()).decode()
                 url_context = json.loads(ctx_json)
-                print(f"📦 DECODED URL CONTEXT: {json.dumps(url_context, default=str)}", flush=True)
                 logger.info(f"Decoded URL context: {json.dumps(url_context)}")
             except Exception as e:
                 logger.warning(f"Failed to decode ctx param: {e}")
@@ -71,21 +67,14 @@ def route_call_to_queue(queue_id):
         # PRIORITY 2: Get context from request body global_data (backup)
         # The AI agents also set global_data which SignalWire may or may not forward
         global_data = data.get('global_data', {})
-        print(f"📦 BODY GLOBAL_DATA: {json.dumps(global_data, default=str)}", flush=True)
 
         # Merge: URL context takes priority over body global_data
         # This ensures we get the data even if SignalWire doesn't forward global_data
         merged_global_data = {**global_data, **url_context}
         global_data = merged_global_data
 
-        print(f"📦 MERGED CONTEXT: {json.dumps(global_data, default=str)}", flush=True)
-        logger.info(f"Merged context data: {json.dumps(global_data)}")
-
-        # Debug logging to see what we're receiving
-        logger.info(f"=== QUEUE ROUTE DEBUG ===")
-        logger.info(f"Received data keys: {list(data.keys())}")
-        logger.info(f"global_data: {json.dumps(global_data, indent=2)}")
-        logger.info(f"caller_number: {caller_number}, call_id: {call_id}")
+        logger.info(f"Merged context data: {json.dumps(global_data, default=str)}")
+        logger.debug(f"caller_number: {caller_number}, call_id: {call_id}")
 
         context = {
             # Direct fields (legacy support)
@@ -416,8 +405,7 @@ def route_call_to_queue(queue_id):
                 # answering (verto.answer never gets sent). Outbound calls work fine.
                 # So we let the agent dial out instead of receiving an inbound call.
 
-                print(f"📞 Notifying agent {selected_user.id} about call assignment", flush=True)
-                print(f"📞 Conference: {conference_name}", flush=True)
+                logger.info(f"Notifying agent {selected_user.id} about call assignment for conference: {conference_name}")
 
                 # Emit notification so frontend shows the incoming call UI
                 # Agent will dial out to join the conference when they click Accept
@@ -456,7 +444,7 @@ def route_call_to_queue(queue_id):
                         ]
                     }
                 }
-                print(f"📤 Returning SWML (agent found, conference={conference_name}): {json.dumps(swml_response)}", flush=True)
+                logger.info(f"Returning SWML for agent conference: {conference_name}")
                 return jsonify(swml_response)
             else:
                 # No agents with valid Call Fabric addresses
@@ -545,7 +533,7 @@ def route_call_to_queue(queue_id):
                 }
             }
 
-        print(f"📤 Returning SWML (no agents, AI fallback={offer_ai_fallback}): {json.dumps(swml_response)}", flush=True)
+        logger.info(f"Returning SWML (no agents available, AI fallback={offer_ai_fallback})")
         return jsonify(swml_response)
 
     except Exception as e:

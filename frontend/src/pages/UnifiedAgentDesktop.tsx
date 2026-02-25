@@ -10,7 +10,10 @@ import { ContactDetailView } from '../components/contacts/ContactDetailView';
 import { contactsApi, callsApi } from '../services/api';
 import { Contact, ContactMinimal, Call } from '../types/callcenter';
 import { Users } from 'lucide-react';
+import { ContactDetailSkeleton } from '../components/shared/Skeleton';
 import toast from 'react-hot-toast';
+import { logger } from '../lib/logger';
+import { mapCall, mapCalls } from '../lib/mapCall';
 
 // View modes for the unified interface
 export type ViewMode = 'contacts' | 'calls' | 'queue' | 'supervisor';
@@ -46,12 +49,15 @@ export function UnifiedAgentDesktop() {
   // Contact state
   const [contacts, setContacts] = useState<ContactMinimal[]>([]);
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null);
+  const [isLoadingContactDetail, setIsLoadingContactDetail] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoadingContacts, setIsLoadingContacts] = useState(true);
 
   // Call state
   const [activeCalls, setActiveCalls] = useState<Call[]>([]);
   const [queuedCalls, setQueuedCalls] = useState<Call[]>([]);
+  const [isLoadingCalls, setIsLoadingCalls] = useState(true);
+  const [isLoadingQueue, setIsLoadingQueue] = useState(true);
   const [callCounts, setCallCounts] = useState({
     active: 0,
     queue: 0,
@@ -69,15 +75,7 @@ export function UnifiedAgentDesktop() {
 
   // WebSocket subscriptions
   useEffect(() => {
-    console.log('🔌 [UNIFIED] Setting up WebSocket listeners, socket exists:', !!socket, 'socket.id:', socket?.id, 'connected:', socket?.connected);
-    if (!socket) {
-      console.log('❌ [UNIFIED] No socket available, skipping listener setup');
-      return;
-    }
-
-    // IMPORTANT: Register listeners even if not connected yet - they will work once connected
-    // The socket.id check was causing a race condition where listeners were never registered
-    console.log('✅ [UNIFIED] Registering listeners on socket (connected:', socket.connected, ')');
+    if (!socket) return;
 
     // Remove any existing listeners first to prevent duplicates
     socket.off('call_update');
@@ -91,71 +89,30 @@ export function UnifiedAgentDesktop() {
 
     // Handle socket connect/reconnect - reload data when connected
     socket.on('connect', () => {
-      console.log('🔌 [UNIFIED] Socket connected event received, socket.id:', socket.id);
+      logger.debug('[Unified] Socket connected:', socket.id);
     });
 
     // Handle authentication success - reload data
     socket.on('authenticated', () => {
-      console.log('🔐 [UNIFIED] Socket authenticated, reloading data');
+      logger.debug('[Unified] Socket authenticated, reloading data');
       loadActiveCalls();
       loadQueuedCalls();
       updateCallCounts();
     });
 
-    // Call updates - note: backend sends { call: callData }
+    // Call updates
     socket.on('call_update', (data: { call: Call }) => {
-      console.log('📞 [UNIFIED] Received call_update:', data);
+      logger.debug('[Unified] call_update:', data);
       const call = data.call;
-      if (!call) {
-        console.log('❌ [UNIFIED] No call in event data');
-        return;
-      }
+      if (!call) return;
 
-      // Map backend fields (backend uses camelCase, frontend uses snake_case)
-      const mappedCall: Call = {
-        ...call,
-        from_number: call.from_number || (call as any).fromNumber,
-        handler_type: call.handler_type || (call as any).handlerType || (call.status === 'ai_active' ? 'ai' : 'human'),
-        phoneNumber: call.from_number || (call as any).fromNumber || call.phoneNumber || 'Unknown',
-        // Map contact_id from backend's contactId
-        contact_id: call.contact_id || (call as any).contactId,
-        // Map signalwire_call_sid from various possible field names
-        signalwire_call_sid: call.signalwire_call_sid || (call as any).signalwireCallSid || (call as any).signalwire_call_sid,
-        call_sid: call.signalwire_call_sid || (call as any).signalwireCallSid || call.call_sid,
-        // Map direction for outbound call detection
-        direction: call.direction || (call as any).direction,
-        // Map destination for outbound calls
-        destination: (call as any).destination,
-        // Map AI context for display in call panel
-        aiContext: (call as any).aiContext || (call as any).ai_context,
-      };
-
-      console.log('📞 [UNIFIED] Mapped call:', {
-        id: mappedCall.id,
-        status: mappedCall.status,
-        handler_type: mappedCall.handler_type,
-        contact_id: mappedCall.contact_id,
-        phoneNumber: mappedCall.phoneNumber,
-        signalwire_call_sid: mappedCall.signalwire_call_sid,
-        direction: mappedCall.direction,
-        destination: (mappedCall as any).destination
-      });
-
-      // Check if call is ended/completed - remove from active list
+      const mappedCall = mapCall(call);
       const isEnded = ['ended', 'completed'].includes(mappedCall.status);
 
       setActiveCalls(prev => {
-        if (isEnded) {
-          console.log('🏁 [UNIFIED] Removing ended call from list:', mappedCall.id);
-          return prev.filter(c => c.id !== mappedCall.id);
-        }
-
+        if (isEnded) return prev.filter(c => c.id !== mappedCall.id);
         const exists = prev.find(c => c.id === mappedCall.id);
-        if (exists) {
-          console.log('✏️ [UNIFIED] Updating existing call:', mappedCall.id);
-          return prev.map(c => c.id === mappedCall.id ? mappedCall : c);
-        }
-        console.log('➕ [UNIFIED] Adding new call:', mappedCall.id, 'status:', mappedCall.status);
+        if (exists) return prev.map(c => c.id === mappedCall.id ? mappedCall : c);
         return [...prev, mappedCall];
       });
       updateCallCounts();
@@ -163,7 +120,7 @@ export function UnifiedAgentDesktop() {
 
     // New call assigned to this agent
     socket.on('call_assigned', (data: { call: Call }) => {
-      console.log('📞 [UNIFIED] Received call_assigned:', data);
+      logger.debug('[Unified] call_assigned:', data);
       const call = data.call;
       if (call) {
         setActiveCalls(prev => [...prev, call]);
@@ -176,23 +133,21 @@ export function UnifiedAgentDesktop() {
 
     // Call ended
     socket.on('call_ended', (data: { callId: number }) => {
-      console.log('🏁 [UNIFIED] Received call_ended:', data);
+      logger.debug('[Unified] call_ended:', data);
       setActiveCalls(prev => prev.filter(c => c.id !== data.callId));
       updateCallCounts();
     });
 
     // Contact updated (e.g., when AI agent collects customer name)
     socket.on('contact_update', (data: { contact: any }) => {
-      console.log('👤 [UNIFIED] Received contact_update:', data);
+      logger.debug('[Unified] contact_update:', data);
       const updatedContact = data.contact;
       if (!updatedContact) return;
 
-      // Update in contacts list
       setContacts(prev => prev.map(c =>
         c.id === updatedContact.id ? { ...c, ...updatedContact } : c
       ));
 
-      // Update selected contact if it matches
       if (selectedContact?.id === updatedContact.id) {
         setSelectedContact(prev => prev ? { ...prev, ...updatedContact } : null);
       }
@@ -200,73 +155,41 @@ export function UnifiedAgentDesktop() {
 
     // Agent stats update
     socket.on('agent_stats', (newStats: typeof stats) => {
-      console.log('📊 [UNIFIED] Received agent_stats:', newStats);
+      logger.debug('[Unified] agent_stats:', newStats);
       setStats(newStats);
     });
 
     // Queue update - call added, assigned, or removed from queue
     socket.on('queue_update', (data: { call: Call; queue_id: string; action: string; assigned_agent_id?: number; assigned_agent_name?: string }) => {
-      console.log('📋 [UNIFIED] Received queue_update:', data);
+      logger.debug('[Unified] queue_update:', data);
       const { call, action } = data;
+      if (!call) return;
 
-      if (!call) {
-        console.log('❌ [UNIFIED] No call in queue_update event');
-        return;
-      }
-
-      // Map backend fields to frontend format
-      const mappedCall: Call = {
-        ...call,
-        from_number: call.from_number || (call as any).fromNumber,
-        handler_type: call.handler_type || (call as any).handlerType,
-        phoneNumber: call.from_number || (call as any).fromNumber || call.phoneNumber || 'Unknown',
-        queue_id: call.queue_id || (call as any).queueId,
-        is_urgent: call.is_urgent || (call as any).isUrgent,
-        queue_status: call.queue_status || (call as any).queueStatus,
-        assigned_agent_id: call.assigned_agent_id || (call as any).assignedAgentId,
-        assigned_at: call.assigned_at || (call as any).assignedAt,
-        contact_id: call.contact_id || (call as any).contactId,
-      };
+      const mappedCall = mapCall(call);
 
       setQueuedCalls(prev => {
-        // Handle different actions
         switch (action) {
           case 'added':
-            // New call added to queue
-            if (!prev.find(c => c.id === mappedCall.id)) {
-              console.log('➕ [UNIFIED] Adding call to queue:', mappedCall.id);
-              return [...prev, mappedCall];
-            }
+            if (!prev.find(c => c.id === mappedCall.id)) return [...prev, mappedCall];
             return prev;
-
           case 'assigned':
-            // Call assigned to an agent (status changed)
-            console.log('✏️ [UNIFIED] Updating call status to assigned:', mappedCall.id);
             return prev.map(c => c.id === mappedCall.id ? mappedCall : c);
-
           case 'removed':
           case 'active':
           case 'ended':
-            // Call removed from queue (agent accepted or call ended)
-            console.log('🗑️ [UNIFIED] Removing call from queue:', mappedCall.id);
             return prev.filter(c => c.id !== mappedCall.id);
-
-          default:
-            // Generic update
+          default: {
             const exists = prev.find(c => c.id === mappedCall.id);
-            if (exists) {
-              return prev.map(c => c.id === mappedCall.id ? mappedCall : c);
-            }
+            if (exists) return prev.map(c => c.id === mappedCall.id ? mappedCall : c);
             return [...prev, mappedCall];
+          }
         }
       });
 
-      // Update call counts
       updateCallCounts();
     });
 
     return () => {
-      console.log('🧹 [UNIFIED] Cleaning up WebSocket listeners');
       socket.off('call_update');
       socket.off('call_assigned');
       socket.off('call_ended');
@@ -288,7 +211,7 @@ export function UnifiedAgentDesktop() {
       });
       setContacts(response.data.contacts);
     } catch (error) {
-      console.error('Failed to load contacts:', error);
+      logger.error('Failed to load contacts:', error);
     } finally {
       setIsLoadingContacts(false);
     }
@@ -296,94 +219,46 @@ export function UnifiedAgentDesktop() {
 
   // Load contact detail
   const loadContactDetail = useCallback(async (id: number) => {
+    setIsLoadingContactDetail(true);
     try {
       const response = await contactsApi.get(id);
       setSelectedContact(response.data);
     } catch (error) {
-      console.error('Failed to load contact:', error);
+      logger.error('Failed to load contact:', error);
       setSelectedContact(null);
+    } finally {
+      setIsLoadingContactDetail(false);
     }
   }, []);
 
   // Load active calls
   const loadActiveCalls = useCallback(async () => {
     try {
-      console.log('📞 [UNIFIED] Loading active calls...');
-      // Include ringing and connecting status to catch outbound calls and calls in transition
       const response = await callsApi.list({ status: 'active,ai_active,connecting,ringing' });
-      console.log('📞 [UNIFIED] Active calls response:', response.data);
-
-      // Map backend fields to frontend format
-      // API returns camelCase (fromNumber, handlerType, signalwireCallSid) while WebSocket uses snake_case
-      const mappedCalls = (response.data.calls || []).map((call: any) => ({
-        ...call,
-        // Normalize to snake_case for consistency with WebSocket events
-        from_number: call.fromNumber || call.from_number,
-        handler_type: call.handlerType || call.handler_type || (call.status === 'ai_active' ? 'ai' : 'human'),
-        phoneNumber: call.fromNumber || call.from_number || call.destination || 'Unknown',
-        status: call.dashboard_status || call.status,
-        // Map contact_id from backend's contactId
-        contact_id: call.contactId || call.contact_id,
-        // CRITICAL: Map signalwireCallSid (camelCase from API) to signalwire_call_sid (snake_case expected by frontend)
-        signalwire_call_sid: call.signalwireCallSid || call.signalwire_call_sid,
-        call_sid: call.signalwireCallSid || call.signalwire_call_sid || call.call_sid,
-        // Map direction and destination for outbound call detection
-        direction: call.direction,
-        destination: call.destination,
-        // Map AI context for display in call panel
-        aiContext: call.aiContext || call.ai_context,
-      }));
-
-      console.log('📞 [UNIFIED] Mapped active calls:', mappedCalls.map((c: any) => ({
-        id: c.id,
-        phoneNumber: c.phoneNumber,
-        status: c.status,
-        handler_type: c.handler_type,
-        contact_id: c.contact_id,
-        signalwire_call_sid: c.signalwire_call_sid,
-        direction: c.direction,
-        destination: c.destination
-      })));
-
-      setActiveCalls(mappedCalls);
+      setActiveCalls(mapCalls(response.data.calls));
     } catch (error) {
-      console.error('Failed to load active calls:', error);
+      logger.error('Failed to load active calls:', error);
+    } finally {
+      setIsLoadingCalls(false);
     }
   }, []);
 
   // Load queued calls - includes 'waiting', 'assigned', and computed 'urgent' status
   const loadQueuedCalls = useCallback(async () => {
     try {
-      // Use the dedicated queue endpoint that returns calls sorted by urgency
       const response = await callsApi.getQueuedCalls();
-      console.log('📋 [UNIFIED] Loaded queued calls:', response.data);
-
-      // Map backend fields to frontend format
-      const mappedCalls = (response.data.calls || []).map((call: any) => ({
-        ...call,
-        from_number: call.fromNumber || call.from_number,
-        handler_type: call.handlerType || call.handler_type,
-        phoneNumber: call.fromNumber || call.from_number || call.destination || 'Unknown',
-        queue_id: call.queue_id || call.queueId,
-        is_urgent: call.is_urgent || call.isUrgent,
-        queue_status: call.queue_status || call.queueStatus,
-        assigned_agent_id: call.assigned_agent_id || call.assignedAgentId,
-        assigned_at: call.assigned_at || call.assignedAt,
-        conference_name: call.conference_name || call.conferenceName,
-        wait_time_seconds: call.wait_time_seconds || call.waitTimeSeconds,
-        contact_id: call.contactId || call.contact_id,
-      }));
-
-      setQueuedCalls(mappedCalls);
+      setQueuedCalls(mapCalls(response.data.calls));
     } catch (error) {
-      console.error('Failed to load queued calls:', error);
+      logger.error('Failed to load queued calls:', error);
       // Fallback to old endpoint if new one doesn't exist
       try {
         const response = await callsApi.list({ status: 'waiting,assigned' });
         setQueuedCalls(response.data.calls || []);
       } catch (fallbackError) {
-        console.error('Fallback also failed:', fallbackError);
+        logger.error('Fallback also failed:', fallbackError);
       }
+    } finally {
+      setIsLoadingQueue(false);
     }
   }, []);
 
@@ -392,7 +267,6 @@ export function UnifiedAgentDesktop() {
     try {
       const [activeRes, queueRes] = await Promise.all([
         callsApi.list({ status: 'active,ai_active', per_page: 1 }),
-        // Include both waiting and assigned calls in queue count
         callsApi.list({ status: 'waiting,assigned', per_page: 1 }),
       ]);
       setCallCounts({
@@ -401,7 +275,7 @@ export function UnifiedAgentDesktop() {
         aiActive: activeRes.data.calls?.filter((c: Call) => c.status === 'ai_active').length || 0,
       });
     } catch (error) {
-      console.error('Failed to update call counts:', error);
+      logger.error('Failed to update call counts:', error);
     }
   }, []);
 
@@ -416,11 +290,8 @@ export function UnifiedAgentDesktop() {
   // Handle customer connected to agent's conference (auto-navigation)
   useEffect(() => {
     const handleCustomerConnected = async (customer: ConnectedCustomer) => {
-      console.log('📞 [UNIFIED] Customer connected to conference:', customer);
-      console.log('📞 [UNIFIED] Customer info:', customer.customerInfo);
-      console.log('📞 [UNIFIED] AI context:', customer.aiContext);
+      logger.debug('[Unified] Customer connected:', customer);
 
-      // Show toast notification
       const customerName = customer.aiContext?.customer_name ||
                           customer.customerInfo.name ||
                           customer.callerNumber;
@@ -429,19 +300,14 @@ export function UnifiedAgentDesktop() {
         icon: '📞',
       });
 
-      // Reload active calls to get the new call
       await loadActiveCalls();
 
       // Use contact_id from the event if backend already created/updated the contact
-      // This is more efficient than making another API call
       if (customer.customerInfo.contact_id) {
-        console.log('📞 [UNIFIED] Using contact_id from event:', customer.customerInfo.contact_id);
         setViewMode('contacts');
         navigate(`/contacts/${customer.customerInfo.contact_id}`);
         loadContactDetail(customer.customerInfo.contact_id);
-        // Also reload contacts list to reflect any updates
         loadContacts();
-        console.log('📍 [UNIFIED] Navigated to contact:', customer.customerInfo.contact_id);
         return;
       }
 
@@ -454,29 +320,19 @@ export function UnifiedAgentDesktop() {
         });
 
         const contact = response.data.contact;
-
-        // Navigate to the contact detail view
         setViewMode('contacts');
         navigate(`/contacts/${contact.id}`);
-
-        // Load full contact details
         loadContactDetail(contact.id);
-        // Reload contacts list
         loadContacts();
-
-        console.log('📍 [UNIFIED] Navigated to contact:', contact.id);
       } catch (error) {
-        console.error('Failed to lookup/create contact:', error);
-        // Still navigate to calls view as fallback
+        logger.error('Failed to lookup/create contact:', error);
         setViewMode('calls');
         navigate('/calls');
       }
     };
 
-    // Register the callback
     callFabric.setOnCustomerConnected(handleCustomerConnected);
 
-    // Cleanup
     return () => {
       callFabric.setOnCustomerConnected(undefined);
     };
@@ -498,7 +354,6 @@ export function UnifiedAgentDesktop() {
         loadContactDetail(id);
       }
     } else if (callId) {
-      // If we have a callId, find the contact from the call
       const call = activeCalls.find(c => c.id === parseInt(callId, 10));
       if (call?.contact_id) {
         loadContactDetail(call.contact_id);
@@ -516,7 +371,6 @@ export function UnifiedAgentDesktop() {
   // Handle view mode change
   const handleViewModeChange = (mode: ViewMode) => {
     setViewMode(mode);
-    // Update URL to match view
     switch (mode) {
       case 'contacts':
         navigate(selectedContact ? `/contacts/${selectedContact.id}` : '/');
@@ -563,7 +417,6 @@ export function UnifiedAgentDesktop() {
   const handleContactDelete = (contactId: number) => {
     setContacts(prev => prev.filter(c => c.id !== contactId));
     setSelectedContact(null);
-    // Navigate back to contacts list
     navigate('/');
   };
 
@@ -575,43 +428,27 @@ export function UnifiedAgentDesktop() {
 
   // Handle call selection (from Active Calls view)
   const handleCallSelect = async (call: Call) => {
-    console.log('📞 [UNIFIED] handleCallSelect:', {
-      id: call.id,
-      contact_id: call.contact_id,
-      from_number: call.from_number,
-      phoneNumber: call.phoneNumber
-    });
-
     if (call.contact_id) {
-      // Navigate to contact view
       await loadContactDetail(call.contact_id);
       navigate(`/contacts/${call.contact_id}`);
     } else {
-      // Get phone number from various possible fields
       const phoneNumber = call.from_number || call.phoneNumber || (call as any).fromNumber;
 
       if (phoneNumber && phoneNumber !== 'Unknown' && phoneNumber !== 'unknown') {
-        // Try to find or create contact by phone
         try {
-          console.log('📞 [UNIFIED] Looking up or creating contact for:', phoneNumber);
           const response = await contactsApi.lookupOrCreate({
             phone: phoneNumber,
             displayName: phoneNumber,
           });
-          console.log('📞 [UNIFIED] lookupOrCreate response:', response.data);
 
-          // Response is { contact: Contact, created: boolean }
           const contactId = response.data.contact?.id || response.data.id;
           if (contactId) {
-            // Reload contacts list to show the new contact
             loadContacts();
             navigate(`/contacts/${contactId}`);
           }
         } catch (error) {
-          console.error('Failed to lookup/create contact:', error);
+          logger.error('Failed to lookup/create contact:', error);
         }
-      } else {
-        console.warn('📞 [UNIFIED] No phone number available for call:', call.id);
       }
     }
     setViewMode('contacts');
@@ -620,17 +457,10 @@ export function UnifiedAgentDesktop() {
   // Handle take call from queue
   const handleTakeCall = async (call: Call) => {
     try {
-      console.log('📞 [UNIFIED] Taking call from queue:', call.id);
-
-      // Call API to take/assign the call
       const response = await callsApi.take(call.id);
-      console.log('📞 [UNIFIED] Take call response:', response.data);
-
       const conferenceName = response.data.conference_name || call.conference_name;
 
       if (conferenceName) {
-        // Set up the pending call assignment so acceptCallAssignment can use it
-        // This simulates receiving a call_assignment socket event
         const callAssignment = {
           callId: call.signalwire_call_sid || String(call.id),
           callDbId: Number(call.id),
@@ -645,23 +475,18 @@ export function UnifiedAgentDesktop() {
           context: (call as any).aiContext || {},
         };
 
-        console.log('📞 [UNIFIED] Triggering acceptCallAssignment with:', callAssignment);
-
-        // Use callFabric to dial out and join the conference
         await callFabric.acceptCallAssignmentWithData(callAssignment);
       }
 
-      // Navigate to the contact view
       handleCallSelect(call);
     } catch (error) {
-      console.error('Failed to take call:', error);
+      logger.error('Failed to take call:', error);
       toast.error('Failed to take call');
     }
   };
 
   // Handle incoming call answer
   const handleAnswerIncoming = async (phoneNumber: string) => {
-    // Lookup or create contact
     try {
       const response = await contactsApi.lookupOrCreate({
         phone: phoneNumber,
@@ -671,8 +496,7 @@ export function UnifiedAgentDesktop() {
       navigate(`/contacts/${response.data.id}`);
       setViewMode('contacts');
     } catch (error) {
-      console.error('Failed to handle incoming call:', error);
-      // Still try to answer
+      logger.error('Failed to handle incoming call:', error);
       await callFabric.answerCall();
     }
   };
@@ -684,26 +508,21 @@ export function UnifiedAgentDesktop() {
 
   // Handle outbound call started from QuickDial - navigate to contact page
   const handleOutboundCallStarted = async (phoneNumber: string) => {
-    console.log('📞 [UNIFIED] Outbound call started to:', phoneNumber);
+    logger.debug('[Unified] Outbound call started to:', phoneNumber);
     try {
-      // Lookup or create contact for this phone number
       const response = await contactsApi.lookupOrCreate({
         phone: phoneNumber,
         displayName: phoneNumber,
       });
-      console.log('📞 [UNIFIED] Contact lookup/create response:', response.data);
 
-      // Get contact ID from response
       const contactId = response.data.contact?.id || response.data.id;
       if (contactId) {
-        // Reload contacts list to show the new contact
         loadContacts();
-        // Navigate to the contact page which will show the live call
         navigate(`/contacts/${contactId}`);
         setViewMode('contacts');
       }
     } catch (error) {
-      console.error('Failed to lookup/create contact for outbound call:', error);
+      logger.error('Failed to lookup/create contact for outbound call:', error);
     }
   };
 
@@ -712,7 +531,6 @@ export function UnifiedAgentDesktop() {
     if (callFabric.pendingCallAssignment) {
       try {
         await callFabric.acceptCallAssignment();
-        // Navigate to contact if available
         const contactId = callFabric.pendingCallAssignment.customerInfo?.contact_id ||
                          callFabric.pendingCallAssignment.customerInfo?.contactId;
         if (contactId) {
@@ -720,7 +538,7 @@ export function UnifiedAgentDesktop() {
           setViewMode('contacts');
         }
       } catch (error) {
-        console.error('Failed to accept call assignment:', error);
+        logger.error('Failed to accept call assignment:', error);
         toast.error('Failed to accept call');
       }
     }
@@ -743,6 +561,7 @@ export function UnifiedAgentDesktop() {
           phoneNumber={callFabric.pendingCallAssignment.callerNumber || callFabric.pendingCallAssignment.customerInfo?.phone || 'Unknown'}
           callerName={callFabric.pendingCallAssignment.customerInfo?.name}
           queueId={callFabric.pendingCallAssignment.queueId}
+          aiContext={callFabric.pendingCallAssignment.context}
           onAnswer={handleAcceptAssignment}
           onDecline={callFabric.rejectCallAssignment}
         />
@@ -779,28 +598,28 @@ export function UnifiedAgentDesktop() {
             queuedCalls={queuedCalls}
             onSelectCall={handleCallSelect}
             onTakeCall={handleTakeCall}
+            isLoadingCalls={isLoadingCalls}
+            isLoadingQueue={isLoadingQueue}
           />
         </div>
 
-        {/* Right Panel - 360° Contact Detail */}
+        {/* Right Panel - 360 Contact Detail */}
         <div className="flex-1 bg-gray-900 overflow-hidden">
-          {selectedContact ? (
+          {isLoadingContactDetail && !selectedContact ? (
+            <ContactDetailSkeleton />
+          ) : selectedContact ? (
             <ContactDetailView
               contact={selectedContact}
               onContactUpdate={handleContactUpdate}
               onContactDelete={handleContactDelete}
               activeCallForContact={
-                // Check both active calls AND queued calls for this contact
                 [...activeCalls, ...queuedCalls].find(c => {
-                  // First check contact_id match (most reliable)
                   if (c.contact_id === selectedContact.id || (c as any).contactId === selectedContact.id) {
                     return true;
                   }
-                  // For outbound calls, match by destination (customer's number)
                   if (c.direction === 'outbound') {
                     return (c as any).destination === selectedContact.phone;
                   }
-                  // For inbound calls, match by from_number (customer's number)
                   return c.from_number === selectedContact.phone ||
                          (c as any).fromNumber === selectedContact.phone ||
                          c.phoneNumber === selectedContact.phone;

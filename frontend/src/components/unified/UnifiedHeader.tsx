@@ -69,8 +69,9 @@ export function UnifiedHeader({
       {/* Top row - Logo, Status, Stats, User */}
       <div className="h-14 flex items-center justify-between px-4">
         {/* Left - Logo and Title */}
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
           <h1 className="text-lg font-semibold text-white">SignalWire Call Center</h1>
+
         </div>
 
         {/* Center - Agent Status and Stats */}

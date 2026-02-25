@@ -20,6 +20,8 @@ interface LeftPanelProps {
   queuedCalls: Call[];
   onSelectCall: (call: Call) => void;
   onTakeCall: (call: Call) => void;
+  isLoadingCalls?: boolean;
+  isLoadingQueue?: boolean;
 }
 
 export function LeftPanel({
@@ -35,6 +37,8 @@ export function LeftPanel({
   queuedCalls,
   onSelectCall,
   onTakeCall,
+  isLoadingCalls,
+  isLoadingQueue,
 }: LeftPanelProps) {
   switch (viewMode) {
     case 'contacts':
@@ -55,6 +59,7 @@ export function LeftPanel({
         <ActiveCallsList
           calls={activeCalls}
           onSelectCall={onSelectCall}
+          isLoading={isLoadingCalls}
         />
       );
 
@@ -64,6 +69,7 @@ export function LeftPanel({
           calls={queuedCalls}
           onSelectCall={onSelectCall}
           onTakeCall={onTakeCall}
+          isLoading={isLoadingQueue}
         />
       );
 

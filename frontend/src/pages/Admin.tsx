@@ -14,9 +14,11 @@ import {
   Check,
   AlertCircle,
   Info,
+  Users,
 } from 'lucide-react';
 import { adminApi } from '../services/api';
 import toast from 'react-hot-toast';
+import { ConfirmModal } from '../components/shared/ConfirmModal';
 
 interface Agent {
   id: string;
@@ -50,7 +52,18 @@ interface Assignment {
   collection_display_name: string;
 }
 
-type TabId = 'routing' | 'knowledge' | 'assignments';
+interface AdminUser {
+  id: number;
+  email: string;
+  name: string | null;
+  role: string;
+  is_active: boolean;
+  created_at: string | null;
+  has_subscriber: boolean;
+  signalwire_address: string | null;
+}
+
+type TabId = 'routing' | 'knowledge' | 'assignments' | 'users';
 
 export default function Admin() {
   const navigate = useNavigate();
@@ -94,6 +107,13 @@ export default function Admin() {
             active={activeTab === 'assignments'}
             onClick={() => setActiveTab('assignments')}
           />
+          <TabButton
+            id="users"
+            icon={<Users className="w-4 h-4" />}
+            label="User Management"
+            active={activeTab === 'users'}
+            onClick={() => setActiveTab('users')}
+          />
         </nav>
       </div>
 
@@ -102,6 +122,7 @@ export default function Admin() {
         {activeTab === 'routing' && <AgentRoutingTab />}
         {activeTab === 'knowledge' && <KnowledgeBaseTab />}
         {activeTab === 'assignments' && <AgentAssignmentsTab />}
+        {activeTab === 'users' && <UserManagementTab />}
       </div>
     </div>
   );
@@ -235,6 +256,7 @@ function KnowledgeBaseTab() {
   const [newCollName, setNewCollName] = useState('');
   const [newCollDisplayName, setNewCollDisplayName] = useState('');
   const [newCollDescription, setNewCollDescription] = useState('');
+  const [pendingDelete, setPendingDelete] = useState<{ type: 'collection'; item: Collection } | { type: 'document'; item: Document } | null>(null);
 
   const loadCollections = useCallback(async () => {
     try {
@@ -285,8 +307,11 @@ function KnowledgeBaseTab() {
     }
   };
 
-  const handleDeleteCollection = async (coll: Collection) => {
-    if (!confirm(`Delete "${coll.display_name}" and all its documents?`)) return;
+  const handleDeleteCollection = (coll: Collection) => {
+    setPendingDelete({ type: 'collection', item: coll });
+  };
+
+  const confirmDeleteCollection = async (coll: Collection) => {
     try {
       await adminApi.deleteCollection(coll.id);
       if (selectedCollection?.id === coll.id) {
@@ -332,8 +357,11 @@ function KnowledgeBaseTab() {
     }
   };
 
-  const handleDeleteDocument = async (doc: Document) => {
-    if (!confirm(`Delete "${doc.title}"?`)) return;
+  const handleDeleteDocument = (doc: Document) => {
+    setPendingDelete({ type: 'document', item: doc });
+  };
+
+  const confirmDeleteDocument = async (doc: Document) => {
     try {
       await adminApi.deleteDocument(doc.id);
       if (editingDoc?.id === doc.id) setEditingDoc(null);
@@ -598,6 +626,27 @@ function KnowledgeBaseTab() {
           </div>
         )}
       </div>
+
+      {/* Confirm Delete Modal */}
+      {pendingDelete && (
+        <ConfirmModal
+          title={pendingDelete.type === 'collection' ? 'Delete Collection' : 'Delete Document'}
+          message={
+            pendingDelete.type === 'collection'
+              ? `Delete "${(pendingDelete.item as Collection).display_name}" and all its documents?`
+              : `Delete "${(pendingDelete.item as Document).title}"?`
+          }
+          onConfirm={async () => {
+            if (pendingDelete.type === 'collection') {
+              await confirmDeleteCollection(pendingDelete.item as Collection);
+            } else {
+              await confirmDeleteDocument(pendingDelete.item as Document);
+            }
+            setPendingDelete(null);
+          }}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </div>
   );
 }
@@ -718,6 +767,125 @@ function AgentAssignmentsTab() {
           Save Assignments
         </button>
       </div>
+    </div>
+  );
+}
+
+
+// =============================================================================
+// Tab 4: User Management
+// =============================================================================
+
+function UserManagementTab() {
+  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [pendingDelete, setPendingDelete] = useState<AdminUser | null>(null);
+
+  const loadUsers = useCallback(async () => {
+    try {
+      const resp = await adminApi.listUsers();
+      setUsers(resp.data.users);
+    } catch (err) {
+      toast.error('Failed to load users');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadUsers(); }, [loadUsers]);
+
+  const confirmDeleteUser = async (user: AdminUser) => {
+    try {
+      const resp = await adminApi.deleteUser(user.id);
+      toast.success(`User "${user.email}" deleted`);
+      if (resp.data.sw_warning) {
+        toast(resp.data.sw_warning, { icon: '\u26a0\ufe0f' });
+      }
+      loadUsers();
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Failed to delete user');
+    }
+  };
+
+  if (loading) return <LoadingSpinner />;
+
+  return (
+    <div className="max-w-4xl">
+      <div className="mb-6">
+        <h2 className="text-xl font-semibold mb-1">User Management</h2>
+        <p className="text-sm text-gray-400">View and manage user accounts. Deleting a user removes their account, calls, and SignalWire subscriber.</p>
+      </div>
+
+      <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+        <table className="w-full">
+          <thead>
+            <tr className="border-b border-gray-700">
+              <th className="text-left px-4 py-3 text-xs font-medium text-gray-400 uppercase tracking-wider">User</th>
+              <th className="text-left px-4 py-3 text-xs font-medium text-gray-400 uppercase tracking-wider">Role</th>
+              <th className="text-left px-4 py-3 text-xs font-medium text-gray-400 uppercase tracking-wider">Subscriber</th>
+              <th className="text-left px-4 py-3 text-xs font-medium text-gray-400 uppercase tracking-wider">Created</th>
+              <th className="text-right px-4 py-3 text-xs font-medium text-gray-400 uppercase tracking-wider">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {users.map(user => (
+              <tr key={user.id} className="border-b border-gray-700/50 hover:bg-gray-700/30">
+                <td className="px-4 py-3">
+                  <div className="text-sm font-medium">{user.email}</div>
+                  {user.name && <div className="text-xs text-gray-500">{user.name}</div>}
+                </td>
+                <td className="px-4 py-3">
+                  <span className={`px-2 py-0.5 text-xs rounded ${
+                    user.role === 'admin'
+                      ? 'bg-purple-900/30 text-purple-400'
+                      : 'bg-blue-900/30 text-blue-400'
+                  }`}>
+                    {user.role}
+                  </span>
+                </td>
+                <td className="px-4 py-3">
+                  {user.has_subscriber ? (
+                    <span className="text-xs text-green-400">{user.signalwire_address || 'Yes'}</span>
+                  ) : (
+                    <span className="text-xs text-gray-500">None</span>
+                  )}
+                </td>
+                <td className="px-4 py-3 text-sm text-gray-400">
+                  {user.created_at ? new Date(user.created_at).toLocaleDateString() : '\u2014'}
+                </td>
+                <td className="px-4 py-3 text-right">
+                  <button
+                    onClick={() => setPendingDelete(user)}
+                    className="p-1.5 hover:bg-gray-600 rounded text-gray-500 hover:text-red-400 transition-colors"
+                    title="Delete user"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {users.length === 0 && (
+              <tr>
+                <td colSpan={5} className="text-center text-gray-500 py-8 text-sm">
+                  No users found.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {pendingDelete && (
+        <ConfirmModal
+          title="Delete User"
+          message={`Permanently delete "${pendingDelete.email}"${pendingDelete.has_subscriber ? ' and their SignalWire subscriber' : ''}? This will also delete all their calls and cannot be undone.`}
+          onConfirm={async () => {
+            await confirmDeleteUser(pendingDelete);
+            setPendingDelete(null);
+          }}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </div>
   );
 }

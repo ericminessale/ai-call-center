@@ -344,7 +344,7 @@ class CallCenterTriageAgent(AgentBase):
         # ============================================================
         self.prompt_add_section(
             "Identity",
-            "You are Sarah, a friendly and efficient customer service representative. "
+            "You are Sam, a friendly and efficient customer service representative. "
             "Your ONLY job is to gather information and route calls appropriately."
         )
 
@@ -392,7 +392,7 @@ Summarize this call and return a JSON object with:
         triage_ctx.add_step("get_name") \
             .add_section("Your Task", "Greet the caller and get their name.") \
             .add_section("What to Say",
-                "'Hi, thank you for calling! I'm Sarah. May I have your name please?'") \
+                "'Hi, thank you for calling! I'm Sam. May I have your name please?'") \
             .add_section("IMPORTANT",
                 "You MUST get their name before moving on. If they start explaining "
                 "their issue, say 'I'd be happy to help with that - may I first get your name?'") \
@@ -424,7 +424,7 @@ Summarize this call and return a JSON object with:
 
         # Sales context prompt
         sales_ctx.add_section("Role",
-            "Continue as Sarah. Customer needs sales help. Use their name.")
+            "Continue as Sam. Customer needs sales help. Use their name.")
 
         sales_ctx.add_section("REMEMBER",
             "You are TRIAGE only. Do NOT answer product questions, provide pricing, "
@@ -465,7 +465,7 @@ Summarize this call and return a JSON object with:
 
         # Support context prompt
         support_ctx.add_section("Role",
-            "Continue as Sarah. Customer needs support. Use their name.")
+            "Continue as Sam. Customer needs support. Use their name.")
 
         support_ctx.add_section("CRITICAL - NO TROUBLESHOOTING",
             "You are TRIAGE only. You must NOT:\n"
@@ -522,7 +522,7 @@ Summarize this call and return a JSON object with:
             name="transfer_to_human",
             description="Transfer customer to a human representative. Use when they choose to speak with a human.",
             parameters={
-                "customer_name": {"type": "string", "description": "Customer's name"},
+                "customer_name": {"type": "string", "description": "Customer's spoken name (NOT their phone number - only use a name they verbally provide)"},
                 "reason": {"type": "string", "description": "Brief description of what they need"},
                 "department": {"type": "string", "description": "'sales' or 'support'"},
                 "urgency": {"type": "string", "description": "'high', 'medium', or 'low'"},
@@ -535,7 +535,7 @@ Summarize this call and return a JSON object with:
             name="transfer_to_ai_specialist",
             description="Transfer customer to AI specialist. Use when they choose AI assistance.",
             parameters={
-                "customer_name": {"type": "string", "description": "Customer's name"},
+                "customer_name": {"type": "string", "description": "Customer's spoken name (NOT their phone number - only use a name they verbally provide)"},
                 "reason": {"type": "string", "description": "Brief description of what they need"},
                 "department": {"type": "string", "description": "'sales' or 'support'"},
                 "urgency": {"type": "string", "description": "'high', 'medium', or 'low'"},

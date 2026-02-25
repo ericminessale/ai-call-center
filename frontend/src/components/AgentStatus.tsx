@@ -44,7 +44,6 @@ export default function AgentStatus() {
     if (!socket) return;
 
     const handleIncomingCall = (data: IncomingCall) => {
-      console.log('📞 [AgentStatus] Incoming call notification:', data);
       setIncomingCall(data);
       // Auto-dismiss after 30 seconds (matches the SWML connect timeout)
       setTimeout(() => {
@@ -60,13 +59,7 @@ export default function AgentStatus() {
   }, [socket]);
 
   const changeStatus = async (newStatus: AgentStatusType) => {
-    console.log('🔄 [AgentStatus] changeStatus called:', newStatus);
-    console.log('  - client:', !!client, 'isOnline:', isOnline);
-
-    if (!client) {
-      console.log('❌ [AgentStatus] Call Fabric client not initialized');
-      return;
-    }
+    if (!client) return;
 
     setIsDropdownOpen(false);
 

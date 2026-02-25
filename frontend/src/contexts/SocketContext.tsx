@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useRef, useState, ReactNod
 import { io, Socket } from 'socket.io-client';
 import { useAuthStore } from '../stores/authStore';
 import { socketService } from '../services/api';
+import { logger } from '../lib/logger';
 
 interface SocketContextType {
   socket: Socket | null;
@@ -26,12 +27,9 @@ export function SocketProvider({ children }: SocketProviderProps) {
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'disconnected' | 'reconnecting'>('disconnected');
 
   useEffect(() => {
-    console.log('🔌 [SocketContext] Effect running, isAuthenticated:', isAuthenticated);
-
     if (!isAuthenticated) {
-      console.log('🔌 [SocketContext] Not authenticated, skipping socket setup');
       if (socketRef.current) {
-        console.log('🔌 [SocketContext] User logged out, disconnecting socket');
+        logger.debug('[Socket] User logged out, disconnecting');
         socketRef.current.disconnect();
         socketRef.current = null;
         setSocket(null);
@@ -41,14 +39,10 @@ export function SocketProvider({ children }: SocketProviderProps) {
     }
 
     const token = localStorage.getItem('access_token');
-    if (!token) {
-      console.log('🔌 [SocketContext] No token found, skipping socket setup');
-      return;
-    }
+    if (!token) return;
 
-    // Initialize socket connection
     if (!socketRef.current) {
-      console.log('🔌 [SocketContext] Creating new socket connection');
+      logger.debug('[Socket] Creating connection');
       const newSocket = io('/', {
         path: '/socket.io/',
         transports: ['websocket', 'polling'],
@@ -64,36 +58,31 @@ export function SocketProvider({ children }: SocketProviderProps) {
       setSocket(newSocket);
 
       newSocket.on('connect', () => {
-        console.log('🔌 [SocketContext] Connected, socket.id:', newSocket.id);
+        logger.debug('[Socket] Connected:', newSocket.id);
         setConnectionStatus('connected');
         newSocket.emit('authenticate', { token });
       });
 
       newSocket.on('authenticated', (data) => {
-        console.log('🔌 [SocketContext] Authenticated:', data);
+        logger.debug('[Socket] Authenticated:', data);
       });
 
       newSocket.on('disconnect', (reason) => {
-        console.log('🔌 [SocketContext] Disconnected, reason:', reason);
+        logger.debug('[Socket] Disconnected:', reason);
         setConnectionStatus('disconnected');
 
-        // If transport closed (backend restarted), reconnect gracefully
-        if (reason === 'transport close' || reason === 'transport error') {
-          console.log('🔌 [SocketContext] Backend likely restarted, will auto-reconnect');
-          // Socket.IO will auto-reconnect due to reconnection: true
-        } else if (reason === 'io server disconnect') {
-          console.log('🔌 [SocketContext] Server disconnected us, manually reconnecting...');
+        if (reason === 'io server disconnect') {
           newSocket.connect();
         }
       });
 
       newSocket.on('reconnect_attempt', (attemptNumber) => {
-        console.log('🔌 [SocketContext] Reconnection attempt #', attemptNumber);
+        logger.debug('[Socket] Reconnecting, attempt', attemptNumber);
         setConnectionStatus('reconnecting');
       });
 
       newSocket.on('reconnect', (attemptNumber) => {
-        console.log('🔌 [SocketContext] Reconnected after', attemptNumber, 'attempts');
+        logger.debug('[Socket] Reconnected after', attemptNumber, 'attempts');
         setConnectionStatus('connected');
         const currentToken = localStorage.getItem('access_token');
         if (currentToken) {
@@ -102,33 +91,30 @@ export function SocketProvider({ children }: SocketProviderProps) {
       });
 
       newSocket.on('reconnect_error', (error) => {
-        console.error('🔌 [SocketContext] Reconnection error:', error);
+        logger.error('[Socket] Reconnection error:', error);
       });
 
       newSocket.on('reconnect_failed', () => {
-        console.error('🔌 [SocketContext] Reconnection failed after all attempts');
+        logger.error('[Socket] Reconnection failed after all attempts');
         setConnectionStatus('disconnected');
       });
 
       newSocket.on('error', (error) => {
-        console.error('🔌 [SocketContext] Error:', error);
+        logger.error('[Socket] Error:', error);
       });
-
-      console.log('🔌 [SocketContext] Socket created and listeners registered');
     } else if (!socketRef.current.connected) {
-      console.log('🔌 [SocketContext] Socket exists but not connected, reconnecting...');
+      logger.debug('[Socket] Reconnecting existing socket');
       socketRef.current.connect();
     }
 
     return () => {
-      console.log('🔌 [SocketContext] Cleanup (socket persists)');
+      // Socket persists across re-renders, cleaned up on logout
     };
   }, [isAuthenticated]);
 
   // Sync socket to socketService for legacy component support
   useEffect(() => {
     socketService.setSocket(socket);
-    console.log('🔌 [SocketContext] Synced socket to socketService:', !!socket);
   }, [socket]);
 
   return (

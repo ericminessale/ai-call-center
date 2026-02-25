@@ -235,6 +235,12 @@ export const adminApi = {
     api.get('/api/admin/agent-assignments'),
   updateAgentAssignments: (assignments: { assignments: Array<{ agent_id: string; collection_id: number }> }) =>
     api.put('/api/admin/agent-assignments', assignments),
+
+  // User management
+  listUsers: () =>
+    api.get('/api/admin/users'),
+  deleteUser: (id: number) =>
+    api.delete(`/api/admin/users/${id}`),
 };
 
 // WebSocket service - now uses a shared socket from SocketContext
@@ -247,20 +253,15 @@ class SocketService {
     this.socket = socket;
   }
 
-  // Legacy method - no longer creates its own socket
   connect(): Socket | null {
-    console.warn('[socketService] connect() called - socket should be managed by SocketContext');
     return this.socket;
   }
 
   disconnect() {
-    console.warn('[socketService] disconnect() called - socket should be managed by SocketContext');
+    // Managed by SocketContext
   }
 
   getSocket(): Socket | null {
-    if (!this.socket) {
-      console.warn('[socketService] getSocket() called but no socket available. Use useSocketContext() instead.');
-    }
     return this.socket;
   }
 }

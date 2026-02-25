@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Search, Plus, Phone, Star, Building2 } from 'lucide-react';
 import { ContactMinimal } from '../../types/callcenter';
 import { contactsApi } from '../../services/api';
+import { ContactListSkeletonGroup } from '../shared/Skeleton';
 
 interface ContactListProps {
   contacts: ContactMinimal[];
@@ -60,10 +61,7 @@ export function ContactList({
       {/* Contact List */}
       <div className="flex-1 overflow-y-auto">
         {isLoading ? (
-          <div className="p-4 text-center text-gray-400">
-            <div className="animate-spin w-6 h-6 border-2 border-gray-400 border-t-transparent rounded-full mx-auto mb-2" />
-            Loading contacts...
-          </div>
+          <ContactListSkeletonGroup />
         ) : contacts.length === 0 ? (
           <div className="p-4 text-center text-gray-400">
             {searchQuery ? 'No contacts found' : 'No contacts yet'}

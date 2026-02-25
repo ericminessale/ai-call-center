@@ -1,26 +1,20 @@
-import { useState } from 'react';
-import { Search, Phone, Bot, User, Clock, Building2, Star } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Search, Phone, Bot, User, Clock, Building2, Star, Headphones } from 'lucide-react';
 import { Call } from '../../types/callcenter';
+import { logger } from '../../lib/logger';
+import { CallListSkeletonGroup } from '../shared/Skeleton';
 
 interface ActiveCallsListProps {
   calls: Call[];
   onSelectCall: (call: Call) => void;
+  isLoading?: boolean;
 }
 
 type FilterType = 'all' | 'my-calls' | 'ai-active' | 'other';
 
-export function ActiveCallsList({ calls, onSelectCall }: ActiveCallsListProps) {
+export function ActiveCallsList({ calls, onSelectCall, isLoading }: ActiveCallsListProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
-
-  // Debug logging
-  console.log('📋 [ActiveCallsList] Rendering with calls:', calls.map(c => ({
-    id: c.id,
-    status: c.status,
-    handler_type: c.handler_type,
-    from_number: c.from_number,
-    phoneNumber: c.phoneNumber
-  })));
 
   // Filter calls based on search and filter type
   const filteredCalls = calls.filter((call) => {
@@ -66,7 +60,7 @@ export function ActiveCallsList({ calls, onSelectCall }: ActiveCallsListProps) {
   );
 
   if (uncategorizedCalls.length > 0) {
-    console.warn('⚠️ [ActiveCallsList] Uncategorized calls:', uncategorizedCalls.map(c => ({
+    logger.warn('[ActiveCallsList] Uncategorized calls:', uncategorizedCalls.map(c => ({
       id: c.id,
       status: c.status,
       handler_type: c.handler_type
@@ -118,7 +112,9 @@ export function ActiveCallsList({ calls, onSelectCall }: ActiveCallsListProps) {
 
       {/* Call List */}
       <div className="flex-1 overflow-y-auto">
-        {filteredCalls.length === 0 ? (
+        {isLoading ? (
+          <CallListSkeletonGroup count={3} />
+        ) : filteredCalls.length === 0 ? (
           <div className="p-4 text-center text-gray-400">
             <Phone className="w-8 h-8 mx-auto mb-2 opacity-50" />
             <p className="text-sm">No active calls</p>
@@ -202,30 +198,57 @@ function CallSection({
 }
 
 function CallCard({ call, onClick }: { call: Call; onClick: () => void }) {
-  const isAI = call.status === 'ai_active';
+  const isAI = call.status === 'ai_active' || call.handler_type === 'ai';
+  const isConnecting = call.status === 'connecting' || call.status === 'ringing';
   const contactName = call.contact?.displayName || call.from_number || 'Unknown';
   const company = call.contact?.company;
   const isVip = call.contact?.isVip;
 
-  // Format duration
+  // Live ticking duration
+  const [liveDuration, setLiveDuration] = useState(call.duration || 0);
+  useEffect(() => {
+    if (isConnecting) return;
+    setLiveDuration(call.duration || 0);
+    const interval = setInterval(() => {
+      setLiveDuration(prev => prev + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [call.id, call.duration, isConnecting]);
+
   const formatDuration = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}:${String(secs).padStart(2, '0')}`;
   };
 
+  // Determine border and background colors based on call type
+  const borderColor = isAI ? 'border-purple-500' : isConnecting ? 'border-yellow-500' : 'border-green-500';
+  const bgTint = isAI ? 'bg-purple-900/10' : '';
+
   return (
     <button
       onClick={onClick}
-      className="w-full px-3 py-3 flex items-center gap-3 text-left hover:bg-gray-700/50 border-l-2 border-transparent hover:border-blue-500 transition-colors"
+      className={`w-full px-3 py-3 flex items-center gap-3 text-left hover:bg-gray-700/50 border-l-2 ${borderColor} ${bgTint} transition-colors`}
     >
       {/* Avatar */}
-      <div
-        className={`w-10 h-10 rounded-full flex items-center justify-center text-white font-medium ${
-          isAI ? 'bg-purple-600' : 'bg-green-600'
-        }`}
-      >
-        {isAI ? <Bot className="w-5 h-5" /> : contactName.charAt(0).toUpperCase()}
+      <div className="relative">
+        <div
+          className={`w-10 h-10 rounded-full flex items-center justify-center text-white font-medium ${
+            isAI ? 'bg-purple-600' : isConnecting ? 'bg-yellow-600' : 'bg-green-600'
+          }`}
+        >
+          {isAI ? <Bot className="w-5 h-5" /> : contactName.charAt(0).toUpperCase()}
+        </div>
+        {/* Live pulse indicator */}
+        {!isConnecting && (
+          <span className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-gray-800 ${
+            isAI ? 'bg-purple-400' : 'bg-green-400'
+          }`}>
+            <span className={`absolute inset-0 rounded-full animate-ping opacity-75 ${
+              isAI ? 'bg-purple-400' : 'bg-green-400'
+            }`} />
+          </span>
+        )}
       </div>
 
       {/* Info */}
@@ -247,18 +270,26 @@ function CallCard({ call, onClick }: { call: Call; onClick: () => void }) {
         </div>
       </div>
 
-      {/* Status */}
-      <div className="flex flex-col items-end gap-1">
-        <div className="flex items-center gap-1 text-xs">
-          {isAI ? (
-            <span className="text-purple-400">AI Agent</span>
-          ) : (
-            <span className="text-green-400">Active</span>
-          )}
-        </div>
-        <div className="flex items-center gap-1 text-xs text-gray-500">
+      {/* Status Badge + Duration */}
+      <div className="flex flex-col items-end gap-1.5">
+        {isAI ? (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30 uppercase tracking-wider">
+            <Bot className="w-3 h-3" />
+            AI
+          </span>
+        ) : isConnecting ? (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold rounded-full bg-yellow-500/20 text-yellow-300 border border-yellow-500/30 uppercase tracking-wider animate-pulse">
+            Connecting
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold rounded-full bg-green-500/20 text-green-300 border border-green-500/30 uppercase tracking-wider">
+            <Headphones className="w-3 h-3" />
+            Live
+          </span>
+        )}
+        <div className="flex items-center gap-1 text-xs text-gray-500 tabular-nums">
           <Clock className="w-3 h-3" />
-          <span>{formatDuration(call.duration || 0)}</span>
+          <span>{isConnecting ? '--:--' : formatDuration(liveDuration)}</span>
         </div>
       </div>
     </button>

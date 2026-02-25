@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Search,
   Phone,
@@ -12,14 +12,17 @@ import {
   Loader2,
 } from 'lucide-react';
 import { Call } from '../../types/callcenter';
+import { QueueItemSkeleton } from '../shared/Skeleton';
+import { AgentContextCard, hasContext } from '../shared/AgentContextCard';
 
 interface QueueListProps {
   calls: Call[];
   onSelectCall: (call: Call) => void;
   onTakeCall: (call: Call) => void;
+  isLoading?: boolean;
 }
 
-export function QueueList({ calls, onSelectCall, onTakeCall }: QueueListProps) {
+export function QueueList({ calls, onSelectCall, onTakeCall, isLoading }: QueueListProps) {
   const [searchQuery, setSearchQuery] = useState('');
 
   // Filter calls based on search
@@ -71,7 +74,13 @@ export function QueueList({ calls, onSelectCall, onTakeCall }: QueueListProps) {
 
       {/* Queue List */}
       <div className="flex-1 overflow-y-auto">
-        {sortedCalls.length === 0 ? (
+        {isLoading ? (
+          <div className="divide-y divide-gray-700/30">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <QueueItemSkeleton key={i} />
+            ))}
+          </div>
+        ) : sortedCalls.length === 0 ? (
           <div className="p-4 text-center text-gray-400">
             <Phone className="w-8 h-8 mx-auto mb-2 opacity-50" />
             <p className="text-sm">No calls in queue</p>
@@ -155,17 +164,27 @@ function QueueCard({
   const isVip = call.contact?.isVip;
   const wasAI = call.handler_type === 'ai' || call.ai_agent_name;
 
-  // Calculate wait time
-  const getWaitTime = () => {
-    if (!call.created_at) return '0:00';
-    const waitMs = Date.now() - new Date(call.created_at).getTime();
-    const mins = Math.floor(waitMs / 60000);
-    const secs = Math.floor((waitMs % 60000) / 1000);
-    return `${mins}:${String(secs).padStart(2, '0')}`;
-  };
+  // Live ticking wait timer
+  const [waitTime, setWaitTime] = useState('0:00');
+  useEffect(() => {
+    if (!call.created_at) return;
+    const update = () => {
+      const waitMs = Date.now() - new Date(call.created_at!).getTime();
+      const mins = Math.floor(waitMs / 60000);
+      const secs = Math.floor((waitMs % 60000) / 1000);
+      setWaitTime(`${mins}:${String(secs).padStart(2, '0')}`);
+    };
+    update();
+    const interval = setInterval(update, 1000);
+    return () => clearInterval(interval);
+  }, [call.created_at]);
+
+  // Color scheme based on priority
+  const borderColor = call.is_urgent ? 'border-red-500' : wasAI ? 'border-purple-500' : 'border-yellow-500';
+  const bgTint = call.is_urgent ? 'bg-red-900/5' : '';
 
   return (
-    <div className="px-3 py-3 border-b border-gray-700/50 hover:bg-gray-700/30">
+    <div className={`px-3 py-3 border-b border-gray-700/50 border-l-2 ${borderColor} ${bgTint} hover:bg-gray-700/30`}>
       <div className="flex items-start gap-3">
         {/* Avatar */}
         <button
@@ -188,29 +207,29 @@ function QueueCard({
               {call.is_urgent && (
                 <AlertTriangle className="w-3 h-3 text-red-400 flex-shrink-0" />
               )}
+              {wasAI && (
+                <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-semibold rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                  <Bot className="w-2.5 h-2.5" />
+                  AI
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-2 text-xs text-gray-400 mt-0.5">
               {company && (
                 <>
                   <Building2 className="w-3 h-3" />
                   <span className="truncate">{company}</span>
-                  <span>•</span>
+                  <span>·</span>
                 </>
               )}
               <Clock className="w-3 h-3" />
-              <span>Waiting {getWaitTime()}</span>
+              <span className="tabular-nums">Waiting {waitTime}</span>
             </div>
           </button>
 
-          {/* AI Context (if escalated from AI) */}
-          {wasAI && call.ai_summary && (
-            <div className="mt-2 p-2 bg-purple-900/20 border border-purple-700/50 rounded text-xs">
-              <div className="flex items-center gap-1 text-purple-400 mb-1">
-                <Bot className="w-3 h-3" />
-                <span className="font-medium">AI Context</span>
-              </div>
-              <p className="text-gray-300 line-clamp-2">{call.ai_summary}</p>
-            </div>
+          {/* AI Collected Context */}
+          {hasContext(call.aiContext) && (
+            <AgentContextCard context={call.aiContext} variant="compact" className="mt-2" />
           )}
 
           {/* Queue info and assigned agent */}

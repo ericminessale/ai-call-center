@@ -1,16 +1,13 @@
 import { useState, useEffect } from 'react';
-import { Phone, PhoneOff, User, Bot, Star, Building2 } from 'lucide-react';
+import { Phone, PhoneOff, Star, Building2 } from 'lucide-react';
 import { contactsApi } from '../../services/api';
+import { AgentContextCard, AgentCollectedData, hasContext } from '../shared/AgentContextCard';
 
 interface IncomingCallBannerProps {
   phoneNumber: string;
   callerName?: string;  // Pre-resolved caller name (from call assignment)
   queueId?: string;     // Queue the call came from
-  aiContext?: {
-    agentName?: string;
-    reason?: string;
-    sentiment?: number;
-  };
+  aiContext?: AgentCollectedData;
   onAnswer: () => void;
   onDecline: () => void;
 }
@@ -64,7 +61,7 @@ export function IncomingCallBanner({
 
   const displayName = callerName || contactInfo?.displayName || 'Unknown Caller';
   const isKnown = !!contactInfo || !!callerName;
-  const wasAI = !!aiContext?.agentName;
+  const wasAI = hasContext(aiContext);
   const isFromQueue = !!queueId;
 
   // Format phone number for display
@@ -134,19 +131,6 @@ export function IncomingCallBanner({
                   </div>
                 )}
 
-                {/* AI Context (if escalated from AI) */}
-                {wasAI && (
-                  <div className="flex items-center gap-2 mt-1 text-xs text-white/70">
-                    <Bot className="w-3 h-3" />
-                    <span>Transferred from {aiContext.agentName}</span>
-                    {aiContext.reason && (
-                      <>
-                        <span>•</span>
-                        <span>{aiContext.reason}</span>
-                      </>
-                    )}
-                  </div>
-                )}
               </div>
             </div>
 
@@ -169,6 +153,13 @@ export function IncomingCallBanner({
               </button>
             </div>
           </div>
+
+          {/* AI Triage Context - prominent display of data collected during AI triage */}
+          {wasAI && aiContext && (
+            <div className="mt-2 px-4 pb-3">
+              <AgentContextCard context={aiContext} variant="compact" className="bg-white/10 border-white/20" />
+            </div>
+          )}
         </div>
       </div>
     </div>

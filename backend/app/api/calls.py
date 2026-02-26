@@ -453,19 +453,62 @@ def send_ai_message(call_id):
         return jsonify({'error': f'Failed to send AI message: {str(e)}'}), 500
 
 
+@calls_bp.route('/<call_db_id>/register-ai-leg', methods=['POST'])
+def register_ai_leg(call_db_id):
+    """Register the AI agent's B-leg call SID for later use (e.g., takeover).
+
+    Called by the AI agent's capture_base_url callback when it starts handling a call.
+    No auth required - called internally from ai-agents container.
+
+    Request body:
+    {
+        "signalwire_sid": "call-xxxxx"  // The B-leg's call SID
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        signalwire_sid = data.get('signalwire_sid')
+
+        if not signalwire_sid:
+            return jsonify({'error': 'signalwire_sid is required'}), 400
+
+        # Find the active AI leg for this call
+        call_id = int(call_db_id)
+        ai_leg = CallLeg.query.filter_by(
+            call_id=call_id,
+            leg_type='ai_agent',
+            status='active'
+        ).first()
+
+        if ai_leg:
+            ai_leg.signalwire_sid = signalwire_sid
+            db.session.commit()
+            logger.info(f"Registered AI leg SID {signalwire_sid} for call {call_id} (leg {ai_leg.id})")
+        else:
+            logger.warning(f"No active AI leg found for call {call_id} to register SID {signalwire_sid}")
+
+        return jsonify({'success': True}), 200
+
+    except Exception as e:
+        logger.error(f"Failed to register AI leg: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
 @calls_bp.route('/<call_sid>/takeover', methods=['POST'])
 @require_auth
 def initiate_takeover(call_sid):
     """Initiate a takeover of an AI-active call by a human agent.
 
-    This endpoint generates a SWML URL that the agent's Call Fabric client
-    will dial to bridge into the existing call.
+    Conference-first architecture: ends the AI's B-leg so the customer's
+    A-leg falls through to join_conference. Agent then joins the same conference.
 
     Returns:
     {
-        "swml_url": "https://domain/api/swml/takeover/{token}",
+        "dial_address": "/public/agent-conference-swml?token=xxx",
+        "conference_name": "interaction-call-xxxxx",
         "call_sid": "call-xxxxx",
-        "leg_id": 123
+        "call_id": 123,
+        "leg_id": 456
     }
     """
     logger.info(f"TAKEOVER REQUEST for call {call_sid} by user {request.current_user.id}")
@@ -497,32 +540,61 @@ def initiate_takeover(call_sid):
 
         logger.info(f"Created new human leg {new_leg.id} for call {call.id}")
 
-        # Generate secure takeover token
+        # End the AI's B-leg via SignalWire REST API
+        # This causes the customer's A-leg to fall through from connect to join_conference
+        ai_leg = CallLeg.query.filter_by(
+            call_id=call.id,
+            leg_type='ai_agent',
+            status='active'
+        ).first()
+
+        if ai_leg and ai_leg.signalwire_sid:
+            try:
+                sw_api = get_signalwire_api()
+                sw_api.end_call(ai_leg.signalwire_sid)
+                logger.info(f"Ended AI B-leg via REST API: {ai_leg.signalwire_sid}")
+            except Exception as e:
+                logger.warning(f"Failed to end AI B-leg via REST API: {e} - customer may need to wait for timeout")
+            ai_leg.end_leg(reason='agent_takeover')
+        elif ai_leg:
+            logger.warning(f"AI leg {ai_leg.id} has no signalwire_sid - cannot end B-leg via API")
+            ai_leg.end_leg(reason='agent_takeover')
+
+        # Get conference name (created at initial-call time)
+        conference_name = call.conference_name
+        if not conference_name:
+            # Fallback: create one now
+            conference_name = f"interaction-{call.signalwire_call_sid}"
+            call.conference_name = conference_name
+
+        # Ensure Conference DB record exists
+        from app.models import Conference
+        conference = Conference.get_active_by_name(conference_name)
+        if not conference:
+            conference = Conference.create_interaction_conference(
+                call_id=call.signalwire_call_sid,
+                queue_id='general',
+                agent_user_id=request.current_user.id
+            )
+        db.session.flush()
+
+        # Prepare conference join for agent (same flow as accepting a queued call)
         token = secrets.token_urlsafe(32)
-
-        # Store takeover info in Redis using the same key pattern as conference join
-        # The agent_conference_webhook will check for type='takeover' and return
-        # the appropriate SWML (connect to existing call instead of join conference)
-        takeover_data = json.dumps({
-            'type': 'takeover',
+        join_data = json.dumps({
             'agent_id': request.current_user.id,
-            'call_sid': call.signalwire_call_sid,
-            'call_id': call.id,
-            'leg_id': new_leg.id,
-            'user_id': request.current_user.id
+            'conf': conference_name,
+            'call_id': call.id
         })
-        redis_client.setex(f'conference_join:{token}', 120, takeover_data)
+        redis_client.setex(f'conference_join:{token}', 120, join_data)
 
-        logger.info(f"Stored takeover token in Redis: {token[:8]}...")
-
-        # Build dial address with token in URL - same pattern as conference join
-        # (prepare-join stores in Redis, returns /public/resource?token=xxx)
         resource_address = os.getenv('AGENT_CONFERENCE_RESOURCE', '/public/agent-conference-swml')
         dial_address = f"{resource_address}?token={token}"
 
-        # Update call handler type to human (takeover in progress)
+        # Update call handler type to human
         call.handler_type = 'human'
         call.user_id = request.current_user.id
+        new_leg.conference_id = conference.id
+        new_leg.conference_name = conference_name
         db.session.commit()
 
         # Emit event to notify UI
@@ -530,12 +602,14 @@ def initiate_takeover(call_sid):
             'call_sid': call.signalwire_call_sid,
             'call_id': call.id,
             'agent_id': request.current_user.id,
-            'leg_id': new_leg.id
+            'leg_id': new_leg.id,
+            'conference_name': conference_name
         }, room=f'call_{call.signalwire_call_sid}')
 
         return jsonify({
             'success': True,
             'dial_address': dial_address,
+            'conference_name': conference_name,
             'call_sid': call.signalwire_call_sid,
             'call_id': call.id,
             'leg_id': new_leg.id

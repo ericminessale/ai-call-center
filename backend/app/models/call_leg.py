@@ -17,6 +17,7 @@ class CallLeg(db.Model):
 
     # AI info (if leg_type='ai_agent')
     ai_agent_name = db.Column(db.String(100), nullable=True)
+    signalwire_sid = db.Column(db.String(255), nullable=True)  # B-leg call SID for ending via API
 
     # Status
     status = db.Column(db.String(50), default='active')  # 'connecting', 'active', 'completed'
@@ -51,6 +52,7 @@ class CallLeg(db.Model):
             'legType': self.leg_type,
             'legNumber': self.leg_number,
             'aiAgentName': self.ai_agent_name,
+            'signalwireSid': self.signalwire_sid,
             'status': self.status,
             'startedAt': self.started_at.isoformat() if self.started_at else None,
             'endedAt': self.ended_at.isoformat() if self.ended_at else None,

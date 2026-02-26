@@ -115,20 +115,26 @@ def initial_call():
     # This makes it appear in the Agent Dashboard as "AI Active"
     call.update_status('ai_active')
 
+    # Create interaction conference for this call (conference-first architecture)
+    # Conference is created now so the customer can join it after the AI phase ends
+    conference_name = f"interaction-{call_id}"
+    call.conference_name = conference_name
+
+    conference = Conference.create_interaction_conference(
+        call_id=call_id,
+        queue_id='general'
+    )
+    db.session.flush()
+
     # Create initial AI leg for tracking
-    # Include AI conference info for future conference-based routing
     existing_leg = CallLeg.get_active_leg(call.id)
     if not existing_leg:
-        # Get or create AI conference for this call
-        ai_conference = Conference.get_or_create_ai_conference('receptionist')
-        db.session.flush()
-
         CallLeg.create_initial_leg(
             call=call,
             leg_type='ai_agent',
             ai_agent_name='Receptionist',
-            conference_id=ai_conference.id,
-            conference_name=ai_conference.conference_name
+            conference_id=conference.id,
+            conference_name=conference_name
         )
 
     db.session.commit()
@@ -152,7 +158,8 @@ def initial_call():
         'created_at': call.created_at.isoformat() if call.created_at else None,
         'answered_at': call.answered_at.isoformat() if call.answered_at else None,
         'user_id': call.user_id,
-        'queueId': 'general'
+        'queueId': 'general',
+        'conference_name': conference_name
     }
 
     # Emit to ALL agents for AI calls (no room = broadcast to all)
@@ -171,7 +178,11 @@ def initial_call():
     sales_specialist = SystemConfig.get('route.sales_specialist', '/sales-ai')
     support_specialist = SystemConfig.get('route.support_specialist', '/support-ai')
 
-    # Transfer to configurable AI agent with routing config in global_data
+    # Conference-first architecture: connect customer to AI agent via bridge (A-leg/B-leg).
+    # After AI phase ends (B-leg drops from transfer or takeover), customer falls through
+    # to join_conference where human agents can join.
+    ai_agent_url = f"{base_url}{initial_handler}?conf={conference_name}&call_db_id={call.id}"
+
     swml_response = {
         "version": "1.0.0",
         "sections": {
@@ -205,10 +216,25 @@ def initial_call():
                         }
                     }
                 },
-                # Transfer to admin-configured AI agent
+                # Connect to AI agent via bridge (B-leg runs AI, A-leg is customer)
+                # When B-leg ends (transfer complete or takeover), connect completes
+                # and customer falls through to join_conference below
                 {
-                    "transfer": {
-                        "dest": f"{base_url}{initial_handler}"
+                    "connect": {
+                        "to_swml": {
+                            "url": ai_agent_url
+                        }
+                    }
+                },
+                # After AI phase ends, announce and put customer in conference
+                {
+                    "play": {
+                        "url": "say:Please hold while we connect you to an agent."
+                    }
+                },
+                {
+                    "join_conference": {
+                        "name": conference_name
                     }
                 }
             ]
@@ -355,130 +381,8 @@ def end_call():
     })
 
 
-@swml_bp.route('/takeover/<token>', methods=['POST'])
-def takeover_swml(token):
-    """Return SWML to bridge an agent into an existing AI call.
-
-    DIRECT CONNECT APPROACH:
-    Uses SWML connect verb with call:{call_sid} to bridge the agent
-    directly to the customer's existing call. The AI leg is ended via
-    execute_rpc in the SWML before connecting.
-
-    This is simpler than conferences - agent connects directly to customer.
-    """
-    logger.info(f"TAKEOVER SWML requested with token: {token[:8]}...")
-
-    # Look up the token in Redis
-    takeover_data = redis_client.get(f'takeover:{token}')
-
-    if not takeover_data:
-        logger.error(f"Takeover token not found or expired: {token[:8]}...")
-        return jsonify({
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    "answer",
-                    {
-                        "play": {
-                            "urls": ["say:Sorry, this takeover link has expired. Please try again."]
-                        }
-                    },
-                    "hangup"
-                ]
-            }
-        }), 200
-
-    # Delete the token (one-time use)
-    redis_client.delete(f'takeover:{token}')
-
-    # Parse the takeover data
-    data = json.loads(takeover_data)
-    original_call_sid = data['call_sid']
-    call_id = data['call_id']
-    leg_id = data['leg_id']
-    user_id = data.get('user_id')
-
-    logger.info(f"Takeover: Agent {user_id} taking over call {call_id} (SID: {original_call_sid})")
-
-    # Get the call
-    call = Call.query.filter_by(id=call_id).first()
-    if not call:
-        logger.error(f"Call not found: {call_id}")
-        return jsonify({
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    {"play": {"urls": ["say:Call not found. Please try again."]}},
-                    "hangup"
-                ]
-            }
-        }), 200
-
-    # Update the human leg status
-    leg = db.session.query(CallLeg).filter_by(id=leg_id).first()
-    if leg:
-        leg.status = 'active'
-
-    # Update call handler type
-    call.handler_type = 'human'
-    call.user_id = user_id
-    db.session.commit()
-
-    # Find the AI leg to end it via execute_rpc
-    ai_leg = CallLeg.query.filter_by(
-        call_id=call_id,
-        leg_type='ai_agent',
-        status='active'
-    ).first()
-
-    ai_call_sid = ai_leg.signalwire_sid if ai_leg else None
-    if ai_leg:
-        ai_leg.status = 'ended'
-        db.session.commit()
-        logger.info(f"Will end AI leg via execute_rpc: {ai_call_sid}")
-
-    # Emit WebSocket event
-    from app import socketio
-    socketio.emit('call_takeover_connecting', {
-        'call_sid': original_call_sid,
-        'call_id': call_id,
-        'leg_id': leg_id
-    }, room=f'call_{original_call_sid}')
-
-    # Build SWML response:
-    # 1. Answer the agent's call
-    # 2. End the AI leg via execute_rpc (if we have its SID)
-    # 3. Connect agent directly to the customer's call
-    swml_main = ["answer"]
-
-    # End the AI leg if we have its call SID
-    if ai_call_sid:
-        swml_main.append({
-            "execute_rpc": {
-                "method": "end",
-                "call_id": ai_call_sid,
-                "params": {
-                    "reason": "agent_takeover"
-                }
-            }
-        })
-
-    # Connect to the customer's call
-    swml_main.append({
-        "connect": {
-            "to": f"call:{original_call_sid}"
-        }
-    })
-
-    swml_response = {
-        "version": "1.0.0",
-        "sections": {
-            "main": swml_main
-        }
-    }
-
-    logger.info(f"TAKEOVER SWML RESPONSE: {json.dumps(swml_response, indent=2)}")
-
-    return jsonify(swml_response)
+    # NOTE: Old takeover SWML endpoint removed.
+    # With conference-first architecture, takeover uses the standard conference join flow.
+    # The agent joins the interaction conference directly - no special SWML needed.
 
 

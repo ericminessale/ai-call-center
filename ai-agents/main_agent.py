@@ -301,6 +301,17 @@ def capture_base_url(query_params, body_params, headers, agent):
         post_prompt_url = f"{base_url}/api/webhooks/post-prompt"
         agent.set_post_prompt_url(post_prompt_url)
 
+    # Read conference name and call DB ID from query params (conference-first architecture)
+    conf_param = query_params.get('conf')
+    if conf_param:
+        new_global['conf'] = conf_param
+        print(f"Conference name from query param: {conf_param}", flush=True)
+
+    call_db_id = query_params.get('call_db_id')
+    if call_db_id:
+        new_global['call_db_id'] = call_db_id
+        print(f"Call DB ID from query param: {call_db_id}", flush=True)
+
     # Read context from query params (for outbound AI calls)
     ctx_param = query_params.get('ctx')
     if ctx_param:
@@ -313,6 +324,23 @@ def capture_base_url(query_params, body_params, headers, agent):
 
     if new_global:
         agent.set_global_data(new_global)
+
+    # Register AI leg's B-leg call SID with backend (for takeover support)
+    # Do this in a background thread to avoid blocking the AI agent startup
+    if call_db_id and base_url:
+        call_data = body_params.get('call', {})
+        b_leg_sid = call_data.get('call_id')
+        if b_leg_sid:
+            def register_ai_leg():
+                try:
+                    import requests as http_requests
+                    backend_url = os.getenv('BACKEND_URL', 'http://backend:5000')
+                    url = f"{backend_url}/api/calls/{call_db_id}/register-ai-leg"
+                    http_requests.post(url, json={'signalwire_sid': b_leg_sid}, timeout=5)
+                    print(f"Registered AI B-leg SID: {b_leg_sid} for call {call_db_id}", flush=True)
+                except Exception as e:
+                    print(f"Warning: Failed to register AI leg SID: {e}", flush=True)
+            threading.Thread(target=register_ai_leg, daemon=True).start()
 
 
 class CallCenterTriageAgent(AgentBase):
@@ -557,6 +585,11 @@ Summarize this call and return a JSON object with:
         additional_info = args.get("additional_info", "")
 
         base_url = get_base_url_from_global_data(raw_data)
+        global_data = raw_data.get('global_data', {})
+
+        # Get conference name and call DB ID (conference-first architecture)
+        conf = global_data.get('conf', '')
+        call_db_id = global_data.get('call_db_id', '')
 
         # Map urgency to priority
         urgency_map = {'high': 2, 'medium': 5, 'low': 8}
@@ -576,7 +609,12 @@ Summarize this call and return a JSON object with:
         # Encode context as base64 JSON for URL
         context_json = json.dumps(context_data)
         context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
+        # Include conference name and call DB ID for conference-first flow
         queue_url = f"{base_url}/api/queues/{department}/route?ctx={context_b64}"
+        if conf:
+            queue_url += f"&conf={conf}"
+        if call_db_id:
+            queue_url += f"&call_db_id={call_db_id}"
 
         print(f"Transferring {customer_name} to human queue: {queue_url}", flush=True)
         print(f"Context data: {context_data}", flush=True)
@@ -597,8 +635,18 @@ Summarize this call and return a JSON object with:
         additional_info = args.get("additional_info", "")
 
         base_url = get_base_url_from_global_data(raw_data)
+        global_data = raw_data.get('global_data', {})
+
+        # Pass conference name and call DB ID to specialist (conference-first architecture)
+        conf = global_data.get('conf', '')
+        call_db_id = global_data.get('call_db_id', '')
+
         specialist_route = f"/{department}-ai"
         transfer_url = f"{base_url}{specialist_route}"
+        if conf:
+            transfer_url += f"?conf={conf}"
+        if call_db_id:
+            transfer_url += f"&call_db_id={call_db_id}" if '?' in transfer_url else f"?call_db_id={call_db_id}"
 
         print(f"Transferring {customer_name} to AI specialist: {transfer_url}", flush=True)
 
@@ -703,6 +751,10 @@ Summarize this sales consultation and return a JSON object with:
         base_url = get_base_url_from_global_data(raw_data)
         global_data = raw_data.get('global_data', {})
 
+        # Get conference name and call DB ID (conference-first architecture)
+        conf = global_data.get('conf', '')
+        call_db_id = global_data.get('call_db_id', '')
+
         context_data = {
             'customer_name': global_data.get('customer_name', ''),
             'reason': global_data.get('reason', ''),
@@ -719,6 +771,10 @@ Summarize this sales consultation and return a JSON object with:
         context_json = json.dumps(context_data)
         context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
         queue_url = f"{base_url}/api/queues/sales/route?ctx={context_b64}"
+        if conf:
+            queue_url += f"&conf={conf}"
+        if call_db_id:
+            queue_url += f"&call_db_id={call_db_id}"
 
         print(f"Escalating to human sales: {queue_url}", flush=True)
 
@@ -831,6 +887,10 @@ Summarize this support consultation and return a JSON object with:
         base_url = get_base_url_from_global_data(raw_data)
         global_data = raw_data.get('global_data', {})
 
+        # Get conference name and call DB ID (conference-first architecture)
+        conf = global_data.get('conf', '')
+        call_db_id = global_data.get('call_db_id', '')
+
         context_data = {
             'customer_name': global_data.get('customer_name', ''),
             'reason': global_data.get('reason', ''),
@@ -847,6 +907,10 @@ Summarize this support consultation and return a JSON object with:
         context_json = json.dumps(context_data)
         context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
         queue_url = f"{base_url}/api/queues/support/route?ctx={context_b64}"
+        if conf:
+            queue_url += f"&conf={conf}"
+        if call_db_id:
+            queue_url += f"&call_db_id={call_db_id}"
 
         print(f"Escalating to human support: {queue_url}", flush=True)
 
@@ -968,6 +1032,10 @@ Summarize this outbound sales call and return a JSON object with:
         base_url = get_base_url_from_global_data(raw_data)
         global_data = raw_data.get('global_data', {})
 
+        # Get conference name if available (conference-first architecture)
+        conf = global_data.get('conf', '')
+        call_db_id = global_data.get('call_db_id', '')
+
         context_data = {
             'customer_name': global_data.get('contact_name', ''),
             'company': global_data.get('company', ''),
@@ -984,6 +1052,10 @@ Summarize this outbound sales call and return a JSON object with:
         context_json = json.dumps(context_data)
         context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
         queue_url = f"{base_url}/api/queues/sales/route?ctx={context_b64}"
+        if conf:
+            queue_url += f"&conf={conf}"
+        if call_db_id:
+            queue_url += f"&call_db_id={call_db_id}"
 
         print(f"Outbound sales transferring to human: {queue_url}", flush=True)
 
@@ -1099,6 +1171,10 @@ Summarize this outbound support call and return a JSON object with:
         base_url = get_base_url_from_global_data(raw_data)
         global_data = raw_data.get('global_data', {})
 
+        # Get conference name if available (conference-first architecture)
+        conf = global_data.get('conf', '')
+        call_db_id = global_data.get('call_db_id', '')
+
         context_data = {
             'customer_name': global_data.get('contact_name', ''),
             'company': global_data.get('company', ''),
@@ -1115,6 +1191,10 @@ Summarize this outbound support call and return a JSON object with:
         context_json = json.dumps(context_data)
         context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
         queue_url = f"{base_url}/api/queues/support/route?ctx={context_b64}"
+        if conf:
+            queue_url += f"&conf={conf}"
+        if call_db_id:
+            queue_url += f"&call_db_id={call_db_id}"
 
         print(f"Outbound support transferring to human: {queue_url}", flush=True)
 

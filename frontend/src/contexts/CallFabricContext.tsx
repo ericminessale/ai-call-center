@@ -103,7 +103,6 @@ interface CallFabricContextType {
   setAgentStatus: (status: AgentStatusType) => Promise<void>;
   initializeClient: () => Promise<void>;
   makeCall: (phoneNumber: string, context?: any) => Promise<any>;
-  makeCallToSwml: (swmlUrl: string, context?: any) => Promise<any>;  // For takeover calls
   hangup: () => Promise<void>;
   answerCall: () => Promise<void>;
   requestMicPermission: () => Promise<boolean>;
@@ -202,9 +201,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
   // Ref for activeCall to avoid stale closures in answerCall
   const activeCallRef = useRef<ActiveCall | null>(null);
-
-  // Ref to track the original call SID during a takeover (for socket-based cleanup)
-  const takeoverCallSidRef = useRef<string | null>(null);
 
   // Ref to track the outbound dialed call's DB ID (for cleanup when SDK fires destroy)
   const outboundDialCallIdRef = useRef<number | null>(null);
@@ -866,127 +862,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       throw error; // Re-throw so caller knows it failed
     }
   }, [user]); // Minimal dependencies - use refs for everything else
-
-  // Make call to SWML URL (for takeover calls)
-  const makeCallToSwml = useCallback(async (swmlUrl: string, context?: any) => {
-    if (!client) {
-      setError('Phone system not initialized');
-      return;
-    }
-
-    try {
-      console.log('📞 [CallFabric] Making SWML call to:', swmlUrl);
-      setCallState('ringing');
-
-      // Track the original call SID for socket-based cleanup
-      // When the backend detects the original call ended, we use this to clean up
-      if (context?.original_call_sid) {
-        takeoverCallSidRef.current = context.original_call_sid;
-        console.log('📞 [CallFabric] Tracking takeover for call SID:', context.original_call_sid);
-      }
-
-      // When dialing a URL, SignalWire fetches the SWML and executes it
-      const call = await client.dial({
-        to: swmlUrl,
-        rootElement: rootElementRef.current,
-        audio: true,
-        video: false,  // Voice-only - don't request camera
-        logLevel: 'debug',
-        debug: { logWsTraffic: true },
-        userVariables: {
-          agent_id: user?.id,
-          agent_name: user?.name,
-          call_type: 'takeover',
-          ...context
-        }
-      });
-
-      // Helper to mark call as active (avoid duplicate transitions)
-      let hasMarkedActive = false;
-      const markCallActive = () => {
-        if (hasMarkedActive) return;
-        hasMarkedActive = true;
-        console.log('✅ [CallFabric] Takeover call ACTIVE');
-        setCallState('active');
-      };
-
-      // Cleanup helper for when call ends
-      const cleanupCall = () => {
-        console.log('📞 [CallFabric] SWML call cleanup');
-        setActiveCall(null);
-        activeCallRef.current = null;
-        setCallState('idle');
-        takeoverCallSidRef.current = null;
-      };
-
-      // Match the same connected states as conference join for robustness
-      const connectedStates = ['active', 'answered', 'answering', 'early', 'trying'];
-
-      call.on('call.state', (state: any) => {
-        console.log('📞 [CallFabric] SWML call state:', state);
-        if (connectedStates.includes(state)) {
-          markCallActive();
-        } else if (state === 'ended' || state === 'hangup' || state === 'destroy') {
-          cleanupCall();
-        }
-      });
-
-      // Additional events that indicate connection (same as conference join)
-      call.on('call.joined', () => {
-        console.log('📞 [CallFabric] SWML call joined event');
-        markCallActive();
-      });
-
-      call.on('call.updated', (params: any) => {
-        console.log('📞 [CallFabric] SWML call updated:', params);
-        if (params?.state === 'active' || params?.node_id) {
-          markCallActive();
-        }
-      });
-
-      call.on('destroy', () => {
-        console.log('📞 [CallFabric] SWML call destroyed');
-        cleanupCall();
-      });
-
-      const takeoverCall: ActiveCall = {
-        id: call.id,
-        callerId: 'Takeover Call',
-        direction: 'outbound',
-        status: 'connecting',
-        startTime: new Date(),
-        answer: async () => {},
-        hangup: async () => await call.hangup(),
-        hold: async () => {},
-        unhold: async () => {},
-        mute: async () => await call.audioMute(),
-        unmute: async () => await call.audioUnmute(),
-        sendDigits: async (digits: string) => await call.sendDigits(digits)
-      };
-
-      setActiveCall(takeoverCall);
-      activeCallRef.current = takeoverCall;
-      await call.start();
-      console.log('✅ [CallFabric] SWML call started');
-
-      // Fallback: mark as active after start() if no state event fired
-      // (same pattern as conference join)
-      setTimeout(() => {
-        if (!hasMarkedActive) {
-          console.log('📞 [CallFabric] Fallback: marking takeover call active after start()');
-          markCallActive();
-        }
-      }, 1000);
-
-      return call;
-
-    } catch (error) {
-      console.error('❌ [CallFabric] Failed to make SWML call:', error);
-      setError('Failed to take over call');
-      setCallState('idle');
-      takeoverCallSidRef.current = null;
-    }
-  }, [client, user]);
 
   // Hang up current call
   const hangup = useCallback(async () => {
@@ -1968,7 +1843,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       setCallState('idle');
       setActiveCall(null);
       activeCallRef.current = null;
-      takeoverCallSidRef.current = null;
       outboundDialCallIdRef.current = null;
 
       // Reset conference state (for outbound conference calls)
@@ -1981,10 +1855,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     };
 
     const handleCallEnded = (data: { callId: number; call_sid?: string }) => {
-      // Match takeover calls by SID
-      if (takeoverCallSidRef.current && data.call_sid === takeoverCallSidRef.current) {
-        cleanupSdkState('takeover call ended');
-      }
       // Match outbound dialed calls by DB ID
       if (outboundDialCallIdRef.current && data.callId === outboundDialCallIdRef.current) {
         cleanupSdkState('outbound dial call ended');
@@ -1998,16 +1868,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const isEnded = ['ended', 'completed'].includes(call.status);
       if (!isEnded) return;
 
-      // Match 1: Takeover calls by call SID
-      if (takeoverCallSidRef.current) {
-        const callSid = call.call_sid || call.signalwire_call_sid;
-        if (callSid === takeoverCallSidRef.current) {
-          cleanupSdkState('takeover call_update ended');
-          return;
-        }
-      }
-
-      // Match 2: Conference calls by conference name (outbound calls, queue calls)
+      // Match 1: Conference calls by conference name (outbound calls, queue calls, takeover)
       // When the customer's call ends, its conference_name matches our active conference
       const currentConf = agentConferenceRef.current;
       if (currentConf && call.conference_name === currentConf.conferenceName) {
@@ -2015,7 +1876,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         return;
       }
 
-      // Match 3: Outbound dialed call by DB ID
+      // Match 2: Outbound dialed call by DB ID
       // This handles the case where the SDK already fired 'destroy' (clearing
       // activeCallRef and agentConferenceRef) before the socket event arrives
       if (outboundDialCallIdRef.current && call.id === outboundDialCallIdRef.current) {
@@ -2084,7 +1945,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     setAgentStatus,
     initializeClient,
     makeCall,
-    makeCallToSwml,
     hangup,
     answerCall,
     requestMicPermission,

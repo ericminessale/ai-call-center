@@ -320,17 +320,30 @@ def route_call_to_queue(queue_id):
                 # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
                 base_url = get_base_url()
 
-                # Create interaction conference for agent-customer call
-                # Customer will be transferred to this conference, agent joins it
-                conference_name = f"interaction-{call_id}"
+                # Use existing conference name from conference-first flow, or create new one
+                conf_name = request.args.get('conf')
+                if conf_name:
+                    conference_name = conf_name
+                    logger.info(f"Using conference-first conference: {conference_name}")
+                else:
+                    conference_name = f"interaction-{call_id}"
+                    logger.info(f"Creating new interaction conference: {conference_name}")
+
                 if call:
                     call.conference_name = conference_name
-                logger.info(f"Creating interaction conference {conference_name} for call {call_id} -> agent {selected_user.email}")
-                conference = Conference.create_interaction_conference(
-                    call_id=call_id,
-                    queue_id=queue_id,
-                    agent_user_id=selected_user.id
-                )
+
+                # Get or create Conference DB record
+                conference = Conference.get_active_by_name(conference_name)
+                if not conference:
+                    conference = Conference.create_interaction_conference(
+                        call_id=call_id,
+                        queue_id=queue_id,
+                        agent_user_id=selected_user.id
+                    )
+                else:
+                    # Update existing conference with agent info
+                    conference.owner_user_id = selected_user.id
+                    conference.queue_id = queue_id
 
                 # Create call leg for human agent
                 if call:
@@ -428,23 +441,35 @@ def route_call_to_queue(queue_id):
                 logger.info(f"Emitted call_assignment to agent room {selected_user.id}")
                 logger.info(f"Customer will join interaction conference: {conference_name}")
 
-                # Return raw SWML to put the caller into the interaction conference
-                # (This is fetched via SWML transfer, NOT a SWAIG function call,
-                # so it must be a top-level SWML document, not a SWAIG response wrapper)
-                swml_response = {
-                    "version": "1.0.0",
-                    "sections": {
-                        "main": [
-                            {
-                                "play": {
-                                    "url": "say:I'm connecting you to a specialist now. Please hold."
-                                }
-                            },
-                            {"join_conference": {"name": conference_name}}
-                        ]
+                # Return SWML response
+                # Conference-first: B-leg ends (hangup), customer's A-leg falls through
+                # to join_conference from initial-call SWML
+                # Legacy: put customer directly into conference via join_conference
+                if conf_name:
+                    # Conference-first: end B-leg so A-leg falls through to join_conference
+                    swml_response = {
+                        "version": "1.0.0",
+                        "sections": {
+                            "main": ["hangup"]
+                        }
                     }
-                }
-                logger.info(f"Returning SWML for agent conference: {conference_name}")
+                    logger.info(f"Conference-first: returning hangup SWML (customer joins via A-leg fallback)")
+                else:
+                    # Legacy: put caller directly into conference
+                    swml_response = {
+                        "version": "1.0.0",
+                        "sections": {
+                            "main": [
+                                {
+                                    "play": {
+                                        "url": "say:I'm connecting you to a specialist now. Please hold."
+                                    }
+                                },
+                                {"join_conference": {"name": conference_name}}
+                            ]
+                        }
+                    }
+                    logger.info(f"Legacy: returning join_conference SWML for {conference_name}")
                 return jsonify(swml_response)
             else:
                 # No agents with valid Call Fabric addresses

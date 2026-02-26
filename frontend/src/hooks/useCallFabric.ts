@@ -45,7 +45,6 @@ export const useCallFabric = () => {
       await context.setAgentStatus('offline');
     },
     makeCall: context.makeCall,
-    makeCallToSwml: context.makeCallToSwml,
     hangup: context.hangup,
     answerCall: context.answerCall,
     requestMicPermission: context.requestMicPermission,

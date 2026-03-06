@@ -174,6 +174,16 @@ In your [SignalWire Dashboard](https://signalwire.com/signin):
    https://YOUR-NGROK-URL/api/webhooks/call-status
    ```
 
+### Direct-to-Queue Routing (Optional)
+
+If you want a phone number to skip AI entirely and route callers straight to a human agent queue, set the number's webhook to:
+
+```
+https://YOUR-NGROK-URL/api/queues/{queue-slug}/direct-inbound
+```
+
+Replace `{queue-slug}` with any active queue slug (e.g., `sales`, `support`, `billing`). Callers hear a brief hold message and enter the queue immediately. This uses the same agent assignment, conference, and hold loop logic as AI-routed calls — just without the triage step.
+
 ### 7. Create a Call Fabric Subscriber
 
 Agents need a Call Fabric subscriber to make/receive calls via the browser:

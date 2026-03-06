@@ -101,6 +101,11 @@ def route_call_to_queue(queue_id):
         # Clean up None values
         context = {k: v for k, v in context.items() if v is not None}
 
+        # If no meaningful context was provided (direct inbound, no AI triage),
+        # mark it so the agent dashboard shows something useful
+        if not context or context == {'global_data': {}} or context.get('global_data') == {}:
+            context['source'] = context.get('source', 'direct_inbound')
+
         # Map urgency to priority if urgency is set but priority isn't
         urgency = context.get('urgency', '').lower()
         if urgency and context.get('priority', 5) == 5:  # Only if priority is default
@@ -703,6 +708,124 @@ def queue_hold_menu(queue_id):
                 ]
             }
         })
+
+
+@queues_bp.route('/<queue_slug>/direct-inbound', methods=['POST'])
+def direct_inbound_queue(queue_slug):
+    """
+    Direct inbound call entry point — bypasses AI, routes straight to human queue.
+
+    Usage: In SignalWire Dashboard, set a phone number's webhook to:
+        POST https://your-ngrok-url/api/queues/sales/direct-inbound
+
+    This answers the call, creates a Call record, and transfers into the
+    existing queue routing machinery (agent selection, hold loop, conference).
+    """
+    try:
+        logger.info(f"Direct inbound call → queue '{queue_slug}'")
+        data = request.json or {}
+        call_data = data.get('call', {})
+        call_id = call_data.get('call_id') or data.get('CallSid')
+        caller_number = call_data.get('from_number') or data.get('From')
+        to_number = call_data.get('to_number') or data.get('To')
+
+        logger.info(f"Direct inbound: call_id={call_id}, from={caller_number}, to={to_number}")
+
+        # Validate queue exists
+        queue = Queue.query.filter_by(slug=queue_slug).first()
+        if not queue:
+            logger.warning(f"Direct inbound: unknown queue '{queue_slug}'")
+            return jsonify({
+                "version": "1.0.0",
+                "sections": {
+                    "main": [
+                        {"play": {"url": "say:We're sorry, this number is not configured correctly. Please try again later."}},
+                        "hangup"
+                    ]
+                }
+            })
+
+        # Create Call record so webhooks and dashboard can track it
+        call = Call.query.filter_by(signalwire_call_sid=call_id).first() if call_id else None
+        if not call:
+            system_user = User.query.filter_by(email='system@signalwire.local').first()
+            if not system_user:
+                system_user = db.session.query(User).first()
+
+            call = Call(
+                signalwire_call_sid=call_id,
+                user_id=system_user.id,
+                from_number=caller_number,
+                destination=to_number or 'unknown',
+                destination_type='phone',
+                direction='inbound',
+                handler_type='human',
+                status='waiting',
+                queue_id=queue_slug,
+                ai_context=json.dumps({'source': 'direct_inbound', 'queue': queue_slug}),
+                created_at=datetime.utcnow()
+            )
+            db.session.add(call)
+
+        # Find/create Contact from caller number
+        if caller_number:
+            try:
+                contact = Contact.find_or_create_by_phone(caller_number)
+                call.contact_id = contact.id
+                contact.last_interaction_at = datetime.utcnow()
+                contact.total_calls = (contact.total_calls or 0) + 1
+            except Exception as e:
+                logger.warning(f"Direct inbound: failed to create contact: {e}")
+
+        db.session.commit()
+
+        # Notify dashboard of new inbound call
+        try:
+            emit_call_update(call)
+        except Exception as e:
+            logger.warning(f"Direct inbound: failed to emit call_update: {e}")
+
+        # Return SWML: set up status webhooks, answer, greet, transfer to queue route
+        base_url = get_base_url()
+        swml_response = {
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {
+                        "set": {
+                            "call_state_url": f"{base_url}/api/webhooks/call-status",
+                            "call_state_events": "created,ringing,answered,ended"
+                        }
+                    },
+                    "answer",
+                    {
+                        "play": {
+                            "url": "say:Thank you for calling. Please hold while we connect you with an agent."
+                        }
+                    },
+                    {
+                        "transfer": {
+                            "dest": f"{base_url}/api/queues/{queue_slug}/route"
+                        }
+                    }
+                ]
+            }
+        }
+
+        logger.info(f"Direct inbound call {call_id} → queue '{queue_slug}', returning SWML")
+        return jsonify(swml_response)
+
+    except Exception as e:
+        logger.error(f"Error in direct_inbound_queue: {str(e)}")
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": "say:We're experiencing technical difficulties. Please try again later."}},
+                    "hangup"
+                ]
+            }
+        }), 500
 
 
 @queues_bp.route('/<queue_id>/hold-loop', methods=['POST'])

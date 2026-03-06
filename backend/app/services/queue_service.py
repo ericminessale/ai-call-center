@@ -57,6 +57,9 @@ class QueueService:
         """
         queue_key = f"{self.queue_prefix}{queue_id}"
 
+        # Remove any existing entry for this call (prevents duplicates from hold loop retries)
+        self._remove_call_from_set(queue_key, call_id)
+
         # Create call data
         call_data = {
             "call_id": call_id,
@@ -465,6 +468,32 @@ class QueueService:
         avg_handle_time = 180  # 3 minutes average
 
         return position * avg_handle_time
+
+    def _remove_call_from_set(self, queue_key: str, call_id: str) -> int:
+        """Remove all entries for a call_id from a specific queue sorted set."""
+        removed = 0
+        entries = self.redis.zrange(queue_key, 0, -1)
+        for entry in entries:
+            try:
+                data = json.loads(entry)
+                if data.get("call_id") == call_id:
+                    self.redis.zrem(queue_key, entry)
+                    removed += 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return removed
+
+    def remove_call_from_all_queues(self, call_id: str) -> int:
+        """Remove a call from all queues. Called when a call ends (hangup, timeout, etc.)."""
+        removed = 0
+        # Scan all queue keys
+        for key in self.redis.scan_iter(f"{self.queue_prefix}*"):
+            removed += self._remove_call_from_set(key, call_id)
+        # Also clean up the call data key
+        self.redis.delete(f"{self.call_prefix}{call_id}")
+        if removed:
+            logger.info(f"Removed call {call_id} from {removed} queue entries")
+        return removed
 
     def _notify_agents(self, queue_id: str, call_id: str) -> None:
         """Notify available agents about new call in queue"""

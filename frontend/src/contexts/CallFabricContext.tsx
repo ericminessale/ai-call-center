@@ -1947,10 +1947,18 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       conferenceCallRef.current = null;
     };
 
-    const handleCallEnded = (data: { callId: number; call_sid?: string }) => {
-      // Match outbound dialed calls by DB ID
+    const handleCallEnded = (data: { callId: number; call_sid?: string; conference_name?: string; assigned_agent_id?: number }) => {
+      // Match 1: Conference calls by conference name
+      const currentConf = agentConferenceRef.current;
+      if (currentConf && data.conference_name && data.conference_name === currentConf.conferenceName) {
+        cleanupSdkState(`call_ended: conference ${currentConf.conferenceName}`);
+        return;
+      }
+
+      // Match 2: Outbound dialed calls by DB ID
       if (outboundDialCallIdRef.current && data.callId === outboundDialCallIdRef.current) {
-        cleanupSdkState('outbound dial call ended');
+        cleanupSdkState('call_ended: outbound dial');
+        return;
       }
     };
 

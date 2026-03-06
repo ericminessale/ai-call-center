@@ -371,8 +371,7 @@ class CallCenterTriageAgent(AgentBase):
     This agent does NOT solve problems. It ONLY:
     1. Collects the customer's name
     2. Identifies if they need sales or support
-    3. Gathers basic context info
-    4. Transfers to human queue OR AI specialist
+    3. Offers transfer to human queue OR AI specialist
 
     The AI Specialists (SalesAISpecialist, SupportAISpecialist) are the ONLY
     agents that actually help solve problems or answer questions.
@@ -387,140 +386,148 @@ class CallCenterTriageAgent(AgentBase):
 
         self.set_dynamic_config_callback(capture_base_url)
 
+        # Voice and speech configuration
+        self.add_language("English", "en-US", "openai.alloy",
+            function_fillers=["Bear with me one moment.", "I'm getting you connected now."])
+        self.set_prompt_llm_params(
+            temperature=0.4, top_p=0.9,
+            barge_confidence=0.6, frequency_penalty=0.2)
+        self.set_params({"end_of_speech_timeout": 800, "ai_volume": 0})
+
         # Fetch active queues from backend (dynamic at startup)
         queues = get_active_queues()
         queue_slugs = [q['slug'] for q in queues]
         self._queue_ai_map = {q['slug']: q.get('ai_agent_route', f"/{q['slug']}-ai") for q in queues}
 
+        # Speech recognition hints
+        hint_words = ["SignalWire"] + [q['display_name'] for q in queues] + queue_slugs
+        self.add_hints(hint_words)
+
         # ============================================================
-        # GLOBAL PROMPT - Applies to ALL contexts
-        # Just defines personality - NO problem solving instructions
+        # GLOBAL PROMPT - Personality and role boundaries
         # ============================================================
         self.prompt_add_section(
-            "Identity",
-            "You are Sam, a friendly and efficient customer service representative. "
-            "Your ONLY job is to quickly understand what the caller needs and route them to the right team."
+            "Role",
+            "You are Sam, a warm and efficient call center receptionist. "
+            "You speak in short, natural sentences. You sound like a real person — not a script. "
+            "You are genuinely friendly but you keep things moving."
         )
 
         self.prompt_add_section(
-            "CRITICAL RESTRICTIONS",
-            "You are a TRIAGE agent. You must NEVER:",
+            "Voice Style",
+            body="This is a voice call. Optimize everything for spoken conversation:",
             bullets=[
-                "Attempt to solve, troubleshoot, or fix any problem",
-                "Provide technical advice or suggestions",
-                "Answer product questions or provide pricing",
-                "Diagnose issues or suggest solutions",
-                "Say things like 'did you try...' or 'have you checked...'",
-                "Offer workarounds or temporary fixes"
+                "Keep sentences under 15 words when possible",
+                "Ask one question at a time — never stack multiple questions",
+                "Use everyday language, not corporate-speak",
+                "When acknowledging something, keep it to a few words before moving on"
             ]
         )
 
         self.prompt_add_section(
-            "Your Job",
-            "You ONLY gather information and transfer calls. That's it. "
-            "If someone describes a problem, acknowledge it and move to getting their transfer preference. "
-            "Do NOT engage with the problem itself. Be brief and efficient — route calls quickly."
+            "Boundaries",
+            "Your only job is to greet callers, learn their name, figure out which department they need, "
+            "and connect them. All questions, troubleshooting, and advice are handled by the specialists "
+            "you transfer to. If a caller asks you a question or describes a problem, acknowledge it briefly "
+            "and move toward getting them connected."
         )
 
         # Build department list for post_prompt
         dept_options = '/'.join(queue_slugs + ['unknown'])
-        self.set_post_prompt(f"""
-Summarize this call and return a JSON object with:
-{{
-    "customer_name": "Name if provided, or null",
-    "department": "{dept_options}",
-    "reason": "Brief reason for their call",
-    "outcome": "transferred_to_human/transferred_to_ai/abandoned",
-    "notes": "Any important details"
-}}
-""")
+        self.set_post_prompt(
+            f'Summarize this call as a JSON object: {{"customer_name": "name or null", '
+            f'"department": "{dept_options}", '
+            '"reason": "brief reason for call", '
+            '"outcome": "transferred_to_human/transferred_to_ai/abandoned", '
+            '"notes": "any important details"}'
+        )
+        self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
         # Define the contexts and steps
         contexts = self.define_contexts()
 
         # ============================================================
-        # TRIAGE CONTEXT (default) - Initial greeting and routing
+        # TRIAGE CONTEXT (default) - Greeting and routing
         # ============================================================
         triage_ctx = contexts.add_context("default")
 
-        # Build routing hints from queue config
+        # Build department info for step prompts
         queue_descriptions = []
         for q in queues:
             desc = q.get('description', '')
-            queue_descriptions.append(f"{q['display_name'].upper()} ({q['slug']}): {desc}" if desc else f"{q['display_name'].upper()} ({q['slug']})")
+            queue_descriptions.append(f"{q['display_name']} ({q['slug']}): {desc}" if desc else f"{q['display_name']} ({q['slug']})")
 
-        listen_for_text = "\n".join(queue_descriptions)
-        route_instructions = "\n".join([f"- {q['display_name']}-related: change_context to '{q['slug']}'" for q in queues])
+        dept_list_text = "\n".join(queue_descriptions)
+        route_instructions = "\n".join([f"- {q['display_name']}-related: switch to the '{q['slug']}' context" for q in queues])
 
-        # Build a natural department menu for the greeting
         dept_names = [q['display_name'] for q in queues]
         if len(dept_names) > 1:
-            dept_menu = ', '.join(dept_names[:-1]) + ', or ' + dept_names[-1]
+            dept_menu = ', '.join(dept_names[:-1]) + ' or ' + dept_names[-1]
         else:
             dept_menu = dept_names[0] if dept_names else 'general assistance'
 
-        # Step 1: Get the caller's name
-        triage_ctx.add_step("get_name") \
-            .add_section("Your Task",
-                "Greet the caller and ask for their name. Keep it brief.") \
-            .add_section("What to Say",
-                "'Hi, thank you for calling! My name is Sam. May I get your name please?'") \
-            .add_section("IMPORTANT",
-                "You MUST get their name before moving on. If they start explaining "
-                "their issue, say 'I'd love to help with that — may I first get your name?'") \
-            .set_step_criteria("Customer has clearly stated their name") \
+        # Step 1: Greet and get name
+        triage_ctx.add_step("greeting") \
+            .add_section("Goal",
+                "Welcome the caller and get their name. Introduce yourself as Sam. "
+                "Be warm but brief — this should take one exchange.") \
+            .add_section("Handling Eager Callers",
+                "If the caller gives you their name AND mentions what they need in the same breath, "
+                "great — note both. You can skip asking about the department in the next step.") \
+            .set_step_criteria("The customer has stated their name") \
             .set_valid_steps(["route_department"])
 
-        # Step 2: Ask which department they need — direct, not open-ended
+        # Step 2: Determine department
         triage_ctx.add_step("route_department") \
-            .add_section("Your Task",
-                "Now that you have their name, ask which department they need. "
-                "Present the available options directly.") \
-            .add_section("What to Say",
-                f"'Thanks [name]! Are you calling about {dept_menu}?'") \
-            .add_section("Available Departments", listen_for_text) \
+            .add_section("Goal",
+                "Figure out which department the caller needs. If they already told you during "
+                "the greeting, route them immediately — no need to ask again.") \
+            .add_section("If You Need to Ask",
+                f"Ask naturally which area they need help with: {dept_menu}.") \
+            .add_section("Departments", dept_list_text) \
             .add_section("Routing",
-                "As soon as they indicate a department:\n" + route_instructions + "\n"
-                "Do NOT announce the routing. Just seamlessly move to the right department context.") \
+                "Once you know the department, move to that context seamlessly:\n" + route_instructions) \
             .set_step_criteria("Customer has indicated which department they need") \
             .set_valid_contexts(queue_slugs)
 
         # ============================================================
-        # DYNAMIC QUEUE CONTEXTS - Built from configured queues
+        # DYNAMIC QUEUE CONTEXTS - One per configured queue
         # ============================================================
         for q in queues:
             slug = q['slug']
             display = q['display_name']
 
             queue_ctx = contexts.add_context(slug) \
-                .set_isolated(True)
+                .set_consolidate(True)
 
-            queue_ctx.add_section("Role",
-                f"Continue as Sam. Customer needs {display.lower()} help. Use their name.")
+            queue_ctx.add_section("Context",
+                f"The caller needs {display.lower()} help. You still have their name and "
+                "what they told you from the greeting. Use it naturally.")
 
-            queue_ctx.add_section("REMEMBER",
-                "You are TRIAGE only. Do NOT answer questions, provide advice, "
-                "or make recommendations. Quickly offer transfer options.")
+            # Step 1: Ask what they need help with
+            queue_ctx.add_step("gather_reason") \
+                .add_section("Goal",
+                    f"Briefly ask what they need help with so you can pass useful context "
+                    "to the specialist. One question is enough — don't interrogate them.") \
+                .add_section("If They Already Told You",
+                    "If the caller already described their issue during the greeting, "
+                    "you have what you need. Move on to offering transfer options.") \
+                .set_step_criteria("You have a basic understanding of what the caller needs help with") \
+                .set_valid_steps(["offer_transfer"])
 
-            # Single step: Offer transfer choice immediately
+            # Step 2: Offer transfer choice
             queue_ctx.add_step("offer_transfer") \
-                .add_section("Your Task",
-                    f"The caller needs {display.lower()} help. Offer them their transfer options right away.") \
-                .add_section("What to Say",
-                    f"'I can connect you with one of our {display.lower()} specialists, "
-                    "or if you prefer, our AI assistant can help you right away. "
-                    "Which would you prefer?'") \
-                .add_section("After They Answer",
-                    "- Want human/representative/person/agent: use transfer_to_human tool\n"
-                    "- Want AI/assistant/you can help: use transfer_to_ai_specialist tool\n"
-                    "- If unclear, briefly clarify then transfer\n\n"
-                    f"Include: customer_name (if known), reason, department='{slug}', "
-                    "urgency='medium', additional_info") \
-                .add_section("CRITICAL",
-                    "Do NOT answer their questions or try to solve their problem. "
-                    "If they ask a question, say: "
-                    "'Great question — let me connect you with someone who can help with that.' "
-                    "Then ask if they want a human or AI assistant.") \
+                .add_section("Goal",
+                    f"Offer to connect them with a {display.lower()} specialist, "
+                    "or let them know our AI assistant can help right away. Let them choose.") \
+                .add_section("Handling Questions",
+                    "If they ask you a question about their issue, acknowledge it and "
+                    "let them know a specialist can help with that. Then offer the transfer options.") \
+                .add_section("Transferring",
+                    "Once they choose:\n"
+                    "- Human specialist: use the transfer_to_human tool\n"
+                    "- AI assistant: use the transfer_to_ai_specialist tool\n\n"
+                    f"Always include: customer_name, reason, department='{slug}', urgency, additional_info") \
                 .set_step_criteria("Customer has chosen human or AI assistance")
 
         # ============================================================
@@ -659,59 +666,83 @@ class SalesAISpecialist(AgentBase):
             auto_answer=True
         )
 
+        # Voice and speech configuration
+        self.add_language("English", "en-US", "openai.alloy",
+            speech_fillers=["Good question, let me think about that.", "Hmm, let me consider that."],
+            function_fillers=["Let me look that up for you.", "One moment while I check on that."])
+        self.set_prompt_llm_params(
+            temperature=0.5, top_p=0.9,
+            barge_confidence=0.5, frequency_penalty=0.1)
         self.set_params({
             "wait_for_user": False,
             "end_of_speech_timeout": 1000
         })
+        self.add_hints(["SignalWire", "pricing", "enterprise", "demo", "trial", "API",
+                        "platform", "integration", "SDK", "CPaaS", "UCaaS"])
 
         self.set_dynamic_config_callback(capture_base_url)
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'sales-ai', fallback_collection='sales_knowledge')
 
-        self.set_post_prompt("""
-Summarize this sales consultation and return a JSON object with:
-{
-    "customer_name": "Name if provided, or null",
-    "company": "Company name if provided, or null",
-    "products_discussed": ["List of products/services discussed"],
-    "recommendations_made": ["Products/solutions recommended"],
-    "next_steps": "Recommended next steps",
-    "lead_score": "1-10 (1=hot, 10=cold)",
-    "outcome": "sale/quote_requested/follow_up_needed/lost"
-}
-""")
+        self.set_post_prompt(
+            'Summarize this sales consultation as a JSON object: '
+            '{"customer_name": "name or null", "company": "company or null", '
+            '"products_discussed": ["list"], "recommendations_made": ["list"], '
+            '"next_steps": "recommended next steps", '
+            '"lead_score": "1-10 where 1 is hot", '
+            '"outcome": "sale/quote_requested/follow_up_needed/lost"}'
+        )
+        self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
         self.prompt_add_section(
             "Role",
-            "You are Alex, an AI sales specialist. The customer chose to speak with an AI assistant "
-            "for help with their sales inquiry."
+            "You are Alex, a consultative AI sales specialist. You listen first and recommend second. "
+            "You ask discovery questions to understand what the customer actually needs before suggesting solutions. "
+            "You are knowledgeable, genuine, and never pushy."
+        )
+
+        self.prompt_add_section(
+            "Voice Style",
+            body="This is a voice call. Optimize for spoken conversation:",
+            bullets=[
+                "Keep responses to one or two sentences unless explaining something specific",
+                "Lead with the answer, then add detail if needed",
+                "Never list more than three things at once — offer to go deeper on any of them",
+                "Ask one question at a time"
+            ]
         )
 
         self.prompt_add_section(
             "Customer Context",
             "Customer name: ${global_data.customer_name}\n"
-            "Interest: ${global_data.reason}\n"
-            "Additional info: ${global_data.additional_info}\n\n"
-            "Greet them by name and continue the conversation."
+            "What they're interested in: ${global_data.reason}\n"
+            "Additional context: ${global_data.additional_info}\n\n"
+            "The customer was just transferred from our receptionist. Greet them by name and "
+            "pick up where they left off — don't re-ask what they already told Sam."
         )
 
         self.prompt_add_section(
-            "What You CAN Do",
-            "You are empowered to help with:",
+            "Approach",
+            body="How to handle the conversation:",
             bullets=[
-                "Answer questions about products and services",
-                "Explain features, benefits, and use cases",
-                "Provide general pricing guidance",
-                "Make recommendations based on their needs",
-                "Help them understand which solution fits best"
+                "Start by understanding their situation — what problem are they trying to solve?",
+                "Ask about their current setup, team size, or use case to tailor your recommendations",
+                "Match their needs to specific products or features",
+                "Give honest, straightforward pricing guidance when asked",
+                "Use the search_knowledge tool to find specific product details when needed"
             ]
         )
 
         self.prompt_add_section(
-            "Escalation",
-            "If they want to proceed with a purchase, get a custom quote, "
-            "or speak with a human, use the escalate_to_human tool."
+            "When to Escalate",
+            body="Use the escalate_to_human tool when:",
+            bullets=[
+                "They're ready to make a purchase or need a formal quote",
+                "They need custom pricing or contract terms",
+                "They specifically ask to speak with a person",
+                "The question is about billing or account-specific details you can't access"
+            ]
         )
 
         self.define_tool(
@@ -781,73 +812,85 @@ class SupportAISpecialist(AgentBase):
             auto_answer=True
         )
 
+        # Voice and speech configuration
+        self.add_language("English", "en-US", "openai.alloy",
+            speech_fillers=["Let me think about that.", "Good question."],
+            function_fillers=["Let me search our knowledge base.", "Checking on that for you."])
+        self.set_prompt_llm_params(
+            temperature=0.3, top_p=0.9,
+            barge_confidence=0.5, frequency_penalty=0.2)
         self.set_params({
             "wait_for_user": False,
             "end_of_speech_timeout": 1000
         })
+        self.add_hints(["SignalWire", "error", "restart", "configuration", "API", "log",
+                        "debug", "timeout", "connection", "webhook", "SDK"])
 
         self.set_dynamic_config_callback(capture_base_url)
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'support-ai', fallback_collection='support_knowledge')
 
-        self.set_post_prompt("""
-Summarize this support consultation and return a JSON object with:
-{
-    "customer_name": "Name if provided, or null",
-    "issue_summary": "Brief description of the issue",
-    "troubleshooting_steps": ["Steps attempted during the call"],
-    "resolution": "How resolved, or null if unresolved",
-    "resolved": true/false,
-    "escalation_reason": "Why escalated, or null",
-    "customer_satisfaction": "1-5 based on conversation"
-}
-""")
+        self.set_post_prompt(
+            'Summarize this support consultation as a JSON object: '
+            '{"customer_name": "name or null", '
+            '"issue_summary": "brief description", '
+            '"troubleshooting_steps": ["steps attempted"], '
+            '"resolution": "how resolved or null", '
+            '"resolved": true or false, '
+            '"escalation_reason": "why escalated or null", '
+            '"customer_satisfaction": "1-5 based on tone"}'
+        )
+        self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
         self.prompt_add_section(
             "Role",
-            "You are Jordan, an AI support specialist. The customer chose to speak with an AI assistant "
-            "to help troubleshoot their issue."
+            "You are Jordan, a patient and methodical AI support specialist. "
+            "You confirm you understand a problem before jumping to solutions. "
+            "You are calm, empathetic, and you explain things in plain language."
+        )
+
+        self.prompt_add_section(
+            "Voice Style",
+            body="This is a voice call. Keep it natural:",
+            bullets=[
+                "Give one instruction at a time — wait for confirmation before the next step",
+                "Explain technical terms simply when you use them",
+                "Keep responses short — if an explanation is long, break it into parts",
+                "Check in after each step: a quick 'did that work?' goes a long way"
+            ]
         )
 
         self.prompt_add_section(
             "Customer Context",
             "Customer name: ${global_data.customer_name}\n"
-            "Issue: ${global_data.reason}\n"
+            "Reported issue: ${global_data.reason}\n"
             "Urgency: ${global_data.urgency}\n"
-            "Additional info: ${global_data.additional_info}\n\n"
-            "Greet them by name and let them know you're here to help solve their problem."
+            "Additional context: ${global_data.additional_info}\n\n"
+            "The customer was just transferred from our receptionist. Greet them by name, "
+            "briefly acknowledge what they told Sam, and start helping."
         )
 
         self.prompt_add_section(
-            "What You CAN Do",
-            "You are empowered to:",
+            "Approach",
+            body="How to troubleshoot effectively:",
             bullets=[
-                "Ask diagnostic questions to understand the problem",
-                "Walk through troubleshooting steps systematically",
-                "Suggest solutions and workarounds",
-                "Provide technical guidance and instructions",
-                "Help them resolve the issue"
+                "First, confirm you understand the issue by restating it briefly in your own words",
+                "Ask what they've already tried so you don't repeat steps",
+                "Start with the simplest, most common fix",
+                "Walk through one step at a time — confirm it worked before moving on",
+                "Use the search_knowledge tool to look up solutions when needed"
             ]
         )
 
         self.prompt_add_section(
-            "Troubleshooting Approach",
-            "Start with the basics and work up:",
+            "When to Escalate",
+            body="Use the escalate_to_human tool when:",
             bullets=[
-                "Confirm you understand the issue",
-                "Ask clarifying questions if needed",
-                "Start with simple/common fixes first",
-                "Walk through steps clearly, one at a time",
-                "Confirm each step works before moving on",
-                "If stuck after 3-4 attempts, offer human escalation"
+                "You've tried two or three approaches and the issue persists",
+                "The issue requires account access or admin-level changes you can't make",
+                "The customer asks to speak with a person"
             ]
-        )
-
-        self.prompt_add_section(
-            "Escalation",
-            "If you can't resolve the issue after reasonable troubleshooting, "
-            "or if they request a human, use the escalate_to_human tool."
         )
 
         self.define_tool(
@@ -924,75 +967,82 @@ class OutboundSalesAgent(AgentBase):
             auto_answer=True
         )
 
+        # Voice and speech configuration
+        self.add_language("English", "en-US", "openai.alloy",
+            speech_fillers=["That's a great question.", "Let me think about that."],
+            function_fillers=["Let me look that up.", "One moment while I check."])
+        self.set_prompt_llm_params(
+            temperature=0.5, top_p=0.9,
+            barge_confidence=0.5, frequency_penalty=0.1)
         self.set_params({
             "wait_for_user": False,
             "end_of_speech_timeout": 1000
         })
+        self.add_hints(["SignalWire", "pricing", "enterprise", "demo", "trial", "API",
+                        "platform", "integration"])
 
         self.set_dynamic_config_callback(capture_base_url)
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'outbound-sales', fallback_collection='sales_knowledge')
 
-        self.set_post_prompt("""
-Summarize this outbound sales call and return a JSON object with:
-{
-    "customer_name": "Name of customer called",
-    "company": "Company name if known",
-    "products_discussed": ["List of products/services discussed"],
-    "customer_interest_level": "high/medium/low/none",
-    "next_steps": "Recommended follow-up actions",
-    "outcome": "interested/callback_requested/not_interested/no_answer/voicemail"
-}
-""")
+        self.set_post_prompt(
+            'Summarize this outbound sales call as a JSON object: '
+            '{"customer_name": "name", "company": "company or null", '
+            '"products_discussed": ["list"], '
+            '"customer_interest_level": "high/medium/low/none", '
+            '"next_steps": "recommended follow-up", '
+            '"outcome": "interested/callback_requested/not_interested/no_answer/voicemail"}'
+        )
+        self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
         self.prompt_add_section(
             "Role",
-            "You are Alex, a friendly and professional AI sales representative making an outbound call. "
-            "You are calling on behalf of the company to connect with this customer."
+            "You are Alex, a warm and professional AI sales representative making an outbound call. "
+            "You are genuine, respectful of people's time, and never pushy. "
+            "You get to the point quickly and listen more than you talk."
         )
 
         self.prompt_add_section(
-            "Customer Information",
+            "Voice Style",
+            body="This is an outbound voice call — first impressions matter:",
+            bullets=[
+                "Introduce yourself and the company in your first sentence",
+                "Ask if now is a good time before diving in",
+                "Keep it conversational — this is a phone call, not a pitch deck",
+                "If they say it's not a good time, respect that and offer to call back"
+            ]
+        )
+
+        self.prompt_add_section(
+            "Customer Context",
             "Customer name: ${global_data.contact_name}\n"
             "Company: ${global_data.company}\n"
             "Account tier: ${global_data.account_tier}\n"
-            "VIP customer: ${global_data.is_vip}\n"
-            "Previous interactions: ${global_data.total_calls} calls\n"
+            "VIP: ${global_data.is_vip}\n"
+            "Previous calls: ${global_data.total_calls}\n"
             "Notes: ${global_data.notes}\n"
-            "Special instructions: ${global_data.additional_context}"
+            "Instructions: ${global_data.additional_context}\n\n"
+            "Use this context to personalize the conversation. Don't read it back to them — "
+            "weave it in naturally. Follow any special instructions."
         )
 
         self.prompt_add_section(
-            "Call Approach",
-            "You are making a proactive outbound call. Guidelines:",
+            "Approach",
+            body="How to handle the call:",
             bullets=[
-                "Introduce yourself and the company right away",
-                "Address the customer by name",
-                "If there are special instructions, follow them",
-                "Be respectful of their time — ask if now is a good moment",
-                "If they're a VIP or enterprise customer, acknowledge their importance",
-                "Tailor your pitch based on their account tier and history",
-                "If they have notes from previous interactions, reference them naturally"
+                "Tailor your conversation to their tier and history",
+                "For VIP or enterprise customers, acknowledge their relationship with the company",
+                "Ask discovery questions to understand their current needs",
+                "Match solutions to their specific situation",
+                "Use search_knowledge to find relevant product details when needed"
             ]
         )
 
         self.prompt_add_section(
-            "What You CAN Do",
-            "You are empowered to:",
-            bullets=[
-                "Discuss products, services, features, and pricing",
-                "Make personalized recommendations",
-                "Schedule follow-up calls or demos",
-                "Answer questions about the company's offerings",
-                "Offer promotional deals if appropriate"
-            ]
-        )
-
-        self.prompt_add_section(
-            "Escalation",
-            "If they want to speak with a human representative, "
-            "or need help beyond sales, use the transfer_to_human tool."
+            "When to Transfer",
+            "Use the transfer_to_human tool if they want to speak with a person, "
+            "are ready to purchase, or need help outside of sales."
         )
 
         self.define_tool(
@@ -1062,76 +1112,83 @@ class OutboundSupportAgent(AgentBase):
             auto_answer=True
         )
 
+        # Voice and speech configuration
+        self.add_language("English", "en-US", "openai.alloy",
+            speech_fillers=["Let me think about that.", "Good question."],
+            function_fillers=["Let me check our knowledge base.", "Looking into that for you."])
+        self.set_prompt_llm_params(
+            temperature=0.3, top_p=0.9,
+            barge_confidence=0.5, frequency_penalty=0.2)
         self.set_params({
             "wait_for_user": False,
             "end_of_speech_timeout": 1000
         })
+        self.add_hints(["SignalWire", "error", "restart", "configuration", "API", "log",
+                        "debug", "timeout", "connection", "webhook"])
 
         self.set_dynamic_config_callback(capture_base_url)
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'outbound-support', fallback_collection='support_knowledge')
 
-        self.set_post_prompt("""
-Summarize this outbound support call and return a JSON object with:
-{
-    "customer_name": "Name of customer called",
-    "company": "Company name if known",
-    "issue_discussed": "What was discussed",
-    "resolution": "How it was resolved, or null",
-    "resolved": true/false,
-    "follow_up_needed": true/false,
-    "outcome": "resolved/escalated/callback_requested/no_answer/voicemail"
-}
-""")
+        self.set_post_prompt(
+            'Summarize this outbound support call as a JSON object: '
+            '{"customer_name": "name", "company": "company or null", '
+            '"issue_discussed": "what was discussed", '
+            '"resolution": "how resolved or null", '
+            '"resolved": true or false, '
+            '"follow_up_needed": true or false, '
+            '"outcome": "resolved/escalated/callback_requested/no_answer/voicemail"}'
+        )
+        self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
         self.prompt_add_section(
             "Role",
-            "You are Jordan, a friendly and professional AI support specialist making an outbound call. "
-            "You are proactively reaching out to help this customer."
+            "You are Jordan, a patient and empathetic AI support specialist making a proactive follow-up call. "
+            "You genuinely care about helping the customer resolve their issue. "
+            "You explain things clearly and never rush."
         )
 
         self.prompt_add_section(
-            "Customer Information",
+            "Voice Style",
+            body="This is an outbound voice call — be considerate:",
+            bullets=[
+                "Introduce yourself and explain why you're calling right away",
+                "Ask if it's a good time to talk",
+                "Give one instruction at a time during troubleshooting",
+                "Check in after each step before moving on"
+            ]
+        )
+
+        self.prompt_add_section(
+            "Customer Context",
             "Customer name: ${global_data.contact_name}\n"
             "Company: ${global_data.company}\n"
             "Account tier: ${global_data.account_tier}\n"
-            "VIP customer: ${global_data.is_vip}\n"
-            "Previous interactions: ${global_data.total_calls} calls\n"
+            "VIP: ${global_data.is_vip}\n"
+            "Previous calls: ${global_data.total_calls}\n"
             "Notes: ${global_data.notes}\n"
-            "Special instructions: ${global_data.additional_context}"
+            "Instructions: ${global_data.additional_context}\n\n"
+            "Use this context to personalize the call. Reference their history naturally. "
+            "Follow any special instructions. Prioritize VIP and enterprise customers."
         )
 
         self.prompt_add_section(
-            "Call Approach",
-            "You are making a proactive outbound support call. Guidelines:",
+            "Approach",
+            body="How to handle the call:",
             bullets=[
-                "Introduce yourself and explain why you're calling",
-                "Address the customer by name",
-                "If there are special instructions, follow them",
-                "Be respectful of their time — ask if now is a good moment",
-                "If they're a VIP or enterprise customer, prioritize their experience",
-                "Reference their history and any notes from previous interactions",
-                "Be empathetic and solution-oriented"
+                "Explain the reason for your call clearly",
+                "Ask about their current situation and what they need help with",
+                "Start with the simplest fix and work up from there",
+                "Use search_knowledge to look up solutions when needed",
+                "If you can't resolve it in a reasonable time, offer to connect them with a specialist"
             ]
         )
 
         self.prompt_add_section(
-            "What You CAN Do",
-            "You are empowered to:",
-            bullets=[
-                "Troubleshoot and diagnose technical issues",
-                "Walk through solutions step by step",
-                "Provide product guidance and best practices",
-                "Schedule follow-up calls if more time is needed",
-                "Escalate to human support for complex issues"
-            ]
-        )
-
-        self.prompt_add_section(
-            "Escalation",
-            "If you can't resolve their issue, or they want to speak with a human, "
-            "use the transfer_to_human tool."
+            "When to Transfer",
+            "Use the transfer_to_human tool if the issue needs account-level access, "
+            "you've tried multiple approaches without success, or they request a human."
         )
 
         self.define_tool(

@@ -110,12 +110,14 @@ def call_status():
                 'destination': call.destination,
                 'destination_type': call.destination_type,
                 'transcription_active': call.transcription_active,
+                'conference_name': call.conference_name,  # Needed for frontend SDK cleanup on call end
                 'startTime': call.created_at.isoformat() if call.created_at else None,
                 'created_at': call.created_at.isoformat() if call.created_at else None,
                 'answered_at': call.answered_at.isoformat() if call.answered_at else None,
                 'ended_at': call.ended_at.isoformat() if call.ended_at else None,
                 'user_id': call.user_id,
-                'queueId': 'general'  # TODO: Determine from call routing
+                'assigned_agent_id': call.assigned_agent_id,
+                'queueId': call.queue_id or 'general'
             }
 
             # Emit to call-specific room
@@ -136,6 +138,23 @@ def call_status():
 
             # Special handling for ended status to reset UI
             if mapped_status == 'ended':
+                # Clean up any queue entries for this call
+                from app.services.queue_service import QueueService
+                from app.services.redis_service import get_redis_client
+                redis_client = get_redis_client()
+                if redis_client:
+                    queue_svc = QueueService(redis_client)
+                    queue_svc.remove_call_from_all_queues(call_id)
+
+                    # If call was assigned to an agent, check if they're still
+                    # marked busy for THIS call (meaning they never accepted it).
+                    # Revert them to available so they can take new calls.
+                    if call.assigned_agent_id:
+                        agent_status = queue_svc.get_agent_status(str(call.assigned_agent_id))
+                        if agent_status and agent_status.get('status') == 'busy' and agent_status.get('current_call_id') == call_id:
+                            queue_svc.set_agent_status(str(call.assigned_agent_id), 'available')
+                            logger.info(f"Reverted agent {call.assigned_agent_id} to available (caller hung up before acceptance)")
+
                 # Close any active or connecting call legs
                 active_leg = CallLeg.get_active_leg(call.id)
                 if not active_leg:
@@ -153,6 +172,8 @@ def call_status():
                 call_ended_data = {
                     'callId': call.id,  # Use database ID
                     'call_sid': call_id,  # Also provide SignalWire ID
+                    'conference_name': call.conference_name,  # For frontend conference cleanup
+                    'assigned_agent_id': call.assigned_agent_id,
                     'reset_ui': True
                 }
                 # Emit to user room
@@ -454,6 +475,14 @@ def post_prompt():
             # If we have a raw summary and no existing summary, use it
             if raw_summary and not call.summary:
                 call.summary = raw_summary
+
+            # Clean up any queue entries for this call
+            from app.services.queue_service import QueueService
+            from app.services.redis_service import get_redis_client
+            redis_client = get_redis_client()
+            if redis_client:
+                queue_svc = QueueService(redis_client)
+                queue_svc.remove_call_from_all_queues(call_id)
 
             # post_prompt fires when the AI conversation ends — mark the call as ended
             # so the frontend can clean up, even if the call-status webhook is delayed

@@ -6,17 +6,19 @@ import { useSocket } from '../hooks/useSocket';
 import { UnifiedHeader } from '../components/unified/UnifiedHeader';
 import { LeftPanel } from '../components/unified/LeftPanel';
 import { IncomingCallBanner } from '../components/unified/IncomingCallBanner';
+import { SettingsPanel } from '../components/unified/SettingsPanel';
 import { ContactDetailView } from '../components/contacts/ContactDetailView';
-import { contactsApi, callsApi } from '../services/api';
-import { Contact, ContactMinimal, Call } from '../types/callcenter';
+import { contactsApi, callsApi, queueApi } from '../services/api';
+import { Contact, ContactMinimal, Call, QueueConfig } from '../types/callcenter';
 import { Users } from 'lucide-react';
 import { ContactDetailSkeleton } from '../components/shared/Skeleton';
+import { DashboardCharts } from '../components/unified/DashboardCharts';
 import toast from 'react-hot-toast';
 import { logger } from '../lib/logger';
 import { mapCall, mapCalls } from '../lib/mapCall';
 
 // View modes for the unified interface
-export type ViewMode = 'contacts' | 'calls' | 'queue' | 'supervisor';
+export type ViewMode = 'contacts' | 'calls' | 'queue' | 'supervisor' | 'settings';
 
 // Agent status options
 export type AgentStatus = 'available' | 'busy' | 'after-call' | 'break' | 'offline';
@@ -32,6 +34,7 @@ export function UnifiedAgentDesktop() {
     if (location.pathname.startsWith('/calls')) return 'calls';
     if (location.pathname.startsWith('/queue')) return 'queue';
     if (location.pathname.startsWith('/supervisor')) return 'supervisor';
+    if (location.pathname.startsWith('/settings')) return 'settings';
     return 'contacts';
   };
 
@@ -63,6 +66,9 @@ export function UnifiedAgentDesktop() {
     queue: 0,
     aiActive: 0,
   });
+
+  // Queue configs for filter pills + badges
+  const [queueConfigs, setQueueConfigs] = useState<QueueConfig[]>([]);
 
   // Call Fabric integration (shared context)
   const callFabric = useCallFabricContext();
@@ -159,6 +165,12 @@ export function UnifiedAgentDesktop() {
       setStats(newStats);
     });
 
+    // Queue config changed - admin CRUD on queues
+    socket.on('queue_config_changed', () => {
+      logger.debug('[Unified] queue_config_changed — reload queue data');
+      loadQueueConfigs();
+    });
+
     // Queue update - call added, assigned, or removed from queue
     socket.on('queue_update', (data: { call: Call; queue_id: string; action: string; assigned_agent_id?: number; assigned_agent_name?: string }) => {
       logger.debug('[Unified] queue_update:', data);
@@ -198,6 +210,7 @@ export function UnifiedAgentDesktop() {
       socket.off('authenticated');
       socket.off('connect');
       socket.off('queue_update');
+      socket.off('queue_config_changed');
     };
   }, [socket]);
 
@@ -279,12 +292,23 @@ export function UnifiedAgentDesktop() {
     }
   }, []);
 
+  // Load active queue configs (for filter pills and badges)
+  const loadQueueConfigs = useCallback(async () => {
+    try {
+      const response = await queueApi.getActiveQueueConfigs();
+      setQueueConfigs(response.data.queues || []);
+    } catch (error) {
+      logger.error('Failed to load queue configs:', error);
+    }
+  }, []);
+
   // Initial data load
   useEffect(() => {
     loadContacts();
     loadActiveCalls();
     loadQueuedCalls();
     updateCallCounts();
+    loadQueueConfigs();
   }, []);
 
   // Handle customer connected to agent's conference (auto-navigation)
@@ -383,6 +407,9 @@ export function UnifiedAgentDesktop() {
         break;
       case 'supervisor':
         navigate('/supervisor');
+        break;
+      case 'settings':
+        navigate('/settings');
         break;
     }
   };
@@ -583,66 +610,77 @@ export function UnifiedAgentDesktop() {
 
       {/* Main Content */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left Panel */}
-        <div className="w-80 border-r border-gray-700 flex flex-col bg-gray-800">
-          <LeftPanel
-            viewMode={viewMode}
-            contacts={contacts}
-            selectedContactId={selectedContact?.id}
-            onSelectContact={handleContactSelect}
-            onSearch={setSearchQuery}
-            onContactCreated={handleContactCreated}
-            searchQuery={searchQuery}
-            isLoadingContacts={isLoadingContacts}
-            activeCalls={activeCalls}
-            queuedCalls={queuedCalls}
-            onSelectCall={handleCallSelect}
-            onTakeCall={handleTakeCall}
-            isLoadingCalls={isLoadingCalls}
-            isLoadingQueue={isLoadingQueue}
-          />
-        </div>
-
-        {/* Right Panel - 360 Contact Detail */}
-        <div className="flex-1 bg-gray-900 overflow-hidden">
-          {isLoadingContactDetail && !selectedContact ? (
-            <ContactDetailSkeleton />
-          ) : selectedContact ? (
-            <ContactDetailView
-              contact={selectedContact}
-              onContactUpdate={handleContactUpdate}
-              onContactDelete={handleContactDelete}
-              activeCallForContact={
-                [...activeCalls, ...queuedCalls].find(c => {
-                  if (c.contact_id === selectedContact.id || (c as any).contactId === selectedContact.id) {
-                    return true;
-                  }
-                  if (c.direction === 'outbound') {
-                    return (c as any).destination === selectedContact.phone;
-                  }
-                  return c.from_number === selectedContact.phone ||
-                         (c as any).fromNumber === selectedContact.phone ||
-                         c.phoneNumber === selectedContact.phone;
-                })
-              }
-            />
-          ) : (
-            <div className="h-full flex items-center justify-center text-gray-500">
-              <div className="text-center">
-                <Users className="w-16 h-16 mx-auto mb-4 opacity-50" />
-                <p className="text-lg">
-                  {viewMode === 'contacts' && 'Select a contact to view details'}
-                  {viewMode === 'calls' && 'Select a call to view contact details'}
-                  {viewMode === 'queue' && 'Select a queued call to view details'}
-                  {viewMode === 'supervisor' && 'Select an agent or call to monitor'}
-                </p>
-                <p className="text-sm mt-2">
-                  {viewMode === 'contacts' && 'Or create a new contact to get started'}
-                </p>
-              </div>
+        {viewMode === 'settings' ? (
+          /* Full-width settings panel */
+          <div className="flex-1 bg-gray-900 overflow-hidden">
+            <SettingsPanel />
+          </div>
+        ) : (
+          <>
+            {/* Left Panel */}
+            <div className="w-80 border-r border-gray-700 flex flex-col bg-gray-800">
+              <LeftPanel
+                viewMode={viewMode}
+                contacts={contacts}
+                selectedContactId={selectedContact?.id}
+                onSelectContact={handleContactSelect}
+                onSearch={setSearchQuery}
+                onContactCreated={handleContactCreated}
+                searchQuery={searchQuery}
+                isLoadingContacts={isLoadingContacts}
+                activeCalls={activeCalls}
+                queuedCalls={queuedCalls}
+                onSelectCall={handleCallSelect}
+                onTakeCall={handleTakeCall}
+                isLoadingCalls={isLoadingCalls}
+                isLoadingQueue={isLoadingQueue}
+                queueConfigs={queueConfigs}
+              />
             </div>
-          )}
-        </div>
+
+            {/* Right Panel - 360 Contact Detail */}
+            <div className="flex-1 bg-gray-900 overflow-hidden">
+              {isLoadingContactDetail && !selectedContact ? (
+                <ContactDetailSkeleton />
+              ) : selectedContact ? (
+                <ContactDetailView
+                  contact={selectedContact}
+                  onContactUpdate={handleContactUpdate}
+                  onContactDelete={handleContactDelete}
+                  activeCallForContact={
+                    [...activeCalls, ...queuedCalls].find(c => {
+                      if (c.contact_id === selectedContact.id || (c as any).contactId === selectedContact.id) {
+                        return true;
+                      }
+                      if (c.direction === 'outbound') {
+                        return (c as any).destination === selectedContact.phone;
+                      }
+                      return c.from_number === selectedContact.phone ||
+                             (c as any).fromNumber === selectedContact.phone ||
+                             c.phoneNumber === selectedContact.phone;
+                    })
+                  }
+                />
+              ) : viewMode === 'supervisor' ? (
+                <DashboardCharts activeCalls={activeCalls} queuedCalls={queuedCalls} />
+              ) : (
+                <div className="h-full flex items-center justify-center text-gray-500">
+                  <div className="text-center">
+                    <Users className="w-16 h-16 mx-auto mb-4 opacity-50" />
+                    <p className="text-lg">
+                      {viewMode === 'contacts' && 'Select a contact to view details'}
+                      {viewMode === 'calls' && 'Select a call to view contact details'}
+                      {viewMode === 'queue' && 'Select a queued call to view details'}
+                    </p>
+                    <p className="text-sm mt-2">
+                      {viewMode === 'contacts' && 'Or create a new contact to get started'}
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

@@ -4,8 +4,11 @@ from app.api import admin_bp
 from app.models import Call, Transcription, User
 from app.models.system_config import SystemConfig
 from app.models.document import DocumentCollection, Document, AgentCollectionAssignment
+from app.models.queue import Queue, QueueAgentAssignment
 from app.utils.decorators import require_auth
+from app.utils.url_utils import get_base_url
 import logging
+import re
 import requests as http_requests
 import os
 from base64 import b64encode
@@ -134,6 +137,182 @@ def update_agent_config():
     except Exception as e:
         db.session.rollback()
         logger.error(f"Failed to update agent config: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# Queue Management
+# =============================================================================
+
+@admin_bp.route('/queues', methods=['GET'])
+@require_auth
+def list_queues():
+    """List all queues with agent counts."""
+    try:
+        queues = Queue.query.order_by(Queue.display_name).all()
+        return jsonify({
+            'queues': [q.to_dict(include_agent_count=True) for q in queues]
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to list queues: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/queues', methods=['POST'])
+@require_auth
+def create_queue():
+    """Create a new queue."""
+    try:
+        data = request.get_json()
+        if not data or not data.get('slug') or not data.get('display_name'):
+            return jsonify({'error': 'slug and display_name are required'}), 400
+
+        slug = data['slug'].lower().strip()
+        if not re.match(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$', slug):
+            return jsonify({'error': 'slug must be lowercase alphanumeric with hyphens'}), 400
+
+        if Queue.find_by_slug(slug):
+            return jsonify({'error': f'Queue "{slug}" already exists'}), 409
+
+        queue = Queue(
+            slug=slug,
+            display_name=data['display_name'],
+            description=data.get('description'),
+            routing_strategy=data.get('routing_strategy', 'round_robin'),
+            ai_agent_route=data.get('ai_agent_route'),
+            default_priority=data.get('default_priority', 5),
+            sla_threshold_seconds=data.get('sla_threshold_seconds', 60),
+            max_wait_before_ai_fallback=data.get('max_wait_before_ai_fallback', 120),
+        )
+        db.session.add(queue)
+        db.session.commit()
+
+        from app import socketio
+        socketio.emit('queue_config_changed', {'action': 'created', 'queue': queue.to_dict()})
+
+        return jsonify({'queue': queue.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to create queue: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/queues/<int:queue_id>', methods=['PUT'])
+@require_auth
+def update_queue(queue_id):
+    """Update queue settings."""
+    try:
+        queue = Queue.query.get(queue_id)
+        if not queue:
+            return jsonify({'error': 'Queue not found'}), 404
+
+        data = request.get_json()
+        for field in ['display_name', 'description', 'is_active', 'routing_strategy',
+                      'ai_agent_route', 'default_priority', 'sla_threshold_seconds',
+                      'max_wait_before_ai_fallback']:
+            if field in data:
+                setattr(queue, field, data[field])
+
+        db.session.commit()
+
+        from app import socketio
+        socketio.emit('queue_config_changed', {'action': 'updated', 'queue': queue.to_dict()})
+
+        return jsonify({'queue': queue.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to update queue: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/queues/<int:queue_id>', methods=['DELETE'])
+@require_auth
+def delete_queue(queue_id):
+    """Delete a queue and its agent assignments."""
+    try:
+        queue = Queue.query.get(queue_id)
+        if not queue:
+            return jsonify({'error': 'Queue not found'}), 404
+
+        slug = queue.slug
+        db.session.delete(queue)
+        db.session.commit()
+
+        from app import socketio
+        socketio.emit('queue_config_changed', {'action': 'deleted', 'queue_slug': slug})
+
+        return jsonify({'success': True, 'message': f'Queue "{slug}" deleted'}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to delete queue: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# Queue-Agent Assignments
+# =============================================================================
+
+@admin_bp.route('/queues/<int:queue_id>/agents', methods=['GET'])
+@require_auth
+def get_queue_agents(queue_id):
+    """Get agents assigned to a queue."""
+    try:
+        queue = Queue.query.get(queue_id)
+        if not queue:
+            return jsonify({'error': 'Queue not found'}), 404
+
+        assignments = QueueAgentAssignment.query.filter_by(queue_id=queue_id).all()
+        return jsonify({
+            'queue': queue.to_dict(),
+            'assignments': [a.to_dict() for a in assignments],
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to get queue agents: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/queues/<int:queue_id>/agents', methods=['PUT'])
+@require_auth
+def update_queue_agents(queue_id):
+    """Replace all agent assignments for a queue.
+    Body: { "assignments": [{ "user_id": 1, "skill_level": 7 }, ...] }
+    """
+    try:
+        queue = Queue.query.get(queue_id)
+        if not queue:
+            return jsonify({'error': 'Queue not found'}), 404
+
+        data = request.get_json()
+        if not data or 'assignments' not in data:
+            return jsonify({'error': 'assignments array required'}), 400
+
+        QueueAgentAssignment.query.filter_by(queue_id=queue_id).delete()
+
+        for item in data['assignments']:
+            user_id = item.get('user_id')
+            if not user_id:
+                continue
+            user = User.query.get(user_id)
+            if not user:
+                continue
+            assignment = QueueAgentAssignment(
+                queue_id=queue_id,
+                user_id=user_id,
+                skill_level=item.get('skill_level', 5),
+                is_activated=False,
+            )
+            db.session.add(assignment)
+
+        db.session.commit()
+
+        assignments = QueueAgentAssignment.query.filter_by(queue_id=queue_id).all()
+        return jsonify({
+            'success': True,
+            'assignments': [a.to_dict() for a in assignments],
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to update queue agents: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -550,3 +729,285 @@ def delete_user(user_id):
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({'error': f'Failed to delete user: {str(e)}'}), 500
+
+
+# =============================================================================
+# Phone Number Management (uses SignalWire Fabric Resources API)
+# =============================================================================
+
+def _sw_rest_url():
+    """Return the SignalWire REST API base URL (for phone numbers, etc.)."""
+    return f"https://{SIGNALWIRE_SPACE}/api/relay/rest"
+
+
+def _sw_fabric_url():
+    """Return the SignalWire Fabric API base URL (for resources, webhooks, etc.)."""
+    return f"https://{SIGNALWIRE_SPACE}/api/fabric"
+
+
+def _find_or_create_swml_webhook(webhook_url):
+    """Find an existing SWML webhook resource for our URL, or create one.
+
+    Uses the Fabric Resources API at /api/fabric/resources/swml_webhooks.
+    Returns the webhook resource ID, or None on failure.
+    """
+    fabric_url = _sw_fabric_url()
+    headers = _get_sw_auth_headers()
+
+    # Step 1: List existing SWML webhooks to see if one already points to our URL
+    list_url = f"{fabric_url}/resources/swml_webhooks"
+    logger.warning(f"[PHONE-DEBUG] Listing SWML webhooks at: {list_url}")
+    list_resp = http_requests.get(list_url, headers=headers, timeout=15)
+
+    logger.warning(f"[PHONE-DEBUG] List SWML webhooks response: {list_resp.status_code}")
+    if list_resp.status_code == 200:
+        resp_json = list_resp.json()
+        webhooks = resp_json.get('data', resp_json.get('webhooks', []))
+        logger.warning(f"[PHONE-DEBUG] Found {len(webhooks)} existing SWML webhooks, raw keys: {list(resp_json.keys())}")
+        for wh in webhooks:
+            logger.warning(f"[PHONE-DEBUG]   Webhook raw: {wh}")
+            wh_url = wh.get('primary_request_url') or wh.get('request_url') or wh.get('url') or ''
+            if wh_url.rstrip('/') == webhook_url.rstrip('/'):
+                logger.warning(f"[PHONE-DEBUG] Found existing SWML webhook resource: {wh.get('id')}")
+                return wh.get('id')
+    else:
+        logger.warning(f"[PHONE-DEBUG] List SWML webhooks failed: {list_resp.status_code} - {list_resp.text[:500]}")
+
+    # Step 2: Create a new SWML webhook resource
+    create_url = f"{fabric_url}/resources/swml_webhooks"
+    create_payload = {
+        'name': 'Call Center Inbound Handler',
+        'primary_request_url': webhook_url,
+    }
+    logger.warning(f"[PHONE-DEBUG] Creating SWML webhook at: {create_url}")
+    create_resp = http_requests.post(
+        create_url,
+        json=create_payload,
+        headers=headers,
+        timeout=15,
+    )
+
+    logger.warning(f"[PHONE-DEBUG] Create SWML webhook response: {create_resp.status_code} - {create_resp.text[:1000]}")
+    if create_resp.status_code in (200, 201):
+        result = create_resp.json()
+        webhook_id = result.get('id')
+        logger.warning(f"[PHONE-DEBUG] Created SWML webhook resource: {webhook_id} - full response: {result}")
+        return webhook_id
+    else:
+        logger.error(f"Failed to create SWML webhook: {create_resp.status_code} - {create_resp.text[:1000]}")
+        return None
+
+
+def _assign_phone_number_direct(number_sid, webhook_url, headers):
+    """Fallback: Try to assign phone number directly via PUT with call_handler.
+
+    Tries 'swml_webhooks' as the call_handler value (matching laml_webhooks pattern).
+    Returns (success, message) tuple.
+    """
+    rest_url = _sw_rest_url()
+    for handler_value in ['swml_webhooks', 'swml_script']:
+        update_url = f"{rest_url}/phone_numbers/{number_sid}"
+        payload = {
+            'call_handler': handler_value,
+            'call_request_url': webhook_url,
+        }
+        logger.warning(f"[PHONE-DEBUG] Direct assign attempt with call_handler='{handler_value}' at: {update_url}")
+        resp = http_requests.put(update_url, json=payload, headers=headers, timeout=15)
+        logger.warning(f"[PHONE-DEBUG] Direct assign response: {resp.status_code} - {resp.text[:500]}")
+
+        if resp.status_code == 200:
+            return True, f'Phone number assigned with call_handler={handler_value}'
+        else:
+            logger.warning(f"Direct assign with call_handler='{handler_value}' failed: {resp.status_code}")
+
+    return False, 'All direct assignment methods failed'
+
+
+@admin_bp.route('/phone-numbers', methods=['GET'])
+@require_auth
+def list_phone_numbers():
+    """List all phone numbers from SignalWire REST API."""
+    try:
+        if not SIGNALWIRE_SPACE or not SIGNALWIRE_PROJECT_KEY:
+            return jsonify({'error': 'SignalWire credentials not configured'}), 500
+
+        # Build webhook URL from EXTERNAL_URL
+        base_url = get_base_url()
+        webhook_url = f"{base_url}/api/swml/initial-call" if base_url else None
+
+        # Call SignalWire REST API
+        url = f"{_sw_rest_url()}/phone_numbers"
+        resp = http_requests.get(
+            url,
+            headers=_get_sw_auth_headers(),
+            params={'page_size': 100},
+            timeout=15,
+        )
+
+        if resp.status_code != 200:
+            logger.error(f"SignalWire API error listing phone numbers: {resp.status_code} - {resp.text}")
+            return jsonify({'error': f'SignalWire API error: {resp.status_code}'}), 502
+
+        data = resp.json()
+        raw_numbers = data.get('data', [])
+
+        # Log first number's raw structure for debugging
+        if raw_numbers:
+            logger.info(f"Phone number raw fields: {list(raw_numbers[0].keys())}")
+            logger.debug(f"Phone number sample: {raw_numbers[0]}")
+
+        phone_numbers = []
+        for n in raw_numbers:
+            # Try multiple possible field names for the webhook URL
+            call_request_url = (
+                n.get('call_request_url') or
+                n.get('call_relay_context') or
+                ''
+            )
+            call_handler = n.get('call_handler') or ''
+
+            # Number is assigned if its webhook URL matches ours
+            is_assigned = bool(
+                webhook_url and call_request_url and
+                webhook_url.rstrip('/') == call_request_url.rstrip('/')
+            )
+            phone_numbers.append({
+                'sid': n.get('id'),
+                'phone_number': n.get('number') or n.get('phone_number', ''),
+                'friendly_name': n.get('name') or '',
+                'voice_url': call_request_url,
+                'call_handler': call_handler,
+                'status_callback': n.get('call_status_callback_url') or '',
+                'is_assigned': is_assigned,
+            })
+
+        return jsonify({
+            'phone_numbers': phone_numbers,
+            'webhook_url': webhook_url or '',
+            'is_configured': bool(base_url),
+        }), 200
+
+    except http_requests.exceptions.ConnectionError:
+        return jsonify({'error': 'Cannot reach SignalWire API'}), 503
+    except http_requests.exceptions.Timeout:
+        return jsonify({'error': 'SignalWire API request timed out'}), 504
+    except Exception as e:
+        logger.error(f"Failed to list phone numbers: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/phone-numbers/<string:number_sid>', methods=['POST'])
+@require_auth
+def update_phone_number(number_sid):
+    """Assign/unassign a phone number to the call center via SWML webhook resource."""
+    try:
+        data = request.get_json()
+        action = data.get('action') if data else None
+
+        if action not in ('assign', 'unassign'):
+            return jsonify({'error': 'action must be "assign" or "unassign"'}), 400
+
+        base_url = get_base_url()
+        if action == 'assign' and not base_url:
+            return jsonify({'error': 'EXTERNAL_URL not configured. Cannot assign webhook.'}), 400
+
+        rest_url = _sw_rest_url()
+        fabric_url = _sw_fabric_url()
+        headers = _get_sw_auth_headers()
+
+        if action == 'assign':
+            webhook_url = f"{base_url}/api/swml/initial-call"
+
+            # Strategy 1: Fabric Resources API — create SWML webhook + assign phone route
+            webhook_id = _find_or_create_swml_webhook(webhook_url)
+            if webhook_id:
+                assign_url = f"{fabric_url}/resources/{webhook_id}/phone_routes"
+                assign_payload = {'phone_number_id': number_sid}
+                logger.warning(f"[PHONE-DEBUG] Assigning resource to phone route at: {assign_url} with payload: {assign_payload}")
+
+                assign_resp = http_requests.post(
+                    assign_url,
+                    json=assign_payload,
+                    headers=headers,
+                    timeout=15,
+                )
+
+                logger.warning(f"[PHONE-DEBUG] Assign phone route response: {assign_resp.status_code} - {assign_resp.text[:500]}")
+
+                if assign_resp.status_code in (200, 201):
+                    logger.info(f"Assigned SWML webhook {webhook_id} to phone number {number_sid}")
+                    return jsonify({
+                        'success': True,
+                        'phone_number': {
+                            'sid': number_sid,
+                            'is_assigned': True,
+                        },
+                        'message': 'Phone number assigned to call center (SWML handler via Fabric Resources)',
+                    }), 200
+                else:
+                    logger.warning(f"Fabric Resources phone_routes failed, trying direct assignment fallback")
+
+            # Strategy 2: Fallback — direct PUT on phone number with call_handler variants
+            logger.info("Trying direct phone number assignment fallback...")
+            success, message = _assign_phone_number_direct(number_sid, webhook_url, headers)
+            if success:
+                return jsonify({
+                    'success': True,
+                    'phone_number': {
+                        'sid': number_sid,
+                        'is_assigned': True,
+                    },
+                    'message': message,
+                }), 200
+            else:
+                return jsonify({
+                    'error': 'Failed to assign phone number. Fabric Resources API and direct assignment both failed.',
+                    'details': message,
+                }), 502
+
+        else:
+            # Unassign: Update phone number to clear handler
+            update_resp = http_requests.put(
+                f"{rest_url}/phone_numbers/{number_sid}",
+                json={
+                    'call_handler': 'laml_webhooks',
+                    'call_request_url': '',
+                },
+                headers=headers,
+                timeout=15,
+            )
+
+            if update_resp.status_code != 200:
+                logger.error(f"Failed to unassign phone number: {update_resp.status_code} - {update_resp.text}")
+                return jsonify({
+                    'error': f'Failed to unassign: {update_resp.status_code}',
+                    'details': update_resp.text,
+                }), 502
+
+            return jsonify({
+                'success': True,
+                'phone_number': {
+                    'sid': number_sid,
+                    'is_assigned': False,
+                },
+                'message': 'Phone number unassigned from call center',
+            }), 200
+
+    except http_requests.exceptions.ConnectionError:
+        return jsonify({'error': 'Cannot reach SignalWire API'}), 503
+    except http_requests.exceptions.Timeout:
+        return jsonify({'error': 'SignalWire API request timed out'}), 504
+    except Exception as e:
+        logger.error(f"Failed to update phone number: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/webhook-url', methods=['GET'])
+@require_auth
+def get_webhook_url():
+    """Return the backend's webhook URL that phone numbers should point to."""
+    base_url = get_base_url()
+    return jsonify({
+        'webhook_url': f"{base_url}/api/swml/initial-call" if base_url else '',
+        'is_configured': bool(base_url),
+    }), 200

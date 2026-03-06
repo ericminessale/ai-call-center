@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Users,
@@ -14,6 +14,8 @@ import {
 } from 'lucide-react';
 import { ViewMode, AgentStatus } from '../../pages/UnifiedAgentDesktop';
 import { QuickDialDropdown } from './QuickDialDropdown';
+import { queueApi } from '../../services/api';
+import toast from 'react-hot-toast';
 
 interface UnifiedHeaderProps {
   user: { email: string } | null;
@@ -37,12 +39,29 @@ interface UnifiedHeaderProps {
   onOutboundCallStarted?: (phoneNumber: string) => void;
 }
 
+interface AvailableQueue {
+  id: number;
+  slug: string;
+  display_name: string;
+  routing_strategy: string;
+  assignment_id: number | null;
+  is_assigned: boolean;
+  is_activated: boolean;
+}
+
 const statusConfig: Record<AgentStatus, { label: string; color: string; bgColor: string }> = {
   available: { label: 'Available', color: 'text-green-400', bgColor: 'bg-green-500' },
   busy: { label: 'Busy', color: 'text-red-400', bgColor: 'bg-red-500' },
   'after-call': { label: 'After Call', color: 'text-yellow-400', bgColor: 'bg-yellow-500' },
   break: { label: 'Break', color: 'text-orange-400', bgColor: 'bg-orange-500' },
   offline: { label: 'Offline', color: 'text-gray-400', bgColor: 'bg-gray-500' },
+};
+
+const STRATEGY_SHORT: Record<string, string> = {
+  fifo: 'FIFO',
+  round_robin: 'RR',
+  priority: 'Priority',
+  skill_based: 'Skill',
 };
 
 export function UnifiedHeader({
@@ -62,7 +81,44 @@ export function UnifiedHeader({
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showQuickDial, setShowQuickDial] = useState(false);
 
+  // Queue opt-in state
+  const [availableQueues, setAvailableQueues] = useState<AvailableQueue[]>([]);
+
+  const loadQueues = useCallback(async () => {
+    try {
+      const resp = await queueApi.getAvailableQueues();
+      setAvailableQueues(resp.data.queues);
+    } catch {
+      setAvailableQueues([]);
+    }
+  }, []);
+
+  useEffect(() => { loadQueues(); }, [loadQueues]);
+
+  const handleQueueToggle = async (queue: AvailableQueue) => {
+    try {
+      if (!queue.is_assigned) {
+        // Self-subscribe: create assignment + activate
+        const resp = await queueApi.selfSubscribe(queue.id);
+        setAvailableQueues(prev => prev.map(q =>
+          q.id === queue.id
+            ? { ...q, assignment_id: resp.data.assignment.id, is_assigned: true, is_activated: true }
+            : q
+        ));
+      } else {
+        // Toggle existing assignment
+        const resp = await queueApi.toggleQueueActivation(queue.assignment_id!, !queue.is_activated);
+        setAvailableQueues(prev => prev.map(q =>
+          q.id === queue.id ? { ...q, is_activated: resp.data.assignment.is_activated } : q
+        ));
+      }
+    } catch {
+      toast.error('Failed to update queue');
+    }
+  };
+
   const currentStatus = statusConfig[agentStatus];
+  const activeQueueCount = availableQueues.filter(q => q.is_activated).length;
 
   return (
     <header className="bg-gray-800 border-b border-gray-700">
@@ -86,6 +142,11 @@ export function UnifiedHeader({
               <span className={`text-sm font-medium ${currentStatus.color}`}>
                 {currentStatus.label}
               </span>
+              {activeQueueCount > 0 && (
+                <span className="px-1.5 py-0.5 text-[9px] rounded-full bg-green-600 text-white leading-none">
+                  {activeQueueCount}
+                </span>
+              )}
               <ChevronDown className="w-4 h-4 text-gray-400" />
             </button>
 
@@ -109,7 +170,8 @@ export function UnifiedHeader({
             )}
 
             {showStatusDropdown && (
-              <div className="absolute top-full left-0 mt-1 w-40 bg-gray-700 rounded-lg shadow-lg border border-gray-600 py-1 z-50">
+              <div className="absolute top-full left-0 mt-1 w-56 bg-gray-700 rounded-lg shadow-lg border border-gray-600 py-1 z-50">
+                {/* Status options */}
                 {(Object.keys(statusConfig) as AgentStatus[]).map((status) => (
                   <button
                     key={status}
@@ -127,6 +189,35 @@ export function UnifiedHeader({
                     </span>
                   </button>
                 ))}
+
+                {/* Queue opt-in section */}
+                {availableQueues.length > 0 && (
+                  <>
+                    <div className="border-t border-gray-600 my-1" />
+                    <div className="px-3 py-1.5">
+                      <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">My Queues</span>
+                    </div>
+                    <div className="max-h-40 overflow-y-auto">
+                      {availableQueues.map(queue => (
+                        <label
+                          key={queue.id}
+                          className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-600 cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={queue.is_activated}
+                            onChange={() => handleQueueToggle(queue)}
+                            className="rounded bg-gray-600 border-gray-500 text-blue-500 focus:ring-blue-500 focus:ring-offset-0"
+                          />
+                          <span className="text-sm text-gray-200 flex-1">{queue.display_name}</span>
+                          <span className="px-1.5 py-0.5 text-[9px] rounded bg-blue-900/40 text-blue-300">
+                            {STRATEGY_SHORT[queue.routing_strategy] || queue.routing_strategy}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -194,17 +285,6 @@ export function UnifiedHeader({
                 <button
                   onClick={() => {
                     setShowUserMenu(false);
-                    navigate('/admin');
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-left text-gray-300 hover:bg-gray-600"
-                >
-                  <Settings className="w-4 h-4" />
-                  <span className="text-sm">Admin Settings</span>
-                </button>
-                <hr className="border-gray-600 my-1" />
-                <button
-                  onClick={() => {
-                    setShowUserMenu(false);
                     onLogout();
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-left text-red-400 hover:bg-gray-600"
@@ -246,6 +326,12 @@ export function UnifiedHeader({
             label="Supervisor"
             active={viewMode === 'supervisor'}
             onClick={() => onViewModeChange('supervisor')}
+          />
+          <ViewTab
+            icon={<Settings className="w-4 h-4" />}
+            label="Settings"
+            active={viewMode === 'settings'}
+            onClick={() => onViewModeChange('settings')}
           />
         </nav>
       </div>

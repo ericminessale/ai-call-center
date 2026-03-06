@@ -499,13 +499,12 @@ def register_ai_leg(call_db_id):
 def initiate_takeover(call_sid):
     """Initiate a takeover of an AI-active call by a human agent.
 
-    Conference-first architecture: ends the AI's B-leg so the customer's
-    A-leg falls through to join_conference. Agent then joins the same conference.
+    Generates a SWML URL that the agent's Call Fabric client will dial.
+    The SWML uses execute_rpc to end the AI and connect to call:{sid}.
 
     Returns:
     {
         "dial_address": "/public/agent-conference-swml?token=xxx",
-        "conference_name": "interaction-call-xxxxx",
         "call_sid": "call-xxxxx",
         "call_id": 123,
         "leg_id": 456
@@ -540,61 +539,30 @@ def initiate_takeover(call_sid):
 
         logger.info(f"Created new human leg {new_leg.id} for call {call.id}")
 
-        # End the AI's B-leg via SignalWire REST API
-        # This causes the customer's A-leg to fall through from connect to join_conference
-        ai_leg = CallLeg.query.filter_by(
-            call_id=call.id,
-            leg_type='ai_agent',
-            status='active'
-        ).first()
-
-        if ai_leg and ai_leg.signalwire_sid:
-            try:
-                sw_api = get_signalwire_api()
-                sw_api.end_call(ai_leg.signalwire_sid)
-                logger.info(f"Ended AI B-leg via REST API: {ai_leg.signalwire_sid}")
-            except Exception as e:
-                logger.warning(f"Failed to end AI B-leg via REST API: {e} - customer may need to wait for timeout")
-            ai_leg.end_leg(reason='agent_takeover')
-        elif ai_leg:
-            logger.warning(f"AI leg {ai_leg.id} has no signalwire_sid - cannot end B-leg via API")
-            ai_leg.end_leg(reason='agent_takeover')
-
-        # Get conference name (created at initial-call time)
-        conference_name = call.conference_name
-        if not conference_name:
-            # Fallback: create one now
-            conference_name = f"interaction-{call.signalwire_call_sid}"
-            call.conference_name = conference_name
-
-        # Ensure Conference DB record exists
-        from app.models import Conference
-        conference = Conference.get_active_by_name(conference_name)
-        if not conference:
-            conference = Conference.create_interaction_conference(
-                call_id=call.signalwire_call_sid,
-                queue_id='general',
-                agent_user_id=request.current_user.id
-            )
-        db.session.flush()
-
-        # Prepare conference join for agent (same flow as accepting a queued call)
+        # Generate secure takeover token
         token = secrets.token_urlsafe(32)
-        join_data = json.dumps({
-            'agent_id': request.current_user.id,
-            'conf': conference_name,
-            'call_id': call.id
-        })
-        redis_client.setex(f'conference_join:{token}', 120, join_data)
 
+        # Store takeover info in Redis — the conference webhook will check for
+        # type='takeover' and return SWML that connects agent to call:{sid}
+        takeover_data = json.dumps({
+            'type': 'takeover',
+            'agent_id': request.current_user.id,
+            'call_sid': call.signalwire_call_sid,
+            'call_id': call.id,
+            'leg_id': new_leg.id,
+            'user_id': request.current_user.id
+        })
+        redis_client.setex(f'conference_join:{token}', 120, takeover_data)
+
+        logger.info(f"Stored takeover token in Redis: {token[:8]}...")
+
+        # Build dial address with token — same resource as conference join
         resource_address = os.getenv('AGENT_CONFERENCE_RESOURCE', '/public/agent-conference-swml')
         dial_address = f"{resource_address}?token={token}"
 
-        # Update call handler type to human
+        # Update call handler type to human (takeover in progress)
         call.handler_type = 'human'
         call.user_id = request.current_user.id
-        new_leg.conference_id = conference.id
-        new_leg.conference_name = conference_name
         db.session.commit()
 
         # Emit event to notify UI
@@ -602,14 +570,12 @@ def initiate_takeover(call_sid):
             'call_sid': call.signalwire_call_sid,
             'call_id': call.id,
             'agent_id': request.current_user.id,
-            'leg_id': new_leg.id,
-            'conference_name': conference_name
+            'leg_id': new_leg.id
         }, room=f'call_{call.signalwire_call_sid}')
 
         return jsonify({
             'success': True,
             'dial_address': dial_address,
-            'conference_name': conference_name,
             'call_sid': call.signalwire_call_sid,
             'call_id': call.id,
             'leg_id': new_leg.id

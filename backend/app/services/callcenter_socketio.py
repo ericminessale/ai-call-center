@@ -76,13 +76,13 @@ def handle_agent_status_change(data):
         'socket_id': request.sid
     }
 
-    # Store in Redis for persistence
+    # Store in Redis using QueueService for consistent status tracking
+    # This ensures agents:available set is properly managed
     redis_client = get_redis_client()
     if redis_client:
-        redis_client.hset(f'agent:{user_id}', mapping={
-            'status': status,
-            'last_update': datetime.utcnow().isoformat()
-        })
+        from app.services.queue_service import QueueService
+        queue_svc = QueueService(redis_client)
+        queue_svc.set_agent_status(str(user_id), status)
     else:
         logger.warning("Redis not available for agent status update")
 
@@ -259,7 +259,8 @@ def handle_end_call(data):
 def check_and_assign_queued_call(agent_id: str) -> Optional[dict]:
     """Check queues and assign next call to available agent."""
     # Check each queue for waiting calls
-    queues = ['sales', 'support', 'billing']
+    from app.models.queue import Queue
+    queues = Queue.get_active_slugs()
 
     for queue_id in queues:
         call_data = dequeue_call(queue_id, agent_id)
@@ -318,7 +319,8 @@ def broadcast_queue_updates():
 
     queues_data = []
 
-    for queue_id in ['sales', 'support', 'billing']:
+    from app.models.queue import Queue
+    for queue_id in Queue.get_active_slugs():
         queue_key = f"queue:{queue_id}"
         queue_depth = redis_client.zcard(queue_key)
 
@@ -382,12 +384,17 @@ def start_queue_monitor():
             logger.warning(f"Could not acquire queue monitor lock: {e}")
 
     def monitor_queues():
+        # Import Flask app for context in background thread
+        from app import create_app_context
         while True:
             try:
                 # Refresh the lock
                 if redis_client:
                     redis_client.set('queue_monitor_lock', '1', ex=10)
-                broadcast_queue_updates()
+                # broadcast_queue_updates uses SQLAlchemy models (Queue),
+                # so it needs the Flask app context in this background thread
+                with create_app_context():
+                    broadcast_queue_updates()
             except Exception as e:
                 logger.error(f"Error broadcasting queue updates: {e}")
             time.sleep(5)  # Update every 5 seconds

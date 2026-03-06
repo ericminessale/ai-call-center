@@ -3,7 +3,7 @@ import { ContactList } from '../contacts/ContactList';
 import { ActiveCallsList } from './ActiveCallsList';
 import { QueueList } from './QueueList';
 import { SupervisorPanel } from './SupervisorPanel';
-import { ContactMinimal, Call } from '../../types/callcenter';
+import { ContactMinimal, Call, QueueConfig } from '../../types/callcenter';
 
 interface LeftPanelProps {
   viewMode: ViewMode;
@@ -22,6 +22,8 @@ interface LeftPanelProps {
   onTakeCall: (call: Call) => void;
   isLoadingCalls?: boolean;
   isLoadingQueue?: boolean;
+  // Queue configs for filter pills + badges
+  queueConfigs?: QueueConfig[];
 }
 
 export function LeftPanel({
@@ -39,6 +41,7 @@ export function LeftPanel({
   onTakeCall,
   isLoadingCalls,
   isLoadingQueue,
+  queueConfigs,
 }: LeftPanelProps) {
   switch (viewMode) {
     case 'contacts':
@@ -60,6 +63,7 @@ export function LeftPanel({
           calls={activeCalls}
           onSelectCall={onSelectCall}
           isLoading={isLoadingCalls}
+          queueConfigs={queueConfigs}
         />
       );
 
@@ -70,6 +74,7 @@ export function LeftPanel({
           onSelectCall={onSelectCall}
           onTakeCall={onTakeCall}
           isLoading={isLoadingQueue}
+          queueConfigs={queueConfigs}
         />
       );
 

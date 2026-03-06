@@ -7,6 +7,7 @@ from app.utils.url_utils import get_base_url
 import logging
 import json
 import os
+import requests as http_requests
 
 logger = logging.getLogger(__name__)
 
@@ -115,26 +116,19 @@ def initial_call():
     # This makes it appear in the Agent Dashboard as "AI Active"
     call.update_status('ai_active')
 
-    # Create interaction conference for this call (conference-first architecture)
-    # Conference is created now so the customer can join it after the AI phase ends
-    conference_name = f"interaction-{call_id}"
-    call.conference_name = conference_name
-
-    conference = Conference.create_interaction_conference(
-        call_id=call_id,
-        queue_id='general'
-    )
-    db.session.flush()
-
     # Create initial AI leg for tracking
     existing_leg = CallLeg.get_active_leg(call.id)
     if not existing_leg:
+        # Get or create AI conference for this call
+        ai_conference = Conference.get_or_create_ai_conference('receptionist')
+        db.session.flush()
+
         CallLeg.create_initial_leg(
             call=call,
             leg_type='ai_agent',
             ai_agent_name='Receptionist',
-            conference_id=conference.id,
-            conference_name=conference_name
+            conference_id=ai_conference.id,
+            conference_name=ai_conference.conference_name
         )
 
     db.session.commit()
@@ -158,8 +152,7 @@ def initial_call():
         'created_at': call.created_at.isoformat() if call.created_at else None,
         'answered_at': call.answered_at.isoformat() if call.answered_at else None,
         'user_id': call.user_id,
-        'queueId': 'general',
-        'conference_name': conference_name
+        'queueId': 'general'
     }
 
     # Emit to ALL agents for AI calls (no room = broadcast to all)
@@ -178,11 +171,9 @@ def initial_call():
     sales_specialist = SystemConfig.get('route.sales_specialist', '/sales-ai')
     support_specialist = SystemConfig.get('route.support_specialist', '/support-ai')
 
-    # Conference-first architecture: connect customer to AI agent via bridge (A-leg/B-leg).
-    # After AI phase ends (B-leg drops from transfer or takeover), customer falls through
-    # to join_conference where human agents can join.
-    ai_agent_url = f"{base_url}{initial_handler}?conf={conference_name}&call_db_id={call.id}"
-
+    # Transfer to admin-configured AI agent
+    # The caller's A-leg is transferred directly to the AI agent's SWML
+    # No conference at this stage - conference is only created when AI transfers to human
     swml_response = {
         "version": "1.0.0",
         "sections": {
@@ -216,25 +207,10 @@ def initial_call():
                         }
                     }
                 },
-                # Connect to AI agent via bridge (B-leg runs AI, A-leg is customer)
-                # When B-leg ends (transfer complete or takeover), connect completes
-                # and customer falls through to join_conference below
+                # Transfer to AI agent — caller's A-leg runs the AI agent's SWML directly
                 {
-                    "connect": {
-                        "to_swml": {
-                            "url": ai_agent_url
-                        }
-                    }
-                },
-                # After AI phase ends, announce and put customer in conference
-                {
-                    "play": {
-                        "url": "say:Please hold while we connect you to an agent."
-                    }
-                },
-                {
-                    "join_conference": {
-                        "name": conference_name
+                    "transfer": {
+                        "dest": f"{base_url}{initial_handler}?call_db_id={call.id}"
                     }
                 }
             ]
@@ -381,8 +357,63 @@ def end_call():
     })
 
 
-    # NOTE: Old takeover SWML endpoint removed.
-    # With conference-first architecture, takeover uses the standard conference join flow.
-    # The agent joins the interaction conference directly - no special SWML needed.
+@swml_bp.route('/ai-agent-proxy', methods=['POST'])
+def ai_agent_proxy():
+    """Proxy AI agent SWML requests from SignalWire.
 
+    This endpoint solves the auth problem: the AI agents container requires
+    Basic Auth, but SignalWire doesn't include auth when fetching 'url' param.
+    This proxy fetches internally (with auth) and returns the SWML to SignalWire.
 
+    The AI agent uses request headers to generate SWAIG callback URLs, so we
+    forward the original Host/X-Forwarded headers from the SignalWire request.
+    """
+    agent_route = request.args.get('agent', '/receptionist')
+    conf = request.args.get('conf', '')
+    call_db_id = request.args.get('call_db_id', '')
+
+    # Build the internal URL to the AI agent
+    query_parts = []
+    if conf:
+        query_parts.append(f"conf={conf}")
+    if call_db_id:
+        query_parts.append(f"call_db_id={call_db_id}")
+    query_string = '&'.join(query_parts)
+
+    internal_url = f"http://ai-agents:8080{agent_route}"
+    if query_string:
+        internal_url += f"?{query_string}"
+
+    try:
+        # Forward the request with auth and original headers
+        agent_user = os.environ.get('AGENT_AUTH_USER', 'agent')
+        agent_pass = os.environ.get('AGENT_AUTH_PASS', 'agent123')
+
+        # Forward relevant headers so AI agent generates correct external URLs
+        forward_headers = {
+            'Content-Type': 'application/json',
+            'Host': request.headers.get('Host', ''),
+            'X-Forwarded-Proto': request.headers.get('X-Forwarded-Proto', 'https'),
+            'X-Forwarded-Host': request.headers.get('X-Forwarded-Host', request.headers.get('Host', '')),
+            'X-Real-IP': request.headers.get('X-Real-IP', request.remote_addr),
+        }
+
+        resp = http_requests.post(
+            internal_url,
+            json=request.get_json(silent=True) or {},
+            auth=(agent_user, agent_pass),
+            headers=forward_headers,
+            timeout=10
+        )
+
+        logger.warning(f"[AI-PROXY] Fetched AI SWML from {internal_url}: {resp.status_code}")
+
+        if resp.status_code == 200:
+            return jsonify(resp.json())
+        else:
+            logger.error(f"[AI-PROXY] AI agent returned {resp.status_code}: {resp.text[:200]}")
+            return jsonify({"error": "Failed to fetch AI SWML"}), 502
+
+    except Exception as e:
+        logger.error(f"[AI-PROXY] Error proxying to AI agent: {str(e)}")
+        return jsonify({"error": str(e)}), 500

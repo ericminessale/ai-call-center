@@ -223,7 +223,7 @@ class QueueService:
         self.redis.sadd(status_key, agent_id)
 
         # Remove from other status sets
-        for other_status in ["available", "busy", "break", "offline"]:
+        for other_status in ["available", "busy", "after-call", "break", "offline"]:
             if other_status != status:
                 self.redis.srem(f"agents:{other_status}", agent_id)
 
@@ -232,31 +232,144 @@ class QueueService:
     def get_agent_status(self, agent_id: str) -> Optional[Dict[str, Any]]:
         """Get current agent status"""
         agent_key = f"{self.agent_prefix}{agent_id}"
-        data = self.redis.get(agent_key)
-
-        if data:
-            return json.loads(data)
+        try:
+            data = self.redis.get(agent_key)
+            if data:
+                return json.loads(data)
+        except redis.exceptions.ResponseError:
+            # Key exists but is wrong type (HASH from legacy code) — delete and return None
+            self.redis.delete(agent_key)
+            logger.warning(f"Deleted stale agent key with wrong type: {agent_key}")
         return None
 
-    def get_available_agents(self, queue_id: Optional[str] = None) -> List[str]:
+    def get_available_agents(self, queue_slug: Optional[str] = None) -> List[str]:
         """
-        Get list of available agents
+        Get list of available agents, optionally filtered by queue activation.
 
         Args:
-            queue_id: Optional queue filter
+            queue_slug: Optional queue slug to filter by activated agents
 
         Returns:
-            List of available agent IDs
+            Sorted list of available agent ID strings
         """
-        # Get all available agents
         available = self.redis.smembers("agents:available")
 
-        if not queue_id:
-            return list(available)
+        if not queue_slug:
+            return sorted(list(available))
 
-        # Filter by queue assignment if needed
-        # In production, this would check agent-queue assignments in database
-        return list(available)
+        # Filter by agents who have activated this queue
+        queue_agents = self.redis.smembers(f"queue_agents:{queue_slug}")
+        if queue_agents:
+            filtered = list(available & queue_agents)
+            if filtered:
+                return sorted(filtered)
+            # If intersection is empty (agents available but none activated this queue),
+            # fall through to return all available agents as fallback
+
+        # Fallback: return all available if no queue-specific filtering matched
+        return sorted(list(available))
+
+    def select_agent(self, queue_slug: str, routing_strategy: str,
+                     available_agents: List[str], skill_levels: Dict[str, int] = None,
+                     call_priority: int = 5) -> Optional[str]:
+        """Select the next agent based on the queue's routing strategy.
+
+        Args:
+            queue_slug: Queue identifier for round-robin state tracking
+            routing_strategy: 'fifo', 'round_robin', 'priority', 'skill_based'
+            available_agents: Sorted list of available agent ID strings
+            skill_levels: Dict mapping agent_id -> skill_level (for skill_based)
+            call_priority: 1-10 priority of the incoming call (for priority routing)
+
+        Returns:
+            Selected agent ID string, or None if no agents available
+        """
+        if not available_agents:
+            return None
+
+        if routing_strategy == 'fifo':
+            return self._strategy_fifo(available_agents)
+        elif routing_strategy == 'round_robin':
+            return self._strategy_round_robin(queue_slug, available_agents)
+        elif routing_strategy == 'priority':
+            return self._strategy_priority(available_agents, skill_levels or {}, call_priority)
+        elif routing_strategy == 'skill_based':
+            return self._strategy_skill_based(available_agents, skill_levels or {})
+        else:
+            return self._strategy_round_robin(queue_slug, available_agents)
+
+    def _strategy_fifo(self, available_agents: List[str]) -> str:
+        """FIFO: pick the agent who has been idle longest (oldest last_assigned timestamp)."""
+        oldest_time = None
+        oldest_agent = available_agents[0]
+
+        for agent_id in available_agents:
+            last_assigned = self.redis.get(f"agent_last_assigned:{agent_id}")
+            if last_assigned is None:
+                return agent_id  # Never assigned = longest idle
+            ts = float(last_assigned)
+            if oldest_time is None or ts < oldest_time:
+                oldest_time = ts
+                oldest_agent = agent_id
+
+        return oldest_agent
+
+    def _strategy_round_robin(self, queue_slug: str, available_agents: List[str]) -> str:
+        """Round-robin: cycle through agents in order."""
+        rr_key = f"round_robin:{queue_slug}"
+        last_index_raw = self.redis.get(rr_key)
+        last_index = int(last_index_raw) if last_index_raw else -1
+        next_index = (last_index + 1) % len(available_agents)
+        self.redis.set(rr_key, next_index)
+        return available_agents[next_index]
+
+    def _strategy_priority(self, available_agents: List[str],
+                           skill_levels: Dict[str, int], call_priority: int) -> str:
+        """Priority-based: high-priority calls get the most skilled agent,
+        low-priority calls get the least skilled (preserve experts for urgent work)."""
+        agents_with_skill = [
+            (agent_id, skill_levels.get(agent_id, 5))
+            for agent_id in available_agents
+        ]
+
+        if call_priority <= 3:  # High priority
+            agents_with_skill.sort(key=lambda x: x[1], reverse=True)
+        else:
+            agents_with_skill.sort(key=lambda x: x[1])
+
+        return agents_with_skill[0][0]
+
+    def _strategy_skill_based(self, available_agents: List[str],
+                              skill_levels: Dict[str, int]) -> str:
+        """Skill-based: always pick the agent with the highest skill level."""
+        best_agent = available_agents[0]
+        best_skill = skill_levels.get(best_agent, 0)
+
+        for agent_id in available_agents[1:]:
+            skill = skill_levels.get(agent_id, 0)
+            if skill > best_skill:
+                best_skill = skill
+                best_agent = agent_id
+
+        return best_agent
+
+    def get_skill_levels_for_queue(self, queue_slug: str, agent_ids: List[str]) -> Dict[str, int]:
+        """Get skill levels for agents in a specific queue from database."""
+        from app.models.queue import QueueAgentAssignment, Queue
+        queue = Queue.find_by_slug(queue_slug)
+        if not queue:
+            return {}
+
+        numeric_ids = [int(a) for a in agent_ids if a.isdigit()]
+        if not numeric_ids:
+            return {}
+
+        assignments = QueueAgentAssignment.query.filter(
+            QueueAgentAssignment.queue_id == queue.id,
+            QueueAgentAssignment.user_id.in_(numeric_ids)
+        ).all()
+
+        return {str(a.user_id): a.skill_level for a in assignments}
 
     def get_agents_by_status(self, status: str) -> List[str]:
         """Get all agents with a specific status"""

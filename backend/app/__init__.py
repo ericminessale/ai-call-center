@@ -14,9 +14,19 @@ socketio = SocketIO(async_mode='threading', logger=True, engineio_logger=False)
 bcrypt = Bcrypt()
 jwt = JWTManager()
 redis_client = None
+_app_instance = None
+
+
+def create_app_context():
+    """Return the Flask app context for use in background threads."""
+    if _app_instance is None:
+        raise RuntimeError("App not initialized yet")
+    return _app_instance.app_context()
 
 def create_app():
+    global _app_instance
     app = Flask(__name__)
+    _app_instance = app
 
     # Configuration
     app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')

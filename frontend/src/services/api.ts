@@ -241,6 +241,42 @@ export const adminApi = {
     api.get('/api/admin/users'),
   deleteUser: (id: number) =>
     api.delete(`/api/admin/users/${id}`),
+
+  // Phone number management
+  getPhoneNumbers: () =>
+    api.get('/api/admin/phone-numbers'),
+  updatePhoneNumber: (sid: string, action: 'assign' | 'unassign') =>
+    api.post(`/api/admin/phone-numbers/${sid}`, { action }),
+  getWebhookUrl: () =>
+    api.get('/api/admin/webhook-url'),
+
+  // Queue management
+  getQueues: () =>
+    api.get('/api/admin/queues'),
+  createQueue: (data: { slug: string; display_name: string; description?: string; routing_strategy?: string; ai_agent_route?: string; default_priority?: number; sla_threshold_seconds?: number; max_wait_before_ai_fallback?: number }) =>
+    api.post('/api/admin/queues', data),
+  updateQueue: (id: number, data: Record<string, unknown>) =>
+    api.put(`/api/admin/queues/${id}`, data),
+  deleteQueue: (id: number) =>
+    api.delete(`/api/admin/queues/${id}`),
+  getQueueAgents: (queueId: number) =>
+    api.get(`/api/admin/queues/${queueId}/agents`),
+  updateQueueAgents: (queueId: number, assignments: Array<{ user_id: number; skill_level?: number }>) =>
+    api.put(`/api/admin/queues/${queueId}/agents`, { assignments }),
+};
+
+// Agent-facing queue operations
+export const queueApi = {
+  getMyQueues: () =>
+    api.get('/api/queues/my-queues'),
+  toggleQueueActivation: (assignmentId: number, isActivated: boolean) =>
+    api.put(`/api/queues/my-queues/${assignmentId}/activate`, { is_activated: isActivated }),
+  getAvailableQueues: () =>
+    api.get('/api/queues/available'),
+  selfSubscribe: (queueId: number) =>
+    api.post(`/api/queues/self-subscribe/${queueId}`),
+  getActiveQueueConfigs: () =>
+    api.get('/api/queues/config/active'),
 };
 
 // WebSocket service - now uses a shared socket from SocketContext

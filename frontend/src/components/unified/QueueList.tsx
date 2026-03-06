@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import {
   Search,
   Phone,
@@ -11,22 +11,43 @@ import {
   UserCheck,
   Loader2,
 } from 'lucide-react';
-import { Call } from '../../types/callcenter';
+import { Call, QueueConfig } from '../../types/callcenter';
 import { QueueItemSkeleton } from '../shared/Skeleton';
 import { AgentContextCard, hasContext } from '../shared/AgentContextCard';
+import { getQueueBadgeColor, getQueueDisplayName } from '../../lib/queueColors';
 
 interface QueueListProps {
   calls: Call[];
   onSelectCall: (call: Call) => void;
   onTakeCall: (call: Call) => void;
   isLoading?: boolean;
+  queueConfigs?: QueueConfig[];
 }
 
-export function QueueList({ calls, onSelectCall, onTakeCall, isLoading }: QueueListProps) {
+export function QueueList({ calls, onSelectCall, onTakeCall, isLoading, queueConfigs }: QueueListProps) {
   const [searchQuery, setSearchQuery] = useState('');
+  const [queueFilter, setQueueFilter] = useState<string | null>(null); // null = all queues
 
-  // Filter calls based on search
+  // Build queue pills data from configs + actual calls
+  const queuePills = useMemo(() => {
+    if (!queueConfigs || queueConfigs.length === 0) return [];
+    const counts: Record<string, number> = {};
+    calls.forEach((c) => {
+      const slug = c.queue_id || '';
+      if (slug) counts[slug] = (counts[slug] || 0) + 1;
+    });
+    return queueConfigs.map((q) => ({
+      slug: q.slug,
+      label: q.display_name,
+      count: counts[q.slug] || 0,
+    }));
+  }, [queueConfigs, calls]);
+
+  // Filter calls based on search and queue filter
   const filteredCalls = calls.filter((call) => {
+    // Queue filter
+    if (queueFilter && (call.queue_id || '') !== queueFilter) return false;
+
     if (!searchQuery) return true;
     const query = searchQuery.toLowerCase();
     return (
@@ -70,6 +91,42 @@ export function QueueList({ calls, onSelectCall, onTakeCall, isLoading }: QueueL
             className="w-full pl-9 pr-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-sm text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
           />
         </div>
+
+        {/* Queue Filter Pills */}
+        {queuePills.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            <button
+              onClick={() => setQueueFilter(null)}
+              className={`px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
+                queueFilter === null
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-700/60 text-gray-400 hover:bg-gray-600'
+              }`}
+            >
+              All Queues
+            </button>
+            {queuePills.map((pill) => {
+              const colors = getQueueBadgeColor(pill.slug);
+              const isActive = queueFilter === pill.slug;
+              return (
+                <button
+                  key={pill.slug}
+                  onClick={() => setQueueFilter(isActive ? null : pill.slug)}
+                  className={`px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
+                    isActive
+                      ? 'bg-blue-600 text-white'
+                      : `${colors.pill} hover:brightness-125`
+                  }`}
+                >
+                  {pill.label}
+                  {pill.count > 0 && (
+                    <span className="ml-1 opacity-75">({pill.count})</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Queue List */}
@@ -103,6 +160,7 @@ export function QueueList({ calls, onSelectCall, onTakeCall, isLoading }: QueueL
                     call={call}
                     onSelect={() => onSelectCall(call)}
                     onTake={() => onTakeCall(call)}
+                    queueConfigs={queueConfigs}
                   />
                 ))}
               </div>
@@ -121,6 +179,7 @@ export function QueueList({ calls, onSelectCall, onTakeCall, isLoading }: QueueL
                     call={call}
                     onSelect={() => onSelectCall(call)}
                     onTake={() => onTakeCall(call)}
+                    queueConfigs={queueConfigs}
                   />
                 ))}
               </div>
@@ -139,6 +198,7 @@ export function QueueList({ calls, onSelectCall, onTakeCall, isLoading }: QueueL
                     call={call}
                     onSelect={() => onSelectCall(call)}
                     onTake={() => onTakeCall(call)}
+                    queueConfigs={queueConfigs}
                   />
                 ))}
               </div>
@@ -154,15 +214,22 @@ function QueueCard({
   call,
   onSelect,
   onTake,
+  queueConfigs,
 }: {
   call: Call;
   onSelect: () => void;
   onTake: () => void;
+  queueConfigs?: QueueConfig[];
 }) {
   const contactName = call.contact?.displayName || call.from_number || 'Unknown Caller';
   const company = call.contact?.company;
   const isVip = call.contact?.isVip;
   const wasAI = call.handler_type === 'ai' || call.ai_agent_name;
+  const queueSlug = call.queue_id || '';
+
+  // Queue badge
+  const queueBadge = queueSlug ? getQueueBadgeColor(queueSlug) : null;
+  const queueDisplayName = queueSlug ? getQueueDisplayName(queueSlug, queueConfigs) : '';
 
   // Live ticking wait timer
   const [waitTime, setWaitTime] = useState('0:00');
@@ -219,7 +286,7 @@ function QueueCard({
                 <>
                   <Building2 className="w-3 h-3" />
                   <span className="truncate">{company}</span>
-                  <span>·</span>
+                  <span className="text-gray-600">·</span>
                 </>
               )}
               <Clock className="w-3 h-3" />
@@ -232,10 +299,12 @@ function QueueCard({
             <AgentContextCard context={call.aiContext} variant="compact" className="mt-2" />
           )}
 
-          {/* Queue info and assigned agent */}
-          <div className="mt-1 flex items-center gap-2 text-xs text-gray-500">
-            {call.queue_id && (
-              <span>Queue: {call.queue_id}</span>
+          {/* Queue badge and assigned agent */}
+          <div className="mt-1 flex items-center gap-2 text-xs">
+            {queueBadge && (
+              <span className={`px-1.5 py-0.5 text-[9px] font-semibold rounded ${queueBadge.pill}`}>
+                {queueDisplayName}
+              </span>
             )}
             {call.status === 'assigned' && call.assigned_agent_id && (
               <span className="text-blue-400 flex items-center gap-1">

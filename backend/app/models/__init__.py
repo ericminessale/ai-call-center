@@ -8,6 +8,7 @@ from .conference import Conference
 from .conference_participant import ConferenceParticipant
 from .system_config import SystemConfig
 from .document import DocumentCollection, Document, AgentCollectionAssignment
+from .queue import Queue, QueueAgentAssignment
 
 __all__ = [
     'User',
@@ -22,4 +23,6 @@ __all__ = [
     'DocumentCollection',
     'Document',
     'AgentCollectionAssignment',
+    'Queue',
+    'QueueAgentAssignment',
 ]

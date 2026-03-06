@@ -279,3 +279,35 @@ export interface PerformanceMetrics {
   nextMilestone: number;
   isPersonalBest: boolean;
 }
+
+// Configurable Queue System types
+export type RoutingStrategy = 'fifo' | 'round_robin' | 'priority' | 'skill_based';
+
+export interface QueueConfig {
+  id: number;
+  slug: string;
+  display_name: string;
+  description: string | null;
+  is_active: boolean;
+  routing_strategy: RoutingStrategy;
+  ai_agent_route: string | null;
+  default_priority: number;
+  sla_threshold_seconds: number;
+  max_wait_before_ai_fallback: number;
+  agent_count?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface QueueAgentAssignmentType {
+  id: number;
+  queue_id: number;
+  queue_slug: string;
+  queue_display_name: string;
+  routing_strategy: RoutingStrategy;
+  user_id: number;
+  user_name: string | null;
+  user_email: string;
+  skill_level: number;
+  is_activated: boolean;
+}

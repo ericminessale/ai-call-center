@@ -89,7 +89,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   } = useCallFabric();
 
   // Call Fabric context for taking queued calls
-  const { acceptCallAssignmentWithData, isClientReady, isInConference, joinInteractionConference } = useCallFabricContext();
+  const { acceptCallAssignmentWithData, isClientReady, isInConference, joinInteractionConference, makeCallToSwml } = useCallFabricContext();
 
   // State for taking queued calls
   const [isTakingCall, setIsTakingCall] = useState(false);
@@ -527,19 +527,23 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     try {
       console.log('📞 [TakeOver] Initiating takeover for call:', callSid);
 
-      // Call the takeover API — ends AI B-leg, returns conference join info
+      // Call the takeover API to get the resource dial address (includes token)
       const response = await api.post(`/api/calls/${callSid}/takeover`);
-      const { dial_address, conference_name } = response.data;
+      const { dial_address, leg_id } = response.data;
 
-      console.log('📞 [TakeOver] Got dial address:', dial_address, 'conference:', conference_name);
+      console.log('📞 [TakeOver] Got dial address:', dial_address);
 
-      // Join the interaction conference — same path as accepting a queued call
-      // Customer's A-leg falls through to join_conference after AI B-leg ends
-      await joinInteractionConference(dial_address, conference_name);
+      // Dial the resource address — token is embedded in the URL
+      // The SWML will use execute_rpc to end AI + connect to call:{sid}
+      await makeCallToSwml(dial_address, {
+        contact_id: contact.id,
+        original_call_sid: callSid,
+        leg_id: leg_id
+      });
 
       // Update state - no longer an AI call once we've taken over
       setIsAICall(false);
-      console.log('📞 [TakeOver] Successfully joined conference:', conference_name);
+      console.log('📞 [TakeOver] Successfully initiated takeover');
 
     } catch (error: any) {
       console.error('Failed to take over call:', error);

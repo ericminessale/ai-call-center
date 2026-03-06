@@ -23,30 +23,35 @@ AI_AGENTS = [
         'id': 'outbound-sales',
         'name': 'Outbound Sales Agent',
         'route': '/outbound-sales',
+        'type': 'outbound',
         'description': 'Proactive sales outreach with customer context'
     },
     {
         'id': 'outbound-support',
         'name': 'Outbound Support Agent',
         'route': '/outbound-support',
+        'type': 'outbound',
         'description': 'Proactive support follow-up with customer context'
     },
     {
         'id': 'sales-ai',
         'name': 'Sales AI Specialist',
         'route': '/sales-ai',
+        'type': 'inbound',
         'description': 'General sales help (designed for inbound transfers)'
     },
     {
         'id': 'support-ai',
         'name': 'Support AI Specialist',
         'route': '/support-ai',
+        'type': 'inbound',
         'description': 'General support help (designed for inbound transfers)'
     },
     {
         'id': 'receptionist',
         'name': 'Receptionist / Triage',
         'route': '/receptionist',
+        'type': 'inbound',
         'description': 'Call triage and routing (designed for inbound)'
     },
 ]

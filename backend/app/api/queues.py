@@ -11,6 +11,7 @@ from app.utils.decorators import require_auth
 from app.utils.url_utils import get_base_url
 from app import db
 from app.models import Call, User, Conference, ConferenceParticipant, CallLeg, Contact
+from app.models.queue import Queue, QueueAgentAssignment
 from datetime import datetime
 import logging
 import json
@@ -242,29 +243,45 @@ def route_call_to_queue(queue_id):
             }
         )
 
-        # Check for available agents
+        # Check for available agents (filtered by queue activation)
         available_agents = service.get_available_agents(queue_id)
         redis_client = get_redis_client()
 
-        # Sort for consistent round-robin ordering (Redis sets are unordered)
-        available_agents = sorted(available_agents) if available_agents else []
+        # Look up queue config for routing strategy
+        queue_config = Queue.find_by_slug(queue_id)
+        routing_strategy = queue_config.routing_strategy if queue_config else 'round_robin'
+
+        # Get skill levels if needed for routing
+        skill_levels = {}
+        if routing_strategy in ('skill_based', 'priority') and available_agents:
+            skill_levels = service.get_skill_levels_for_queue(queue_id, available_agents)
 
         if available_agents:
-            # Round-robin selection: track last agent index in Redis
-            rr_key = f"round_robin:{queue_id}"
-            last_index_raw = redis_client.get(rr_key)
-            last_index = int(last_index_raw) if last_index_raw else -1
-
-            # Try each agent in round-robin order until we find one with Call Fabric
+            # Use configured routing strategy to select agent
+            # We still need to validate agents (Call Fabric address, actual availability)
+            # so we try strategy-selected agents in order, falling back as needed
             selected_user = None
-            attempts = 0
-            num_agents = len(available_agents)
+            tried_agents = set()
 
-            while attempts < num_agents:
-                next_index = (last_index + 1 + attempts) % num_agents
-                agent_id_str = available_agents[next_index]
+            while len(tried_agents) < len(available_agents):
+                # Get remaining untried agents
+                remaining = [a for a in available_agents if a not in tried_agents]
+                if not remaining:
+                    break
 
-                logger.info(f"Round-robin attempt {attempts + 1}: checking agent {agent_id_str} (index {next_index})")
+                # Select next agent via strategy
+                agent_id_str = service.select_agent(
+                    queue_slug=queue_id,
+                    routing_strategy=routing_strategy,
+                    available_agents=remaining,
+                    skill_levels=skill_levels,
+                    call_priority=priority,
+                )
+                if not agent_id_str:
+                    break
+
+                tried_agents.add(agent_id_str)
+                logger.info(f"Strategy '{routing_strategy}' selected agent {agent_id_str} (attempt {len(tried_agents)})")
 
                 # Look up user by ID (agent_id is stored as string in Redis)
                 try:
@@ -276,31 +293,26 @@ def route_call_to_queue(queue_id):
 
                 if not user:
                     logger.warning(f"Agent {agent_id_str} not found in database, trying next")
-                    attempts += 1
                     continue
 
                 if not user.signalwire_address:
                     logger.warning(f"Agent {agent_id_str} has no signalwire_address, trying next")
-                    attempts += 1
                     continue
 
-                # CRITICAL: Double-check agent is actually available in Redis
-                # This catches cases where the set wasn't properly cleaned up
+                # Double-check agent is actually available in Redis
                 agent_status = service.get_agent_status(str(user.id))
                 actual_status = agent_status.get('status') if agent_status else None
                 logger.info(f"Agent {user.id} ({user.email}): Redis status = {actual_status}")
 
                 if actual_status != 'available':
                     logger.warning(f"Agent {user.id} is in available set but actual status is '{actual_status}', removing from set and trying next")
-                    # Clean up the stale entry
                     redis_client.srem('agents:available', str(user.id))
-                    attempts += 1
                     continue
 
                 # Agent is valid and actually available
                 selected_user = user
-                # Update round-robin index to this agent
-                redis_client.set(rr_key, next_index)
+                # Track last assigned time for FIFO strategy
+                redis_client.set(f"agent_last_assigned:{user.id}", datetime.utcnow().timestamp())
                 break
 
             if selected_user:
@@ -460,12 +472,13 @@ def route_call_to_queue(queue_id):
                         "version": "1.0.0",
                         "sections": {
                             "main": [
+                                "answer",
                                 {
                                     "play": {
                                         "url": "say:I'm connecting you to a specialist now. Please hold."
                                     }
                                 },
-                                {"join_conference": {"name": conference_name}}
+                                {"join_conference": {"name": conference_name, "end_on_exit": False}}
                             ]
                         }
                     }
@@ -495,13 +508,9 @@ def route_call_to_queue(queue_id):
         # Build appropriate SWML response based on wait time
         if offer_ai_fallback:
             # Offer AI fallback after waiting too long
-            # Map queue_id to appropriate AI agent
-            ai_agent_map = {
-                'sales': 'sales-ai',
-                'support': 'support-ai',
-                'billing': 'support-ai'  # Billing uses support AI
-            }
-            ai_agent = ai_agent_map.get(queue_id, 'receptionist')
+            # Look up AI agent fallback from queue config
+            queue_config = Queue.find_by_slug(queue_id)
+            ai_agent = queue_config.ai_agent_route.lstrip('/') if queue_config and queue_config.ai_agent_route else 'receptionist'
 
             swml_response = {
                 "version": "1.0.0",
@@ -596,13 +605,9 @@ def queue_hold_menu(queue_id):
         # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
         base_url = get_base_url()
 
-        # Map queue_id to AI agent
-        ai_agent_map = {
-            'sales': 'sales-ai',
-            'support': 'support-ai',
-            'billing': 'support-ai'
-        }
-        ai_agent = ai_agent_map.get(queue_id, 'support-ai')
+        # Look up AI agent fallback from queue config
+        queue_config = Queue.find_by_slug(queue_id)
+        ai_agent = queue_config.ai_agent_route.lstrip('/') if queue_config and queue_config.ai_agent_route else 'support-ai'
 
         # Build DTMF menu with prompt
         swml_response = {
@@ -868,7 +873,7 @@ def update_agent_status():
         next_call = None
         if new_status == 'available':
             # Check all configured queues
-            for queue_id in ['sales', 'support', 'billing']:
+            for queue_id in Queue.get_active_slugs():
                 call_data = service.dequeue_call(queue_id, agent_id)
                 if call_data:
                     next_call = call_data
@@ -985,7 +990,7 @@ def get_all_queues_status():
             return jsonify({"error": "Redis not available"}), 503
 
         # Define available queues
-        queue_ids = ['sales', 'support', 'billing']
+        queue_ids = Queue.get_active_slugs()
 
         all_status = []
         for queue_id in queue_ids:
@@ -1075,7 +1080,7 @@ def clear_mock_data():
         cleared_count = 0
 
         # Clear demo calls from all queues
-        for queue_id in ['sales', 'support', 'billing']:
+        for queue_id in Queue.get_active_slugs():
             queue_key = f"queue:{queue_id}"
             redis_client = service.redis_client
 
@@ -1134,7 +1139,7 @@ def generate_mock_data():
             return jsonify({"error": "Redis not available"}), 503
 
         # Clear existing queue data
-        for queue_id in ['sales', 'support', 'billing']:
+        for queue_id in Queue.get_active_slugs():
             redis_client.delete(f"queue:{queue_id}")
 
         # Queue configurations for realistic demo data
@@ -1307,3 +1312,157 @@ def generate_mock_data():
     except Exception as e:
         logger.error(f"Error generating mock data: {str(e)}")
         return jsonify({"error": f"Failed to generate mock data: {str(e)}"}), 500
+
+
+# =============================================================================
+# Agent-facing queue endpoints
+# =============================================================================
+
+@queues_bp.route('/my-queues', methods=['GET'])
+@require_auth
+def get_my_queues():
+    """Get the current agent's assigned queues with activation status."""
+    try:
+        user_id = request.current_user.id
+        assignments = QueueAgentAssignment.query.filter_by(user_id=user_id).all()
+        return jsonify({
+            'queues': [a.to_dict() for a in assignments]
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to get agent queues: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@queues_bp.route('/my-queues/<int:assignment_id>/activate', methods=['PUT'])
+@require_auth
+def toggle_queue_activation(assignment_id):
+    """Agent toggles their activation for a queue."""
+    try:
+        user_id = request.current_user.id
+        assignment = QueueAgentAssignment.query.filter_by(
+            id=assignment_id, user_id=user_id
+        ).first()
+        if not assignment:
+            return jsonify({'error': 'Assignment not found'}), 404
+
+        data = request.get_json() or {}
+        assignment.is_activated = data.get('is_activated', not assignment.is_activated)
+        db.session.commit()
+
+        # Update Redis agent-queue membership for real-time routing
+        redis_client = get_redis_client()
+        if redis_client:
+            queue_agents_key = f"queue_agents:{assignment.queue.slug}"
+            if assignment.is_activated:
+                redis_client.sadd(queue_agents_key, str(user_id))
+            else:
+                redis_client.srem(queue_agents_key, str(user_id))
+
+        # Broadcast activation change
+        from app import socketio
+        socketio.emit('agent_queue_activation', {
+            'user_id': user_id,
+            'queue_slug': assignment.queue.slug,
+            'is_activated': assignment.is_activated,
+        })
+
+        return jsonify({'success': True, 'assignment': assignment.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to toggle queue activation: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@queues_bp.route('/available', methods=['GET'])
+@require_auth
+def get_available_queues():
+    """Returns all active queues annotated with the calling agent's assignment state.
+    Used by the status dropdown for queue opt-in."""
+    try:
+        user_id = request.current_user.id
+        queues = Queue.get_active_queues()
+
+        # Build lookup of existing assignments for this user
+        assignments = QueueAgentAssignment.query.filter_by(user_id=user_id).all()
+        assignment_map = {a.queue_id: a for a in assignments}
+
+        result = []
+        for q in queues:
+            data = q.to_dict()
+            a = assignment_map.get(q.id)
+            data['assignment_id'] = a.id if a else None
+            data['is_assigned'] = a is not None
+            data['is_activated'] = a.is_activated if a else False
+            data['skill_level'] = a.skill_level if a else 5
+            result.append(data)
+
+        return jsonify({'queues': result}), 200
+    except Exception as e:
+        logger.error(f"Failed to get available queues: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@queues_bp.route('/self-subscribe/<int:queue_id>', methods=['POST'])
+@require_auth
+def self_subscribe_queue(queue_id):
+    """Agent self-subscribes to a queue. Creates assignment if none exists, activates it."""
+    try:
+        user_id = request.current_user.id
+        queue = Queue.query.get(queue_id)
+        if not queue:
+            return jsonify({'error': 'Queue not found'}), 404
+        if not queue.is_active:
+            return jsonify({'error': 'Queue is not active'}), 400
+
+        # Find or create assignment
+        assignment = QueueAgentAssignment.query.filter_by(
+            queue_id=queue_id, user_id=user_id
+        ).first()
+
+        if assignment:
+            assignment.is_activated = True
+        else:
+            assignment = QueueAgentAssignment(
+                queue_id=queue_id,
+                user_id=user_id,
+                skill_level=5,
+                is_activated=True,
+            )
+            db.session.add(assignment)
+
+        db.session.commit()
+
+        # Update Redis
+        redis_client = get_redis_client()
+        if redis_client:
+            redis_client.sadd(f"queue_agents:{queue.slug}", str(user_id))
+
+        # Broadcast
+        from app import socketio
+        socketio.emit('agent_queue_activation', {
+            'user_id': user_id,
+            'queue_slug': queue.slug,
+            'is_activated': True,
+        })
+
+        return jsonify({'success': True, 'assignment': assignment.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to self-subscribe to queue: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@queues_bp.route('/config/active', methods=['GET'])
+def get_active_queue_config():
+    """Public endpoint: returns all active queues.
+    Used by AI agents at startup to build dynamic triage contexts.
+    No auth required — internal use only.
+    """
+    try:
+        queues = Queue.get_active_queues()
+        return jsonify({
+            'queues': [q.to_dict() for q in queues]
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to get active queue config: {str(e)}")
+        return jsonify({'error': str(e)}), 500

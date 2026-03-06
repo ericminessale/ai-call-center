@@ -116,6 +116,9 @@ interface CallFabricContextType {
   joinInteractionConference: (dialAddress: string, conferenceName: string) => Promise<void>;
   leaveConference: () => Promise<void>;
 
+  // Takeover calls (connect to existing call via SWML)
+  makeCallToSwml: (swmlUrl: string, context?: any) => Promise<any>;
+
   // Pending call assignment (when customer routed but agent hasn't joined yet)
   pendingCallAssignment: CallAssignment | null;
   acceptCallAssignment: () => Promise<void>;
@@ -222,6 +225,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   const { socket, connectionStatus } = useSocketContext();
   const rootElementRef = useRef<HTMLDivElement | null>(null);
   const inviteRef = useRef<any>(null);
+  const takeoverCallSidRef = useRef<string | null>(null);
   const initializingRef = useRef(false);
 
   // Get subscriber token from backend
@@ -288,7 +292,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         return;
       }
       const script = document.createElement('script');
-      // Use stable @signalwire/client (no @dev) per SignalWire recommendation
+      // Use stable @signalwire/client release
       script.src = 'https://unpkg.com/@signalwire/client';
       script.async = true;
       script.onload = () => {
@@ -329,9 +333,15 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         console.log('📞 [CallFabric] Created rootElement for media (matching SDK example)');
       }
 
+      // Match reference implementation pattern for host parameter:
+      // explicitly pass undefined when not set, rather than empty string
+      const swHost = import.meta.env.VITE_SIGNALWIRE_HOST;
+      const hostParam = swHost && swHost.trim().length ? swHost : undefined;
+      console.log('📱 [CallFabric] Using host:', hostParam || '(default from token)');
+
       const swClient = await SWire({
         token: token,
-        host: import.meta.env.VITE_SIGNALWIRE_HOST,
+        host: hostParam,
         debug: { logWsTraffic: true },
         logLevel: 'debug'
       });
@@ -1015,6 +1025,89 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       throw error;
     }
   }, [client, user, isInConference, socket]);
+
+  // Make a call to a SWML resource (for takeover — connects agent to existing call)
+  const makeCallToSwml = useCallback(async (swmlUrl: string, context?: any) => {
+    if (!client) {
+      setError('Phone system not initialized');
+      return;
+    }
+
+    try {
+      console.log('📞 [CallFabric] Making SWML call to:', swmlUrl);
+      setCallState('ringing');
+
+      // Track the original call SID for socket-based cleanup
+      if (context?.original_call_sid) {
+        takeoverCallSidRef.current = context.original_call_sid;
+        console.log('📞 [CallFabric] Tracking takeover for call SID:', context.original_call_sid);
+      }
+
+      const call = await client.dial({
+        to: swmlUrl,
+        rootElement: rootElementRef.current,
+        audio: true,
+        video: false,
+        logLevel: 'debug',
+        debug: { logWsTraffic: true },
+        userVariables: {
+          agent_id: user?.id,
+          agent_name: user?.name,
+          call_type: 'takeover',
+          ...context
+        }
+      });
+
+      let hasMarkedActive = false;
+      const markCallActive = () => {
+        if (hasMarkedActive) return;
+        hasMarkedActive = true;
+        console.log('✅ [CallFabric] Takeover call ACTIVE');
+        setCallState('active');
+      };
+
+      const cleanupCall = () => {
+        console.log('📞 [CallFabric] SWML call cleanup');
+        setActiveCall(null);
+        activeCallRef.current = null;
+        setCallState('idle');
+        takeoverCallSidRef.current = null;
+      };
+
+      const connectedStates = ['active', 'answered', 'answering', 'early', 'trying'];
+
+      call.on('call.state', (state: any) => {
+        console.log('📞 [CallFabric] SWML call state:', state);
+        if (connectedStates.includes(state)) {
+          markCallActive();
+        } else if (state === 'ended' || state === 'hangup' || state === 'destroy') {
+          cleanupCall();
+        }
+      });
+
+      call.on('call.joined', () => {
+        console.log('📞 [CallFabric] SWML call joined');
+        markCallActive();
+      });
+
+      call.on('destroy', () => {
+        console.log('📞 [CallFabric] SWML call destroyed');
+        cleanupCall();
+      });
+
+      setActiveCall(call);
+      activeCallRef.current = call;
+      await call.start();
+
+      console.log('✅ [CallFabric] SWML call started');
+      return call;
+    } catch (error) {
+      console.error('❌ [CallFabric] Failed to make SWML call:', error);
+      setError('Failed to connect to call');
+      setCallState('idle');
+      throw error;
+    }
+  }, [client, user]);
 
   // Leave current conference (works for both agent and interaction conferences)
   const leaveConference = useCallback(async () => {
@@ -1897,16 +1990,31 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // Note: We intentionally do NOT auto-restore 'available' status on page load
   // Agent must explicitly go available when ready to take calls
 
-  // Initialize client on mount
+  // Initialize client on mount, clean up on unmount
   useEffect(() => {
     if (user && !client && !initializingRef.current) {
       initializeClient();
     }
 
     return () => {
+      // Properly disconnect the SDK client to prevent orphaned WebRTC connections
+      // This is critical during Vite HMR — without cleanup, old RTCPeerConnections
+      // linger and cause "_sdpReady called in wrong state: closed" errors
+      const currentClient = clientRef.current;
+      if (currentClient) {
+        console.log('🧹 [CallFabric] Cleaning up SDK client on unmount');
+        try {
+          currentClient.offline().catch(() => {});
+        } catch (e) {
+          // Ignore cleanup errors
+        }
+      }
       if (rootElementRef.current) {
         rootElementRef.current.remove();
+        rootElementRef.current = null;
       }
+      // Reset initialization ref so re-mount can initialize again
+      initializingRef.current = false;
     };
   }, [user]);
 
@@ -1956,6 +2064,8 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     // Conference actions (per-interaction model)
     joinInteractionConference,
     leaveConference,
+    // Takeover calls
+    makeCallToSwml,
     // Pending call assignment
     pendingCallAssignment,
     acceptCallAssignment,

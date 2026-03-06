@@ -105,6 +105,8 @@ services:
       VITE_API_URL: ${VITE_API_URL:-http://localhost:5000}
       VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:5000}
       VITE_SIGNALWIRE_PHONE_NUMBER: ${VITE_SIGNALWIRE_PHONE_NUMBER:-${SIGNALWIRE_PHONE_NUMBER}}
+      VITE_SIGNALWIRE_HOST: ${VITE_SIGNALWIRE_HOST:-${SIGNALWIRE_SPACE}}
+      VITE_FABRIC_APPLICATION_ID: ${FABRIC_APPLICATION_ID:-}
     volumes:
       - ./frontend:/app
       - /app/node_modules

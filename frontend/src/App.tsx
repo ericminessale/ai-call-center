@@ -95,7 +95,17 @@ function App() {
             }
           />
 
-          {/* Admin Settings */}
+          {/* Settings View */}
+          <Route
+            path="/settings"
+            element={
+              <ProtectedRoute>
+                <UnifiedAgentDesktop />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Admin Settings (standalone fallback) */}
           <Route
             path="/admin"
             element={

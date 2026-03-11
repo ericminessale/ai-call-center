@@ -101,6 +101,18 @@ export function CallDetailTab({
             <span className="text-gray-500">Handler:</span>
             <span className="text-white ml-2 capitalize">{interaction.handlerType}</span>
           </div>
+          {interaction.sentimentScore != null && (
+            <div>
+              <span className="text-gray-500">Sentiment:</span>
+              <span className={`ml-2 ${
+                interaction.sentimentScore > 0.3 ? 'text-green-400' :
+                interaction.sentimentScore < -0.3 ? 'text-red-400' :
+                'text-gray-300'
+              }`}>
+                {interaction.sentimentScore > 0 ? '+' : ''}{interaction.sentimentScore.toFixed(1)}
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Summary if available */}

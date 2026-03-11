@@ -364,6 +364,75 @@ def capture_base_url(query_params, body_params, headers, agent):
             threading.Thread(target=register_ai_leg, daemon=True).start()
 
 
+def add_sentiment_tool(agent):
+    """Add the report_sentiment global tool and prompt to any agent.
+
+    Uses define_tool with a local handler that POSTs to the backend over the
+    Docker network. skip_fillers is not yet supported via define_tool (SDK gap).
+    """
+
+    def _handle_report_sentiment(args, raw_data):
+        score = args.get('score', 0.0)
+        reason = args.get('reason', '')
+        global_data = raw_data.get('global_data', {})
+        call_db_id = global_data.get('call_db_id')
+
+        if call_db_id:
+            def post_sentiment():
+                try:
+                    import requests as http_requests
+                    backend_url = os.getenv('BACKEND_URL', 'http://backend:5000')
+                    url = f"{backend_url}/api/calls/{call_db_id}/sentiment"
+                    http_requests.post(url, json={'score': score, 'reason': reason}, timeout=5)
+                except Exception as e:
+                    print(f"Warning: Failed to post sentiment for call {call_db_id}: {e}", flush=True)
+            threading.Thread(target=post_sentiment, daemon=True).start()
+        else:
+            print(f"Warning: report_sentiment called but no call_db_id in global_data", flush=True)
+
+        result = SwaigFunctionResult()
+        result.set_response("ok")
+        return result
+
+    agent.define_tool(
+        name="report_sentiment",
+        description=(
+            "Silently report a change in customer sentiment. Only call this when "
+            "you detect a meaningful shift — not for every utterance."
+        ),
+        parameters={
+            "score": {
+                "type": "number",
+                "description": (
+                    "Sentiment score from -1.0 to 1.0. "
+                    "-1.0 = extremely negative, 0.0 = neutral, 1.0 = extremely positive"
+                )
+            },
+            "reason": {
+                "type": "string",
+                "description": "Brief note on what triggered the change (e.g. 'customer frustrated about wait time')"
+            }
+        },
+        handler=_handle_report_sentiment,
+        skip_fillers=True
+    )
+
+    agent.prompt_add_section(
+        "Sentiment Tracking",
+        body=(
+            "You have a silent tool called report_sentiment. Use it when you detect a "
+            "meaningful shift in the customer's emotional state — frustration, relief, "
+            "confusion, satisfaction, anger, gratitude, etc."
+        ),
+        bullets=[
+            "Only report changes — if the customer stays in the same emotional state, do not call it again",
+            "Call it silently with no filler words, no acknowledgment to the caller",
+            "It must never interrupt or alter the conversation flow in any way",
+            "Score guide: -1.0 extremely negative, 0.0 neutral, 1.0 extremely positive"
+        ]
+    )
+
+
 class CallCenterTriageAgent(AgentBase):
     """
     Call Center TRIAGE Agent - Information gathering ONLY.
@@ -385,6 +454,7 @@ class CallCenterTriageAgent(AgentBase):
         )
 
         self.set_dynamic_config_callback(capture_base_url)
+        add_sentiment_tool(self)
 
         # Voice and speech configuration
         self.add_language("English", "en-US", "openai.alloy",
@@ -681,6 +751,7 @@ class SalesAISpecialist(AgentBase):
                         "platform", "integration", "SDK", "CPaaS", "UCaaS"])
 
         self.set_dynamic_config_callback(capture_base_url)
+        add_sentiment_tool(self)
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'sales-ai', fallback_collection='sales_knowledge')
@@ -827,6 +898,7 @@ class SupportAISpecialist(AgentBase):
                         "debug", "timeout", "connection", "webhook", "SDK"])
 
         self.set_dynamic_config_callback(capture_base_url)
+        add_sentiment_tool(self)
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'support-ai', fallback_collection='support_knowledge')
@@ -982,6 +1054,7 @@ class OutboundSalesAgent(AgentBase):
                         "platform", "integration"])
 
         self.set_dynamic_config_callback(capture_base_url)
+        add_sentiment_tool(self)
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'outbound-sales', fallback_collection='sales_knowledge')
@@ -1127,6 +1200,7 @@ class OutboundSupportAgent(AgentBase):
                         "debug", "timeout", "connection", "webhook"])
 
         self.set_dynamic_config_callback(capture_base_url)
+        add_sentiment_tool(self)
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'outbound-support', fallback_collection='support_knowledge')

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { PhoneOutgoing, Bot, Mic, Send, AlertCircle } from 'lucide-react';
+import { PhoneOutgoing, Bot, Mic, Send, AlertCircle, TrendingUp, TrendingDown, Minus } from 'lucide-react';
 import { TranscriptionMessage } from '../../types/callcenter';
 import api from '../../services/api';
 import { logger } from '../../lib/logger';
@@ -26,6 +26,12 @@ export interface AIContext {
   global_data?: Record<string, any>;
 }
 
+export interface SentimentData {
+  score: number;       // -1.0 to 1.0
+  reason?: string;     // What triggered the change
+  timestamp?: string;  // ISO timestamp
+}
+
 interface LiveCallTabProps {
   transcription: TranscriptionMessage[];
   isAICall: boolean;
@@ -34,6 +40,26 @@ interface LiveCallTabProps {
   callState?: 'idle' | 'ringing' | 'active' | 'ending';
   isOutboundCallInProgress?: boolean;
   aiContext?: AIContext;
+  sentiment?: SentimentData | null;
+}
+
+function SentimentIndicator({ sentiment }: { sentiment: SentimentData }) {
+  const score = sentiment.score;
+  const label = score > 0.3 ? 'Positive' : score < -0.3 ? 'Negative' : 'Neutral';
+  const Icon = score > 0.3 ? TrendingUp : score < -0.3 ? TrendingDown : Minus;
+  const colorClass = score > 0.3
+    ? 'text-green-400 bg-green-500/15 border-green-500/30'
+    : score < -0.3
+    ? 'text-red-400 bg-red-500/15 border-red-500/30'
+    : 'text-gray-400 bg-gray-500/15 border-gray-500/30';
+
+  return (
+    <div className={`flex items-center gap-1.5 px-2 py-1 rounded-md border text-xs font-medium ${colorClass}`} title={sentiment.reason || label}>
+      <Icon className="w-3 h-3" />
+      <span>{label}</span>
+      <span className="opacity-70">({score > 0 ? '+' : ''}{score.toFixed(1)})</span>
+    </div>
+  );
 }
 
 export function LiveCallTab({
@@ -44,6 +70,7 @@ export function LiveCallTab({
   callState,
   isOutboundCallInProgress,
   aiContext,
+  sentiment,
 }: LiveCallTabProps) {
   const [systemMessage, setSystemMessage] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -118,9 +145,12 @@ export function LiveCallTab({
           <h3 className="text-lg font-semibold text-white">
             {isOutboundCallInProgress && callState === 'ringing' ? 'Outbound Call' : 'Live Transcription'}
           </h3>
-          <div className={`flex items-center gap-2 ${status.color} text-sm`}>
-            <div className={`w-2 h-2 ${status.bgColor} rounded-full animate-pulse`} />
-            {status.text}
+          <div className="flex items-center gap-3">
+            {sentiment && <SentimentIndicator sentiment={sentiment} />}
+            <div className={`flex items-center gap-2 ${status.color} text-sm`}>
+              <div className={`w-2 h-2 ${status.bgColor} rounded-full animate-pulse`} />
+              {status.text}
+            </div>
           </div>
         </div>
 

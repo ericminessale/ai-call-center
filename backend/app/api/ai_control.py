@@ -532,6 +532,15 @@ def initiate_outbound_ai_call():
         )
         call.ai_context_dict = context
         db.session.add(call)
+
+        # Update contact's last interaction
+        if contact_id:
+            from app.models import Contact
+            contact = Contact.query.get(contact_id)
+            if contact:
+                contact.last_interaction_at = datetime.utcnow()
+                contact.total_calls = (contact.total_calls or 0) + 1
+
         db.session.commit()
 
         # Build the SWML webhook URL that SignalWire will fetch when the call is answered

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Search, Phone, Bot, User, Clock, Building2, Star, Headphones } from 'lucide-react';
+import { Search, Phone, Bot, User, Clock, Building2, Star, Headphones, AlertTriangle } from 'lucide-react';
 import { Call, QueueConfig } from '../../types/callcenter';
 import { logger } from '../../lib/logger';
 import { CallListSkeletonGroup } from '../shared/Skeleton';
@@ -286,9 +286,12 @@ function CallCard({ call, onClick, queueConfigs }: { call: Call; onClick: () => 
     return `${mins}:${String(secs).padStart(2, '0')}`;
   };
 
-  // Determine border and background colors based on call type
-  const borderColor = isAI ? 'border-purple-500' : isConnecting ? 'border-yellow-500' : 'border-green-500';
-  const bgTint = isAI ? 'bg-purple-900/10' : '';
+  // Negative sentiment detection
+  const isNegativeSentiment = call.sentiment !== undefined && call.sentiment < -0.3;
+
+  // Determine border and background colors based on call type + sentiment
+  const borderColor = isNegativeSentiment ? 'border-red-500' : isAI ? 'border-purple-500' : isConnecting ? 'border-yellow-500' : 'border-green-500';
+  const bgTint = isNegativeSentiment ? 'bg-red-900/10' : isAI ? 'bg-purple-900/10' : '';
 
   // Queue badge
   const queueBadge = queueSlug ? getQueueBadgeColor(queueSlug) : null;
@@ -324,6 +327,9 @@ function CallCard({ call, onClick, queueConfigs }: { call: Call; onClick: () => 
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <span className="font-medium text-white truncate">{contactName}</span>
+          {isNegativeSentiment && (
+            <AlertTriangle className="w-3 h-3 text-red-400 flex-shrink-0" title="Negative sentiment detected" />
+          )}
           {isVip && (
             <Star className="w-3 h-3 text-yellow-400 fill-yellow-400 flex-shrink-0" />
           )}

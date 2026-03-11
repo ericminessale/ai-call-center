@@ -1255,6 +1255,15 @@ def dial_out_to_conference(conference_name):
             created_at=datetime.utcnow()
         )
         db.session.add(call)
+
+        # Update contact's last interaction
+        if contact_id:
+            from app.models import Contact
+            contact = Contact.query.get(contact_id)
+            if contact:
+                contact.last_interaction_at = datetime.utcnow()
+                contact.total_calls = (contact.total_calls or 0) + 1
+
         db.session.commit()
 
         # Emit call update so frontend knows about the new call

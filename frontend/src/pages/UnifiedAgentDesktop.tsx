@@ -10,6 +10,7 @@ import { SettingsPanel } from '../components/unified/SettingsPanel';
 import { ContactDetailView } from '../components/contacts/ContactDetailView';
 import { contactsApi, callsApi, queueApi } from '../services/api';
 import { Contact, ContactMinimal, Call, QueueConfig } from '../types/callcenter';
+import type { SentimentData } from '../components/contacts/LiveCallTab';
 import { Users } from 'lucide-react';
 import { ContactDetailSkeleton } from '../components/shared/Skeleton';
 import { DashboardCharts } from '../components/unified/DashboardCharts';
@@ -70,6 +71,9 @@ export function UnifiedAgentDesktop() {
   // Queue configs for filter pills + badges
   const [queueConfigs, setQueueConfigs] = useState<QueueConfig[]>([]);
 
+  // Live sentiment from AI agents, keyed by call ID
+  const [liveSentimentMap, setLiveSentimentMap] = useState<Record<number, SentimentData>>({});
+
   // Call Fabric integration (shared context)
   const callFabric = useCallFabricContext();
 
@@ -92,6 +96,7 @@ export function UnifiedAgentDesktop() {
     socket.off('authenticated');
     socket.off('connect');
     socket.off('queue_update');
+    socket.off('sentiment_update');
 
     // Handle socket connect/reconnect - reload data when connected
     socket.on('connect', () => {
@@ -201,6 +206,20 @@ export function UnifiedAgentDesktop() {
       updateCallCounts();
     });
 
+    // Real-time sentiment updates from AI agents
+    socket.on('sentiment_update', (data: { callId: number; score: number; reason?: string; timestamp?: string }) => {
+      logger.debug('[Unified] sentiment_update:', data);
+      setLiveSentimentMap(prev => ({
+        ...prev,
+        [data.callId]: { score: data.score, reason: data.reason, timestamp: data.timestamp },
+      }));
+
+      // Also update the sentiment field on the matching active call
+      setActiveCalls(prev => prev.map(c =>
+        (c.id === data.callId) ? { ...c, sentiment: data.score } : c
+      ));
+    });
+
     return () => {
       socket.off('call_update');
       socket.off('call_assigned');
@@ -211,6 +230,7 @@ export function UnifiedAgentDesktop() {
       socket.off('connect');
       socket.off('queue_update');
       socket.off('queue_config_changed');
+      socket.off('sentiment_update');
     };
   }, [socket]);
 
@@ -643,24 +663,28 @@ export function UnifiedAgentDesktop() {
               {isLoadingContactDetail && !selectedContact ? (
                 <ContactDetailSkeleton />
               ) : selectedContact ? (
-                <ContactDetailView
-                  contact={selectedContact}
-                  onContactUpdate={handleContactUpdate}
-                  onContactDelete={handleContactDelete}
-                  activeCallForContact={
-                    [...activeCalls, ...queuedCalls].find(c => {
-                      if (c.contact_id === selectedContact.id || (c as any).contactId === selectedContact.id) {
-                        return true;
-                      }
-                      if (c.direction === 'outbound') {
-                        return (c as any).destination === selectedContact.phone;
-                      }
-                      return c.from_number === selectedContact.phone ||
-                             (c as any).fromNumber === selectedContact.phone ||
-                             c.phoneNumber === selectedContact.phone;
-                    })
-                  }
-                />
+                (() => {
+                  const activeCallForContact = [...activeCalls, ...queuedCalls].find(c => {
+                    if (c.contact_id === selectedContact.id || (c as any).contactId === selectedContact.id) {
+                      return true;
+                    }
+                    if (c.direction === 'outbound') {
+                      return (c as any).destination === selectedContact.phone;
+                    }
+                    return c.from_number === selectedContact.phone ||
+                           (c as any).fromNumber === selectedContact.phone ||
+                           c.phoneNumber === selectedContact.phone;
+                  });
+                  return (
+                    <ContactDetailView
+                      contact={selectedContact}
+                      onContactUpdate={handleContactUpdate}
+                      onContactDelete={handleContactDelete}
+                      activeCallForContact={activeCallForContact}
+                      liveSentiment={activeCallForContact?.id ? liveSentimentMap[activeCallForContact.id] || null : null}
+                    />
+                  );
+                })()
               ) : viewMode === 'supervisor' ? (
                 <DashboardCharts activeCalls={activeCalls} queuedCalls={queuedCalls} />
               ) : (

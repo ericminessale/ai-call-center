@@ -37,15 +37,18 @@ import { useCallFabric } from '../../hooks/useCallFabric';
 import { useCallFabricContext } from '../../contexts/CallFabricContext';
 import { useSocketContext } from '../../contexts/SocketContext';
 import { CallTimeline } from './CallTimeline';
+import { LiveCallTab, SentimentData } from './LiveCallTab';
+import { CallDetailTab } from './CallDetailTab';
 
 interface ContactDetailViewProps {
   contact: Contact;
   onContactUpdate: (contact: Contact) => void;
   onContactDelete?: (contactId: number) => void;
   activeCallForContact?: Call; // Inbound/AI call for this contact from parent
+  liveSentiment?: SentimentData | null; // Real-time sentiment from AI agent
 }
 
-export function ContactDetailView({ contact, onContactUpdate, onContactDelete, activeCallForContact }: ContactDetailViewProps) {
+export function ContactDetailView({ contact, onContactUpdate, onContactDelete, activeCallForContact, liveSentiment }: ContactDetailViewProps) {
   const [interactions, setInteractions] = useState<Interaction[]>([]);
   const [isLoadingInteractions, setIsLoadingInteractions] = useState(false);
   const [showAllNotes, setShowAllNotes] = useState(false);
@@ -268,6 +271,24 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
     console.log('📝 [ContactDetail] Subscribing to transcription for call:', effectiveCallSid);
 
+    // Fetch existing transcription history for this call
+    api.get(`/api/calls/${effectiveCallSid}`)
+      .then(res => {
+        const existing = res.data.transcriptions || [];
+        if (existing.length > 0) {
+          console.log(`📝 [ContactDetail] Loaded ${existing.length} existing transcriptions`);
+          setTranscription(existing.map((t: any) => ({
+            id: String(t.id || t.sequence_number),
+            speaker: t.speaker || 'caller',
+            text: t.transcript || t.text,
+            timestamp: t.created_at || new Date().toISOString(),
+          })));
+        }
+      })
+      .catch(err => {
+        console.debug('📝 [ContactDetail] Could not load transcription history:', err.message);
+      });
+
     // Join the call room to receive events for this specific call
     const token = localStorage.getItem('access_token');
     if (token) {
@@ -288,12 +309,17 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         if (!speaker && data.role) {
           speaker = data.role === 'remote-caller' ? 'caller' : 'agent';
         }
-        setTranscription(prev => [...prev, {
-          id: `${Date.now()}`,
-          speaker: speaker || 'caller',
-          text: data.text,
-          timestamp: new Date().toISOString(),
-        }]);
+        setTranscription(prev => {
+          // Deduplicate: skip if last entry has same text and speaker
+          const last = prev[prev.length - 1];
+          if (last && last.text === data.text && last.speaker === (speaker || 'caller')) return prev;
+          return [...prev, {
+            id: `${Date.now()}`,
+            speaker: speaker || 'caller',
+            text: data.text,
+            timestamp: new Date().toISOString(),
+          }];
+        });
       }
     };
 
@@ -1124,6 +1150,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
             callState={callState}
             isOutboundCallInProgress={isOutboundCallInProgress}
             aiContext={connectedCustomer?.aiContext || (activeCallForContact as any)?.aiContext}
+            sentiment={liveSentiment}
           />
         )}
         {activeTab === 'history' && (
@@ -1414,530 +1441,8 @@ function DetailRow({ label, value }: { label: string; value?: string }) {
   );
 }
 
-interface AIContext {
-  // Customer identification
-  customer_name?: string;
-  account_number?: string;
-
-  // Issue/Request details
-  reason?: string;           // General reason for call
-  issue?: string;           // Support issue description
-  issue_description?: string; // Legacy field
-  urgency?: string;         // low/medium/high
-  priority?: number;        // Numeric priority (1-10)
-  department?: string;      // sales/support/billing
-
-  // Sales-specific
-  interest?: string;        // Product interest
-  company?: string;         // Company name
-  budget?: string;          // Budget range
-
-  // Support-specific
-  error_message?: string;   // Error message if applicable
-  additional_info?: string; // Additional details collected by AI
-
-  // AI summary and metadata
-  ai_summary?: string;
-  source_agent?: string;    // Which AI agent collected this
-  preferred_handling?: 'ai' | 'human';
-  queue?: string;           // Which queue they came from
-
-  // Raw data fallback
-  global_data?: Record<string, any>;
-}
-
-function LiveCallTab({
-  transcription,
-  isAICall,
-  callSid,
-  callDuration,
-  callState,
-  isOutboundCallInProgress,
-  aiContext,
-}: {
-  transcription: TranscriptionMessage[];
-  isAICall: boolean;
-  callSid?: string;
-  callDuration?: number;
-  callState?: 'idle' | 'ringing' | 'active' | 'ending';
-  isOutboundCallInProgress?: boolean;
-  aiContext?: AIContext;
-}) {
-  const [systemMessage, setSystemMessage] = useState('');
-  const [isSending, setIsSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
-
-  // Debug logging for props
-  useEffect(() => {
-    console.log('🎯 [LiveCallTab] Component rendered with props:', { isAICall, callSid, transcriptionCount: transcription.length });
-  }, [isAICall, callSid, transcription.length]);
-
-  // Auto-scroll to bottom when new transcription arrives
-  useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [transcription]);
-
-  const quickTemplates = [
-    { label: 'Offer Discount', message: 'The customer qualifies for a 20% discount. Offer this to help close the sale.' },
-    { label: 'Transfer to Human', message: 'This customer needs specialized help. Transfer them to a human agent now.' },
-    { label: 'Apologize', message: 'Acknowledge the customer\'s frustration with empathy and apologize for any inconvenience.' },
-    { label: 'Gather Details', message: 'Ask more specific questions to better understand the customer\'s needs.' },
-  ];
-
-  const sendSystemMessage = async () => {
-    console.log('🎯 [AI MESSAGE] Send button clicked');
-    console.log('🎯 [AI MESSAGE] callSid:', callSid);
-    console.log('🎯 [AI MESSAGE] systemMessage:', systemMessage);
-    console.log('🎯 [AI MESSAGE] isAICall:', isAICall);
-
-    if (!systemMessage.trim()) {
-      console.log('🎯 [AI MESSAGE] No message to send');
-      return;
-    }
-    if (!callSid) {
-      console.error('🎯 [AI MESSAGE] No call SID available!');
-      setError('No active call SID available');
-      return;
-    }
-
-    setIsSending(true);
-    setError(null);
-    setSuccess(false);
-
-    try {
-      const payload = {
-        call_id: callSid,
-        message: systemMessage,
-        role: 'system'
-      };
-      console.log('🎯 [AI MESSAGE] Sending payload:', payload);
-
-      const response = await api.post('/api/ai/inject-message', payload);
-      console.log('🎯 [AI MESSAGE] Response:', response);
-
-      setSuccess(true);
-      setSystemMessage('');
-      setTimeout(() => setSuccess(false), 3000);
-    } catch (err: any) {
-      console.error('🎯 [AI MESSAGE] Failed to send AI message:', err);
-      console.error('🎯 [AI MESSAGE] Error response:', err.response?.data);
-      setError(err.response?.data?.error || 'Failed to send message to AI agent');
-    } finally {
-      setIsSending(false);
-    }
-  };
-
-  // Get status display
-  const getStatusDisplay = () => {
-    if (isOutboundCallInProgress) {
-      if (callState === 'ringing') return { text: 'Calling...', color: 'text-yellow-400', bgColor: 'bg-yellow-500' };
-      if (callState === 'ending') return { text: 'Ending...', color: 'text-gray-400', bgColor: 'bg-gray-500' };
-    }
-    if (callState === 'active') return { text: 'Connected', color: 'text-green-400', bgColor: 'bg-green-500' };
-    return { text: 'Recording', color: 'text-green-400', bgColor: 'bg-green-500' };
-  };
-
-  const status = getStatusDisplay();
-
-  return (
-    <div className="h-full flex flex-col">
-      {/* AI Context Panel - Shows data collected by AI agent (ABOVE transcription) */}
-      {aiContext && Object.keys(aiContext).length > 0 && (
-        <div className="p-4 pb-0">
-          <div className="p-3 bg-blue-900/30 border border-blue-500/30 rounded-lg">
-            <h4 className="text-sm font-medium text-blue-400 mb-2 flex items-center gap-2">
-              <Bot className="w-4 h-4" />
-              AI Agent Collected Information
-              {aiContext.source_agent && (
-                <span className="text-xs text-gray-500 font-normal">
-                  (via {aiContext.source_agent.replace(/_/g, ' ')})
-                </span>
-              )}
-            </h4>
-            <div className="space-y-2 text-sm">
-              {/* Customer Info */}
-              {aiContext.customer_name && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Customer:</span>
-                  <span className="text-white">{aiContext.customer_name}</span>
-                </div>
-              )}
-              {aiContext.company && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Company:</span>
-                  <span className="text-white">{aiContext.company}</span>
-                </div>
-              )}
-              {aiContext.account_number && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Account:</span>
-                  <span className="text-white">{aiContext.account_number}</span>
-                </div>
-              )}
-
-              {/* Request/Issue Details */}
-              {(aiContext.reason || aiContext.issue || aiContext.issue_description || aiContext.additional_info) && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Issue/Request:</span>
-                  <span className="text-white">
-                    {aiContext.issue || aiContext.issue_description || aiContext.reason || aiContext.additional_info}
-                  </span>
-                </div>
-              )}
-              {aiContext.interest && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Interest:</span>
-                  <span className="text-white">{aiContext.interest}</span>
-                </div>
-              )}
-              {aiContext.budget && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Budget:</span>
-                  <span className="text-white">{aiContext.budget}</span>
-                </div>
-              )}
-              {aiContext.error_message && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Error:</span>
-                  <span className="text-red-400 font-mono text-xs">{aiContext.error_message}</span>
-                </div>
-              )}
-              {aiContext.department && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Department:</span>
-                  <span className="text-white capitalize">{aiContext.department}</span>
-                </div>
-              )}
-
-              {/* Priority/Urgency */}
-              {(aiContext.urgency || aiContext.priority) && (
-                <div className="flex items-start gap-2">
-                  <span className="text-gray-400 min-w-[100px]">Priority:</span>
-                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-                    (aiContext.urgency === 'high' || (aiContext.priority && aiContext.priority <= 3))
-                      ? 'bg-red-500/30 text-red-400'
-                      : (aiContext.urgency === 'medium' || (aiContext.priority && aiContext.priority <= 6))
-                      ? 'bg-yellow-500/30 text-yellow-400'
-                      : 'bg-green-500/30 text-green-400'
-                  }`}>
-                    {aiContext.urgency
-                      ? aiContext.urgency.charAt(0).toUpperCase() + aiContext.urgency.slice(1)
-                      : (aiContext.priority && aiContext.priority <= 3) ? 'High'
-                      : (aiContext.priority && aiContext.priority <= 6) ? 'Medium'
-                      : 'Low'}
-                    {aiContext.priority && ` (${aiContext.priority})`}
-                  </span>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Live Transcription */}
-      <div className="flex-1 p-4 overflow-y-auto">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-semibold text-white">
-            {isOutboundCallInProgress && callState === 'ringing' ? 'Outbound Call' : 'Live Transcription'}
-          </h3>
-          <div className={`flex items-center gap-2 ${status.color} text-sm`}>
-            <div className={`w-2 h-2 ${status.bgColor} rounded-full animate-pulse`} />
-            {status.text}
-          </div>
-        </div>
-
-        <div className="bg-gray-900 rounded-lg p-4 min-h-[300px] max-h-[400px] overflow-y-auto font-mono text-sm">
-          {/* Show calling state UI when outbound call is ringing */}
-          {isOutboundCallInProgress && callState === 'ringing' && transcription.length === 0 ? (
-            <div className="flex items-center justify-center h-64 text-gray-500">
-              <div className="text-center">
-                <PhoneOutgoing className="w-12 h-12 mx-auto mb-2 text-yellow-400 animate-pulse" />
-                <p className="text-yellow-400 font-medium">Calling...</p>
-                <p className="text-gray-500 text-sm mt-1">Waiting for answer</p>
-              </div>
-            </div>
-          ) : transcription.length > 0 ? (
-            <div className="space-y-3">
-              {transcription.map((entry, idx) => (
-                <div key={entry.id || idx} className="flex flex-col space-y-1">
-                  <div className="flex items-center space-x-2">
-                    <span className={`font-semibold ${
-                      entry.speaker === 'agent' || entry.speaker === 'ai' ? 'text-purple-400' : 'text-blue-400'
-                    }`}>
-                      {entry.speaker === 'agent' ? 'Agent:' : entry.speaker === 'ai' ? 'AI:' : 'Caller:'}
-                    </span>
-                    <span className="text-xs text-gray-500">
-                      {new Date(entry.timestamp).toLocaleTimeString()}
-                    </span>
-                  </div>
-                  <p className="text-gray-300 pl-4">{entry.text}</p>
-                </div>
-              ))}
-              <div ref={scrollRef} />
-            </div>
-          ) : (
-            <div className="flex items-center justify-center h-64 text-gray-500">
-              <div className="text-center">
-                <Mic className="w-12 h-12 mx-auto mb-2 opacity-50" />
-                <p>Waiting for conversation...</p>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* AI Message Controls - Only for AI calls */}
-      {isAICall && (
-        <div className="border-t border-gray-700 p-4 bg-gray-800">
-          <div className="bg-purple-900/30 border border-purple-500/30 rounded-lg p-3 mb-3">
-            <div className="flex items-start gap-2">
-              <Bot className="w-4 h-4 text-purple-400 mt-0.5 flex-shrink-0" />
-              <p className="text-xs text-purple-300">
-                Send instructions to guide the AI agent's behavior during this call
-              </p>
-            </div>
-          </div>
-
-          {/* Quick Templates */}
-          <div className="flex flex-wrap gap-2 mb-3">
-            {quickTemplates.map((template, idx) => (
-              <button
-                key={idx}
-                onClick={() => setSystemMessage(template.message)}
-                className="text-xs px-3 py-1.5 bg-purple-500/20 text-purple-300 rounded-md hover:bg-purple-500/30 transition-colors"
-                disabled={isSending}
-              >
-                {template.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Message Input */}
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={systemMessage}
-              onChange={(e) => setSystemMessage(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  console.log('🎯 [AI MESSAGE] Enter key pressed');
-                  sendSystemMessage();
-                }
-              }}
-              placeholder="Type message to AI agent..."
-              className="flex-1 px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-sm text-white placeholder-gray-400 focus:outline-none focus:border-purple-500"
-              disabled={isSending}
-            />
-            <button
-              onClick={() => {
-                console.log('🎯 [AI MESSAGE] Button clicked directly');
-                sendSystemMessage();
-              }}
-              disabled={!systemMessage.trim() || isSending}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-2 ${
-                systemMessage.trim() && !isSending
-                  ? 'bg-purple-600 text-white hover:bg-purple-700'
-                  : 'bg-gray-600 text-gray-400 cursor-not-allowed'
-              }`}
-            >
-              {isSending ? (
-                <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent" />
-              ) : (
-                <Send className="w-4 h-4" />
-              )}
-              Send
-            </button>
-          </div>
-
-          {/* Status Messages */}
-          {error && (
-            <div className="mt-2 p-2 bg-red-500/20 border border-red-500/50 rounded-lg text-xs text-red-400 flex items-center gap-2">
-              <AlertCircle className="w-3 h-3 flex-shrink-0" />
-              {error}
-            </div>
-          )}
-          {success && (
-            <div className="mt-2 p-2 bg-green-500/20 border border-green-500/50 rounded-lg text-xs text-green-400 flex items-center gap-2">
-              <Bot className="w-3 h-3 flex-shrink-0" />
-              Message sent to AI agent successfully!
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Call Detail Tab - displays historical call details with transcription
-function CallDetailTab({
-  interaction,
-  formatDate,
-  formatDuration,
-}: {
-  interaction: Interaction;
-  formatDate: (date?: string) => string;
-  formatDuration: (seconds?: number) => string;
-}) {
-  const [transcriptions, setTranscriptions] = useState<{ speaker: string; text: string; timestamp: string }[]>([]);
-  const [legs, setLegs] = useState<CallLeg[]>([]);
-  const [isLoadingTranscriptions, setIsLoadingTranscriptions] = useState(true);
-  const scrollRef = useRef<HTMLDivElement>(null);
-
-  // Fetch transcriptions and legs for this call
-  useEffect(() => {
-    const fetchCallDetails = async () => {
-      setIsLoadingTranscriptions(true);
-      try {
-        // Use the SignalWire call SID to fetch call details which includes transcriptions
-        const response = await api.get(`/api/calls/${interaction.signalwireCallSid}`);
-        const data = response.data.transcriptions || [];
-        setTranscriptions(data.map((t: any) => ({
-          speaker: t.speaker || 'caller',
-          text: t.transcript || t.text,
-          timestamp: t.createdAt || t.created_at,
-        })));
-
-        // Fetch legs separately
-        try {
-          const legsResponse = await api.get(`/api/calls/${interaction.signalwireCallSid}/legs`);
-          setLegs(legsResponse.data.legs || []);
-        } catch (legsError) {
-          console.log('No legs data available for this call');
-          setLegs([]);
-        }
-      } catch (error) {
-        console.error('Failed to load call details:', error);
-        setTranscriptions([]);
-        setLegs([]);
-      } finally {
-        setIsLoadingTranscriptions(false);
-      }
-    };
-
-    fetchCallDetails();
-  }, [interaction.signalwireCallSid]);
-
-  return (
-    <div className="h-full flex flex-col">
-      {/* Call Info Header */}
-      <div className="p-4 border-b border-gray-700 bg-gray-800/50">
-        <div className="flex items-center gap-3 mb-3">
-          <div className={`w-12 h-12 rounded-full flex items-center justify-center ${
-            interaction.direction === 'inbound' ? 'bg-blue-500/20' : 'bg-green-500/20'
-          }`}>
-            {interaction.direction === 'inbound' ? (
-              <PhoneIncoming className="w-6 h-6 text-blue-400" />
-            ) : (
-              <PhoneOutgoing className="w-6 h-6 text-green-400" />
-            )}
-          </div>
-          <div>
-            <h3 className="text-lg font-semibold text-white">
-              {interaction.direction === 'inbound' ? 'Inbound' : 'Outbound'} Call
-            </h3>
-            <p className="text-sm text-gray-400">
-              {formatDate(interaction.createdAt)} • {formatDuration(interaction.duration)}
-            </p>
-          </div>
-          {interaction.handlerType === 'ai' && (
-            <span className="flex items-center gap-1 px-3 py-1 bg-purple-500/20 text-purple-400 text-sm rounded-full ml-auto">
-              <Bot className="w-4 h-4" />
-              {interaction.aiAgentName || 'AI Agent'}
-            </span>
-          )}
-        </div>
-
-        {/* Call Details Grid */}
-        <div className="grid grid-cols-2 gap-4 text-sm">
-          <div>
-            <span className="text-gray-500">From:</span>
-            <span className="text-white ml-2">{interaction.fromNumber || '--'}</span>
-          </div>
-          <div>
-            <span className="text-gray-500">To:</span>
-            <span className="text-white ml-2">{interaction.destination || '--'}</span>
-          </div>
-          <div>
-            <span className="text-gray-500">Status:</span>
-            <span className="text-white ml-2 capitalize">{interaction.status}</span>
-          </div>
-          <div>
-            <span className="text-gray-500">Handler:</span>
-            <span className="text-white ml-2 capitalize">{interaction.handlerType}</span>
-          </div>
-        </div>
-
-        {/* Summary if available */}
-        {interaction.summary && (
-          <div className="mt-4 p-3 bg-gray-900 rounded-lg">
-            <h4 className="text-sm font-medium text-gray-300 mb-1">AI Summary</h4>
-            <p className="text-sm text-gray-400">{interaction.summary}</p>
-          </div>
-        )}
-
-        {/* Call Journey Timeline */}
-        {legs.length > 0 && (
-          <CallTimeline legs={legs} />
-        )}
-      </div>
-
-      {/* Transcription Section */}
-      <div className="flex-1 p-4 overflow-y-auto">
-        <h4 className="text-sm font-semibold text-white mb-3">Call Transcription</h4>
-
-        {isLoadingTranscriptions ? (
-          <div className="flex items-center justify-center h-32 text-gray-400">
-            <div className="animate-spin w-6 h-6 border-2 border-gray-400 border-t-transparent rounded-full mr-2" />
-            Loading transcription...
-          </div>
-        ) : transcriptions.length > 0 ? (
-          <div className="bg-gray-900 rounded-lg p-4 space-y-3 font-mono text-sm">
-            {transcriptions.map((entry, idx) => (
-              <div key={idx} className="flex flex-col space-y-1">
-                <div className="flex items-center space-x-2">
-                  <span className={`font-semibold ${
-                    entry.speaker === 'agent' || entry.speaker === 'ai' ? 'text-purple-400' : 'text-blue-400'
-                  }`}>
-                    {entry.speaker === 'agent' ? 'Agent:' : entry.speaker === 'ai' ? 'AI:' : 'Caller:'}
-                  </span>
-                  {entry.timestamp && (
-                    <span className="text-xs text-gray-500">
-                      {new Date(entry.timestamp).toLocaleTimeString()}
-                    </span>
-                  )}
-                </div>
-                <p className="text-gray-300 pl-4">{entry.text}</p>
-              </div>
-            ))}
-            <div ref={scrollRef} />
-          </div>
-        ) : (
-          <div className="bg-gray-900 rounded-lg p-8 text-center text-gray-500">
-            <Mic className="w-10 h-10 mx-auto mb-2 opacity-50" />
-            <p>No transcription available for this call</p>
-          </div>
-        )}
-      </div>
-
-      {/* Recording link if available */}
-      {interaction.recordingUrl && (
-        <div className="p-4 border-t border-gray-700">
-          <a
-            href={interaction.recordingUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-2 text-blue-400 hover:text-blue-300 text-sm"
-          >
-            <Play className="w-4 h-4" />
-            Listen to Recording
-          </a>
-        </div>
-      )}
-    </div>
-  );
-}
+// LiveCallTab imported from ./LiveCallTab
+// CallDetailTab imported from ./CallDetailTab
 
 function EditContactModal({
   contact,

@@ -1,3 +1,4 @@
+from datetime import datetime
 from flask import request, jsonify
 from app import db, redis_client
 from app.api import swml_bp
@@ -76,6 +77,9 @@ def initial_call():
                 db.session.flush()  # Get the ID
                 logger.info(f"Created new contact for {from_number}: ID {contact.id}")
             contact_id = contact.id
+            # Update last interaction timestamp
+            contact.last_interaction_at = datetime.utcnow()
+            contact.total_calls = (contact.total_calls or 0) + 1
 
         # Create new call record
         # Calls coming to /initial-call are INBOUND (SignalWire calling us when someone dials our number)

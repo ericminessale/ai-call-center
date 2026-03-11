@@ -58,18 +58,22 @@ export function QueueList({ calls, onSelectCall, onTakeCall, isLoading, queueCon
     );
   });
 
-  // Sort by priority (urgent first) then wait time
+  // Sort by priority (urgent/negative sentiment first) then wait time
   const sortedCalls = [...filteredCalls].sort((a, b) => {
-    if (a.is_urgent && !b.is_urgent) return -1;
-    if (!a.is_urgent && b.is_urgent) return 1;
+    const aNeedsAttention = a.is_urgent || (a.sentiment !== undefined && a.sentiment < -0.3);
+    const bNeedsAttention = b.is_urgent || (b.sentiment !== undefined && b.sentiment < -0.3);
+    if (aNeedsAttention && !bNeedsAttention) return -1;
+    if (!aNeedsAttention && bNeedsAttention) return 1;
     // Sort by wait time (older first)
     return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
   });
 
   // Separate urgent, waiting, and assigned calls
-  const urgentCalls = sortedCalls.filter((c) => c.is_urgent || c.queue_status === 'urgent');
-  const waitingCalls = sortedCalls.filter((c) => !c.is_urgent && c.queue_status !== 'urgent' && c.status === 'waiting');
-  const assignedCalls = sortedCalls.filter((c) => !c.is_urgent && c.queue_status !== 'urgent' && c.status === 'assigned');
+  // Negative sentiment calls get promoted to urgent section
+  const urgentCalls = sortedCalls.filter((c) => c.is_urgent || c.queue_status === 'urgent' || (c.sentiment !== undefined && c.sentiment < -0.3));
+  const isUrgentOrNegative = (c: Call) => c.is_urgent || c.queue_status === 'urgent' || (c.sentiment !== undefined && c.sentiment < -0.3);
+  const waitingCalls = sortedCalls.filter((c) => !isUrgentOrNegative(c) && c.status === 'waiting');
+  const assignedCalls = sortedCalls.filter((c) => !isUrgentOrNegative(c) && c.status === 'assigned');
 
   return (
     <div className="h-full flex flex-col">
@@ -226,6 +230,7 @@ function QueueCard({
   const isVip = call.contact?.isVip;
   const wasAI = call.handler_type === 'ai' || call.ai_agent_name;
   const queueSlug = call.queue_id || '';
+  const isNegativeSentiment = call.sentiment !== undefined && call.sentiment < -0.3;
 
   // Queue badge
   const queueBadge = queueSlug ? getQueueBadgeColor(queueSlug) : null;
@@ -246,9 +251,9 @@ function QueueCard({
     return () => clearInterval(interval);
   }, [call.created_at]);
 
-  // Color scheme based on priority
-  const borderColor = call.is_urgent ? 'border-red-500' : wasAI ? 'border-purple-500' : 'border-yellow-500';
-  const bgTint = call.is_urgent ? 'bg-red-900/5' : '';
+  // Color scheme based on priority + sentiment
+  const borderColor = (call.is_urgent || isNegativeSentiment) ? 'border-red-500' : wasAI ? 'border-purple-500' : 'border-yellow-500';
+  const bgTint = (call.is_urgent || isNegativeSentiment) ? 'bg-red-900/5' : '';
 
   return (
     <div className={`px-3 py-3 border-b border-gray-700/50 border-l-2 ${borderColor} ${bgTint} hover:bg-gray-700/30`}>
@@ -271,8 +276,8 @@ function QueueCard({
               {isVip && (
                 <Star className="w-3 h-3 text-yellow-400 fill-yellow-400 flex-shrink-0" />
               )}
-              {call.is_urgent && (
-                <AlertTriangle className="w-3 h-3 text-red-400 flex-shrink-0" />
+              {(call.is_urgent || isNegativeSentiment) && (
+                <AlertTriangle className="w-3 h-3 text-red-400 flex-shrink-0" title={isNegativeSentiment ? 'Negative sentiment detected' : 'Urgent — SLA exceeded'} />
               )}
               {wasAI && (
                 <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-semibold rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">

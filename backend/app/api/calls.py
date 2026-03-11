@@ -494,6 +494,74 @@ def register_ai_leg(call_db_id):
         return jsonify({'error': str(e)}), 500
 
 
+@calls_bp.route('/<call_db_id>/sentiment', methods=['POST'])
+def report_sentiment(call_db_id):
+    """Receive real-time sentiment updates from AI agents during a call.
+
+    Called by the AI agent's report_sentiment SWAIG tool (fire-and-forget).
+    No auth required - called internally from ai-agents container.
+
+    Request body:
+    {
+        "score": 0.7,         // -1.0 to 1.0
+        "reason": "Customer expressed satisfaction with resolution"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        score = data.get('score')
+        reason = data.get('reason', '')
+
+        if score is None:
+            return jsonify({'error': 'score is required'}), 400
+
+        # Clamp to valid range
+        score = max(-1.0, min(1.0, float(score)))
+
+        call_id = int(call_db_id)
+        call = Call.query.get(call_id)
+        if not call:
+            return jsonify({'error': 'Call not found'}), 404
+
+        # Update the call's sentiment score
+        call.sentiment_score = score
+        db.session.commit()
+
+        logger.info(f"Sentiment update for call {call_id}: {score} ({reason})")
+
+        # Emit real-time socket event so the UI updates immediately
+        sentiment_data = {
+            'callId': call_id,
+            'score': score,
+            'reason': reason,
+            'timestamp': datetime.utcnow().isoformat(),
+        }
+
+        # Broadcast to anyone watching this call + the assigned agent
+        socketio.emit('sentiment_update', sentiment_data)
+
+        # Also update the contact's average sentiment if linked
+        if call.contact_id:
+            from app.models import Contact
+            contact = Contact.query.get(call.contact_id)
+            if contact:
+                # Simple running average from all calls with sentiment data
+                from sqlalchemy import func
+                avg = db.session.query(func.avg(Call.sentiment_score)).filter(
+                    Call.contact_id == call.contact_id,
+                    Call.sentiment_score.isnot(None)
+                ).scalar()
+                if avg is not None:
+                    contact.average_sentiment = round(float(avg), 2)
+                    db.session.commit()
+
+        return jsonify({'success': True}), 200
+
+    except Exception as e:
+        logger.error(f"Failed to process sentiment update: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
 @calls_bp.route('/<call_sid>/takeover', methods=['POST'])
 @require_auth
 def initiate_takeover(call_sid):

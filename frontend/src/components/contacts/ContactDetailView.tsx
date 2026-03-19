@@ -39,6 +39,9 @@ import { useSocketContext } from '../../contexts/SocketContext';
 import { CallTimeline } from './CallTimeline';
 import { LiveCallTab, SentimentData } from './LiveCallTab';
 import { CallDetailTab } from './CallDetailTab';
+import CallControlPanel from './CallControlPanel';
+import { ConferenceParticipants } from './ConferenceParticipants';
+import { useAuthStore } from '../../stores/authStore';
 
 interface ContactDetailViewProps {
   contact: Contact;
@@ -46,6 +49,52 @@ interface ContactDetailViewProps {
   onContactDelete?: (contactId: number) => void;
   activeCallForContact?: Call; // Inbound/AI call for this contact from parent
   liveSentiment?: SentimentData | null; // Real-time sentiment from AI agent
+}
+
+/** Renders AI context summary as readable text instead of raw JSON */
+export function AISummaryDisplay({ summary }: { summary: string }) {
+  // Try to parse as JSON — if it looks like AI context, render it nicely
+  try {
+    const parsed = JSON.parse(summary);
+    if (typeof parsed === 'object' && parsed !== null) {
+      const { customer_name, department, reason, outcome, notes, ...rest } = parsed;
+      const parts: string[] = [];
+      if (reason) parts.push(reason);
+      if (notes && notes !== reason) parts.push(notes);
+      if (!parts.length) {
+        // Fallback: render all values as a sentence
+        parts.push(...Object.values(rest).filter(v => typeof v === 'string' && v !== 'unknown' && v !== 'not specified') as string[]);
+      }
+
+      return (
+        <span className="inline">
+          {parts.length > 0 ? (
+            <span>{parts.join(' — ')}</span>
+          ) : (
+            <span className="text-gray-500 italic">No summary available</span>
+          )}
+          {(department && department !== 'unknown') && (
+            <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-gray-600 text-gray-300">
+              {department}
+            </span>
+          )}
+          {outcome && (
+            <span className={`ml-1 px-1.5 py-0.5 text-[10px] rounded ${
+              outcome === 'resolved' ? 'bg-green-900/40 text-green-300' :
+              outcome === 'transferred_to_human' ? 'bg-blue-900/40 text-blue-300' :
+              outcome === 'abandoned' ? 'bg-red-900/40 text-red-300' :
+              'bg-gray-600 text-gray-300'
+            }`}>
+              {outcome.replace(/_/g, ' ')}
+            </span>
+          )}
+        </span>
+      );
+    }
+  } catch {
+    // Not JSON — render as plain text
+  }
+  return <span>{summary}</span>;
 }
 
 export function ContactDetailView({ contact, onContactUpdate, onContactDelete, activeCallForContact, liveSentiment }: ContactDetailViewProps) {
@@ -92,10 +141,15 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   } = useCallFabric();
 
   // Call Fabric context for taking queued calls
-  const { acceptCallAssignmentWithData, isClientReady, isInConference, joinInteractionConference, makeCallToSwml } = useCallFabricContext();
+  const { acceptCallAssignmentWithData, isClientReady, isInConference, conferenceParticipants, joinInteractionConference, makeCallToSwml } = useCallFabricContext();
 
   // State for taking queued calls
   const [isTakingCall, setIsTakingCall] = useState(false);
+
+  // Call control state
+  const [isOnHold, setIsOnHold] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const { user: currentUser } = useAuthStore();
   const [takeCallError, setTakeCallError] = useState<string | null>(null);
 
   // AI Agent form state
@@ -510,22 +564,25 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
   const handleEndCall = async () => {
     try {
-      // End AI calls via API, browser calls via Call Fabric
-      if (isAICall || isInboundAICall) {
-        const callSid = effectiveCallSid;
-        if (callSid) {
-          await api.post(`/api/calls/${callSid}/end`);
+      // Disconnect our Call Fabric leg first if we're connected
+      if (activeCall) {
+        try {
+          await hangup();
+        } catch (err) {
+          console.warn('📞 [ContactDetail] hangup() failed (may already be disconnected):', err);
         }
-      } else if (activeCall) {
-        // Browser-initiated call
-        await hangup();
-      } else if (activeCallForContact) {
-        // Server-initiated outbound call - end via API
-        const callId = activeCallForContact.id || activeCallForContact.signalwire_call_sid || (activeCallForContact as any).signalwireCallSid;
-        if (callId) {
-          console.log('📞 [ContactDetail] Ending server-initiated call:', callId);
-          await api.post(`/api/calls/${callId}/end`);
-        }
+      }
+
+      // Always end the call via backend API so the phone call is terminated
+      // and the frontend gets proper socket events to clean up
+      const callId = activeCallForContact?.id
+        || activeCallForContact?.signalwire_call_sid
+        || (activeCallForContact as any)?.signalwireCallSid;
+      const callSid = effectiveCallSid || callId;
+
+      if (callSid) {
+        console.log('📞 [ContactDetail] Ending call via API:', callSid);
+        await api.post(`/api/calls/${callSid}/end`);
       }
     } catch (error) {
       console.error('Failed to end call:', error);
@@ -804,6 +861,25 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
                 <PhoneOff className="w-4 h-4" />
                 End Call
               </button>
+              <CallControlPanel
+                callId={activeCallForContact?.id || currentCallSid || ''}
+                callSid={effectiveCallSid || ''}
+                isAICall={isAICall || isInboundAICall}
+                isHumanCall={!isAICall && !isInboundAICall}
+                isInConference={isInConference}
+                isOnHold={isOnHold}
+                isRecording={isRecording}
+                userRole={currentUser?.role}
+                onHoldChange={setIsOnHold}
+                onRecordingChange={setIsRecording}
+              />
+              {/* Conference Participants */}
+              {isInConference && conferenceParticipants.length > 0 && (
+                <ConferenceParticipants
+                  participants={conferenceParticipants}
+                  className="mt-3"
+                />
+              )}
             </>
           ) : (
             // Idle state - show call buttons
@@ -1029,7 +1105,13 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
             <div className="text-xs text-gray-400">Total Calls</div>
           </div>
           <div className="text-center">
-            <div className="text-2xl font-bold text-white">
+            <div className={`text-2xl font-bold ${
+              contact.averageSentiment != null
+                ? contact.averageSentiment > 0.3 ? 'text-green-400'
+                  : contact.averageSentiment < -0.3 ? 'text-red-400'
+                  : 'text-gray-300'
+                : 'text-white'
+            }`}>
               {contact.averageSentiment != null ?
                 (contact.averageSentiment > 0 ? '+' : '') + contact.averageSentiment.toFixed(1) : '--'}
             </div>
@@ -1337,7 +1419,7 @@ function InteractionHistory({
               {interaction.summary && (
                 <div className="mt-2 p-2 bg-gray-700/50 rounded-lg text-sm text-gray-300">
                   <FileText className="w-4 h-4 inline-block mr-1 text-gray-400" />
-                  {interaction.summary}
+                  <AISummaryDisplay summary={interaction.summary} />
                 </div>
               )}
             </div>

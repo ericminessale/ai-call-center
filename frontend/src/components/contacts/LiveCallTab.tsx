@@ -4,6 +4,7 @@ import { TranscriptionMessage } from '../../types/callcenter';
 import api from '../../services/api';
 import { logger } from '../../lib/logger';
 import { AgentContextCard, hasContext } from '../shared/AgentContextCard';
+import CallEventStream from './CallEventStream';
 
 export interface AIContext {
   customer_name?: string;
@@ -76,11 +77,14 @@ export function LiveCallTab({
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const transcriptionContainerRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to bottom when new transcription arrives
+  // Auto-scroll transcription container to bottom when new lines arrive
   useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const container = transcriptionContainerRef.current;
+    if (container) {
+      container.scrollTop = container.scrollHeight;
+    }
   }, [transcription]);
 
   const quickTemplates = [
@@ -139,9 +143,16 @@ export function LiveCallTab({
         </div>
       )}
 
+      {/* Call Event Stream */}
+      {callSid && (
+        <div className="px-4 pt-2">
+          <CallEventStream callId={callSid} callSid={callSid} />
+        </div>
+      )}
+
       {/* Live Transcription */}
-      <div className="flex-1 p-4 overflow-y-auto">
-        <div className="flex items-center justify-between mb-4">
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700 bg-gray-800/80 sticky top-0 z-10">
           <h3 className="text-lg font-semibold text-white">
             {isOutboundCallInProgress && callState === 'ringing' ? 'Outbound Call' : 'Live Transcription'}
           </h3>
@@ -153,8 +164,9 @@ export function LiveCallTab({
             </div>
           </div>
         </div>
+        <div className="flex-1 p-4 overflow-y-auto">
 
-        <div className="bg-gray-900 rounded-lg p-4 min-h-[300px] max-h-[400px] overflow-y-auto font-mono text-sm">
+        <div ref={transcriptionContainerRef} className="bg-gray-900 rounded-lg p-4 min-h-[300px] max-h-[400px] overflow-y-auto font-mono text-sm">
           {isOutboundCallInProgress && callState === 'ringing' && transcription.length === 0 ? (
             <div className="flex items-center justify-center h-64 text-gray-500">
               <div className="text-center">
@@ -180,7 +192,7 @@ export function LiveCallTab({
                   <p className="text-gray-300 pl-4">{entry.text}</p>
                 </div>
               ))}
-              <div ref={scrollRef} />
+              {/* scroll anchor removed - container scrolls via ref */}
             </div>
           ) : (
             <div className="flex items-center justify-center h-64 text-gray-500">
@@ -190,6 +202,7 @@ export function LiveCallTab({
               </div>
             </div>
           )}
+        </div>
         </div>
       </div>
 

@@ -119,7 +119,7 @@ export function SettingsPanel() {
   };
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full flex flex-col text-white">
       {/* Tab navigation */}
       <div className="bg-gray-800 border-b border-gray-700 px-6">
         <nav className="flex gap-1">
@@ -333,12 +333,12 @@ function PhoneNumbersTab() {
               return (
                 <tr key={number.sid} className="border-b border-gray-700/50 hover:bg-gray-700/30">
                   <td className="px-4 py-3">
-                    <div className="text-sm font-medium font-mono">
+                    <div className="text-sm font-medium font-mono text-white">
                       {formatPhoneNumber(number.phone_number)}
                     </div>
                   </td>
                   <td className="px-4 py-3">
-                    <span className="text-sm text-gray-300">
+                    <span className="text-sm text-white">
                       {number.friendly_name || '\u2014'}
                     </span>
                   </td>
@@ -364,7 +364,7 @@ function PhoneNumbersTab() {
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    <span className="text-xs text-gray-500 font-mono truncate block max-w-[250px]" title={number.voice_url || 'None'}>
+                    <span className="text-xs text-gray-400 font-mono truncate block max-w-[250px]" title={number.voice_url || 'None'}>
                       {number.voice_url || '\u2014'}
                     </span>
                   </td>
@@ -589,11 +589,11 @@ function QueuesTab() {
                 </button>
               </div>
               <div className="flex items-center gap-2 mt-1.5">
-                <span className="px-1.5 py-0.5 text-[10px] rounded bg-blue-900/40 text-blue-300">
+                <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-blue-600/30 text-blue-200">
                   {ROUTING_STRATEGIES.find(s => s.value === q.routing_strategy)?.label || q.routing_strategy}
                 </span>
                 {q.agent_count !== undefined && (
-                  <span className="text-[10px] text-gray-400">{q.agent_count} agents</span>
+                  <span className="text-[10px] text-gray-300">{q.agent_count} agents</span>
                 )}
               </div>
             </div>
@@ -609,8 +609,7 @@ function QueuesTab() {
         {selectedQueue ? (
           <div className="space-y-6">
             <div>
-              <h2 className="text-lg font-semibold mb-1">{selectedQueue.display_name}</h2>
-              <p className="text-xs text-gray-500 font-mono">{selectedQueue.slug}</p>
+              <h2 className="text-lg font-semibold text-white">{selectedQueue.display_name}</h2>
             </div>
 
             {/* Settings form */}
@@ -835,7 +834,7 @@ function AgentsTab({ onNavigateToCollection }: { onNavigateToCollection: (collec
                     </span>
                   )}
                 </div>
-                <div className="text-xs text-gray-500 font-mono mt-0.5">{agent.route}</div>
+                <div className="text-xs text-gray-400 font-mono mt-0.5">{agent.route}</div>
 
                 {assignedColl ? (
                   <div className="flex items-center gap-1 mt-2">
@@ -869,14 +868,14 @@ function AgentsTab({ onNavigateToCollection }: { onNavigateToCollection: (collec
                   </span>
                 )}
               </div>
-              <p className="text-xs text-gray-500 font-mono mt-1">{selectedAgent.route}</p>
+              <p className="text-xs text-gray-400 font-mono mt-1">{selectedAgent.route}</p>
               <p className="text-sm text-gray-400 mt-2">{selectedAgent.description}</p>
             </div>
 
             {/* Section: Knowledge Base */}
             <div>
               <h3 className="text-sm font-medium text-gray-300 mb-2">Knowledge Base</h3>
-              <p className="text-xs text-gray-500 mb-3">
+              <p className="text-xs text-gray-400 mb-3">
                 Assign a document collection for this agent to search during conversations.
               </p>
               <div className="flex items-center gap-2">
@@ -1166,7 +1165,7 @@ function KnowledgeBaseTab({ focusCollectionId }: { focusCollectionId?: number | 
               <div className="flex items-start justify-between">
                 <div>
                   <div className="text-sm font-medium">{coll.display_name}</div>
-                  <div className="text-xs text-gray-500 mt-0.5">{coll.name}</div>
+                  <div className="text-xs text-gray-400 mt-0.5">{coll.name}</div>
                   <div className="text-xs text-gray-400 mt-1">{coll.document_count} documents</div>
                 </div>
                 <button
@@ -1177,7 +1176,7 @@ function KnowledgeBaseTab({ focusCollectionId }: { focusCollectionId?: number | 
                 </button>
               </div>
               {coll.description && (
-                <div className="text-xs text-gray-500 mt-1">{coll.description}</div>
+                <div className="text-xs text-gray-400 mt-1">{coll.description}</div>
               )}
             </div>
           ))}
@@ -1191,7 +1190,7 @@ function KnowledgeBaseTab({ focusCollectionId }: { focusCollectionId?: number | 
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h2 className="text-lg font-semibold">{selectedCollection.display_name}</h2>
-                <p className="text-xs text-gray-500">{selectedCollection.description}</p>
+                <p className="text-xs text-gray-400">{selectedCollection.description}</p>
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -1474,7 +1473,7 @@ function UserManagementTab() {
               <tr key={user.id} className="border-b border-gray-700/50 hover:bg-gray-700/30">
                 <td className="px-4 py-3">
                   <div className="text-sm font-medium">{user.email}</div>
-                  {user.name && <div className="text-xs text-gray-500">{user.name}</div>}
+                  {user.name && <div className="text-xs text-gray-400">{user.name}</div>}
                 </td>
                 <td className="px-4 py-3">
                   <span className={`px-2 py-0.5 text-xs rounded ${

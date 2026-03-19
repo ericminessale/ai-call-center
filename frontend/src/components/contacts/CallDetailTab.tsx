@@ -4,6 +4,7 @@ import { Interaction, CallLeg } from '../../types/callcenter';
 import api from '../../services/api';
 import { logger } from '../../lib/logger';
 import { CallTimeline } from './CallTimeline';
+import { AISummaryDisplay } from './ContactDetailView';
 
 interface CallDetailTabProps {
   interaction: Interaction;
@@ -86,19 +87,19 @@ export function CallDetailTab({
         {/* Call Details Grid */}
         <div className="grid grid-cols-2 gap-4 text-sm">
           <div>
-            <span className="text-gray-500">From:</span>
+            <span className="text-gray-400">From:</span>
             <span className="text-white ml-2">{interaction.fromNumber || '--'}</span>
           </div>
           <div>
-            <span className="text-gray-500">To:</span>
+            <span className="text-gray-400">To:</span>
             <span className="text-white ml-2">{interaction.destination || '--'}</span>
           </div>
           <div>
-            <span className="text-gray-500">Status:</span>
+            <span className="text-gray-400">Status:</span>
             <span className="text-white ml-2 capitalize">{interaction.status}</span>
           </div>
           <div>
-            <span className="text-gray-500">Handler:</span>
+            <span className="text-gray-400">Handler:</span>
             <span className="text-white ml-2 capitalize">{interaction.handlerType}</span>
           </div>
           {interaction.sentimentScore != null && (
@@ -119,7 +120,9 @@ export function CallDetailTab({
         {interaction.summary && (
           <div className="mt-4 p-3 bg-gray-900 rounded-lg">
             <h4 className="text-sm font-medium text-gray-300 mb-1">AI Summary</h4>
-            <p className="text-sm text-gray-400">{interaction.summary}</p>
+            <div className="text-sm text-gray-300">
+              <AISummaryDisplay summary={interaction.summary} />
+            </div>
           </div>
         )}
 
@@ -130,8 +133,9 @@ export function CallDetailTab({
       </div>
 
       {/* Transcription Section */}
-      <div className="flex-1 p-4 overflow-y-auto">
-        <h4 className="text-sm font-semibold text-white mb-3">Call Transcription</h4>
+      <div className="flex-[2] min-h-[300px] flex flex-col">
+        <h4 className="text-sm font-semibold text-white px-4 py-3 border-b border-gray-700 bg-gray-800/80 sticky top-0 z-10">Call Transcription</h4>
+        <div className="flex-1 p-4 overflow-y-auto">
 
         {isLoadingTranscriptions ? (
           <div className="flex items-center justify-center h-32 text-gray-400">
@@ -149,7 +153,7 @@ export function CallDetailTab({
                     {entry.speaker === 'agent' ? 'Agent:' : entry.speaker === 'ai' ? 'AI:' : 'Caller:'}
                   </span>
                   {entry.timestamp && (
-                    <span className="text-xs text-gray-500">
+                    <span className="text-xs text-gray-400">
                       {new Date(entry.timestamp).toLocaleTimeString()}
                     </span>
                   )}
@@ -165,6 +169,7 @@ export function CallDetailTab({
             <p>No transcription available for this call</p>
           </div>
         )}
+        </div>
       </div>
 
       {/* Recording link if available */}

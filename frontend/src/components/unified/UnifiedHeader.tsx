@@ -13,6 +13,7 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { ViewMode, AgentStatus } from '../../pages/UnifiedAgentDesktop';
+import Logo from '../shared/Logo';
 import { QuickDialDropdown } from './QuickDialDropdown';
 import { queueApi } from '../../services/api';
 import toast from 'react-hot-toast';
@@ -24,8 +25,8 @@ interface UnifiedHeaderProps {
   stats: {
     callsToday: number;
     avgHandleTime: number;
-    fcr: number;
-    csat: number;
+    queueDepth: number;
+    longestWait: number;
   };
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
@@ -126,8 +127,8 @@ export function UnifiedHeader({
       <div className="h-14 flex items-center justify-between px-4">
         {/* Left - Logo and Title */}
         <div className="flex items-center gap-3">
+          <Logo size="sm" />
           <h1 className="text-lg font-semibold text-white">SignalWire Call Center</h1>
-
         </div>
 
         {/* Center - Agent Status and Stats */}
@@ -142,7 +143,7 @@ export function UnifiedHeader({
               <span className={`text-sm font-medium ${currentStatus.color}`}>
                 {currentStatus.label}
               </span>
-              {activeQueueCount > 0 && (
+              {activeQueueCount > 0 && agentStatus !== 'offline' && (
                 <span className="px-1.5 py-0.5 text-[9px] rounded-full bg-green-600 text-white leading-none">
                   {activeQueueCount}
                 </span>
@@ -235,12 +236,19 @@ export function UnifiedHeader({
               </div>
             </div>
             <div className="text-center">
-              <div className="text-gray-400 text-xs">FCR</div>
-              <div className="text-white font-medium">{stats.fcr}%</div>
+              <div className="text-gray-400 text-xs">In Queue</div>
+              <div className={`font-medium ${stats.queueDepth > 0 ? 'text-yellow-400' : 'text-white'}`}>
+                {stats.queueDepth}
+              </div>
             </div>
             <div className="text-center">
-              <div className="text-gray-400 text-xs">CSAT</div>
-              <div className="text-white font-medium">{stats.csat.toFixed(1)}</div>
+              <div className="text-gray-400 text-xs">Wait</div>
+              <div className={`font-medium ${stats.longestWait > 60 ? 'text-red-400' : stats.longestWait > 30 ? 'text-yellow-400' : 'text-white'}`}>
+                {stats.longestWait > 0
+                  ? `${Math.floor(stats.longestWait / 60)}:${String(stats.longestWait % 60).padStart(2, '0')}`
+                  : '—'
+                }
+              </div>
             </div>
           </div>
         </div>

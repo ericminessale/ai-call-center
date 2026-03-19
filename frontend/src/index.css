@@ -2,6 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
+html, body, #root {
+  background-color: #1a1f2e;
+  height: 100vh;
+  overflow: hidden;
+}
+
 /* Custom animations */
 @keyframes slide-down {
   from {

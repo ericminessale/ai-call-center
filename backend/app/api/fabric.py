@@ -1,82 +1,84 @@
 """
-Call Fabric API endpoints for browser-based calling
-Handles subscriber token generation and call management
+Call Fabric API endpoints for browser-based calling.
+Handles subscriber token generation and subscriber management via the
+canonical signalwire-sdk REST client.
 """
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
-import requests
-import os
-from base64 import b64encode
 import logging
+import os
+
+from app.services import signalwire_client as sw_client
 
 logger = logging.getLogger(__name__)
 
 fabric_bp = Blueprint('fabric', __name__)
 
-# SignalWire configuration
-SIGNALWIRE_SPACE = os.getenv('SIGNALWIRE_SPACE')
-SIGNALWIRE_PROJECT_KEY = os.getenv('SIGNALWIRE_PROJECT_ID')
-SIGNALWIRE_TOKEN = os.getenv('SIGNALWIRE_API_TOKEN')
-FABRIC_APPLICATION_ID = os.getenv('FABRIC_APPLICATION_ID')  # Subscriber ID or application ID
+FABRIC_APPLICATION_ID = os.getenv('FABRIC_APPLICATION_ID')
 
-def get_auth_headers():
-    """Get authentication headers for SignalWire API."""
-    credentials = f"{SIGNALWIRE_PROJECT_KEY}:{SIGNALWIRE_TOKEN}"
-    auth = b64encode(credentials.encode()).decode('ascii')
-    return {
-        'Content-Type': 'application/json',
-        'Authorization': f'Basic {auth}'
-    }
+
+_DUPLICATE_EMAIL_CODES = {'value_not_unique', 'not_unique_within_project'}
+
+
+def _is_duplicate_email_error(err: sw_client.SignalWireRestError) -> bool:
+    """Detect SignalWire's 'email already in use' error shape."""
+    body = getattr(err, 'body', None) or {}
+    if not isinstance(body, dict):
+        return False
+    for e in body.get('errors', []) or []:
+        if e.get('code') in _DUPLICATE_EMAIL_CODES and e.get('attribute') == 'email':
+            return True
+    return False
+
 
 def _find_subscriber_by_email(email):
-    """
-    Find an existing subscriber by email.
-    Returns subscriber data dict or None if not found.
-    """
-    url = f"https://{SIGNALWIRE_SPACE}/api/fabric/subscribers"
-    response = requests.get(url, headers=get_auth_headers())
+    """Return the subscriber resource dict for a given email, or None.
 
-    if response.status_code != 200:
-        logger.error(f"Failed to list subscribers: {response.text}")
+    SignalWire's subscriber list returns a Fabric resource wrapper with the
+    real subscriber fields nested under `subscriber`; the top-level `email`
+    is always null. We match against the nested field.
+    """
+    try:
+        resp = sw_client.get_client().fabric.subscribers.list(page_size=100)
+    except sw_client.SignalWireRestError as e:
+        logger.error(f"Failed to list subscribers: {e}")
         return None
-
-    subscribers = response.json().get('data', [])
-    for sub in subscribers:
-        if sub.get('email') == email:
-            return sub
+    items = resp.get('data', []) if isinstance(resp, dict) else resp
+    for item in items:
+        nested = item.get('subscriber') or {}
+        if (item.get('email') or nested.get('email')) == email:
+            # Flatten useful nested fields up so callers see a consistent shape.
+            flat = {**item}
+            for k in ('email', 'username', 'first_name', 'last_name'):
+                if nested.get(k) and not flat.get(k):
+                    flat[k] = nested.get(k)
+            return flat
     return None
 
 
 def _update_subscriber_password(subscriber_id, new_password):
-    """
-    Update an existing subscriber's password.
-    Returns True on success, False on failure.
-    """
-    url = f"https://{SIGNALWIRE_SPACE}/api/fabric/subscribers/{subscriber_id}"
-    payload = {"password": new_password}
-
-    response = requests.put(url, json=payload, headers=get_auth_headers())
-
-    if response.status_code not in [200, 204]:
-        logger.error(f"Failed to update subscriber password: {response.text}")
+    """Rotate an existing subscriber's password. True on success."""
+    try:
+        sw_client.get_client().fabric.subscribers.update(
+            subscriber_id, password=new_password,
+        )
+        return True
+    except sw_client.SignalWireRestError as e:
+        logger.error(f"Failed to update subscriber password: {e}")
         return False
-    return True
 
 
 def _create_permanent_subscriber(user):
-    """
-    Internal helper to create a permanent subscriber in SignalWire.
-    If subscriber already exists (same email), links to existing one.
-    Returns subscriber data dict or raises exception.
+    """Create (or link to existing) a Fabric subscriber for the given user.
+
+    Returns dict with id/username/password/address. Raises on failure.
     """
     import secrets
     from datetime import datetime
 
-    # Generate secure password for this subscriber
     password = secrets.token_urlsafe(32)
 
-    # Create subscriber payload
     payload = {
         "email": user.email,
         "password": password,
@@ -87,51 +89,26 @@ def _create_permanent_subscriber(user):
         "metadata": {
             "user_id": user.id,
             "role": user.role,
-            "department": "general"
-        }
+            "department": "general",
+        },
     }
 
-    # Call SignalWire API
-    url = f"https://{SIGNALWIRE_SPACE}/api/fabric/subscribers"
-    response = requests.post(
-        url,
-        json=payload,
-        headers=get_auth_headers()
-    )
-
-    if response.status_code not in [200, 201]:
-        # Check if it's a duplicate email error
-        try:
-            error_data = response.json()
-            errors = error_data.get('errors', [])
-            is_duplicate = any(
-                e.get('code') == 'value_not_unique' and e.get('attribute') == 'email'
-                for e in errors
-            )
-        except:
-            is_duplicate = False
-
-        if is_duplicate:
-            logger.info(f"Subscriber with email {user.email} already exists, linking to existing...")
-
-            # Find existing subscriber
+    client = sw_client.get_client()
+    try:
+        subscriber_data = client.fabric.subscribers.create(**payload)
+    except sw_client.SignalWireRestError as e:
+        if _is_duplicate_email_error(e):
+            logger.info(f"Subscriber with email {user.email} already exists, linking...")
             existing = _find_subscriber_by_email(user.email)
             if not existing:
                 raise Exception("Subscriber exists but could not be found")
-
-            logger.info(f"Found existing subscriber data: {existing}")
-
-            # Update their password so we know what it is
             if not _update_subscriber_password(existing.get('id'), password):
                 raise Exception("Failed to update existing subscriber password")
-
             subscriber_data = existing
             logger.info(f"Linked to existing subscriber: {existing.get('id')}")
         else:
-            logger.error(f"Failed to create subscriber: {response.text}")
-            raise Exception(f"Failed to create subscriber: {response.status_code}")
-    else:
-        subscriber_data = response.json()
+            logger.error(f"Failed to create subscriber: {e}")
+            raise Exception(f"Failed to create subscriber: {e}")
 
     # Store subscriber info in user record
     # SignalWire API may use different field names for username/reference
@@ -210,23 +187,14 @@ def get_subscriber_token():
             return jsonify({'error': 'Invalid subscriber credentials'}), 500
 
         # Request token from SignalWire using permanent credentials
-        url = f"https://{SIGNALWIRE_SPACE}/api/fabric/subscribers/tokens"
-        payload = {
-            "reference": reference,
-            "password": password
-        }
-
-        response = requests.post(
-            url,
-            json=payload,
-            headers=get_auth_headers()
-        )
-
-        if response.status_code != 200:
-            logger.error(f"Failed to get subscriber token: {response.text}")
+        try:
+            token_data = sw_client.get_client().fabric.tokens.create_subscriber_token(
+                reference=reference,
+                password=password,
+            )
+        except sw_client.SignalWireRestError as e:
+            logger.error(f"Failed to get subscriber token: {e}")
             return jsonify({'error': 'Failed to generate token'}), 500
-
-        token_data = response.json()
 
         logger.info(f"Generated token for permanent subscriber: {reference}")
 
@@ -294,18 +262,13 @@ def list_subscribers():
     Useful for showing available agents for transfers.
     """
     try:
-        url = f"https://{SIGNALWIRE_SPACE}/api/fabric/subscribers"
-
-        response = requests.get(
-            url,
-            headers=get_auth_headers()
-        )
-
-        if response.status_code != 200:
-            logger.error(f"Failed to list subscribers: {response.text}")
+        try:
+            resp = sw_client.get_client().fabric.subscribers.list(page_size=100)
+        except sw_client.SignalWireRestError as e:
+            logger.error(f"Failed to list subscribers: {e}")
             return jsonify({'error': 'Failed to list subscribers'}), 500
 
-        subscribers = response.json().get('data', [])
+        subscribers = resp.get('data', []) if isinstance(resp, dict) else resp
 
         # Filter to only show agents (not system subscribers)
         agents = [

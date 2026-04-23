@@ -8,6 +8,7 @@ from app.models.queue import Queue, QueueAgentAssignment
 from app.utils.decorators import require_auth, require_role
 from app.utils.jwt_utils import verify_token
 from app.utils.url_utils import get_base_url
+from app.services import signalwire_client as sw_client
 
 VALID_USER_ROLES = ('admin', 'supervisor', 'agent')
 
@@ -43,30 +44,14 @@ def _enforce_admin_role():
 
     request.current_user = user
 import logging
+import os
 import re
 import requests as http_requests
-import os
-from base64 import b64encode
 
 logger = logging.getLogger(__name__)
 
 # AI agents URL for internal communication (port 8081 for admin/reindex API)
 AI_AGENTS_ADMIN_URL = os.getenv('AI_AGENTS_ADMIN_URL', 'http://ai-agents:8081')
-
-# SignalWire API credentials for subscriber management
-SIGNALWIRE_SPACE = os.getenv('SIGNALWIRE_SPACE')
-SIGNALWIRE_PROJECT_KEY = os.getenv('SIGNALWIRE_PROJECT_ID')
-SIGNALWIRE_TOKEN = os.getenv('SIGNALWIRE_API_TOKEN')
-
-
-def _get_sw_auth_headers():
-    """Get authentication headers for SignalWire API."""
-    credentials = f"{SIGNALWIRE_PROJECT_KEY}:{SIGNALWIRE_TOKEN}"
-    auth = b64encode(credentials.encode()).decode('ascii')
-    return {
-        'Content-Type': 'application/json',
-        'Authorization': f'Basic {auth}'
-    }
 
 
 # =============================================================================
@@ -756,19 +741,22 @@ def delete_user(user_id):
 
         user_email = user.email
 
-        # Step 1: Delete SignalWire Call Fabric subscriber if one exists
+        # Step 1: Delete SignalWire Call Fabric subscriber if one exists.
+        # 404 is treated as success — subscriber already gone.
         sw_delete_error = None
-        if user.signalwire_subscriber_id and SIGNALWIRE_SPACE:
+        if user.signalwire_subscriber_id and sw_client.is_configured():
             try:
-                url = f"https://{SIGNALWIRE_SPACE}/api/fabric/subscribers/{user.signalwire_subscriber_id}"
-                resp = http_requests.delete(url, headers=_get_sw_auth_headers(), timeout=10)
-                if resp.status_code in [200, 204, 404]:
-                    logger.info(f"SignalWire subscriber {user.signalwire_subscriber_id} deleted (status {resp.status_code})")
+                sw_client.get_client().fabric.subscribers.delete(user.signalwire_subscriber_id)
+                logger.info(f"SignalWire subscriber {user.signalwire_subscriber_id} deleted")
+            except sw_client.SignalWireRestError as e:
+                # 404 means already deleted — fine.
+                if getattr(e, 'status_code', None) == 404:
+                    logger.info(f"SignalWire subscriber {user.signalwire_subscriber_id} already gone (404)")
                 else:
-                    sw_delete_error = f"SignalWire subscriber delete returned {resp.status_code}"
+                    sw_delete_error = f"SignalWire subscriber delete failed: {e}"
                     logger.warning(sw_delete_error)
             except Exception as e:
-                sw_delete_error = f"Failed to reach SignalWire: {str(e)}"
+                sw_delete_error = f"Failed to reach SignalWire: {e}"
                 logger.warning(sw_delete_error)
             # Continue with local deletion regardless
 
@@ -804,151 +792,54 @@ def delete_user(user_id):
 
 
 # =============================================================================
-# Phone Number Management (uses SignalWire Fabric Resources API)
+# Phone Number Management
 # =============================================================================
-
-def _sw_rest_url():
-    """Return the SignalWire REST API base URL (for phone numbers, etc.)."""
-    return f"https://{SIGNALWIRE_SPACE}/api/relay/rest"
-
-
-def _sw_fabric_url():
-    """Return the SignalWire Fabric API base URL (for resources, webhooks, etc.)."""
-    return f"https://{SIGNALWIRE_SPACE}/api/fabric"
-
-
-def _find_or_create_swml_webhook(webhook_url):
-    """Find an existing SWML webhook resource for our URL, or create one.
-
-    Uses the Fabric Resources API at /api/fabric/resources/swml_webhooks.
-    Returns the webhook resource ID, or None on failure.
-    """
-    fabric_url = _sw_fabric_url()
-    headers = _get_sw_auth_headers()
-
-    # Step 1: List existing SWML webhooks to see if one already points to our URL
-    list_url = f"{fabric_url}/resources/swml_webhooks"
-    logger.warning(f"[PHONE-DEBUG] Listing SWML webhooks at: {list_url}")
-    list_resp = http_requests.get(list_url, headers=headers, timeout=15)
-
-    logger.warning(f"[PHONE-DEBUG] List SWML webhooks response: {list_resp.status_code}")
-    if list_resp.status_code == 200:
-        resp_json = list_resp.json()
-        webhooks = resp_json.get('data', resp_json.get('webhooks', []))
-        logger.warning(f"[PHONE-DEBUG] Found {len(webhooks)} existing SWML webhooks, raw keys: {list(resp_json.keys())}")
-        for wh in webhooks:
-            logger.warning(f"[PHONE-DEBUG]   Webhook raw: {wh}")
-            wh_url = wh.get('primary_request_url') or wh.get('request_url') or wh.get('url') or ''
-            if wh_url.rstrip('/') == webhook_url.rstrip('/'):
-                logger.warning(f"[PHONE-DEBUG] Found existing SWML webhook resource: {wh.get('id')}")
-                return wh.get('id')
-    else:
-        logger.warning(f"[PHONE-DEBUG] List SWML webhooks failed: {list_resp.status_code} - {list_resp.text[:500]}")
-
-    # Step 2: Create a new SWML webhook resource
-    create_url = f"{fabric_url}/resources/swml_webhooks"
-    create_payload = {
-        'name': 'Call Center Inbound Handler',
-        'primary_request_url': webhook_url,
-    }
-    logger.warning(f"[PHONE-DEBUG] Creating SWML webhook at: {create_url}")
-    create_resp = http_requests.post(
-        create_url,
-        json=create_payload,
-        headers=headers,
-        timeout=15,
-    )
-
-    logger.warning(f"[PHONE-DEBUG] Create SWML webhook response: {create_resp.status_code} - {create_resp.text[:1000]}")
-    if create_resp.status_code in (200, 201):
-        result = create_resp.json()
-        webhook_id = result.get('id')
-        logger.warning(f"[PHONE-DEBUG] Created SWML webhook resource: {webhook_id} - full response: {result}")
-        return webhook_id
-    else:
-        logger.error(f"Failed to create SWML webhook: {create_resp.status_code} - {create_resp.text[:1000]}")
-        return None
-
-
-def _assign_phone_number_direct(number_sid, webhook_url, headers):
-    """Fallback: Try to assign phone number directly via PUT with call_handler.
-
-    Tries 'swml_webhooks' as the call_handler value (matching laml_webhooks pattern).
-    Returns (success, message) tuple.
-    """
-    rest_url = _sw_rest_url()
-    for handler_value in ['swml_webhooks', 'swml_script']:
-        update_url = f"{rest_url}/phone_numbers/{number_sid}"
-        payload = {
-            'call_handler': handler_value,
-            'call_request_url': webhook_url,
-        }
-        logger.warning(f"[PHONE-DEBUG] Direct assign attempt with call_handler='{handler_value}' at: {update_url}")
-        resp = http_requests.put(update_url, json=payload, headers=headers, timeout=15)
-        logger.warning(f"[PHONE-DEBUG] Direct assign response: {resp.status_code} - {resp.text[:500]}")
-
-        if resp.status_code == 200:
-            return True, f'Phone number assigned with call_handler={handler_value}'
-        else:
-            logger.warning(f"Direct assign with call_handler='{handler_value}' failed: {resp.status_code}")
-
-    return False, 'All direct assignment methods failed'
+# Canonical routing per the SignalWire REST docs (phone-numbers update):
+#
+#   call_handler='relay_script'  +  call_relay_script_url=<our URL>
+#
+# `relay_script` is the documented handler for external SWML: "The URL must
+# respond with a valid SWML script." SignalWire server-derives a Fabric
+# `swml_webhook` resource from the URL (see `calling_handler_resource_id` in
+# the response — response-only, not writable).
+#
+# `laml_webhooks` is deliberately NOT used here — it's Twilio-compat cXML
+# and materializes as a `cxml_webhook` resource in Fabric, which is the
+# wrong resource type for a call center returning SWML.
 
 
 @admin_bp.route('/phone-numbers', methods=['GET'])
 @require_auth
 def list_phone_numbers():
-    """List all phone numbers from SignalWire REST API."""
+    """List SignalWire phone numbers and flag which are routed to this app."""
+    if not sw_client.is_configured():
+        return jsonify({'error': 'SignalWire credentials not configured'}), 500
+
+    base_url = get_base_url()
+    webhook_url = f"{base_url}/api/swml/initial-call" if base_url else None
+
     try:
-        if not SIGNALWIRE_SPACE or not SIGNALWIRE_PROJECT_KEY:
-            return jsonify({'error': 'SignalWire credentials not configured'}), 500
-
-        # Build webhook URL from EXTERNAL_URL
-        base_url = get_base_url()
-        webhook_url = f"{base_url}/api/swml/initial-call" if base_url else None
-
-        # Call SignalWire REST API
-        url = f"{_sw_rest_url()}/phone_numbers"
-        resp = http_requests.get(
-            url,
-            headers=_get_sw_auth_headers(),
-            params={'page_size': 100},
-            timeout=15,
-        )
-
-        if resp.status_code != 200:
-            logger.error(f"SignalWire API error listing phone numbers: {resp.status_code} - {resp.text}")
-            return jsonify({'error': f'SignalWire API error: {resp.status_code}'}), 502
-
-        data = resp.json()
-        raw_numbers = data.get('data', [])
-
-        # Log first number's raw structure for debugging
-        if raw_numbers:
-            logger.info(f"Phone number raw fields: {list(raw_numbers[0].keys())}")
-            logger.debug(f"Phone number sample: {raw_numbers[0]}")
+        client = sw_client.get_client()
+        resp = client.phone_numbers.list(page_size=100)
+        raw_numbers = resp.get('data', []) if isinstance(resp, dict) else resp
 
         phone_numbers = []
         for n in raw_numbers:
-            # Try multiple possible field names for the webhook URL
-            call_request_url = (
-                n.get('call_request_url') or
-                n.get('call_relay_context') or
-                ''
-            )
-            call_handler = n.get('call_handler') or ''
-
-            # Number is assigned if its webhook URL matches ours
+            # relay_script handler stores the URL in call_relay_script_url.
+            # Also honor call_request_url so legacy (laml_webhooks) assignments
+            # from earlier migrations still show as assigned.
+            current_url = n.get('call_relay_script_url') or n.get('call_request_url') or ''
             is_assigned = bool(
-                webhook_url and call_request_url and
-                webhook_url.rstrip('/') == call_request_url.rstrip('/')
+                webhook_url
+                and current_url
+                and current_url.rstrip('/') == webhook_url.rstrip('/')
             )
             phone_numbers.append({
                 'sid': n.get('id'),
                 'phone_number': n.get('number') or n.get('phone_number', ''),
                 'friendly_name': n.get('name') or '',
-                'voice_url': call_request_url,
-                'call_handler': call_handler,
+                'voice_url': current_url,
+                'call_handler': n.get('call_handler') or '',
                 'status_callback': n.get('call_status_callback_url') or '',
                 'is_assigned': is_assigned,
             })
@@ -959,118 +850,65 @@ def list_phone_numbers():
             'is_configured': bool(base_url),
         }), 200
 
-    except http_requests.exceptions.ConnectionError:
-        return jsonify({'error': 'Cannot reach SignalWire API'}), 503
-    except http_requests.exceptions.Timeout:
-        return jsonify({'error': 'SignalWire API request timed out'}), 504
+    except sw_client.SignalWireRestError as e:
+        logger.error(f"SignalWire API error listing phone numbers: {e}")
+        return jsonify({'error': f'SignalWire API error: {e}'}), 502
     except Exception as e:
-        logger.error(f"Failed to list phone numbers: {str(e)}")
+        logger.error(f"Failed to list phone numbers: {e}")
         return jsonify({'error': str(e)}), 500
 
 
 @admin_bp.route('/phone-numbers/<string:number_sid>', methods=['POST'])
 @require_auth
 def update_phone_number(number_sid):
-    """Assign/unassign a phone number to the call center via SWML webhook resource."""
+    """Route/unroute a phone number to the call center's SWML webhook."""
+    data = request.get_json() or {}
+    action = data.get('action')
+
+    if action not in ('assign', 'unassign'):
+        return jsonify({'error': 'action must be "assign" or "unassign"'}), 400
+
+    base_url = get_base_url()
+    if action == 'assign' and not base_url:
+        return jsonify({'error': 'EXTERNAL_URL not configured. Cannot assign webhook.'}), 400
+
+    webhook_url = f"{base_url}/api/swml/initial-call"
+    client = sw_client.get_client()
+
     try:
-        data = request.get_json()
-        action = data.get('action') if data else None
-
-        if action not in ('assign', 'unassign'):
-            return jsonify({'error': 'action must be "assign" or "unassign"'}), 400
-
-        base_url = get_base_url()
-        if action == 'assign' and not base_url:
-            return jsonify({'error': 'EXTERNAL_URL not configured. Cannot assign webhook.'}), 400
-
-        rest_url = _sw_rest_url()
-        fabric_url = _sw_fabric_url()
-        headers = _get_sw_auth_headers()
-
         if action == 'assign':
-            webhook_url = f"{base_url}/api/swml/initial-call"
-
-            # Strategy 1: Fabric Resources API — create SWML webhook + assign phone route
-            webhook_id = _find_or_create_swml_webhook(webhook_url)
-            if webhook_id:
-                assign_url = f"{fabric_url}/resources/{webhook_id}/phone_routes"
-                assign_payload = {'phone_number_id': number_sid}
-                logger.warning(f"[PHONE-DEBUG] Assigning resource to phone route at: {assign_url} with payload: {assign_payload}")
-
-                assign_resp = http_requests.post(
-                    assign_url,
-                    json=assign_payload,
-                    headers=headers,
-                    timeout=15,
-                )
-
-                logger.warning(f"[PHONE-DEBUG] Assign phone route response: {assign_resp.status_code} - {assign_resp.text[:500]}")
-
-                if assign_resp.status_code in (200, 201):
-                    logger.info(f"Assigned SWML webhook {webhook_id} to phone number {number_sid}")
-                    return jsonify({
-                        'success': True,
-                        'phone_number': {
-                            'sid': number_sid,
-                            'is_assigned': True,
-                        },
-                        'message': 'Phone number assigned to call center (SWML handler via Fabric Resources)',
-                    }), 200
-                else:
-                    logger.warning(f"Fabric Resources phone_routes failed, trying direct assignment fallback")
-
-            # Strategy 2: Fallback — direct PUT on phone number with call_handler variants
-            logger.info("Trying direct phone number assignment fallback...")
-            success, message = _assign_phone_number_direct(number_sid, webhook_url, headers)
-            if success:
-                return jsonify({
-                    'success': True,
-                    'phone_number': {
-                        'sid': number_sid,
-                        'is_assigned': True,
-                    },
-                    'message': message,
-                }), 200
-            else:
-                return jsonify({
-                    'error': 'Failed to assign phone number. Fabric Resources API and direct assignment both failed.',
-                    'details': message,
-                }), 502
-
-        else:
-            # Unassign: Update phone number to clear handler
-            update_resp = http_requests.put(
-                f"{rest_url}/phone_numbers/{number_sid}",
-                json={
-                    'call_handler': 'laml_webhooks',
-                    'call_request_url': '',
-                },
-                headers=headers,
-                timeout=15,
+            client.phone_numbers.update(
+                number_sid,
+                call_handler='relay_script',
+                call_relay_script_url=webhook_url,
             )
-
-            if update_resp.status_code != 200:
-                logger.error(f"Failed to unassign phone number: {update_resp.status_code} - {update_resp.text}")
-                return jsonify({
-                    'error': f'Failed to unassign: {update_resp.status_code}',
-                    'details': update_resp.text,
-                }), 502
-
+            logger.info(f"Routed phone {number_sid} to SWML webhook {webhook_url}")
             return jsonify({
                 'success': True,
-                'phone_number': {
-                    'sid': number_sid,
-                    'is_assigned': False,
-                },
-                'message': 'Phone number unassigned from call center',
+                'phone_number': {'sid': number_sid, 'is_assigned': True},
+                'message': 'Phone number routed to call center (SWML)',
             }), 200
 
-    except http_requests.exceptions.ConnectionError:
-        return jsonify({'error': 'Cannot reach SignalWire API'}), 503
-    except http_requests.exceptions.Timeout:
-        return jsonify({'error': 'SignalWire API request timed out'}), 504
+        # Unassign — keep the handler as relay_script but clear the URL so
+        # no Fabric resource gets associated. Matches the "detached"
+        # presentation in the dashboard.
+        client.phone_numbers.update(
+            number_sid,
+            call_handler='relay_script',
+            call_relay_script_url='',
+        )
+        logger.info(f"Unrouted phone {number_sid} (cleared call_relay_script_url)")
+        return jsonify({
+            'success': True,
+            'phone_number': {'sid': number_sid, 'is_assigned': False},
+            'message': 'Phone number unrouted from call center',
+        }), 200
+
+    except sw_client.SignalWireRestError as e:
+        logger.error(f"Failed to update phone number {number_sid}: {e}")
+        return jsonify({'error': f'SignalWire API error: {e}'}), 502
     except Exception as e:
-        logger.error(f"Failed to update phone number: {str(e)}")
+        logger.error(f"Failed to update phone number {number_sid}: {e}")
         return jsonify({'error': str(e)}), 500
 
 

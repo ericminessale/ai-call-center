@@ -21,8 +21,11 @@ cryptography==41.0.7
 redis==5.0.1 
 hiredis==2.2.3 
  
-# Twilio 
-twilio==8.10.3 
+# SignalWire SDK — canonical REST client for Fabric, phone numbers, DataSphere
+signalwire-sdk>=3.0.0,<4.0.0
+
+# Twilio
+twilio==8.10.3
  
 # Server 
 gunicorn==21.2.0 
@@ -36,8 +39,8 @@ Faker==20.1.0
 flask-sock==0.7.0
 simple-websocket==1.0.0
 
-# HTTP Requests
-requests==2.31.0
+# HTTP Requests (bumped to satisfy signalwire-sdk >= 2.32.3 floor)
+requests>=2.32.3,<3.0.0
 marshmallow==3.20.1 
 python-dateutil==2.8.2 
  

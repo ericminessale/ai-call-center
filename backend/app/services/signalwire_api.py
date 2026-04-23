@@ -4,6 +4,7 @@ import logging
 import requests
 import base64
 import json
+import uuid
 from flask import current_app
 
 logger = logging.getLogger(__name__)
@@ -614,6 +615,142 @@ class SignalWireAPI:
             logger.error(f"Failed to move participant: {str(e)}")
             raise
 
+
+    # ==================== Real-Time Call Control Methods ====================
+
+    def _call_command(self, call_id, command, params=None):
+        """Generic helper for issuing a call control command.
+
+        All call control commands share the same pattern: POST to api_url
+        with {id, command, params}.
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': self.auth_header
+            }
+
+            data = {
+                "id": call_id,
+                "command": command,
+                "params": params or {}
+            }
+
+            logger.info("=" * 50)
+            logger.info(f"SIGNALWIRE CALL CONTROL: {command} on call {call_id}")
+            logger.info(f"JSON BODY: {json.dumps(data, indent=2)}")
+            logger.info("=" * 50)
+
+            response = requests.post(
+                self.api_url,
+                json=data,
+                headers=headers
+            )
+
+            logger.info(f"SIGNALWIRE API RESPONSE: Status {response.status_code}")
+            if response.text:
+                try:
+                    logger.info(f"JSON RESPONSE: {json.dumps(response.json(), indent=2)}")
+                except Exception:
+                    logger.info(f"RAW RESPONSE: {response.text}")
+
+            if 200 <= response.status_code < 300:
+                logger.info(f"{command} succeeded on call {call_id}")
+                return response.json()
+            else:
+                logger.error(f"{command} failed: {response.status_code} - {response.text}")
+                raise Exception(f"{command} failed: {response.status_code}")
+
+        except Exception as e:
+            logger.error(f"{command} failed: {str(e)}")
+            raise
+
+    def hold_call(self, call_id):
+        """Place an active call on hold."""
+        return self._call_command(call_id, "calling.hold")
+
+    def unhold_call(self, call_id):
+        """Resume a held call."""
+        return self._call_command(call_id, "calling.unhold")
+
+    def play_audio(self, call_id, url):
+        """Play an audio file into an active call."""
+        return self._call_command(call_id, "calling.play", {
+            "control_id": str(uuid.uuid4()),
+            "media": [{"type": "audio", "url": url}]
+        })
+
+    def play_tts(self, call_id, text, voice="en-US-Neural2-F"):
+        """Play text-to-speech into an active call.
+
+        Note: calling.play may fail on AI-managed calls since the ai verb
+        owns the audio pipeline. Works on human-agent or conference calls.
+        """
+        return self._call_command(call_id, "calling.play", {
+            "control_id": str(uuid.uuid4()),
+            "media": [{"type": "tts", "text": text, "language": "en-US", "gender": "female"}]
+        })
+
+    def start_recording(self, call_id, stereo=False, direction="both"):
+        """Start recording an active call. Returns control_id for stopping."""
+        return self._call_command(call_id, "calling.record", {
+            "record": {
+                "stereo": stereo,
+                "direction": direction,
+                "format": "mp3"
+            }
+        })
+
+    def stop_recording(self, call_id, control_id=None):
+        """Stop an active recording."""
+        params = {}
+        if control_id:
+            params["control_id"] = control_id
+        return self._call_command(call_id, "calling.stop_record", params)
+
+    def send_dtmf(self, call_id, digits):
+        """Send DTMF tones into an active call."""
+        return self._call_command(call_id, "calling.send_digits", {"digits": digits})
+
+    def tap_call(self, call_id, ws_uri, direction="both", codec="PCMU"):
+        """Start a media tap on an active call, streaming audio to a WebSocket.
+
+        Args:
+            call_id: The SignalWire call ID
+            ws_uri: WebSocket URI to stream audio to (wss://...)
+            direction: 'speak' (caller), 'listen' (agent/AI), or 'both'
+            codec: Audio codec - 'PCMU' or 'PCMA'
+
+        Returns:
+            Response with control_id for stopping the tap
+        """
+        import uuid
+        ctrl_id = str(uuid.uuid4())
+        return self._call_command(call_id, "calling.tap", {
+            "control_id": ctrl_id,
+            "tap": {
+                "type": "audio",
+                "params": {
+                    "direction": direction
+                }
+            },
+            "device": {
+                "type": "ws",
+                "params": {
+                    "uri": ws_uri
+                }
+            }
+        })
+
+    def stop_tap(self, call_id, control_id=None):
+        """Stop an active media tap."""
+        params = {}
+        if control_id:
+            params["control_id"] = control_id
+        return self._call_command(call_id, "calling.stop_tap", params)
+
+    # ==================== Conference Dialing ====================
 
     def dial_to_conference(self, to_address, conference_name, swml_url, status_callback=None):
         """Dial an address (agent, phone, etc.) and connect them to a conference.

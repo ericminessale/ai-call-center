@@ -144,6 +144,12 @@ export interface CallAssignment {
     name?: string;
     contactId?: number;
   };
+  // Multi-agent conference fields
+  assignmentType?: 'normal' | 'backup' | 'escalation';
+  requestingAgent?: { id: number; name: string; email: string };
+  whisperMode?: boolean;
+  targetAgentCallSid?: string;  // For coach/whisper mode — the agent's call SID to coach
+  legId?: number;
 }
 
 const CallFabricContext = createContext<CallFabricContextType | null>(null);
@@ -1154,25 +1160,44 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   const acceptCallAssignment = useCallback(async () => {
     if (!pendingCallAssignment) {
       console.log('⚠️ [CallFabric] No pending call assignment to accept');
-      return;
+      throw new Error('No pending call assignment to accept');
     }
 
     if (!client || !user) {
       console.log('⚠️ [CallFabric] Cannot accept assignment - client or user not ready');
-      return;
+      throw new Error(`Cannot accept: ${!client ? 'Call Fabric client not connected' : 'user not loaded'}`);
     }
 
-    const { conferenceName, callDbId } = pendingCallAssignment;
-    console.log('📞 [CallFabric] Accepting call assignment via DIAL-OUT:', conferenceName);
+    const { conferenceName, callDbId, assignmentType, context, whisperMode, targetAgentCallSid } = pendingCallAssignment;
+    console.log(`📞 [CallFabric] Accepting ${assignmentType || 'normal'} call assignment via DIAL-OUT:`, conferenceName);
 
     try {
       // Step 1: Prepare the join by storing params in Redis (more reliable than query params)
       console.log('📞 [CallFabric] Preparing conference join via API...');
-      const prepareResponse = await conferencesApi.prepareJoin({
+      const prepareParams: Parameters<typeof conferencesApi.prepareJoin>[0] = {
         agent_id: user.id,
         conference_name: conferenceName,
-        call_id: callDbId
-      });
+        call_id: callDbId,
+      };
+
+      // For backup/escalation, pass the join type and context for SWML mode switching + whisper
+      if (assignmentType === 'backup' || assignmentType === 'escalation') {
+        prepareParams.type = assignmentType;
+        if (context && Object.keys(context).length > 0) {
+          prepareParams.context = context;
+        }
+        if (whisperMode) {
+          prepareParams.whisper_mode = true;
+          if (targetAgentCallSid) {
+            prepareParams.agent_call_sid = targetAgentCallSid;
+          }
+        }
+      } else if (context && Object.keys(context).length > 0) {
+        // Normal assignment with AI context — still enable whisper
+        prepareParams.context = context;
+      }
+
+      const prepareResponse = await conferencesApi.prepareJoin(prepareParams);
 
       const dialAddress = prepareResponse.data.dial_address;
       console.log('📞 [CallFabric] Got dial address from API:', dialAddress);
@@ -1842,48 +1867,67 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     // Handle call assignment (NEW: per-interaction conference model)
     // When a customer is routed to this agent, we receive a call_assignment event
     // with the dial address to join the interaction conference
-    const handleCallAssignment = (data: {
-      call_id: string;
-      call_db_id: number;
-      caller_number: string;
-      queue_id: string;
-      context: any;
-      agent_id: number;
-      agent_name: string;
-      conference_name: string;
-      agent_call_sid?: string;  // Server-initiated call to agent
-      customer_info: {
-        phone: string;
-        name?: string;
-        contact_id?: number;
-      };
-    }) => {
+    const handleCallAssignment = (data: any) => {
       console.log('📥 [CallFabric] Call assignment received:', data);
-      console.log('📞 Conference:', data.conference_name);
-      console.log('👤 Customer:', data.customer_info);
-      console.log('📱 Agent call SID:', data.agent_call_sid);
 
-      // Set the pending call assignment
-      // With server-initiated calls, the backend already called the agent
-      // The agent will see an incoming call and can answer it
-      const assignment: CallAssignment = {
-        callId: data.call_id,
-        callDbId: data.call_db_id,
-        callerNumber: data.caller_number,
-        queueId: data.queue_id,
-        context: data.context,
-        agentId: data.agent_id,
-        agentName: data.agent_name,
-        conferenceName: data.conference_name,
-        agentCallSid: data.agent_call_sid,
-        customerInfo: data.customer_info
-      };
+      // Detect if this is a backup/escalation assignment from call_control.py
+      // vs a normal queue assignment from callcenter_socketio.py
+      const isMultiAgent = data.type === 'backup' || data.type === 'escalation';
+
+      let assignment: CallAssignment;
+
+      if (isMultiAgent) {
+        // Backup or escalation assignment — different payload shape
+        const callData = data.call || {};
+        console.log(`📞 [CallFabric] ${data.type} assignment: conference ${data.conference_name}`);
+        console.log('👤 Requesting agent:', data.requesting_agent);
+
+        assignment = {
+          callId: callData.signalwire_call_sid || callData.id?.toString() || '',
+          callDbId: data.call_db_id || callData.id,
+          callerNumber: callData.from_number || '',
+          queueId: callData.queue_id || '',
+          context: callData.ai_context || {},
+          agentId: 0,  // Will be set by the accepting agent
+          agentName: '',
+          conferenceName: data.conference_name,
+          customerInfo: {
+            phone: callData.from_number || '',
+            name: callData.contact_name || callData.customer_name,
+          },
+          // Multi-agent specific fields
+          assignmentType: data.type,
+          requestingAgent: data.requesting_agent,
+          whisperMode: data.whisper_mode || false,
+          targetAgentCallSid: data.agent_call_sid,
+          legId: data.leg_id,
+        };
+      } else {
+        // Normal queue assignment
+        console.log('📞 Conference:', data.conference_name);
+        console.log('👤 Customer:', data.customer_info);
+        console.log('📱 Agent call SID:', data.agent_call_sid);
+
+        assignment = {
+          callId: data.call_id,
+          callDbId: data.call_db_id,
+          callerNumber: data.caller_number,
+          queueId: data.queue_id,
+          context: data.context,
+          agentId: data.agent_id,
+          agentName: data.agent_name,
+          conferenceName: data.conference_name,
+          agentCallSid: data.agent_call_sid,
+          customerInfo: data.customer_info,
+          assignmentType: 'normal',
+        };
+      }
 
       setPendingCallAssignment(assignment);
 
       // The incoming call from the server will trigger the 'ringing' state
       // UI will show call info from this assignment + standard answer/reject buttons
-      console.log('🔔 [CallFabric] Call assignment received - incoming call from server');
+      console.log(`🔔 [CallFabric] Call assignment received (${assignment.assignmentType || 'normal'})`);
     };
 
     socket.on('conference_participant_joined', handleParticipantJoined);

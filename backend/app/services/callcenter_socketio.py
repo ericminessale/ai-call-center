@@ -58,6 +58,32 @@ def emit_call_update(call):
     if call.signalwire_call_sid:
         socketio.emit('call_update', {'call': call_data}, room=call.signalwire_call_sid)
 
+def emit_call_event(call_id, event_type, data, call_sid=None):
+    """Emit a structured call event for the live event stream.
+
+    Used by call_control.py, webhooks.py, calls.py to send real-time events
+    that populate the Call Event Stream panel in the frontend.
+
+    Args:
+        call_id: Database call ID
+        event_type: Category (state_change, hold, record, play, dtmf, monitor, conference, ai_tool_call, sentiment, transcription)
+        data: Event-specific payload dict
+        call_sid: Optional SignalWire call SID for room targeting
+    """
+    event = {
+        'call_id': call_id,
+        'event_type': event_type,
+        'data': data,
+        'timestamp': datetime.utcnow().isoformat(),
+    }
+    # Emit to call-specific room
+    if call_sid:
+        socketio.emit('call_event', event, room=call_sid)
+    # Also broadcast globally for supervisor panels
+    socketio.emit('call_event', event)
+    logger.debug(f"Call event emitted: {event_type} for call {call_id}")
+
+
 @socketio.on('agent_status')
 def handle_agent_status_change(data):
     """Handle agent status changes."""

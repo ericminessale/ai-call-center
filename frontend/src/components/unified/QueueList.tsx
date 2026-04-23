@@ -6,7 +6,6 @@ import {
   AlertTriangle,
   Building2,
   Star,
-  PhoneIncoming,
   Bot,
   UserCheck,
   Loader2,
@@ -26,9 +25,8 @@ interface QueueListProps {
 
 export function QueueList({ calls, onSelectCall, onTakeCall, isLoading, queueConfigs }: QueueListProps) {
   const [searchQuery, setSearchQuery] = useState('');
-  const [queueFilter, setQueueFilter] = useState<string | null>(null); // null = all queues
+  const [queueFilter, setQueueFilter] = useState<string | null>(null);
 
-  // Build queue pills data from configs + actual calls
   const queuePills = useMemo(() => {
     if (!queueConfigs || queueConfigs.length === 0) return [];
     const counts: Record<string, number> = {};
@@ -43,11 +41,8 @@ export function QueueList({ calls, onSelectCall, onTakeCall, isLoading, queueCon
     }));
   }, [queueConfigs, calls]);
 
-  // Filter calls based on search and queue filter
   const filteredCalls = calls.filter((call) => {
-    // Queue filter
     if (queueFilter && (call.queue_id || '') !== queueFilter) return false;
-
     if (!searchQuery) return true;
     const query = searchQuery.toLowerCase();
     return (
@@ -58,158 +53,168 @@ export function QueueList({ calls, onSelectCall, onTakeCall, isLoading, queueCon
     );
   });
 
-  // Sort by priority (urgent/negative sentiment first) then wait time
   const sortedCalls = [...filteredCalls].sort((a, b) => {
     const aNeedsAttention = a.is_urgent || (a.sentiment !== undefined && a.sentiment < -0.3);
     const bNeedsAttention = b.is_urgent || (b.sentiment !== undefined && b.sentiment < -0.3);
     if (aNeedsAttention && !bNeedsAttention) return -1;
     if (!aNeedsAttention && bNeedsAttention) return 1;
-    // Sort by wait time (older first)
     return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
   });
 
-  // Separate urgent, waiting, and assigned calls
-  // Negative sentiment calls get promoted to urgent section
-  const urgentCalls = sortedCalls.filter((c) => c.is_urgent || c.queue_status === 'urgent' || (c.sentiment !== undefined && c.sentiment < -0.3));
   const isUrgentOrNegative = (c: Call) => c.is_urgent || c.queue_status === 'urgent' || (c.sentiment !== undefined && c.sentiment < -0.3);
+  const urgentCalls = sortedCalls.filter(isUrgentOrNegative);
   const waitingCalls = sortedCalls.filter((c) => !isUrgentOrNegative(c) && c.status === 'waiting');
   const assignedCalls = sortedCalls.filter((c) => !isUrgentOrNegative(c) && c.status === 'assigned');
 
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="p-3 border-b border-gray-700">
-        <h2 className="text-sm font-semibold text-white mb-2 flex items-center gap-2">
-          <PhoneIncoming className="w-4 h-4 text-yellow-400" />
-          Waiting Calls ({calls.length})
-        </h2>
+      <div className="px-4 pt-4 pb-3 border-b border-rule">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <span className="kicker">Queue</span>
+            {calls.length > 0 && (
+              <span className="dot dot-wait" />
+            )}
+          </div>
+          <span className="mono text-[11px] text-ink-dim">{calls.length}</span>
+        </div>
 
-        {/* Search */}
         <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-ink-dim" />
           <input
             type="text"
-            placeholder="Search queue..."
+            placeholder="Search queue…"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-9 pr-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-sm text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
+            className="input pl-8 py-[7px]"
           />
         </div>
 
-        {/* Queue Filter Pills */}
         {queuePills.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mt-2">
-            <button
-              onClick={() => setQueueFilter(null)}
-              className={`px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
-                queueFilter === null
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-700/60 text-gray-400 hover:bg-gray-600'
-              }`}
-            >
-              All Queues
-            </button>
+          <div className="flex flex-wrap gap-1 mt-3">
+            <QueuePill active={queueFilter === null} onClick={() => setQueueFilter(null)}>
+              All queues
+            </QueuePill>
             {queuePills.map((pill) => {
               const colors = getQueueBadgeColor(pill.slug);
               const isActive = queueFilter === pill.slug;
               return (
-                <button
+                <QueuePill
                   key={pill.slug}
+                  active={isActive}
                   onClick={() => setQueueFilter(isActive ? null : pill.slug)}
-                  className={`px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
-                    isActive
-                      ? 'bg-blue-600 text-white'
-                      : `${colors.pill} hover:brightness-125`
-                  }`}
+                  tint={colors.dot}
                 >
                   {pill.label}
                   {pill.count > 0 && (
-                    <span className="ml-1 opacity-75">({pill.count})</span>
+                    <span className="mono text-[9.5px] ml-1 opacity-70">{pill.count}</span>
                   )}
-                </button>
+                </QueuePill>
               );
             })}
           </div>
         )}
       </div>
 
-      {/* Queue List */}
+      {/* List */}
       <div className="flex-1 overflow-y-auto">
         {isLoading ? (
-          <div className="divide-y divide-gray-700/30">
-            {Array.from({ length: 3 }).map((_, i) => (
-              <QueueItemSkeleton key={i} />
-            ))}
-          </div>
+          <div>{Array.from({ length: 3 }).map((_, i) => <QueueItemSkeleton key={i} />)}</div>
         ) : sortedCalls.length === 0 ? (
-          <div className="p-4 text-center text-gray-400">
-            <Phone className="w-8 h-8 mx-auto mb-2 opacity-50" />
-            <p className="text-sm">No calls in queue</p>
-            <p className="text-xs mt-1">
-              Calls will appear here when customers are waiting
-            </p>
-          </div>
+          <EmptyQueue />
         ) : (
           <>
-            {/* Urgent/Priority Calls - needs immediate attention */}
             {urgentCalls.length > 0 && (
-              <div className="mb-2">
-                <div className="px-3 py-2 text-xs font-semibold text-red-400 uppercase tracking-wider bg-red-900/20 flex items-center gap-2">
-                  <AlertTriangle className="w-3 h-3" />
-                  Urgent ({urgentCalls.length})
-                </div>
+              <QueueSection title="Urgent" icon={<AlertTriangle className="w-3 h-3" />} tone="urgent" count={urgentCalls.length}>
                 {urgentCalls.map((call) => (
-                  <QueueCard
-                    key={call.id}
-                    call={call}
-                    onSelect={() => onSelectCall(call)}
-                    onTake={() => onTakeCall(call)}
-                    queueConfigs={queueConfigs}
-                  />
+                  <QueueCard key={call.id} call={call} onSelect={() => onSelectCall(call)} onTake={() => onTakeCall(call)} queueConfigs={queueConfigs} />
                 ))}
-              </div>
+              </QueueSection>
             )}
-
-            {/* Waiting Calls - no agent assigned yet */}
             {waitingCalls.length > 0 && (
-              <div className="mb-2">
-                <div className="px-3 py-2 text-xs font-semibold text-yellow-400 uppercase tracking-wider bg-yellow-900/20 flex items-center gap-2">
-                  <Loader2 className="w-3 h-3 animate-spin" />
-                  Waiting ({waitingCalls.length})
-                </div>
+              <QueueSection title="Waiting" icon={<Loader2 className="w-3 h-3 animate-spin" />} tone="wait" count={waitingCalls.length}>
                 {waitingCalls.map((call) => (
-                  <QueueCard
-                    key={call.id}
-                    call={call}
-                    onSelect={() => onSelectCall(call)}
-                    onTake={() => onTakeCall(call)}
-                    queueConfigs={queueConfigs}
-                  />
+                  <QueueCard key={call.id} call={call} onSelect={() => onSelectCall(call)} onTake={() => onTakeCall(call)} queueConfigs={queueConfigs} />
                 ))}
-              </div>
+              </QueueSection>
             )}
-
-            {/* Assigned Calls - agent notified, waiting for them to accept */}
             {assignedCalls.length > 0 && (
-              <div>
-                <div className="px-3 py-2 text-xs font-semibold text-blue-400 uppercase tracking-wider bg-blue-900/20 flex items-center gap-2">
-                  <UserCheck className="w-3 h-3" />
-                  Assigned ({assignedCalls.length})
-                </div>
+              <QueueSection title="Assigned" icon={<UserCheck className="w-3 h-3" />} tone="info" count={assignedCalls.length}>
                 {assignedCalls.map((call) => (
-                  <QueueCard
-                    key={call.id}
-                    call={call}
-                    onSelect={() => onSelectCall(call)}
-                    onTake={() => onTakeCall(call)}
-                    queueConfigs={queueConfigs}
-                  />
+                  <QueueCard key={call.id} call={call} onSelect={() => onSelectCall(call)} onTake={() => onTakeCall(call)} queueConfigs={queueConfigs} />
                 ))}
-              </div>
+              </QueueSection>
             )}
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+function EmptyQueue() {
+  return (
+    <div className="p-8 text-center">
+      <Phone className="w-5 h-5 mx-auto mb-3 text-ink-faint" />
+      <p className="font-display text-[20px] text-ink-muted mb-1">Queue is clear</p>
+      <p className="text-[12px] text-ink-dim">Callers waiting will show here, urgent first.</p>
+    </div>
+  );
+}
+
+function QueuePill({
+  children,
+  active,
+  onClick,
+  tint,
+}: {
+  children: React.ReactNode;
+  active: boolean;
+  onClick: () => void;
+  tint?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[10.5px] font-medium border transition-colors ${
+        active
+          ? 'bg-canvas-elevated text-ink border-rule-strong'
+          : 'bg-canvas-raised text-ink-muted hover:text-ink border-rule hover:border-rule-strong'
+      }`}
+    >
+      {!active && tint && (
+        <span className="w-1.5 h-1.5 rounded-full" style={{ background: tint }} />
+      )}
+      {children}
+    </button>
+  );
+}
+
+function QueueSection({
+  title,
+  icon,
+  tone,
+  count,
+  children,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  tone: 'urgent' | 'wait' | 'info';
+  count: number;
+  children: React.ReactNode;
+}) {
+  const colorClass = tone === 'urgent' ? 'text-urgent-soft' : tone === 'wait' ? 'text-wait-soft' : 'text-info-soft';
+  return (
+    <div>
+      <div className="sticky top-0 z-10 bg-canvas-sunken/95 backdrop-blur-sm flex items-center justify-between px-4 py-1.5 border-b border-rule">
+        <div className={`flex items-center gap-2 ${colorClass}`}>
+          {icon}
+          <span className="kicker" style={{ color: 'inherit' }}>{title}</span>
+        </div>
+        <span className="mono text-[10px] text-ink-dim">{count}</span>
+      </div>
+      {children}
     </div>
   );
 }
@@ -225,44 +230,48 @@ function QueueCard({
   onTake: () => void;
   queueConfigs?: QueueConfig[];
 }) {
-  const contactName = call.contact?.displayName || call.from_number || 'Unknown Caller';
+  const contactName = call.contact?.displayName || call.from_number || 'Unknown caller';
   const company = call.contact?.company;
   const isVip = call.contact?.isVip;
   const wasAI = call.handler_type === 'ai' || call.ai_agent_name;
   const queueSlug = call.queue_id || '';
   const isNegativeSentiment = call.sentiment !== undefined && call.sentiment < -0.3;
 
-  // Queue badge
   const queueBadge = queueSlug ? getQueueBadgeColor(queueSlug) : null;
   const queueDisplayName = queueSlug ? getQueueDisplayName(queueSlug, queueConfigs) : '';
 
-  // Live ticking wait timer
   const [waitTime, setWaitTime] = useState('0:00');
+  const [waitSeconds, setWaitSeconds] = useState(0);
   useEffect(() => {
     if (!call.created_at) return;
     const update = () => {
       const waitMs = Date.now() - new Date(call.created_at!).getTime();
-      const mins = Math.floor(waitMs / 60000);
-      const secs = Math.floor((waitMs % 60000) / 1000);
+      const totalSec = Math.floor(waitMs / 1000);
+      const mins = Math.floor(totalSec / 60);
+      const secs = totalSec % 60;
       setWaitTime(`${mins}:${String(secs).padStart(2, '0')}`);
+      setWaitSeconds(totalSec);
     };
     update();
     const interval = setInterval(update, 1000);
     return () => clearInterval(interval);
   }, [call.created_at]);
 
-  // Color scheme based on priority + sentiment
-  const borderColor = (call.is_urgent || isNegativeSentiment) ? 'border-red-500' : wasAI ? 'border-purple-500' : 'border-yellow-500';
-  const bgTint = (call.is_urgent || isNegativeSentiment) ? 'bg-red-900/5' : '';
+  const railColor = (call.is_urgent || isNegativeSentiment)
+    ? 'border-l-urgent'
+    : wasAI ? 'border-l-ai' : 'border-l-wait';
+  const waitToneClass = waitSeconds > 120 ? 'text-urgent-soft' : waitSeconds > 60 ? 'text-wait-soft' : 'text-ink';
 
   return (
-    <div className={`px-3 py-3 border-b border-gray-700/50 border-l-2 ${borderColor} ${bgTint} hover:bg-gray-700/30`}>
+    <div className={`px-4 py-3 border-b border-rule/60 border-l-[2px] ${railColor} hover:bg-canvas-hover/40`}>
       <div className="flex items-start gap-3">
         {/* Avatar */}
         <button
           onClick={onSelect}
-          className={`w-10 h-10 rounded-full flex items-center justify-center text-white font-medium flex-shrink-0 ${
-            call.is_urgent ? 'bg-red-600' : isVip ? 'bg-yellow-600' : 'bg-gray-600'
+          className={`shrink-0 w-9 h-9 rounded flex items-center justify-center text-[13px] font-semibold ${
+            call.is_urgent ? 'bg-urgent/15 text-urgent-soft border border-urgent/30' :
+            isVip ? 'bg-wait/15 text-wait-soft border border-wait/30' :
+            'bg-canvas-raised text-ink-muted border border-rule'
           }`}
         >
           {contactName.charAt(0).toUpperCase()}
@@ -271,62 +280,49 @@ function QueueCard({
         {/* Info */}
         <div className="flex-1 min-w-0">
           <button onClick={onSelect} className="text-left w-full">
-            <div className="flex items-center gap-2">
-              <span className="font-medium text-white truncate">{contactName}</span>
-              {isVip && (
-                <Star className="w-3 h-3 text-yellow-400 fill-yellow-400 flex-shrink-0" />
-              )}
+            <div className="flex items-center gap-1.5">
+              <span className="font-medium text-ink truncate text-[13.5px]">{contactName}</span>
+              {isVip && <Star className="w-3 h-3 text-wait fill-wait flex-shrink-0" />}
               {(call.is_urgent || isNegativeSentiment) && (
-                <AlertTriangle className="w-3 h-3 text-red-400 flex-shrink-0" title={isNegativeSentiment ? 'Negative sentiment detected' : 'Urgent — SLA exceeded'} />
+                <AlertTriangle className="w-3 h-3 text-urgent-soft flex-shrink-0" />
               )}
               {wasAI && (
-                <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-semibold rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
-                  <Bot className="w-2.5 h-2.5" />
-                  AI
-                </span>
+                <span className="chip chip-ai"><Bot className="w-2.5 h-2.5" />AI</span>
               )}
             </div>
-            <div className="flex items-center gap-2 text-xs text-gray-400 mt-0.5">
+            <div className="flex items-center gap-1.5 text-[11.5px] text-ink-dim mt-0.5">
               {company && (
                 <>
                   <Building2 className="w-3 h-3" />
                   <span className="truncate">{company}</span>
-                  <span className="text-gray-600">·</span>
+                  <span className="text-ink-faint">·</span>
                 </>
               )}
               <Clock className="w-3 h-3" />
-              <span className="tabular-nums">Waiting {waitTime}</span>
+              <span className={`mono ${waitToneClass}`}>{waitTime}</span>
             </div>
           </button>
 
-          {/* AI Collected Context */}
           {hasContext(call.aiContext) && (
             <AgentContextCard context={call.aiContext} variant="compact" className="mt-2" />
           )}
 
-          {/* Queue badge and assigned agent */}
-          <div className="mt-1 flex items-center gap-2 text-xs">
+          <div className="mt-1.5 flex items-center gap-2 text-xs">
             {queueBadge && (
-              <span className={`px-1.5 py-0.5 text-[9px] font-semibold rounded ${queueBadge.pill}`}>
+              <span className={`chip ${queueBadge.pill}`}>
                 {queueDisplayName}
               </span>
             )}
             {call.status === 'assigned' && call.assigned_agent_id && (
-              <span className="text-blue-400 flex items-center gap-1">
-                <UserCheck className="w-3 h-3" />
-                Assigned to agent
-              </span>
+              <span className="chip chip-info"><UserCheck className="w-2.5 h-2.5" />Assigned</span>
             )}
           </div>
         </div>
 
-        {/* Take Call Button */}
+        {/* Take button */}
         <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onTake();
-          }}
-          className="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white text-xs font-medium rounded-lg transition-colors flex items-center gap-1"
+          onClick={(e) => { e.stopPropagation(); onTake(); }}
+          className="btn-primary !py-1.5 !px-3 !text-[12px]"
         >
           <Phone className="w-3 h-3" />
           Take

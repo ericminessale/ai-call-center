@@ -5,8 +5,43 @@ from app.models import Call, Transcription, User
 from app.models.system_config import SystemConfig
 from app.models.document import DocumentCollection, Document, AgentCollectionAssignment
 from app.models.queue import Queue, QueueAgentAssignment
-from app.utils.decorators import require_auth
+from app.utils.decorators import require_auth, require_role
+from app.utils.jwt_utils import verify_token
 from app.utils.url_utils import get_base_url
+
+VALID_USER_ROLES = ('admin', 'supervisor', 'agent')
+
+
+@admin_bp.before_request
+def _enforce_admin_role():
+    """Require admin role for every /api/admin/* route.
+
+    Replaces per-route @require_auth; populates request.current_user so existing
+    handlers can read it without changes.
+    """
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        return jsonify({'error': 'No authorization header'}), 401
+    try:
+        token = auth_header.split(' ', 1)[1]
+    except IndexError:
+        return jsonify({'error': 'Invalid authorization header format'}), 401
+
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Invalid or expired token'}), 401
+
+    user = User.find_by_id(user_id)
+    if not user or not user.is_active:
+        return jsonify({'error': 'User not found or inactive'}), 401
+
+    if user.role != 'admin':
+        return jsonify({
+            'error': 'Admin role required',
+            'current_role': user.role,
+        }), 403
+
+    request.current_user = user
 import logging
 import re
 import requests as http_requests
@@ -666,6 +701,43 @@ def list_users():
         }), 200
     except Exception as e:
         logger.error(f"Failed to list users: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/users/<int:user_id>', methods=['PUT'])
+@require_auth
+def update_user(user_id):
+    """Update a user's role. Admin-only (enforced at blueprint level)."""
+    data = request.get_json() or {}
+    new_role = data.get('role')
+
+    if new_role not in VALID_USER_ROLES:
+        return jsonify({
+            'error': f'role must be one of: {", ".join(VALID_USER_ROLES)}'
+        }), 400
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    # Prevent admins from demoting themselves — avoids lockout when there is
+    # only one admin left.
+    if request.current_user.id == user_id and new_role != 'admin':
+        return jsonify({
+            'error': 'You cannot change your own role away from admin'
+        }), 400
+
+    try:
+        user.role = new_role
+        db.session.commit()
+        logger.info(
+            f"User {user_id} ({user.email}) role set to '{new_role}' "
+            f"by admin {request.current_user.id}"
+        )
+        return jsonify({'user': user.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to update user role: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 

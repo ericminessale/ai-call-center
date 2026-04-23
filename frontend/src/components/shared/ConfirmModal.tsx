@@ -22,7 +22,6 @@ export function ConfirmModal({
 }: ConfirmModalProps) {
   const cancelRef = useRef<HTMLButtonElement>(null);
 
-  // Focus cancel button on mount, close on Escape
   useEffect(() => {
     cancelRef.current?.focus();
     const handleKey = (e: KeyboardEvent) => {
@@ -32,48 +31,31 @@ export function ConfirmModal({
     return () => document.removeEventListener('keydown', handleKey);
   }, [onCancel]);
 
-  const confirmColors =
+  const iconTone =
     variant === 'danger'
-      ? 'bg-red-600 hover:bg-red-700 focus:ring-red-500'
-      : 'bg-yellow-600 hover:bg-yellow-700 focus:ring-yellow-500';
-
-  const iconColors =
-    variant === 'danger'
-      ? 'text-red-400 bg-red-900/30'
-      : 'text-yellow-400 bg-yellow-900/30';
+      ? 'text-urgent-soft bg-urgent/15'
+      : 'text-wait-soft bg-wait/15';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/60"
-        onClick={onCancel}
-      />
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onCancel} />
 
-      {/* Modal */}
-      <div className="relative bg-gray-800 rounded-lg shadow-xl border border-gray-700 w-full max-w-sm mx-4 p-6">
-        <div className="flex items-start gap-4">
-          <div className={`p-2 rounded-full ${iconColors}`}>
-            <AlertTriangle className="w-5 h-5" />
+      <div className="relative bg-canvas-raised rounded-md shadow-panel w-full max-w-sm">
+        <div className="px-5 pt-5 pb-5 flex items-start gap-4">
+          <div className={`p-2 rounded-full ${iconTone} flex-shrink-0`}>
+            <AlertTriangle className="w-4 h-4" />
           </div>
           <div className="flex-1 min-w-0">
-            <h3 className="text-base font-semibold text-white">{title}</h3>
-            <p className="mt-1 text-sm text-gray-400">{message}</p>
+            <h3 className="font-heading text-[16px] font-semibold text-ink tracking-heading">{title}</h3>
+            <p className="mt-1.5 text-[13px] text-ink-muted leading-relaxed">{message}</p>
           </div>
         </div>
 
-        <div className="mt-6 flex justify-end gap-3">
-          <button
-            ref={cancelRef}
-            onClick={onCancel}
-            className="px-4 py-2 text-sm font-medium text-gray-300 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-gray-500"
-          >
+        <div className="px-5 pb-5 flex justify-end gap-2">
+          <button ref={cancelRef} onClick={onCancel} className="btn-ghost">
             {cancelLabel}
           </button>
-          <button
-            onClick={onConfirm}
-            className={`px-4 py-2 text-sm font-medium text-white rounded-lg transition-colors focus:outline-none focus:ring-2 ${confirmColors}`}
-          >
+          <button onClick={onConfirm} className={variant === 'danger' ? 'btn-danger' : 'btn-primary'}>
             {confirmLabel}
           </button>
         </div>

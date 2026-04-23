@@ -2,39 +2,443 @@
 @tailwind components;
 @tailwind utilities;
 
+/* =============================================================================
+   Design tokens — SignalWire brand system (dark theme)
+   Source: signalwire-knowledge MCP design cheatsheet + signalwire-tokens.dtcg.json.
+   60-30-10 discipline. Brand colors are rare, not regurgitated.
+   Dark mode best-practice: avoid pure black (eye strain/halation on astigmatism).
+   Surfaces use cool blue undertone; elevation via tonal lightening + shadow.
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* Surfaces — brand tokens. Tonal elevation: raised is LIGHTER, not bordered. */
+  --bg-page:           #0e0e18;
+  --bg-surface:        #181a28;
+  --bg-surface-raised: #222436;
+  --bg-surface-hover:  rgba(255, 255, 255, 0.04);
+  --bg-overlay:        rgba(14, 14, 24, 0.94);
+  --bg-subtle:         rgba(255, 255, 255, 0.03);
+
+  /* Foreground — off-white, never pure white (avoid halation) */
+  --fg-default:   #f0f0f4;
+  --fg-secondary: #e8e8ec;
+  --fg-muted:     #a0a0aa;
+  --fg-subtle:    #73737e;  /* decorative only, never for reading */
+  --fg-headings:  #f0f0f4;
+
+  /* Borders — low contrast, depth from shadow not edges */
+  --border-default: rgba(255, 255, 255, 0.12);
+  --border-strong:  rgba(255, 255, 255, 0.15);
+
+  /* Brand colors (locked — never modify) */
+  --sw-blue:      #044EF4;   /* structural fills, primary buttons, tab indicator, focus ring */
+  --sw-fuchsia:   #F72A72;   /* 10% accent: stats, emphasis, links (hover), table header accent, logo */
+  --sw-turquoise: #40E0D0;   /* links default, tab active, emphasis-small */
+  --sw-gold:      #FFD700;   /* warnings only */
+  --sw-purple:    #601BE6;   /* gradients, glows — not text */
+
+  /* Semantic / status (brand spec) */
+  --status-success:      #22c55e;
+  --status-success-soft: rgba(34, 197, 94, 0.12);
+  --status-warning:      #FFD700;
+  --status-warning-soft: rgba(255, 215, 0, 0.12);
+  --status-error:        #ef4444;
+  --status-error-soft:   rgba(239, 68, 68, 0.12);
+  --status-info:         #044EF4;
+  --status-info-soft:    rgba(4, 78, 244, 0.12);
+
+  /* Shadows — depth comes from these, not from colored borders */
+  --shadow-md:             0 4px 16px rgba(0, 0, 0, 0.5);
+  --shadow-panel:          0 8px 24px -8px rgba(0, 0, 0, 0.5), 0 1px 0 rgba(255,255,255,0.03) inset;
+  --shadow-glow-fuchsia:   0 0 20px rgba(247, 42, 114, 0.25);
+  --shadow-glow-blue:      0 0 20px rgba(4, 78, 244, 0.25);
+
+  /* Component tokens (brand spec) */
+  --btn-primary-bg:       var(--sw-blue);
+  --btn-primary-hover:    #0342cf;
+  --btn-primary-active:   #022da8;
+  --btn-text-on-color:    #ffffff;
+
+  --input-bg:     #2a2a2e;
+  --input-text:   #ffffff;
+  --input-border: var(--border-strong);
+  --input-focus:  var(--sw-blue);
+  --input-focus-ring: 0 0 0 3px rgba(4, 78, 244, 0.3);
+
+  --link-default: var(--sw-turquoise);
+  --link-hover:   var(--sw-fuchsia);
+
+  --tab-default:   var(--fg-muted);
+  --tab-active:    var(--sw-turquoise);
+  --tab-hover:     var(--fg-default);
+  --tab-indicator: var(--sw-blue);
+
+  --table-header-text:    var(--sw-fuchsia);   /* 2px fuchsia underline on header row */
+  --table-row-hover:      rgba(255, 255, 255, 0.03);
+  --table-border:         rgba(255, 255, 255, 0.07);
+
+  /* Typography */
+  --font-heading: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-body:    'Lexend',          ui-sans-serif, system-ui, sans-serif;
+  --font-code:    'JetBrains Mono',  ui-monospace, SFMono-Regular, monospace;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+}
+
+/* Noise grain overlay (1.5% opacity SVG fractal noise) — reduces banding,
+   adds subtle texture to the otherwise-flat surfaces. Applied to <body::before>. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.015;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+}
+
 html, body, #root {
-  background-color: #1a1f2e;
+  background-color: var(--bg-page);
+  color: var(--fg-default);
   height: 100vh;
   overflow: hidden;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-synthesis: none;
 }
 
-/* Custom animations */
+#root {
+  position: relative;
+  z-index: 1;  /* sit above the noise */
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+  color: var(--fg-headings);
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  font-weight: 600;
+}
+
+/* Selection — brand blue at low opacity */
+::selection {
+  background: rgba(4, 78, 244, 0.35);
+  color: #fff;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.15); background-clip: padding-box; border: 2px solid transparent; }
+
+/* =============================================================================
+   Utility classes
+   ========================================================================== */
+
+@layer components {
+
+  /* Eyebrow / kicker — JetBrains Mono, 0.14em tracking per brand */
+  .kicker {
+    font-family: var(--font-code);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+  }
+
+  /* Mono data — for phone numbers, routes, durations, SIDs, code */
+  .mono {
+    font-family: var(--font-code);
+    font-feature-settings: 'tnum', 'zero';
+  }
+
+  /* Heading display — used for page titles */
+  .font-display {
+    font-family: var(--font-heading);
+    letter-spacing: -0.02em;
+    font-weight: 600;
+  }
+
+  /* Hero number — used for stat counters. Tabular nums for alignment. */
+  .hero-num {
+    font-family: var(--font-heading);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+    line-height: 1;
+  }
+
+  /* Dot grid — legacy class used by Dashboard / Supervisor backgrounds */
+  .bg-dotgrid {
+    background-image: radial-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+    background-size: 24px 24px;
+    background-position: 12px 12px;
+  }
+
+  /* Horizontal rule hairline — used for full-width seams */
+  .rule-h {
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--border-default) 10%, var(--border-default) 90%, transparent);
+  }
+
+  /* Rule fade — soft breath divider for between list items. Fades at both ends
+     so the line reads as a pause rather than a drawn edge. */
+  .rule-fade {
+    background: linear-gradient(to right, transparent, var(--border-default), transparent);
+  }
+
+  /* Selected row rail — BLUE structural accent per brand */
+  .row-selected-blue {
+    background: var(--bg-surface-raised);
+    box-shadow: inset 2px 0 0 var(--sw-blue);
+  }
+
+  /* Legacy scanline stub (still referenced in places) — made invisible */
+  .scanline {
+    display: none;
+  }
+
+  /* Panels — raised surface, depth from shadow (brand pattern) */
+  .panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+  }
+  .panel-raised {
+    background: var(--bg-surface-raised);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+  }
+
+  /* Focus ring — blue per brand input-focus token */
+  .focus-ring:focus-visible,
+  .focus-ring:focus {
+    outline: none;
+    box-shadow: var(--input-focus-ring);
+    border-color: var(--sw-blue);
+  }
+
+  /* Primary button — BLUE per brand component spec */
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius-sm);
+    background: var(--btn-primary-bg);
+    color: var(--btn-text-on-color);
+    font-family: var(--font-body);
+    font-weight: 600;
+    font-size: 14px;
+    border: none;
+    transition: background 150ms ease;
+    cursor: pointer;
+  }
+  .btn-primary:hover:not(:disabled) { background: var(--btn-primary-hover); }
+  .btn-primary:active:not(:disabled) { background: var(--btn-primary-active); }
+  .btn-primary:disabled { background: #333338; color: var(--fg-subtle); cursor: not-allowed; }
+
+  /* Secondary button — transparent + border */
+  .btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--fg-default);
+    font-family: var(--font-body);
+    font-weight: 500;
+    font-size: 14px;
+    border: 1px solid var(--border-strong);
+    transition: background 150ms ease;
+    cursor: pointer;
+  }
+  .btn-secondary:hover { background: rgba(255, 255, 255, 0.06); }
+
+  /* Ghost button */
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.875rem;
+    border-radius: var(--radius-sm);
+    color: var(--fg-secondary);
+    font-family: var(--font-body);
+    font-weight: 500;
+    font-size: 14px;
+    background: transparent;
+    border: none;
+    transition: background 150ms ease, color 150ms ease;
+    cursor: pointer;
+  }
+  .btn-ghost:hover { color: var(--fg-default); background: rgba(255, 255, 255, 0.06); }
+
+  /* Destructive — brand error */
+  .btn-danger {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius-sm);
+    background: var(--status-error);
+    color: #fff;
+    font-weight: 600;
+    font-size: 14px;
+    border: none;
+    transition: background 150ms ease;
+    cursor: pointer;
+  }
+  .btn-danger:hover { background: #b91c1c; }
+
+  /* Input */
+  .input {
+    width: 100%;
+    padding: 0.625rem 0.875rem;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: var(--radius-sm);
+    color: var(--input-text);
+    font-family: var(--font-body);
+    font-size: 14px;
+    transition: border-color 150ms ease, box-shadow 150ms ease;
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--input-focus);
+    box-shadow: var(--input-focus-ring);
+  }
+  .input::placeholder { color: var(--fg-subtle); }
+
+  /* Neutral chip — brand rule: status uses surface-raised + fg-secondary, text carries meaning */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 3px 8px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface-raised);
+    color: var(--fg-secondary);
+    border: 1px solid var(--border-default);
+    font-family: var(--font-code);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    line-height: 1.4;
+  }
+  /* The one brand-allowed highlighted chip: fuchsia text on transparent bg */
+  .chip-emphasis {
+    background: transparent;
+    color: var(--sw-fuchsia);
+    border-color: rgba(247, 42, 114, 0.3);
+  }
+  /* Semantic status chips — use sparingly, only when operational state matters */
+  .chip-success { background: var(--status-success-soft); color: #4ade80; border-color: rgba(34,197,94,0.28); }
+  .chip-warning { background: var(--status-warning-soft); color: #fde047; border-color: rgba(255,215,0,0.28); }
+  .chip-error   { background: var(--status-error-soft);   color: #f87171; border-color: rgba(239,68,68,0.28); }
+  .chip-info    { background: var(--status-info-soft);    color: #93c5fd; border-color: rgba(4,78,244,0.28); }
+
+  /* Status dot — solid, no glow (glows add noise) */
+  .dot { width: 8px; height: 8px; border-radius: 999px; flex-shrink: 0; display: inline-block; }
+  .dot-success { background: var(--status-success); }
+  .dot-warning { background: var(--status-warning); }
+  .dot-error   { background: var(--status-error); }
+  .dot-info    { background: var(--status-info); }
+  .dot-offline { background: var(--fg-subtle); }
+  /* Legacy aliases routed to brand semantics */
+  .dot-live    { background: var(--status-success); }
+  .dot-ai      { background: var(--sw-turquoise); }
+  .dot-wait    { background: var(--status-warning); }
+  .dot-urgent  { background: var(--status-error); }
+
+  /* Legacy chip aliases — route old operational chips to brand semantic styling */
+  .chip-live   { background: var(--status-success-soft); color: #4ade80; border-color: rgba(34,197,94,0.28); }
+  .chip-ai     { background: rgba(64,224,208,0.10);      color: #7eeee3; border-color: rgba(64,224,208,0.28); }
+  .chip-wait   { background: var(--status-warning-soft); color: #fde047; border-color: rgba(255,215,0,0.28); }
+  .chip-urgent { background: var(--status-error-soft);   color: #f87171; border-color: rgba(239,68,68,0.28); }
+  .chip-info   { background: var(--status-info-soft);    color: #6e9eff; border-color: rgba(4,78,244,0.28); }
+  .chip-muted  { background: var(--bg-surface-raised);   color: var(--fg-muted); border-color: var(--border-default); }
+
+  /* Tab — underline pattern, active = turquoise per brand */
+  .tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem 0.25rem;
+    color: var(--tab-default);
+    font-family: var(--font-body);
+    font-size: 14px;
+    font-weight: 500;
+    border-bottom: 2px solid transparent;
+    transition: color 150ms ease, border-color 150ms ease;
+    cursor: pointer;
+    background: transparent;
+    border-top: none;
+    border-left: none;
+    border-right: none;
+  }
+  .tab:hover { color: var(--tab-hover); }
+  .tab-active {
+    color: var(--tab-active);
+    border-bottom-color: var(--tab-active);
+  }
+
+  /* Link — turquoise default, fuchsia on hover per brand */
+  .link { color: var(--link-default); transition: color 150ms ease; }
+  .link:hover { color: var(--link-hover); }
+
+  /* Table header underline — fuchsia 2px per brand pattern */
+  .table-header-underline {
+    border-bottom: 2px solid var(--sw-fuchsia);
+  }
+
+  /* Selected row — subtle surface lift, no colored fill */
+  .row-selected {
+    background: var(--bg-surface-raised);
+    box-shadow: inset 2px 0 0 var(--sw-blue);  /* blue structural accent */
+  }
+}
+
+/* =============================================================================
+   Animations
+   ========================================================================== */
+
 @keyframes slide-down {
-  from {
-    transform: translateY(-100%);
-    opacity: 0;
-  }
-  to {
-    transform: translateY(0);
-    opacity: 1;
-  }
+  from { transform: translateY(-100%); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
 }
-
 @keyframes slide-up {
-  from {
-    transform: translateY(0);
-    opacity: 1;
-  }
-  to {
-    transform: translateY(-100%);
-    opacity: 0;
-  }
+  from { transform: translateY(0);    opacity: 1; }
+  to   { transform: translateY(-100%); opacity: 0; }
+}
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
-.animate-slide-down {
-  animation: slide-down 0.3s ease-out forwards;
-}
-
-.animate-slide-up {
-  animation: slide-up 0.3s ease-out forwards;
-}
+.animate-slide-down { animation: slide-down 0.3s cubic-bezier(0.2, 0.8, 0.2, 1) forwards; }
+.animate-slide-up   { animation: slide-up   0.3s ease-in forwards; }
+.animate-fade-up    { animation: fade-up    0.3s ease-out forwards; }
+.animate-fade-in    { animation: fade-in    0.3s ease-out forwards; }

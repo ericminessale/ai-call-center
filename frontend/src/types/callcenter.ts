@@ -269,15 +269,11 @@ export interface ExtractedInfo {
   confidence?: number;
 }
 
-export interface PerformanceMetrics {
+export interface AgentStats {
   callsToday: number;
-  avgHandleTime: number; // in milliseconds
-  avgHandleTimeYesterday: number;
-  fcr: number; // First Call Resolution percentage
-  csat: number; // Customer Satisfaction score
-  perfectDays: number;
-  nextMilestone: number;
-  isPersonalBest: boolean;
+  avgHandleTime: number; // in seconds
+  queueDepth: number;
+  longestWait: number; // in seconds
 }
 
 // Configurable Queue System types

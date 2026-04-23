@@ -39,26 +39,14 @@ frontend/dist/
 # Claude Code local settings
 .claude/
 
-# Development documentation (consolidated into README)
-ARCHITECTURE.md
-BACKEND_API_CONTRACT.md
-DOCKER_COMMANDS.md
-HOLD_AI_FEATURE.md
-IMPLEMENTATION_SUMMARY.md
-PHASE1_IMPLEMENTATION_SUMMARY.md
-PHASE2_IMPLEMENTATION_SUMMARY.md
-QUICK_TEST.md
-REDESIGN_PLAN.md
-SETUP_GUIDE.md
-SUPERVISOR_DEMO_GUIDE.md
-TESTING_CHECKLIST.md
-TESTING_GUIDE.md
-TODO.md
-TYPE_FIXES_SUMMARY.md
-UI_IMPLEMENTATION_STATUS.md
-UI_REQUIREMENTS.md
-CLAUDE.md
+# Documentation — only README.md is tracked.
+*.md
+!README.md
 docs/
+
+# Design-session artifacts and vendored SDKs
+_design_tour/
+ai-agents/signalwire-sdk/
 
 # Utility scripts (development only)
 quick_test.py
@@ -77,5 +65,4 @@ reset_password.py
 tmp/
 temp/
 *.tmp
-backend/nul
-"nul" 
+nul

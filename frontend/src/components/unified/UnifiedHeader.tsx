@@ -1,5 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Users,
   Phone,
@@ -9,7 +8,6 @@ import {
   ChevronDown,
   PhoneCall,
   Settings,
-  Circle,
   AlertTriangle,
 } from 'lucide-react';
 import { ViewMode, AgentStatus } from '../../pages/UnifiedAgentDesktop';
@@ -19,7 +17,7 @@ import { queueApi } from '../../services/api';
 import toast from 'react-hot-toast';
 
 interface UnifiedHeaderProps {
-  user: { email: string } | null;
+  user: { email: string; role?: string } | null;
   agentStatus: AgentStatus;
   onStatusChange: (status: AgentStatus) => void;
   stats: {
@@ -50,19 +48,25 @@ interface AvailableQueue {
   is_activated: boolean;
 }
 
-const statusConfig: Record<AgentStatus, { label: string; color: string; bgColor: string }> = {
-  available: { label: 'Available', color: 'text-green-400', bgColor: 'bg-green-500' },
-  busy: { label: 'Busy', color: 'text-red-400', bgColor: 'bg-red-500' },
-  'after-call': { label: 'After Call', color: 'text-yellow-400', bgColor: 'bg-yellow-500' },
-  break: { label: 'Break', color: 'text-orange-400', bgColor: 'bg-orange-500' },
-  offline: { label: 'Offline', color: 'text-gray-400', bgColor: 'bg-gray-500' },
+type StatusMeta = {
+  label: string;
+  dotClass: string;
+  textClass: string;
+};
+
+const statusMeta: Record<AgentStatus, StatusMeta> = {
+  available:    { label: 'Available',  dotClass: 'dot dot-live',   textClass: 'text-live-soft' },
+  busy:         { label: 'Busy',       dotClass: 'dot dot-urgent', textClass: 'text-urgent-soft' },
+  'after-call': { label: 'After Call', dotClass: 'dot dot-wait',   textClass: 'text-wait-soft' },
+  break:        { label: 'Break',      dotClass: 'dot dot-wait',   textClass: 'text-wait-soft' },
+  offline:      { label: 'Offline',    dotClass: 'dot dot-offline', textClass: 'text-ink-dim' },
 };
 
 const STRATEGY_SHORT: Record<string, string> = {
   fifo: 'FIFO',
   round_robin: 'RR',
-  priority: 'Priority',
-  skill_based: 'Skill',
+  priority: 'PRI',
+  skill_based: 'SKL',
 };
 
 export function UnifiedHeader({
@@ -77,12 +81,12 @@ export function UnifiedHeader({
   callFabric,
   onOutboundCallStarted,
 }: UnifiedHeaderProps) {
-  const navigate = useNavigate();
   const [showStatusDropdown, setShowStatusDropdown] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showQuickDial, setShowQuickDial] = useState(false);
+  const statusRef = useRef<HTMLDivElement>(null);
+  const userRef = useRef<HTMLDivElement>(null);
 
-  // Queue opt-in state
   const [availableQueues, setAvailableQueues] = useState<AvailableQueue[]>([]);
 
   const loadQueues = useCallback(async () => {
@@ -96,10 +100,19 @@ export function UnifiedHeader({
 
   useEffect(() => { loadQueues(); }, [loadQueues]);
 
+  // Close dropdowns on outside click
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (statusRef.current && !statusRef.current.contains(e.target as Node)) setShowStatusDropdown(false);
+      if (userRef.current && !userRef.current.contains(e.target as Node)) setShowUserMenu(false);
+    };
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, []);
+
   const handleQueueToggle = async (queue: AvailableQueue) => {
     try {
       if (!queue.is_assigned) {
-        // Self-subscribe: create assignment + activate
         const resp = await queueApi.selfSubscribe(queue.id);
         setAvailableQueues(prev => prev.map(q =>
           q.id === queue.id
@@ -107,7 +120,6 @@ export function UnifiedHeader({
             : q
         ));
       } else {
-        // Toggle existing assignment
         const resp = await queueApi.toggleQueueActivation(queue.assignment_id!, !queue.is_activated);
         setAvailableQueues(prev => prev.map(q =>
           q.id === queue.id ? { ...q, is_activated: resp.data.assignment.is_activated } : q
@@ -118,157 +130,138 @@ export function UnifiedHeader({
     }
   };
 
-  const currentStatus = statusConfig[agentStatus];
+  const current = statusMeta[agentStatus];
   const activeQueueCount = availableQueues.filter(q => q.is_activated).length;
+  const formatMMSS = (secs: number) =>
+    `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
 
   return (
-    <header className="bg-gray-800 border-b border-gray-700">
-      {/* Top row - Logo, Status, Stats, User */}
-      <div className="h-14 flex items-center justify-between px-4">
-        {/* Left - Logo and Title */}
-        <div className="flex items-center gap-3">
-          <Logo size="sm" />
-          <h1 className="text-lg font-semibold text-white">SignalWire Call Center</h1>
+    <header className="relative bg-canvas border-b border-rule">
+      {/* Top row — Brand | Status · Stats | Quick-dial · User */}
+      <div className="h-[52px] flex items-stretch">
+        {/* Brand cell */}
+        <div className="flex items-center gap-2.5 pl-5 pr-6 border-r border-rule min-w-[260px]">
+          <Logo size="md" />
+          <div className="flex flex-col leading-none">
+            <span className="font-heading text-[16px] text-ink font-semibold tracking-heading">
+              SignalWire
+            </span>
+            <span className="kicker mt-[3px] text-[9px]">Call&nbsp;Center</span>
+          </div>
         </div>
 
-        {/* Center - Agent Status and Stats */}
-        <div className="flex items-center gap-6">
-          {/* Agent Status Dropdown */}
-          <div className="relative flex items-center gap-2">
-            <button
-              onClick={() => setShowStatusDropdown(!showStatusDropdown)}
-              className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 rounded-lg hover:bg-gray-600 transition-colors"
-            >
-              <Circle className={`w-2.5 h-2.5 fill-current ${currentStatus.color}`} />
-              <span className={`text-sm font-medium ${currentStatus.color}`}>
-                {currentStatus.label}
+        {/* Status */}
+        <div ref={statusRef} className="relative flex items-center px-4 border-r border-rule">
+          <button
+            onClick={() => setShowStatusDropdown(v => !v)}
+            className="flex items-center gap-2 px-3 py-1.5 rounded bg-canvas-raised border border-rule hover:border-rule-strong transition-colors"
+          >
+            <span className={current.dotClass} />
+            <span className={`text-[13px] font-medium ${current.textClass}`}>{current.label}</span>
+            {activeQueueCount > 0 && agentStatus !== 'offline' && (
+              <span className="mono text-[10px] px-1.5 py-0.5 rounded bg-live/15 text-live-soft border border-live/25 leading-none">
+                {activeQueueCount}
               </span>
-              {activeQueueCount > 0 && agentStatus !== 'offline' && (
-                <span className="px-1.5 py-0.5 text-[9px] rounded-full bg-green-600 text-white leading-none">
-                  {activeQueueCount}
-                </span>
-              )}
-              <ChevronDown className="w-4 h-4 text-gray-400" />
-            </button>
-
-            {/* Conference Error Indicator */}
-            {callFabric.conferenceJoinError && (
-              <div
-                className="flex items-center gap-1 px-2 py-1 bg-red-900/50 border border-red-700 rounded-lg cursor-help"
-                title={callFabric.conferenceJoinError}
-              >
-                <AlertTriangle className="w-4 h-4 text-red-400" />
-                <span className="text-xs text-red-400">Conference Error</span>
-              </div>
             )}
+            <ChevronDown className="w-3.5 h-3.5 text-ink-dim" />
+          </button>
 
-            {/* Connecting indicator */}
-            {callFabric.isChangingStatus && (
-              <div className="flex items-center gap-1 px-2 py-1 bg-blue-900/50 border border-blue-700 rounded-lg">
-                <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                <span className="text-xs text-blue-400">Connecting...</span>
+          {callFabric.conferenceJoinError && (
+            <div className="ml-2 flex items-center gap-1.5 px-2 py-1 rounded bg-urgent/10 border border-urgent/30" title={callFabric.conferenceJoinError}>
+              <AlertTriangle className="w-3.5 h-3.5 text-urgent-soft" />
+              <span className="text-[11px] text-urgent-soft mono uppercase tracking-wider">Conf&nbsp;Err</span>
+            </div>
+          )}
+          {callFabric.isChangingStatus && (
+            <div className="ml-2 flex items-center gap-1.5 px-2 py-1 rounded bg-info/10 border border-info/30">
+              <span className="w-2.5 h-2.5 border-2 border-info-soft border-t-transparent rounded-full animate-spin" />
+              <span className="text-[11px] text-info-soft mono uppercase tracking-wider">Connecting</span>
+            </div>
+          )}
+
+          {showStatusDropdown && (
+            <div className="absolute top-full left-4 mt-2 w-60 panel-raised rounded-md shadow-panel z-50 animate-fade-up overflow-hidden">
+              <div className="px-3 py-2 border-b border-rule">
+                <span className="kicker">Presence</span>
               </div>
-            )}
-
-            {showStatusDropdown && (
-              <div className="absolute top-full left-0 mt-1 w-56 bg-gray-700 rounded-lg shadow-lg border border-gray-600 py-1 z-50">
-                {/* Status options */}
-                {(Object.keys(statusConfig) as AgentStatus[]).map((status) => (
+              {(Object.keys(statusMeta) as AgentStatus[]).map((s) => {
+                const m = statusMeta[s];
+                const active = s === agentStatus;
+                return (
                   <button
-                    key={status}
-                    onClick={() => {
-                      onStatusChange(status);
-                      setShowStatusDropdown(false);
-                    }}
-                    className={`w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-gray-600 ${
-                      status === agentStatus ? 'bg-gray-600' : ''
+                    key={s}
+                    onClick={() => { onStatusChange(s); setShowStatusDropdown(false); }}
+                    className={`w-full flex items-center gap-2.5 px-3 py-2 text-left transition-colors ${
+                      active ? 'bg-canvas-hover' : 'hover:bg-canvas-hover'
                     }`}
                   >
-                    <Circle className={`w-2.5 h-2.5 fill-current ${statusConfig[status].color}`} />
-                    <span className={`text-sm ${statusConfig[status].color}`}>
-                      {statusConfig[status].label}
-                    </span>
+                    <span className={m.dotClass} />
+                    <span className={`text-[13px] ${m.textClass}`}>{m.label}</span>
+                    {active && <span className="ml-auto kicker" style={{ color: 'var(--sw-turquoise)' }}>Now</span>}
                   </button>
-                ))}
+                );
+              })}
 
-                {/* Queue opt-in section */}
-                {availableQueues.length > 0 && (
-                  <>
-                    <div className="border-t border-gray-600 my-1" />
-                    <div className="px-3 py-1.5">
-                      <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">My Queues</span>
-                    </div>
-                    <div className="max-h-40 overflow-y-auto">
-                      {availableQueues.map(queue => (
-                        <label
-                          key={queue.id}
-                          className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-600 cursor-pointer"
-                        >
-                          <input
-                            type="checkbox"
-                            checked={queue.is_activated}
-                            onChange={() => handleQueueToggle(queue)}
-                            className="rounded bg-gray-600 border-gray-500 text-blue-500 focus:ring-blue-500 focus:ring-offset-0"
-                          />
-                          <span className="text-sm text-gray-200 flex-1">{queue.display_name}</span>
-                          <span className="px-1.5 py-0.5 text-[9px] rounded bg-blue-900/40 text-blue-300">
-                            {STRATEGY_SHORT[queue.routing_strategy] || queue.routing_strategy}
-                          </span>
-                        </label>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Stats */}
-          <div className="flex items-center gap-4 text-sm">
-            <div className="text-center">
-              <div className="text-gray-400 text-xs">Today</div>
-              <div className="text-white font-medium">{stats.callsToday}</div>
+              {availableQueues.length > 0 && (
+                <>
+                  <div className="px-3 py-2 border-t border-rule mt-1">
+                    <span className="kicker">My queues</span>
+                  </div>
+                  <div className="max-h-48 overflow-y-auto pb-1">
+                    {availableQueues.map(queue => (
+                      <label
+                        key={queue.id}
+                        className="flex items-center gap-2.5 px-3 py-1.5 hover:bg-canvas-hover cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={queue.is_activated}
+                          onChange={() => handleQueueToggle(queue)}
+                          className="w-3.5 h-3.5 rounded-sm bg-canvas-raised border-rule-strong accent-sw-blue"
+                        />
+                        <span className="text-[13px] text-ink flex-1 truncate">{queue.display_name}</span>
+                        <span className="chip chip-muted">
+                          {STRATEGY_SHORT[queue.routing_strategy] || queue.routing_strategy}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
-            <div className="text-center">
-              <div className="text-gray-400 text-xs">Avg Time</div>
-              <div className="text-white font-medium">
-                {Math.floor(stats.avgHandleTime / 60)}:{String(stats.avgHandleTime % 60).padStart(2, '0')}
-              </div>
-            </div>
-            <div className="text-center">
-              <div className="text-gray-400 text-xs">In Queue</div>
-              <div className={`font-medium ${stats.queueDepth > 0 ? 'text-yellow-400' : 'text-white'}`}>
-                {stats.queueDepth}
-              </div>
-            </div>
-            <div className="text-center">
-              <div className="text-gray-400 text-xs">Wait</div>
-              <div className={`font-medium ${stats.longestWait > 60 ? 'text-red-400' : stats.longestWait > 30 ? 'text-yellow-400' : 'text-white'}`}>
-                {stats.longestWait > 0
-                  ? `${Math.floor(stats.longestWait / 60)}:${String(stats.longestWait % 60).padStart(2, '0')}`
-                  : '—'
-                }
-              </div>
-            </div>
-          </div>
+          )}
         </div>
 
-        {/* Right - Quick Dial, User Menu */}
-        <div className="flex items-center gap-3">
-          {/* Quick Dial Button */}
+        {/* Stats strip — the hero bit. Mono digits, kicker labels. */}
+        <div className="flex items-center gap-6 px-6 flex-1 min-w-0 overflow-hidden">
+          <Stat kicker="Today"    value={String(stats.callsToday)} />
+          <Stat kicker="Avg Time" value={formatMMSS(stats.avgHandleTime)} />
+          <Stat
+            kicker="In Queue"
+            value={String(stats.queueDepth)}
+            tone={stats.queueDepth > 0 ? 'wait' : 'default'}
+          />
+          <Stat
+            kicker="Wait"
+            value={stats.longestWait > 0 ? formatMMSS(stats.longestWait) : '—'}
+            tone={stats.longestWait > 60 ? 'urgent' : stats.longestWait > 30 ? 'wait' : 'default'}
+          />
+        </div>
+
+        {/* Quick dial + user */}
+        <div className="flex items-center gap-2 pr-4 border-l border-rule">
           <div className="relative">
             <button
-              onClick={() => setShowQuickDial(!showQuickDial)}
-              className={`p-2 rounded-lg transition-colors ${
+              onClick={() => setShowQuickDial(v => !v)}
+              className={`flex items-center justify-center w-9 h-9 rounded transition-colors ${
                 callFabric.isOnline
-                  ? 'text-green-400 hover:bg-gray-700'
-                  : 'text-gray-400 hover:bg-gray-700'
+                  ? 'text-live-soft hover:bg-canvas-hover'
+                  : 'text-ink-dim hover:bg-canvas-hover'
               }`}
               title={callFabric.isOnline ? 'Quick Dial (Online)' : 'Quick Dial (Offline)'}
             >
-              <PhoneCall className="w-5 h-5" />
+              <PhoneCall className="w-4 h-4" />
             </button>
-
             {showQuickDial && (
               <QuickDialDropdown
                 callFabric={callFabric}
@@ -278,27 +271,34 @@ export function UnifiedHeader({
             )}
           </div>
 
-          {/* User Menu */}
-          <div className="relative">
+          <div ref={userRef} className="relative">
             <button
-              onClick={() => setShowUserMenu(!showUserMenu)}
-              className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-700 rounded-lg transition-colors"
+              onClick={() => setShowUserMenu(v => !v)}
+              className="flex items-center gap-2 px-3 py-1.5 rounded hover:bg-canvas-hover transition-colors"
             >
-              <span className="text-sm text-gray-300">{user?.email}</span>
-              <ChevronDown className="w-4 h-4 text-gray-400" />
+              <span className="w-6 h-6 rounded-full bg-canvas-raised border border-rule flex items-center justify-center text-[11px] font-semibold text-ink">
+                {user?.email?.charAt(0).toUpperCase() || '?'}
+              </span>
+              <span className="text-[12px] text-ink-muted mono truncate max-w-[160px]">{user?.email}</span>
+              <ChevronDown className="w-3.5 h-3.5 text-ink-dim" />
             </button>
-
             {showUserMenu && (
-              <div className="absolute top-full right-0 mt-1 w-48 bg-gray-700 rounded-lg shadow-lg border border-gray-600 py-1 z-50">
+              <div className="absolute top-full right-0 mt-2 w-56 panel-raised rounded-md shadow-panel z-50 animate-fade-up overflow-hidden">
+                <div className="px-3 py-2 border-b border-rule">
+                  <div className="kicker">Signed in as</div>
+                  <div className="text-[13px] text-ink mono truncate">{user?.email}</div>
+                  {user?.role && (
+                    <div className="mt-1">
+                      <span className="chip chip-muted">{user.role}</span>
+                    </div>
+                  )}
+                </div>
                 <button
-                  onClick={() => {
-                    setShowUserMenu(false);
-                    onLogout();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-left text-red-400 hover:bg-gray-600"
+                  onClick={() => { setShowUserMenu(false); onLogout(); }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-left text-urgent-soft hover:bg-canvas-hover transition-colors"
                 >
                   <LogOut className="w-4 h-4" />
-                  <span className="text-sm">Logout</span>
+                  <span className="text-[13px]">Sign out</span>
                 </button>
               </div>
             )}
@@ -306,44 +306,70 @@ export function UnifiedHeader({
         </div>
       </div>
 
-      {/* Bottom row - View Tabs */}
-      <div className="h-10 flex items-center px-4 border-t border-gray-700/50">
+      {/* Tab strip — underline nav, serif-lite */}
+      <div className="h-10 flex items-center px-5 border-t border-rule bg-canvas-sunken/40">
         <nav className="flex items-center gap-1">
           <ViewTab
-            icon={<Users className="w-4 h-4" />}
+            icon={<Users className="w-3.5 h-3.5" />}
             label="Contacts"
             active={viewMode === 'contacts'}
             onClick={() => onViewModeChange('contacts')}
           />
           <ViewTab
-            icon={<Phone className="w-4 h-4" />}
+            icon={<Phone className="w-3.5 h-3.5" />}
             label="Active Calls"
             count={callCounts.active}
             active={viewMode === 'calls'}
             onClick={() => onViewModeChange('calls')}
           />
           <ViewTab
-            icon={<ListTodo className="w-4 h-4" />}
+            icon={<ListTodo className="w-3.5 h-3.5" />}
             label="Queue"
             count={callCounts.queue}
+            tone={callCounts.queue > 0 ? 'wait' : 'default'}
             active={viewMode === 'queue'}
             onClick={() => onViewModeChange('queue')}
           />
-          <ViewTab
-            icon={<Eye className="w-4 h-4" />}
-            label="Supervisor"
-            active={viewMode === 'supervisor'}
-            onClick={() => onViewModeChange('supervisor')}
-          />
-          <ViewTab
-            icon={<Settings className="w-4 h-4" />}
-            label="Settings"
-            active={viewMode === 'settings'}
-            onClick={() => onViewModeChange('settings')}
-          />
+          {(user?.role === 'admin' || user?.role === 'supervisor') && (
+            <ViewTab
+              icon={<Eye className="w-3.5 h-3.5" />}
+              label="Supervisor"
+              active={viewMode === 'supervisor'}
+              onClick={() => onViewModeChange('supervisor')}
+            />
+          )}
+          {user?.role === 'admin' && (
+            <ViewTab
+              icon={<Settings className="w-3.5 h-3.5" />}
+              label="Settings"
+              active={viewMode === 'settings'}
+              onClick={() => onViewModeChange('settings')}
+            />
+          )}
         </nav>
       </div>
     </header>
+  );
+}
+
+function Stat({
+  kicker,
+  value,
+  tone = 'default',
+}: {
+  kicker: string;
+  value: string;
+  tone?: 'default' | 'wait' | 'urgent';
+}) {
+  const color =
+    tone === 'urgent' ? 'text-urgent-soft' :
+    tone === 'wait'   ? 'text-wait-soft'   :
+    'text-ink';
+  return (
+    <div className="flex flex-col leading-none gap-1 min-w-0">
+      <span className="kicker">{kicker}</span>
+      <span className={`mono text-[15px] font-medium ${color}`}>{value}</span>
+    </div>
   );
 }
 
@@ -351,34 +377,39 @@ function ViewTab({
   icon,
   label,
   count,
+  tone = 'default',
   active,
   onClick,
 }: {
   icon: React.ReactNode;
   label: string;
   count?: number;
+  tone?: 'default' | 'wait';
   active: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       onClick={onClick}
-      className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm transition-colors ${
+      className={`relative flex items-center gap-2 px-3 h-9 text-[13px] font-medium transition-colors ${
         active
-          ? 'bg-blue-600 text-white'
-          : 'text-gray-400 hover:text-white hover:bg-gray-700'
+          ? 'text-ink'
+          : 'text-ink-dim hover:text-ink-muted'
       }`}
     >
       {icon}
       <span>{label}</span>
       {count !== undefined && count > 0 && (
-        <span
-          className={`px-1.5 py-0.5 text-xs rounded-full ${
-            active ? 'bg-blue-500 text-white' : 'bg-gray-600 text-gray-300'
-          }`}
-        >
+        <span className={`mono text-[10px] px-1.5 py-0.5 rounded border leading-none ${
+          tone === 'wait'
+            ? 'bg-wait/10 text-wait-soft border-wait/25'
+            : 'bg-canvas-raised text-ink-muted border-rule'
+        }`}>
           {count}
         </span>
+      )}
+      {active && (
+        <span className="absolute -bottom-[1px] left-2 right-2 h-[2px] rounded-sm" style={{ background: 'var(--sw-turquoise)' }} />
       )}
     </button>
   );

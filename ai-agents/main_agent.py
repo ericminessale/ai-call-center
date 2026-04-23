@@ -6,8 +6,8 @@ AI Specialists (separate agents) are the ONLY ones that solve problems.
 Includes RAG knowledge base search via pgvector.
 """
 
-from signalwire_agents import AgentBase, AgentServer
-from signalwire_agents.core.function_result import SwaigFunctionResult
+from signalwire import AgentBase, AgentServer
+from signalwire.core.function_result import FunctionResult
 import os
 import json
 import base64
@@ -318,9 +318,12 @@ def capture_base_url(query_params, body_params, headers, agent):
                 base_url = env_url.rstrip('/')
                 new_global['agent_base_url'] = base_url
 
-    if base_url:
-        post_prompt_url = f"{base_url}/api/webhooks/post-prompt"
-        agent.set_post_prompt_url(post_prompt_url)
+    # Post-prompt URL disabled during testing — ngrok only exposes agent port (8080),
+    # not backend port (5000), so this 404s and wastes tunnel quota.
+    # Re-enable when backend is reachable at the same external URL (e.g., via nginx).
+    # if base_url:
+    #     post_prompt_url = f"{base_url}/api/webhooks/post-prompt"
+    #     agent.set_post_prompt_url(post_prompt_url)
 
     # Read conference name and call DB ID from query params (conference-first architecture)
     conf_param = query_params.get('conf')
@@ -384,15 +387,11 @@ def add_sentiment_tool(agent):
                     backend_url = os.getenv('BACKEND_URL', 'http://backend:5000')
                     url = f"{backend_url}/api/calls/{call_db_id}/sentiment"
                     http_requests.post(url, json={'score': score, 'reason': reason}, timeout=5)
-                except Exception as e:
-                    print(f"Warning: Failed to post sentiment for call {call_db_id}: {e}", flush=True)
+                except Exception:
+                    pass
             threading.Thread(target=post_sentiment, daemon=True).start()
-        else:
-            print(f"Warning: report_sentiment called but no call_db_id in global_data", flush=True)
 
-        result = SwaigFunctionResult()
-        result.set_response("ok")
-        return result
+        return FunctionResult("ok")
 
     agent.define_tool(
         name="report_sentiment",
@@ -462,7 +461,21 @@ class CallCenterTriageAgent(AgentBase):
         self.set_prompt_llm_params(
             temperature=0.4, top_p=0.9,
             barge_confidence=0.6, frequency_penalty=0.2)
-        self.set_params({"end_of_speech_timeout": 800, "ai_volume": 0})
+        self.set_params({
+            "end_of_speech_timeout": 800,
+            "ai_volume": 0,
+            "enable_text_normalization": "both",
+        })
+        # Observability: uncomment ONLY when debugging failures
+        # self.enable_debug_events(level=2)
+
+        # Internal fillers for step/context transitions (common-mistakes.md #31)
+        self.add_internal_filler("next_step", "en-US", [
+            "One moment...", "Bear with me...",
+        ])
+        self.add_internal_filler("change_context", "en-US", [
+            "Let me get you to the right team...", "One moment...",
+        ])
 
         # Fetch active queues from backend (dynamic at startup)
         queues = get_active_queues()
@@ -545,7 +558,8 @@ class CallCenterTriageAgent(AgentBase):
                 "If the caller gives you their name AND mentions what they need in the same breath, "
                 "great — note both. You can skip asking about the department in the next step.") \
             .set_step_criteria("The customer has stated their name") \
-            .set_valid_steps(["route_department"])
+            .set_valid_steps(["route_department"]) \
+            .set_functions(["report_sentiment"])
 
         # Step 2: Determine department
         triage_ctx.add_step("route_department") \
@@ -558,7 +572,8 @@ class CallCenterTriageAgent(AgentBase):
             .add_section("Routing",
                 "Once you know the department, move to that context seamlessly:\n" + route_instructions) \
             .set_step_criteria("Customer has indicated which department they need") \
-            .set_valid_contexts(queue_slugs)
+            .set_valid_contexts(queue_slugs) \
+            .set_functions(["report_sentiment"])
 
         # ============================================================
         # DYNAMIC QUEUE CONTEXTS - One per configured queue
@@ -583,7 +598,8 @@ class CallCenterTriageAgent(AgentBase):
                     "If the caller already described their issue during the greeting, "
                     "you have what you need. Move on to offering transfer options.") \
                 .set_step_criteria("You have a basic understanding of what the caller needs help with") \
-                .set_valid_steps(["offer_transfer"])
+                .set_valid_steps(["offer_transfer"]) \
+                .set_functions(["report_sentiment"])
 
             # Step 2: Offer transfer choice
             queue_ctx.add_step("offer_transfer") \
@@ -598,42 +614,31 @@ class CallCenterTriageAgent(AgentBase):
                     "- Human specialist: use the transfer_to_human tool\n"
                     "- AI assistant: use the transfer_to_ai_specialist tool\n\n"
                     f"Always include: customer_name, reason, department='{slug}', urgency, additional_info") \
-                .set_step_criteria("Customer has chosen human or AI assistance")
+                .set_step_criteria("Customer has chosen human or AI assistance") \
+                .set_valid_steps([]) \
+                .set_functions(["transfer_to_human", "transfer_to_ai_specialist", "report_sentiment"])
 
-        # ============================================================
-        # TOOLS - Transfer functions only
-        # ============================================================
-        dept_enum_desc = "Department: " + ", ".join([f"'{s}'" for s in queue_slugs])
-        self.define_tool(
-            name="transfer_to_human",
-            description="Transfer customer to a human representative. Use when they choose to speak with a human.",
-            parameters={
-                "customer_name": {"type": "string", "description": "Customer's spoken name (NOT their phone number - only use a name they verbally provide)"},
-                "reason": {"type": "string", "description": "Brief description of what they need"},
-                "department": {"type": "string", "description": dept_enum_desc},
-                "urgency": {"type": "string", "description": "'high', 'medium', or 'low'"},
-                "additional_info": {"type": "string", "description": "Any other relevant context"}
-            },
-            handler=self.transfer_to_human
-        )
-
-        self.define_tool(
-            name="transfer_to_ai_specialist",
-            description="Transfer customer to AI specialist. Use when they choose AI assistance.",
-            parameters={
-                "customer_name": {"type": "string", "description": "Customer's spoken name (NOT their phone number - only use a name they verbally provide)"},
-                "reason": {"type": "string", "description": "Brief description of what they need"},
-                "department": {"type": "string", "description": dept_enum_desc},
-                "urgency": {"type": "string", "description": "'high', 'medium', or 'low'"},
-                "additional_info": {"type": "string", "description": "Any other relevant context"}
-            },
-            handler=self.transfer_to_ai_specialist
-        )
+        # Tools registered via @AgentBase.tool() decorators below
 
     def _check_basic_auth(self, request) -> bool:
         """Override to disable auth - agents are behind nginx"""
         return True
 
+    @AgentBase.tool(
+        name="transfer_to_human",
+        description=(
+            "Connect the caller to a human representative in the department they need. "
+            "Use this when the caller says they want to talk to a person."
+        ),
+        parameters={
+            "customer_name": {"type": "string", "description": "The caller's name as they said it"},
+            "reason": {"type": "string", "description": "Brief summary of what they need help with"},
+            "department": {"type": "string", "description": "Which department (e.g., 'sales', 'support')"},
+            "urgency": {"type": "string", "description": "'high', 'medium', or 'low'"},
+            "additional_info": {"type": "string", "description": "Any other relevant details from the conversation"},
+        },
+        fillers=["I'm connecting you now.", "One moment, I'll get you to the right person."],
+    )
     def transfer_to_human(self, args, raw_data):
         """Transfer to human representative queue"""
         customer_name = args.get("customer_name", "")
@@ -674,16 +679,35 @@ class CallCenterTriageAgent(AgentBase):
         if call_db_id:
             queue_url += f"&call_db_id={call_db_id}"
 
-        print(f"Transferring {customer_name} to human queue: {queue_url}", flush=True)
-        print(f"Context data: {context_data}", flush=True)
-
-        result = SwaigFunctionResult(
-            "I'll connect you with a representative right now."
+        result = FunctionResult(
+            "I'll connect you with a representative right now.",
+            post_process=True,
         )
         result.update_global_data(context_data)
-        result.swml_transfer(queue_url, "", final=True)
+        result.action.append({
+            "SWML": {
+                "version": "1.0.0",
+                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+            },
+            "transfer": "true"
+        })
         return result
 
+    @AgentBase.tool(
+        name="transfer_to_ai_specialist",
+        description=(
+            "Connect the caller to our AI assistant for their department. "
+            "Use this when the caller says they'd like help from the AI assistant."
+        ),
+        parameters={
+            "customer_name": {"type": "string", "description": "The caller's name as they said it"},
+            "reason": {"type": "string", "description": "Brief summary of what they need help with"},
+            "department": {"type": "string", "description": "Which department (e.g., 'sales', 'support')"},
+            "urgency": {"type": "string", "description": "'high', 'medium', or 'low'"},
+            "additional_info": {"type": "string", "description": "Any other relevant details from the conversation"},
+        },
+        fillers=["Let me connect you with our AI assistant.", "One moment."],
+    )
     def transfer_to_ai_specialist(self, args, raw_data):
         """Transfer to AI specialist agent"""
         customer_name = args.get("customer_name", "")
@@ -706,9 +730,7 @@ class CallCenterTriageAgent(AgentBase):
         if call_db_id:
             transfer_url += f"&call_db_id={call_db_id}" if '?' in transfer_url else f"?call_db_id={call_db_id}"
 
-        print(f"Transferring {customer_name} to AI specialist: {transfer_url}", flush=True)
-
-        result = SwaigFunctionResult('')  # Silent transfer
+        result = FunctionResult('')  # Silent transfer
         result.update_global_data({
             'customer_name': customer_name,
             'reason': reason,
@@ -718,7 +740,13 @@ class CallCenterTriageAgent(AgentBase):
             'preferred_handling': 'ai',
             'source_agent': 'call_center_triage'
         })
-        result.swml_transfer(transfer_url, "", final=True)
+        result.action.append({
+            "SWML": {
+                "version": "1.0.0",
+                "sections": {"main": [{"transfer": {"dest": transfer_url}}]}
+            },
+            "transfer": "true"
+        })
         return result
 
 
@@ -745,8 +773,11 @@ class SalesAISpecialist(AgentBase):
             barge_confidence=0.5, frequency_penalty=0.1)
         self.set_params({
             "wait_for_user": False,
-            "end_of_speech_timeout": 1000
+            "end_of_speech_timeout": 1000,
+            "enable_text_normalization": "both",
         })
+        # Observability: uncomment ONLY when debugging failures
+        # self.enable_debug_events(level=2)
         self.add_hints(["SignalWire", "pricing", "enterprise", "demo", "trial", "API",
                         "platform", "integration", "SDK", "CPaaS", "UCaaS"])
 
@@ -816,18 +847,22 @@ class SalesAISpecialist(AgentBase):
             ]
         )
 
-        self.define_tool(
-            name="escalate_to_human",
-            description="Connect to human sales rep for purchases, quotes, or complex needs",
-            parameters={
-                "reason": {"type": "string", "description": "Reason for escalation"}
-            },
-            handler=self.escalate_to_human
-        )
+        # Tool registered via @AgentBase.tool() decorator below
 
     def _check_basic_auth(self, request) -> bool:
         return True
 
+    @AgentBase.tool(
+        name="escalate_to_human",
+        description=(
+            "Connect the caller to a human sales representative. Use when they want to make "
+            "a purchase, need a formal quote, request custom pricing, or ask to speak with a person."
+        ),
+        parameters={
+            "reason": {"type": "string", "description": "Why the caller needs a human rep"},
+        },
+        fillers=["Let me get a sales representative for you.", "One moment."],
+    )
     def escalate_to_human(self, args, raw_data):
         """Escalate to human sales"""
         reason = args.get("reason", "")
@@ -859,13 +894,18 @@ class SalesAISpecialist(AgentBase):
         if call_db_id:
             queue_url += f"&call_db_id={call_db_id}"
 
-        print(f"Escalating to human sales: {queue_url}", flush=True)
-
-        result = SwaigFunctionResult(
-            "I'll connect you with a sales representative who can help with that."
+        result = FunctionResult(
+            "I'll connect you with a sales representative who can help with that.",
+            post_process=True,
         )
         result.update_global_data(context_data)
-        result.swml_transfer(queue_url, "", final=True)
+        result.action.append({
+            "SWML": {
+                "version": "1.0.0",
+                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+            },
+            "transfer": "true"
+        })
         return result
 
 
@@ -892,8 +932,11 @@ class SupportAISpecialist(AgentBase):
             barge_confidence=0.5, frequency_penalty=0.2)
         self.set_params({
             "wait_for_user": False,
-            "end_of_speech_timeout": 1000
+            "end_of_speech_timeout": 1000,
+            "enable_text_normalization": "both",
         })
+        # Observability: uncomment ONLY when debugging failures
+        # self.enable_debug_events(level=2)
         self.add_hints(["SignalWire", "error", "restart", "configuration", "API", "log",
                         "debug", "timeout", "connection", "webhook", "SDK"])
 
@@ -959,24 +1002,29 @@ class SupportAISpecialist(AgentBase):
             "When to Escalate",
             body="Use the escalate_to_human tool when:",
             bullets=[
+                "The customer asks to speak with a person — escalate IMMEDIATELY, do not try to troubleshoot first",
                 "You've tried two or three approaches and the issue persists",
                 "The issue requires account access or admin-level changes you can't make",
-                "The customer asks to speak with a person"
             ]
         )
 
-        self.define_tool(
-            name="escalate_to_human",
-            description="Connect to human support for complex issues or by request",
-            parameters={
-                "reason": {"type": "string", "description": "Reason for escalation"}
-            },
-            handler=self.escalate_to_human
-        )
+        # Tool registered via @AgentBase.tool() decorator below
 
     def _check_basic_auth(self, request) -> bool:
         return True
 
+    @AgentBase.tool(
+        name="escalate_to_human",
+        description=(
+            "Connect the caller to a human support specialist. Use IMMEDIATELY when "
+            "the caller asks for a person. Also use when the issue needs account access "
+            "or you've tried multiple fixes without success."
+        ),
+        parameters={
+            "reason": {"type": "string", "description": "Why the caller needs a human specialist"},
+        },
+        fillers=["Let me get a support specialist for you.", "One moment."],
+    )
     def escalate_to_human(self, args, raw_data):
         """Escalate to human support"""
         reason = args.get("reason", "")
@@ -1008,13 +1056,18 @@ class SupportAISpecialist(AgentBase):
         if call_db_id:
             queue_url += f"&call_db_id={call_db_id}"
 
-        print(f"Escalating to human support: {queue_url}", flush=True)
-
-        result = SwaigFunctionResult(
-            "I'll connect you with a support specialist who can help with that."
+        result = FunctionResult(
+            "I'll connect you with a support specialist who can help with that.",
+            post_process=True,
         )
         result.update_global_data(context_data)
-        result.swml_transfer(queue_url, "", final=True)
+        result.action.append({
+            "SWML": {
+                "version": "1.0.0",
+                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+            },
+            "transfer": "true"
+        })
         return result
 
 
@@ -1048,8 +1101,11 @@ class OutboundSalesAgent(AgentBase):
             barge_confidence=0.5, frequency_penalty=0.1)
         self.set_params({
             "wait_for_user": False,
-            "end_of_speech_timeout": 1000
+            "end_of_speech_timeout": 1000,
+            "enable_text_normalization": "both",
         })
+        # Observability: uncomment ONLY when debugging failures
+        # self.enable_debug_events(level=2)
         self.add_hints(["SignalWire", "pricing", "enterprise", "demo", "trial", "API",
                         "platform", "integration"])
 
@@ -1118,18 +1174,22 @@ class OutboundSalesAgent(AgentBase):
             "are ready to purchase, or need help outside of sales."
         )
 
-        self.define_tool(
-            name="transfer_to_human",
-            description="Connect to a human sales representative when the customer requests it",
-            parameters={
-                "reason": {"type": "string", "description": "Reason for transfer"}
-            },
-            handler=self.transfer_to_human
-        )
+        # Tool registered via @AgentBase.tool() decorator below
 
     def _check_basic_auth(self, request) -> bool:
         return True
 
+    @AgentBase.tool(
+        name="transfer_to_human",
+        description=(
+            "Connect the caller to a human sales representative. Use when they want to "
+            "speak with a person, are ready to purchase, or need help outside of sales."
+        ),
+        parameters={
+            "reason": {"type": "string", "description": "Why the caller needs a human rep"},
+        },
+        fillers=["Let me connect you with a sales representative.", "One moment."],
+    )
     def transfer_to_human(self, args, raw_data):
         """Transfer to human sales rep"""
         reason = args.get("reason", "")
@@ -1161,13 +1221,18 @@ class OutboundSalesAgent(AgentBase):
         if call_db_id:
             queue_url += f"&call_db_id={call_db_id}"
 
-        print(f"Outbound sales transferring to human: {queue_url}", flush=True)
-
-        result = SwaigFunctionResult(
-            "I'll connect you with a sales representative right away."
+        result = FunctionResult(
+            "I'll connect you with a sales representative right away.",
+            post_process=True,
         )
         result.update_global_data(context_data)
-        result.swml_transfer(queue_url, "", final=True)
+        result.action.append({
+            "SWML": {
+                "version": "1.0.0",
+                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+            },
+            "transfer": "true"
+        })
         return result
 
 
@@ -1194,8 +1259,11 @@ class OutboundSupportAgent(AgentBase):
             barge_confidence=0.5, frequency_penalty=0.2)
         self.set_params({
             "wait_for_user": False,
-            "end_of_speech_timeout": 1000
+            "end_of_speech_timeout": 1000,
+            "enable_text_normalization": "both",
         })
+        # Observability: uncomment ONLY when debugging failures
+        # self.enable_debug_events(level=2)
         self.add_hints(["SignalWire", "error", "restart", "configuration", "API", "log",
                         "debug", "timeout", "connection", "webhook"])
 
@@ -1265,18 +1333,22 @@ class OutboundSupportAgent(AgentBase):
             "you've tried multiple approaches without success, or they request a human."
         )
 
-        self.define_tool(
-            name="transfer_to_human",
-            description="Connect to a human support specialist when needed",
-            parameters={
-                "reason": {"type": "string", "description": "Reason for transfer"}
-            },
-            handler=self.transfer_to_human
-        )
+        # Tool registered via @AgentBase.tool() decorator below
 
     def _check_basic_auth(self, request) -> bool:
         return True
 
+    @AgentBase.tool(
+        name="transfer_to_human",
+        description=(
+            "Connect the caller to a human support specialist. Use when the issue needs "
+            "account-level access, multiple fixes haven't worked, or they request a person."
+        ),
+        parameters={
+            "reason": {"type": "string", "description": "Why the caller needs a human specialist"},
+        },
+        fillers=["Let me connect you with a support specialist.", "One moment."],
+    )
     def transfer_to_human(self, args, raw_data):
         """Transfer to human support"""
         reason = args.get("reason", "")
@@ -1308,13 +1380,18 @@ class OutboundSupportAgent(AgentBase):
         if call_db_id:
             queue_url += f"&call_db_id={call_db_id}"
 
-        print(f"Outbound support transferring to human: {queue_url}", flush=True)
-
-        result = SwaigFunctionResult(
-            "I'll connect you with a support specialist right away."
+        result = FunctionResult(
+            "I'll connect you with a support specialist right away.",
+            post_process=True,
         )
         result.update_global_data(context_data)
-        result.swml_transfer(queue_url, "", final=True)
+        result.action.append({
+            "SWML": {
+                "version": "1.0.0",
+                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+            },
+            "transfer": "true"
+        })
         return result
 
 

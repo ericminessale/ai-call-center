@@ -8,10 +8,10 @@ import { LeftPanel } from '../components/unified/LeftPanel';
 import { IncomingCallBanner } from '../components/unified/IncomingCallBanner';
 import { SettingsPanel } from '../components/unified/SettingsPanel';
 import { ContactDetailView } from '../components/contacts/ContactDetailView';
-import { contactsApi, callsApi, queueApi } from '../services/api';
+import { contactsApi, callsApi, queueApi, callControlApi } from '../services/api';
 import { Contact, ContactMinimal, Call, QueueConfig } from '../types/callcenter';
 import type { SentimentData } from '../components/contacts/LiveCallTab';
-import { Users } from 'lucide-react';
+import { Users, Phone, ListTodo } from 'lucide-react';
 import { ContactDetailSkeleton } from '../components/shared/Skeleton';
 import { DashboardCharts } from '../components/unified/DashboardCharts';
 import toast from 'react-hot-toast';
@@ -46,8 +46,8 @@ export function UnifiedAgentDesktop() {
   const [stats, setStats] = useState({
     callsToday: 0,
     avgHandleTime: 0,
-    fcr: 0,
-    csat: 0,
+    queueDepth: 0,
+    longestWait: 0,
   });
 
   // Contact state
@@ -126,6 +126,10 @@ export function UnifiedAgentDesktop() {
         if (exists) return prev.map(c => c.id === mappedCall.id ? mappedCall : c);
         return [...prev, mappedCall];
       });
+      // Also remove ended calls from queuedCalls so activeCallForContact clears
+      if (isEnded) {
+        setQueuedCalls(prev => prev.filter(c => c.id !== mappedCall.id));
+      }
       updateCallCounts();
     });
 
@@ -146,6 +150,7 @@ export function UnifiedAgentDesktop() {
     socket.on('call_ended', (data: { callId: number }) => {
       logger.debug('[Unified] call_ended:', data);
       setActiveCalls(prev => prev.filter(c => c.id !== data.callId));
+      setQueuedCalls(prev => prev.filter(c => c.id !== data.callId));
       updateCallCounts();
     });
 
@@ -322,6 +327,18 @@ export function UnifiedAgentDesktop() {
     }
   }, []);
 
+  // Load agent stats from backend
+  const loadStats = useCallback(async () => {
+    try {
+      const response = await callsApi.getMyStats();
+      if (response.data.success) {
+        setStats(response.data.stats);
+      }
+    } catch (error) {
+      logger.error('Failed to load agent stats:', error);
+    }
+  }, []);
+
   // Initial data load
   useEffect(() => {
     loadContacts();
@@ -329,7 +346,14 @@ export function UnifiedAgentDesktop() {
     loadQueuedCalls();
     updateCallCounts();
     loadQueueConfigs();
+    loadStats();
   }, []);
+
+  // Poll stats every 30 seconds
+  useEffect(() => {
+    const interval = setInterval(loadStats, 30000);
+    return () => clearInterval(interval);
+  }, [loadStats]);
 
   // Handle customer connected to agent's conference (auto-navigation)
   useEffect(() => {
@@ -412,8 +436,32 @@ export function UnifiedAgentDesktop() {
     setViewMode(getInitialViewMode());
   }, [location.pathname]);
 
+  // Tabs permitted per role. Agents have no supervisor/settings access;
+  // supervisors can monitor but not configure the system.
+  const canAccessView = useCallback(
+    (mode: ViewMode): boolean => {
+      if (mode === 'settings') return user?.role === 'admin';
+      if (mode === 'supervisor') return user?.role === 'admin' || user?.role === 'supervisor';
+      return true;
+    },
+    [user?.role],
+  );
+
+  // If the URL points at a restricted view, bounce back to the default view.
+  // Runs whenever the user or URL changes so token refresh / role change updates flow through.
+  useEffect(() => {
+    if (!user) return;
+    if (!canAccessView(viewMode)) {
+      navigate('/', { replace: true });
+    }
+  }, [user, viewMode, canAccessView, navigate]);
+
   // Handle view mode change
   const handleViewModeChange = (mode: ViewMode) => {
+    if (!canAccessView(mode)) {
+      toast.error('You do not have access to that view');
+      return;
+    }
     setViewMode(mode);
     switch (mode) {
       case 'contacts':
@@ -577,6 +625,16 @@ export function UnifiedAgentDesktop() {
   const handleAcceptAssignment = async () => {
     if (callFabric.pendingCallAssignment) {
       try {
+        // Auto-stop any active tap/monitor on this call before joining as participant
+        const assignedCallId = callFabric.pendingCallAssignment.callDbId;
+        if (assignedCallId) {
+          try {
+            await callControlApi.stopMonitor(assignedCallId);
+            console.log('[Unified] Stopped monitoring before accepting assignment');
+          } catch {
+            // Ignore - may not have been monitoring
+          }
+        }
         await callFabric.acceptCallAssignment();
         const contactId = callFabric.pendingCallAssignment.customerInfo?.contact_id ||
                          callFabric.pendingCallAssignment.customerInfo?.contactId;
@@ -584,15 +642,16 @@ export function UnifiedAgentDesktop() {
           navigate(`/contacts/${contactId}`);
           setViewMode('contacts');
         }
-      } catch (error) {
+      } catch (error: any) {
         logger.error('Failed to accept call assignment:', error);
-        toast.error('Failed to accept call');
+        const detail = error?.response?.data?.error || error?.message || 'Unknown error';
+        toast.error(`Failed to accept call: ${detail}`);
       }
     }
   };
 
   return (
-    <div className="h-screen flex flex-col bg-gray-900">
+    <div className="h-screen flex flex-col bg-canvas">
       {/* Incoming Call Banner - show for inbound calls */}
       {callFabric.callState === 'ringing' && callFabric.activeCall && callFabric.activeCall.direction === 'inbound' && (
         <IncomingCallBanner
@@ -602,7 +661,7 @@ export function UnifiedAgentDesktop() {
         />
       )}
 
-      {/* Call Assignment Banner - show when customer routed from queue */}
+      {/* Call Assignment Banner - show when customer routed from queue, backup request, or escalation */}
       {callFabric.pendingCallAssignment && !callFabric.isInConference && (
         <IncomingCallBanner
           phoneNumber={callFabric.pendingCallAssignment.callerNumber || callFabric.pendingCallAssignment.customerInfo?.phone || 'Unknown'}
@@ -611,6 +670,9 @@ export function UnifiedAgentDesktop() {
           aiContext={callFabric.pendingCallAssignment.context}
           onAnswer={handleAcceptAssignment}
           onDecline={callFabric.rejectCallAssignment}
+          assignmentType={callFabric.pendingCallAssignment.assignmentType}
+          requestingAgent={callFabric.pendingCallAssignment.requestingAgent}
+          whisperMode={callFabric.pendingCallAssignment.whisperMode}
         />
       )}
 
@@ -632,13 +694,13 @@ export function UnifiedAgentDesktop() {
       <div className="flex-1 flex overflow-hidden">
         {viewMode === 'settings' ? (
           /* Full-width settings panel */
-          <div className="flex-1 bg-gray-900 overflow-hidden">
+          <div className="flex-1 bg-canvas overflow-hidden">
             <SettingsPanel />
           </div>
         ) : (
           <>
-            {/* Left Panel */}
-            <div className="w-80 border-r border-gray-700 flex flex-col bg-gray-800">
+            {/* Left Panel — sits on page surface; depth comes from detail pane being raised */}
+            <div className="w-[340px] border-r border-rule flex flex-col bg-canvas">
               <LeftPanel
                 viewMode={viewMode}
                 contacts={contacts}
@@ -659,7 +721,7 @@ export function UnifiedAgentDesktop() {
             </div>
 
             {/* Right Panel - 360 Contact Detail */}
-            <div className="flex-1 bg-gray-900 overflow-hidden">
+            <div className="flex-1 bg-canvas overflow-hidden">
               {isLoadingContactDetail && !selectedContact ? (
                 <ContactDetailSkeleton />
               ) : selectedContact ? (
@@ -688,23 +750,59 @@ export function UnifiedAgentDesktop() {
               ) : viewMode === 'supervisor' ? (
                 <DashboardCharts activeCalls={activeCalls} queuedCalls={queuedCalls} />
               ) : (
-                <div className="h-full flex items-center justify-center text-gray-500">
-                  <div className="text-center">
-                    <Users className="w-16 h-16 mx-auto mb-4 opacity-50" />
-                    <p className="text-lg">
-                      {viewMode === 'contacts' && 'Select a contact to view details'}
-                      {viewMode === 'calls' && 'Select a call to view contact details'}
-                      {viewMode === 'queue' && 'Select a queued call to view details'}
-                    </p>
-                    <p className="text-sm mt-2">
-                      {viewMode === 'contacts' && 'Or create a new contact to get started'}
-                    </p>
-                  </div>
-                </div>
+                <EmptyStage viewMode={viewMode} />
               )}
             </div>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Empty-stage screen shown when no contact/call is selected.
+ * Quiet, atmospheric — dot-grid background, a tiny inline stat, editorial copy.
+ * Better than a tiny centered icon.
+ */
+function EmptyStage({ viewMode }: { viewMode: ViewMode }) {
+  const copy = {
+    contacts: {
+      kicker: 'Contacts',
+      title: 'Waiting on you.',
+      body: 'Pick someone on the left to see their history, sentiment timeline, and call controls. Or start a new contact.',
+      Icon: Users,
+    },
+    calls: {
+      kicker: 'Active calls',
+      title: 'No live calls selected.',
+      body: 'When a call is in progress, choose it from the left to open live transcription, controls, and context.',
+      Icon: Phone,
+    },
+    queue: {
+      kicker: 'Queue',
+      title: 'Queue is clear.',
+      body: 'When customers are waiting, they\u2019ll show up on the left — urgent calls first, sorted by the routing strategy of their queue.',
+      Icon: ListTodo,
+    },
+    supervisor: { kicker: '', title: '', body: '', Icon: Users },
+    settings:   { kicker: '', title: '', body: '', Icon: Users },
+  }[viewMode] || { kicker: '', title: '', body: '', Icon: Users };
+
+  return (
+    <div className="relative h-full bg-dotgrid flex items-center justify-center px-10">
+      <div className="max-w-md text-center animate-fade-up">
+        <div className="kicker mb-4">{copy.kicker}</div>
+        <h2 className="font-display text-[40px] leading-[1.05] text-ink mb-3 tracking-tightest">
+          {copy.title}
+        </h2>
+        <p className="text-[14px] text-ink-muted leading-relaxed">
+          {copy.body}
+        </p>
+      </div>
+      {/* Corner crosshair — quiet operator-console marker */}
+      <div className="absolute bottom-4 right-4 mono text-[9px] text-ink-faint uppercase tracking-[0.3em]">
+        signalwire / cf
       </div>
     </div>
   );

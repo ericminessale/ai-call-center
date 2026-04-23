@@ -74,7 +74,7 @@ def create_app():
         app.logger.warning(f"Initial Redis connection failed: {str(e)} - will retry on demand")
 
     # Register blueprints
-    from app.api import auth_bp, calls_bp, swml_bp, webhooks_bp, admin_bp, contacts_bp, conferences_bp
+    from app.api import auth_bp, calls_bp, swml_bp, webhooks_bp, admin_bp, contacts_bp, conferences_bp, call_control_bp
     from app.api.queues import queues_bp
     from app.api.fabric import fabric_bp
     from app.api.ai_control import ai_control_bp
@@ -88,6 +88,11 @@ def create_app():
     app.register_blueprint(ai_control_bp, url_prefix='/api/ai')
     app.register_blueprint(admin_bp, url_prefix='/api/admin')
     app.register_blueprint(conferences_bp, url_prefix='/api/conferences')
+    app.register_blueprint(call_control_bp, url_prefix='/api/call-control')
+
+    # Initialize tap audio relay WebSocket routes
+    from app.services.tap_relay import init_tap_relay
+    init_tap_relay(app)
 
     # Import WebSocket handlers (must be after socketio.init_app)
     with app.app_context():

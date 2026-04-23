@@ -18,6 +18,63 @@ conferences_bp = Blueprint('conferences', __name__)
 
 
 # ============================================================================
+# Helpers
+# ============================================================================
+
+def build_whisper_text(context: dict) -> str:
+    """Build a natural-language TTS whisper from AI-collected context.
+
+    This is played to the agent BEFORE they join the conference,
+    giving them a summary of what the AI gathered from the caller.
+    Only includes fields that are present and non-empty.
+    """
+    if not context:
+        return ""
+
+    parts = []
+
+    # Caller identity
+    name = context.get('customer_name') or context.get('caller_name')
+    company = context.get('company')
+    if name and company:
+        parts.append(f"Call from {name} at {company}")
+    elif name:
+        parts.append(f"Call from {name}")
+    elif company:
+        parts.append(f"Call from {company}")
+
+    # Department / queue
+    dept = context.get('department') or context.get('queue')
+    if dept:
+        parts.append(f"for {dept}")
+
+    # Issue / reason
+    issue = context.get('issue_description') or context.get('issue') or context.get('reason')
+    if issue:
+        parts.append(f"regarding {issue}")
+
+    # Priority / urgency
+    priority = context.get('priority') or context.get('urgency')
+    if priority:
+        parts.append(f"Priority: {priority}")
+
+    # Account number
+    account = context.get('account_number')
+    if account:
+        parts.append(f"Account: {account}")
+
+    # AI summary (brief, if available and nothing else covered it)
+    summary = context.get('ai_summary')
+    if summary and not issue:
+        parts.append(summary)
+
+    if not parts:
+        return ""
+
+    return ". ".join(parts) + "."
+
+
+# ============================================================================
 # API Endpoints (require auth)
 # ============================================================================
 
@@ -58,16 +115,33 @@ def prepare_conference_join():
     if not conference_name:
         return jsonify({'error': 'conference_name is required'}), 400
 
+    # Optional fields for multi-agent conference modes
+    join_type = data.get('type')              # 'monitor', 'backup', 'escalation', or None (normal)
+    context = data.get('context')             # AI-collected context for whisper
+    whisper_mode = data.get('whisper_mode')   # True for supervisor coach mode
+    agent_call_sid = data.get('agent_call_sid')  # Agent's SID for coach targeting
+
     # Generate a unique token
     token = str(uuid.uuid4())
 
     # Store params in Redis with 5-minute TTL (should only take seconds to use)
     redis_key = f"conference_join:{token}"
-    redis_data = json.dumps({
+    token_data = {
         'agent_id': agent_id,
         'conf': conference_name,
-        'call_id': call_id
-    })
+        'call_id': call_id,
+    }
+    # Include optional mode fields if provided
+    if join_type:
+        token_data['type'] = join_type
+    if context:
+        token_data['context'] = context
+    if whisper_mode:
+        token_data['whisper_mode'] = True
+        if agent_call_sid:
+            token_data['agent_call_sid'] = agent_call_sid
+
+    redis_data = json.dumps(token_data)
     redis_client.setex(redis_key, 300, redis_data)  # 5 minute TTL
 
     logger.info(f"Prepared conference join: token={token}, agent={agent_id}, conf={conference_name}")
@@ -352,24 +426,69 @@ def agent_conference_webhook():
 
     # Mode 1: Per-interaction conference (NEW)
     if conference_name:
-        logger.info(f"Per-interaction mode: Agent {agent_id} joining conference {conference_name}")
+        join_type = parsed_params.get('type')  # monitor, backup, escalation, or None
+        context = parsed_params.get('context')  # AI-collected context for whisper
+        whisper_mode = parsed_params.get('whisper_mode')
+        agent_call_sid = parsed_params.get('agent_call_sid')
+
+        logger.info(f"Per-interaction mode: Agent {agent_id} joining conference {conference_name} (type={join_type})")
         status_callback = f"{base_url}/api/conferences/{conference_name}/status"
+
+        # Build join_conference params based on join type
+        join_params = {
+            "name": conference_name,
+            "status_callback": status_callback,
+            "status_callback_event": "start end join leave",
+        }
+
+        if join_type == 'monitor':
+            # Silent listen-only join — no beep, no impact on conference lifecycle
+            join_params["muted"] = True
+            join_params["beep"] = "false"
+            join_params["start_on_enter"] = False
+            join_params["end_on_exit"] = False
+            logger.info(f"Monitor mode: silent join for agent {agent_id}")
+
+        elif join_type == 'escalation' and whisper_mode and agent_call_sid:
+            # Supervisor coach mode — hears everything, speaks only to the agent
+            join_params["coach"] = agent_call_sid
+            join_params["beep"] = "false"
+            join_params["start_on_enter"] = False
+            join_params["end_on_exit"] = False
+            logger.info(f"Escalation whisper/coach mode: supervisor {agent_id} coaching agent SID {agent_call_sid}")
+
+        elif join_type in ('backup', 'escalation'):
+            # Backup agent or supervisor (non-whisper) — full participant, silent entry
+            join_params["beep"] = "false"
+            join_params["end_on_exit"] = False
+            logger.info(f"{join_type.capitalize()} mode: agent {agent_id} joining as full participant")
+
+        else:
+            # Normal agent join — standard behavior
+            join_params["end_on_exit"] = True
+            join_params["beep"] = "onEnter"
+
+        # Build the SWML instruction list
+        swml_main = ["answer"]
+
+        # Pre-join TTS whisper: play AI-collected context summary before joining
+        if context and isinstance(context, dict):
+            whisper_text = build_whisper_text(context)
+            if whisper_text:
+                logger.info(f"Adding pre-join whisper: {whisper_text[:100]}...")
+                swml_main.append({
+                    "play": {
+                        "url": f"say:{whisper_text}",
+                        "say_voice": "en-US-Neural2-F"
+                    }
+                })
+
+        swml_main.append({"join_conference": join_params})
 
         swml = {
             "version": "1.0.0",
             "sections": {
-                "main": [
-                    "answer",
-                    {
-                        "join_conference": {
-                            "name": conference_name,
-                            "end_on_exit": True,
-                            "beep": "onEnter",
-                            "status_callback": status_callback,
-                            "status_callback_event": "start end join leave"
-                        }
-                    }
-                ]
+                "main": swml_main
             }
         }
         logger.info(f"Returning SWML: {json.dumps(swml)}")

@@ -48,18 +48,18 @@ function SentimentIndicator({ sentiment }: { sentiment: SentimentData }) {
   const score = sentiment.score;
   const label = score > 0.3 ? 'Positive' : score < -0.3 ? 'Negative' : 'Neutral';
   const Icon = score > 0.3 ? TrendingUp : score < -0.3 ? TrendingDown : Minus;
-  const colorClass = score > 0.3
-    ? 'text-green-400 bg-green-500/15 border-green-500/30'
+  const chipClass = score > 0.3
+    ? 'chip-live'
     : score < -0.3
-    ? 'text-red-400 bg-red-500/15 border-red-500/30'
-    : 'text-gray-400 bg-gray-500/15 border-gray-500/30';
+    ? 'chip-urgent'
+    : 'chip-muted';
 
   return (
-    <div className={`flex items-center gap-1.5 px-2 py-1 rounded-md border text-xs font-medium ${colorClass}`} title={sentiment.reason || label}>
-      <Icon className="w-3 h-3" />
+    <span className={`chip ${chipClass}`} title={sentiment.reason || label}>
+      <Icon className="w-2.5 h-2.5" />
       <span>{label}</span>
       <span className="opacity-70">({score > 0 ? '+' : ''}{score.toFixed(1)})</span>
-    </div>
+    </span>
   );
 }
 
@@ -125,106 +125,122 @@ export function LiveCallTab({
 
   const getStatusDisplay = () => {
     if (isOutboundCallInProgress) {
-      if (callState === 'ringing') return { text: 'Calling...', color: 'text-yellow-400', bgColor: 'bg-yellow-500' };
-      if (callState === 'ending') return { text: 'Ending...', color: 'text-gray-400', bgColor: 'bg-gray-500' };
+      if (callState === 'ringing') return { text: 'Calling', dotClass: 'dot dot-wait', textClass: 'text-wait-soft' };
+      if (callState === 'ending') return { text: 'Ending', dotClass: 'dot dot-offline', textClass: 'text-ink-dim' };
     }
-    if (callState === 'active') return { text: 'Connected', color: 'text-green-400', bgColor: 'bg-green-500' };
-    return { text: 'Recording', color: 'text-green-400', bgColor: 'bg-green-500' };
+    if (callState === 'active') return { text: 'Connected', dotClass: 'dot dot-live', textClass: 'text-live-soft' };
+    return { text: 'Recording', dotClass: 'dot dot-live', textClass: 'text-live-soft' };
   };
 
   const status = getStatusDisplay();
 
   return (
     <div className="h-full flex flex-col">
-      {/* AI Context Panel - Shows data collected by AI agent (ABOVE transcription) */}
+      {/* AI Context Panel */}
       {hasContext(aiContext) && (
-        <div className="p-4 pb-0">
+        <div className="px-5 pt-4">
           <AgentContextCard context={aiContext!} variant="full" collapsible />
         </div>
       )}
 
       {/* Call Event Stream */}
       {callSid && (
-        <div className="px-4 pt-2">
+        <div className="px-5 pt-3">
           <CallEventStream callId={callSid} callSid={callSid} />
         </div>
       )}
 
       {/* Live Transcription */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700 bg-gray-800/80 sticky top-0 z-10">
-          <h3 className="text-lg font-semibold text-white">
-            {isOutboundCallInProgress && callState === 'ringing' ? 'Outbound Call' : 'Live Transcription'}
-          </h3>
-          <div className="flex items-center gap-3">
+        <div className="flex items-center justify-between px-5 h-11 border-b border-rule bg-canvas-sunken/60 sticky top-0 z-10">
+          <div>
+            <div className="kicker mb-0.5">
+              {isOutboundCallInProgress && callState === 'ringing' ? 'Outbound call' : 'Live feed'}
+            </div>
+            <h3 className="font-display text-[18px] text-ink leading-none">
+              {isAICall ? 'Agent is speaking with the caller' : 'Transcription'}
+            </h3>
+          </div>
+          <div className="flex items-center gap-2">
             {sentiment && <SentimentIndicator sentiment={sentiment} />}
-            <div className={`flex items-center gap-2 ${status.color} text-sm`}>
-              <div className={`w-2 h-2 ${status.bgColor} rounded-full animate-pulse`} />
+            <div className={`flex items-center gap-1.5 text-[11.5px] font-medium mono uppercase tracking-wider ${status.textClass}`}>
+              <span className={status.dotClass} />
               {status.text}
             </div>
           </div>
         </div>
-        <div className="flex-1 p-4 overflow-y-auto">
-
-        <div ref={transcriptionContainerRef} className="bg-gray-900 rounded-lg p-4 min-h-[300px] max-h-[400px] overflow-y-auto font-mono text-sm">
-          {isOutboundCallInProgress && callState === 'ringing' && transcription.length === 0 ? (
-            <div className="flex items-center justify-center h-64 text-gray-500">
-              <div className="text-center">
-                <PhoneOutgoing className="w-12 h-12 mx-auto mb-2 text-yellow-400 animate-pulse" />
-                <p className="text-yellow-400 font-medium">Calling...</p>
-                <p className="text-gray-500 text-sm mt-1">Waiting for answer</p>
-              </div>
-            </div>
-          ) : transcription.length > 0 ? (
-            <div className="space-y-3">
-              {transcription.map((entry, idx) => (
-                <div key={entry.id || idx} className="flex flex-col space-y-1">
-                  <div className="flex items-center space-x-2">
-                    <span className={`font-semibold ${
-                      entry.speaker === 'agent' || entry.speaker === 'ai' ? 'text-purple-400' : 'text-blue-400'
-                    }`}>
-                      {entry.speaker === 'agent' ? 'Agent:' : entry.speaker === 'ai' ? 'AI:' : 'Caller:'}
-                    </span>
-                    <span className="text-xs text-gray-500">
-                      {new Date(entry.timestamp).toLocaleTimeString()}
-                    </span>
-                  </div>
-                  <p className="text-gray-300 pl-4">{entry.text}</p>
+        <div className="flex-1 px-5 pt-4 pb-5 overflow-y-auto">
+          <div
+            ref={transcriptionContainerRef}
+            className="relative bg-canvas-sunken border border-rule rounded-md min-h-[320px] max-h-[440px] overflow-y-auto p-5"
+          >
+            {isOutboundCallInProgress && callState === 'ringing' && transcription.length === 0 ? (
+              <div className="flex items-center justify-center h-64">
+                <div className="text-center">
+                  <PhoneOutgoing className="w-6 h-6 mx-auto mb-3 text-wait-soft animate-pulse" />
+                  <p className="font-display text-[22px] text-wait-soft leading-none">Calling…</p>
+                  <p className="text-[12px] text-ink-dim mt-2 mono uppercase tracking-wider">Waiting for answer</p>
                 </div>
-              ))}
-              {/* scroll anchor removed - container scrolls via ref */}
-            </div>
-          ) : (
-            <div className="flex items-center justify-center h-64 text-gray-500">
-              <div className="text-center">
-                <Mic className="w-12 h-12 mx-auto mb-2 opacity-50" />
-                <p>Waiting for conversation...</p>
               </div>
-            </div>
-          )}
-        </div>
+            ) : transcription.length > 0 ? (
+              <div className="space-y-4">
+                {transcription.map((entry, idx) => {
+                  const isAgent = entry.speaker === 'agent' || entry.speaker === 'ai';
+                  return (
+                    <div key={entry.id || idx} className="flex gap-3 animate-fade-up">
+                      <div className="shrink-0 pt-0.5 w-16">
+                        <span className={`kicker ${
+                          entry.speaker === 'agent' ? 'text-live-soft' :
+                          entry.speaker === 'ai' ? 'text-ai-soft' :
+                          'text-info-soft'
+                        }`} style={{ color: 'inherit' }}>
+                          {entry.speaker === 'agent' ? 'Agent' : entry.speaker === 'ai' ? 'AI' : 'Caller'}
+                        </span>
+                        <div className="mono text-[9.5px] text-ink-faint mt-0.5">
+                          {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                        </div>
+                      </div>
+                      <div className={`flex-1 text-[13px] leading-relaxed pl-3 border-l ${
+                        isAgent ? 'border-ai/30' : 'border-info/30'
+                      } text-ink`}>
+                        {entry.text}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="flex items-center justify-center h-64">
+                <div className="text-center">
+                  <Mic className="w-5 h-5 mx-auto mb-3 text-ink-faint" />
+                  <p className="font-display text-[20px] text-ink-muted leading-none">Listening…</p>
+                  <p className="text-[12px] text-ink-dim mt-2 mono uppercase tracking-wider">
+                    Transcript will stream here
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* AI Message Controls - Only for AI calls */}
+      {/* AI Message Controls */}
       {isAICall && (
-        <div className="border-t border-gray-700 p-4 bg-gray-800">
-          <div className="bg-purple-900/30 border border-purple-500/30 rounded-lg p-3 mb-3">
-            <div className="flex items-start gap-2">
-              <Bot className="w-4 h-4 text-purple-400 mt-0.5 flex-shrink-0" />
-              <p className="text-xs text-purple-300">
-                Send instructions to guide the AI agent's behavior during this call
-              </p>
-            </div>
+        <div className="border-t border-rule px-5 py-4 bg-canvas-sunken">
+          <div className="flex items-center gap-2 mb-3">
+            <Bot className="w-3.5 h-3.5 text-ai-soft" />
+            <span className="kicker" style={{ color: '#B0A4FF' }}>Whisper to AI</span>
+            <span className="text-[11.5px] text-ink-dim ml-1">
+              Inject a system instruction mid-call.
+            </span>
           </div>
 
-          {/* Quick Templates */}
-          <div className="flex flex-wrap gap-2 mb-3">
+          <div className="flex flex-wrap gap-1.5 mb-3">
             {quickTemplates.map((template, idx) => (
               <button
                 key={idx}
                 onClick={() => setSystemMessage(template.message)}
-                className="text-xs px-3 py-1.5 bg-purple-500/20 text-purple-300 rounded-md hover:bg-purple-500/30 transition-colors"
+                className="text-[11.5px] px-2.5 py-1 rounded bg-ai/10 text-ai-soft border border-ai/25 hover:bg-ai/15 transition-colors"
                 disabled={isSending}
               >
                 {template.label}
@@ -232,48 +248,40 @@ export function LiveCallTab({
             ))}
           </div>
 
-          {/* Message Input */}
           <div className="flex gap-2">
             <input
               type="text"
               value={systemMessage}
               onChange={(e) => setSystemMessage(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') sendSystemMessage();
-              }}
-              placeholder="Type message to AI agent..."
-              className="flex-1 px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-sm text-white placeholder-gray-400 focus:outline-none focus:border-purple-500"
+              onKeyDown={(e) => { if (e.key === 'Enter') sendSystemMessage(); }}
+              placeholder="Tell the AI what to do next…"
+              className="input flex-1"
               disabled={isSending}
             />
             <button
               onClick={sendSystemMessage}
               disabled={!systemMessage.trim() || isSending}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-2 ${
-                systemMessage.trim() && !isSending
-                  ? 'bg-purple-600 text-white hover:bg-purple-700'
-                  : 'bg-gray-600 text-gray-400 cursor-not-allowed'
-              }`}
+              className="btn-secondary !border-ai/30 !text-ai-soft hover:!bg-ai/10 disabled:opacity-50"
             >
               {isSending ? (
-                <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent" />
+                <div className="animate-spin rounded-full h-3.5 w-3.5 border-2 border-ai-soft border-t-transparent" />
               ) : (
-                <Send className="w-4 h-4" />
+                <Send className="w-3.5 h-3.5" />
               )}
               Send
             </button>
           </div>
 
-          {/* Status Messages */}
           {error && (
-            <div className="mt-2 p-2 bg-red-500/20 border border-red-500/50 rounded-lg text-xs text-red-400 flex items-center gap-2">
+            <div className="mt-2 p-2 bg-urgent/10 border border-urgent/30 rounded text-[11.5px] text-urgent-soft flex items-center gap-2">
               <AlertCircle className="w-3 h-3 flex-shrink-0" />
               {error}
             </div>
           )}
           {success && (
-            <div className="mt-2 p-2 bg-green-500/20 border border-green-500/50 rounded-lg text-xs text-green-400 flex items-center gap-2">
+            <div className="mt-2 p-2 bg-live/10 border border-live/30 rounded text-[11.5px] text-live-soft flex items-center gap-2">
               <Bot className="w-3 h-3 flex-shrink-0" />
-              Message sent to AI agent successfully!
+              Whisper delivered to the AI.
             </div>
           )}
         </div>

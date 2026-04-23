@@ -1,6 +1,8 @@
 export interface User {
   id: string;
   email: string;
+  name?: string;
+  role?: string; // 'agent' | 'supervisor' | 'admin'
   is_active: boolean;
   created_at: string;
 }

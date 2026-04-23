@@ -5,7 +5,9 @@ from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth, validate_json
 from app.utils.url_utils import get_base_url
+from app.services.queue_service import QueueService
 from datetime import datetime, timedelta
+from sqlalchemy import func
 import logging
 import secrets
 import json
@@ -340,28 +342,46 @@ def end_call(call_id):
 
         logger.info(f"Attempting to end call via SignalWire API: {call.signalwire_call_sid}")
 
-        # Get SignalWire API and end the call using SignalWire SID
-        sw_api = get_signalwire_api()
-        result = sw_api.end_call(call.signalwire_call_sid)
+        # Try to end via SignalWire API, but don't fail if call already ended on their side
+        sw_api_error = None
+        try:
+            sw_api = get_signalwire_api()
+            result = sw_api.end_call(call.signalwire_call_sid)
+            logger.info(f"SignalWire API response: {result}")
+        except Exception as sw_err:
+            # Call may already be ended on SignalWire's side — that's OK, still update our state
+            sw_api_error = str(sw_err)
+            logger.warning(f"SignalWire end_call failed (call may already be ended): {sw_api_error}")
 
-        logger.info(f"SignalWire API response: {result}")
-
-        # Update call status
+        # Always update call status and emit events regardless of SignalWire API result
         call.update_status('completed')
-        call.ended_at = datetime.utcnow()
+        call.ended_at = call.ended_at or datetime.utcnow()
+        if call.answered_at and not call.duration:
+            call.duration = int((call.ended_at - call.answered_at).total_seconds())
         db.session.commit()
         logger.info(f"Call status updated to 'completed' in database")
 
         # Emit call update so frontend removes from active list
-        # Don't rely on webhook - it might not fire if call already ended
         from app.services.callcenter_socketio import emit_call_update
         emit_call_update(call)
+
+        # Also emit call_ended for comprehensive UI cleanup (matches webhook pattern)
+        from app import socketio
+        call_ended_data = {
+            'callId': call.id,
+            'call_sid': call.signalwire_call_sid,
+            'conference_name': call.conference_name,
+            'reset_ui': True
+        }
+        if call.user_id:
+            socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
+        socketio.emit('call_ended', call_ended_data)
 
         return jsonify({
             'success': True,
             'call_id': call.id,
             'call_sid': call.signalwire_call_sid,
-            'message': 'Call ended successfully'
+            'message': 'Call ended successfully' if not sw_api_error else 'Call marked as ended (was already completed on SignalWire)'
         }), 200
 
     except Exception as e:
@@ -545,11 +565,13 @@ def report_sentiment(call_db_id):
             from app.models import Contact
             contact = Contact.query.get(call.contact_id)
             if contact:
-                # Simple running average from all calls with sentiment data
-                from sqlalchemy import func
-                avg = db.session.query(func.avg(Call.sentiment_score)).filter(
+                # Average sentiment across all completed calls — treat no-sentiment calls as 0 (neutral)
+                from sqlalchemy import func, case
+                avg = db.session.query(
+                    func.avg(case((Call.sentiment_score.isnot(None), Call.sentiment_score), else_=0))
+                ).filter(
                     Call.contact_id == call.contact_id,
-                    Call.sentiment_score.isnot(None)
+                    Call.status.in_(['ended', 'completed'])
                 ).scalar()
                 if avg is not None:
                     contact.average_sentiment = round(float(avg), 2)
@@ -681,7 +703,9 @@ def take_queued_call(call_id):
             return jsonify({'error': 'Call not found'}), 404
 
         # Check if call is in a takeable state
-        if call.status not in ['waiting', 'assigned', 'queued']:
+        # Include 'ai_active' and 'answered' so agents can take calls while AI is still handling
+        takeable_statuses = ['waiting', 'assigned', 'queued', 'ai_active', 'answered']
+        if call.status not in takeable_statuses:
             logger.warning(f"Call {call_id} cannot be taken (status={call.status})")
             return jsonify({'error': f'Call cannot be taken (status: {call.status})'}), 400
 
@@ -883,3 +907,56 @@ def cleanup_stale_calls():
     except Exception as e:
         logger.error(f"Failed to cleanup stale calls: {str(e)}")
         return jsonify({'error': f'Failed to cleanup stale calls: {str(e)}'}), 500
+
+
+@calls_bp.route('/my-stats', methods=['GET'])
+@require_auth
+def get_my_stats():
+    """Get real-time stats for the current agent."""
+    try:
+        user_id = request.user_id
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Calls handled today (where this agent was assigned or initiated)
+        calls_today = db.session.query(func.count(Call.id)).filter(
+            ((Call.assigned_agent_id == user_id) | (Call.user_id == user_id)),
+            Call.created_at >= today_start,
+            Call.status.in_(['ended', 'completed', 'answered', 'active'])
+        ).scalar() or 0
+
+        # Average handle time today (seconds) for completed calls
+        avg_handle_time = db.session.query(func.avg(Call.duration)).filter(
+            ((Call.assigned_agent_id == user_id) | (Call.user_id == user_id)),
+            Call.created_at >= today_start,
+            Call.duration.isnot(None)
+        ).scalar() or 0
+
+        # Queue depth across all queues
+        total_queue_depth = 0
+        longest_wait = 0
+        try:
+            queue_service = QueueService(redis_client)
+            waiting_calls = db.session.query(Call).filter(
+                Call.status.in_(['waiting', 'queued', 'assigned'])
+            ).all()
+            total_queue_depth = len(waiting_calls)
+            for call in waiting_calls:
+                wait = call.wait_time_seconds
+                if wait > longest_wait:
+                    longest_wait = wait
+        except Exception:
+            pass  # Redis may not be available
+
+        return jsonify({
+            'success': True,
+            'stats': {
+                'callsToday': calls_today,
+                'avgHandleTime': int(avg_handle_time),
+                'queueDepth': total_queue_depth,
+                'longestWait': longest_wait,
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get agent stats: {str(e)}")
+        return jsonify({'error': str(e)}), 500

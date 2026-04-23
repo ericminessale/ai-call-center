@@ -38,6 +38,31 @@ def require_auth(f):
     return decorated_function
 
 
+def require_role(*allowed_roles):
+    """Decorator to require specific user roles. Must be used AFTER @require_auth.
+
+    Usage:
+        @require_auth
+        @require_role('supervisor', 'admin')
+        def protected_endpoint():
+            ...
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if not hasattr(request, 'current_user') or not request.current_user:
+                return jsonify({'error': 'Authentication required'}), 401
+            if request.current_user.role not in allowed_roles:
+                return jsonify({
+                    'error': 'Insufficient permissions',
+                    'required_roles': list(allowed_roles),
+                    'current_role': request.current_user.role
+                }), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+
 def validate_json(*expected_args):
     """Decorator to validate JSON request body."""
     def decorator(f):

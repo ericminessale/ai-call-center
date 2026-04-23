@@ -3,9 +3,7 @@ import {
   Eye,
   Bot,
   User,
-  Phone,
   MessageSquare,
-  Clock,
   TrendingUp,
   TrendingDown,
   Minus,
@@ -25,7 +23,6 @@ type ViewFilter = 'all' | 'ai-calls' | 'human-calls' | 'needs-attention';
 export function SupervisorPanel({ activeCalls, onSelectCall }: SupervisorPanelProps) {
   const [viewFilter, setViewFilter] = useState<ViewFilter>('all');
 
-  // Filter calls
   const filteredCalls = activeCalls.filter((call) => {
     switch (viewFilter) {
       case 'ai-calls':
@@ -33,23 +30,18 @@ export function SupervisorPanel({ activeCalls, onSelectCall }: SupervisorPanelPr
       case 'human-calls':
         return call.handler_type === 'human' && call.status === 'active';
       case 'needs-attention':
-        // Calls with negative sentiment or long duration
         return (
           (call.sentiment !== undefined && call.sentiment < -0.3) ||
-          (call.duration && call.duration > 600) // > 10 minutes
+          (call.duration && call.duration > 600)
         );
       default:
         return true;
     }
   });
 
-  // Separate AI and human calls
   const aiCalls = filteredCalls.filter((c) => c.status === 'ai_active');
-  const humanCalls = filteredCalls.filter(
-    (c) => c.handler_type === 'human' && c.status === 'active'
-  );
+  const humanCalls = filteredCalls.filter((c) => c.handler_type === 'human' && c.status === 'active');
 
-  // Quick stats
   const needsAttention = activeCalls.filter(
     (c) =>
       (c.sentiment !== undefined && c.sentiment < -0.3) ||
@@ -57,103 +49,73 @@ export function SupervisorPanel({ activeCalls, onSelectCall }: SupervisorPanelPr
   ).length;
 
   const filterButtons: { key: ViewFilter; label: string; count?: number }[] = [
-    { key: 'all', label: 'All Calls', count: activeCalls.length },
-    { key: 'ai-calls', label: 'AI Agents', count: aiCalls.length },
+    { key: 'all', label: 'All', count: activeCalls.length },
+    { key: 'ai-calls', label: 'AI', count: aiCalls.length },
     { key: 'human-calls', label: 'Agents', count: humanCalls.length },
-    { key: 'needs-attention', label: 'Attention', count: needsAttention },
+    { key: 'needs-attention', label: 'Attn', count: needsAttention },
   ];
 
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="p-3 border-b border-gray-700">
-        <h2 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
-          <Eye className="w-4 h-4 text-blue-400" />
-          Supervisor View
-        </h2>
+      <div className="px-4 pt-4 pb-3 border-b border-rule">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Eye className="w-3.5 h-3.5 text-info-soft" />
+            <span className="kicker">Supervisor view</span>
+          </div>
+          <span className="mono text-[11px] text-ink-dim">{activeCalls.length}</span>
+        </div>
 
-        {/* Filter Buttons */}
-        <div className="flex flex-wrap gap-1">
+        {/* Filter tabs */}
+        <div className="flex items-center gap-0 p-0.5 bg-canvas-raised rounded border border-rule">
           {filterButtons.map((filter) => (
             <button
               key={filter.key}
               onClick={() => setViewFilter(filter.key)}
-              className={`px-2 py-1 text-xs rounded transition-colors ${
+              className={`flex-1 px-1.5 py-1 text-[11.5px] font-medium rounded transition-colors ${
                 viewFilter === filter.key
                   ? filter.key === 'needs-attention'
-                    ? 'bg-red-600 text-white'
-                    : 'bg-blue-600 text-white'
-                  : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
+                    ? 'bg-urgent/15 text-ink border border-urgent/30'
+                    : 'bg-canvas-elevated text-ink border border-rule-strong'
+                  : 'text-ink-dim hover:text-ink-muted border border-transparent'
               }`}
             >
               {filter.label}
               {filter.count !== undefined && filter.count > 0 && (
-                <span className="ml-1">({filter.count})</span>
+                <span className="mono text-[10px] ml-1 opacity-80">{filter.count}</span>
               )}
             </button>
           ))}
         </div>
       </div>
 
-      {/* Quick Stats */}
-      <div className="grid grid-cols-3 gap-2 p-3 border-b border-gray-700">
-        <div className="text-center p-2 bg-gray-700/50 rounded">
-          <div className="text-lg font-bold text-white">{activeCalls.length}</div>
-          <div className="text-xs text-gray-400">Active</div>
-        </div>
-        <div className="text-center p-2 bg-purple-900/30 rounded">
-          <div className="text-lg font-bold text-purple-400">
-            {aiCalls.length}
-          </div>
-          <div className="text-xs text-gray-400">AI Calls</div>
-        </div>
-        <div className="text-center p-2 bg-red-900/30 rounded">
-          <div className="text-lg font-bold text-red-400">{needsAttention}</div>
-          <div className="text-xs text-gray-400">Attention</div>
-        </div>
+      {/* Quick Stats — inline, no grid, no dividers */}
+      <div className="px-4 py-4 flex items-baseline gap-8">
+        <MiniStat label="Active" value={activeCalls.length} tone="default" />
+        <MiniStat label="AI" value={aiCalls.length} tone="ai" />
+        <MiniStat label="Attn" value={needsAttention} tone="urgent" />
       </div>
 
-      {/* Call List */}
+      {/* Call list */}
       <div className="flex-1 overflow-y-auto">
         {filteredCalls.length === 0 ? (
-          <div className="p-4 text-center text-gray-400">
-            <Eye className="w-8 h-8 mx-auto mb-2 opacity-50" />
-            <p className="text-sm">No calls to monitor</p>
-          </div>
+          <EmptyState />
         ) : (
           <>
-            {/* AI Calls Section */}
             {aiCalls.length > 0 && (
-              <div className="mb-2">
-                <div className="px-3 py-2 text-xs font-semibold text-purple-400 uppercase tracking-wider bg-purple-900/20 flex items-center gap-2">
-                  <Bot className="w-3 h-3" />
-                  AI Agent Calls ({aiCalls.length})
-                </div>
+              <MonitorSection title="AI agents" icon={<Bot className="w-3 h-3" />} tone="ai" count={aiCalls.length}>
                 {aiCalls.map((call) => (
-                  <SupervisorCallCard
-                    key={call.id}
-                    call={call}
-                    onClick={() => onSelectCall(call)}
-                  />
+                  <SupervisorCallCard key={call.id} call={call} onClick={() => onSelectCall(call)} />
                 ))}
-              </div>
+              </MonitorSection>
             )}
-
-            {/* Human Agent Calls Section */}
             {humanCalls.length > 0 && (
-              <div>
-                <div className="px-3 py-2 text-xs font-semibold text-blue-400 uppercase tracking-wider bg-blue-900/20 flex items-center gap-2">
-                  <User className="w-3 h-3" />
-                  Agent Calls ({humanCalls.length})
-                </div>
+              <MonitorSection title="Human agents" icon={<User className="w-3 h-3" />} tone="info" count={humanCalls.length}>
                 {humanCalls.map((call) => (
-                  <SupervisorCallCard
-                    key={call.id}
-                    call={call}
-                    onClick={() => onSelectCall(call)}
-                  />
+                  <SupervisorCallCard key={call.id} call={call} onClick={() => onSelectCall(call)} />
                 ))}
-              </div>
+              </MonitorSection>
             )}
           </>
         )}
@@ -162,120 +124,141 @@ export function SupervisorPanel({ activeCalls, onSelectCall }: SupervisorPanelPr
   );
 }
 
-function SupervisorCallCard({
-  call,
-  onClick,
+function EmptyState() {
+  return (
+    <div className="p-8 text-center">
+      <Eye className="w-5 h-5 mx-auto mb-3 text-ink-faint" />
+      <p className="font-display text-[20px] text-ink-muted mb-1">Nothing to monitor</p>
+      <p className="text-[12px] text-ink-dim">Live calls appear here as they open.</p>
+    </div>
+  );
+}
+
+function MiniStat({ label, value, tone }: { label: string; value: number; tone: 'default' | 'ai' | 'urgent' }) {
+  const numColor =
+    tone === 'ai' ? 'text-ai-soft' :
+    tone === 'urgent' ? 'text-urgent-soft' : 'text-ink';
+  return (
+    <div className="flex flex-col gap-0.5 items-start">
+      <span className="kicker">{label}</span>
+      <span className={`font-heading font-semibold text-[24px] leading-none tabular-nums ${numColor}`}>{value}</span>
+    </div>
+  );
+}
+
+function MonitorSection({
+  title,
+  icon,
+  tone,
+  count,
+  children,
 }: {
-  call: Call;
-  onClick: () => void;
+  title: string;
+  icon: React.ReactNode;
+  tone: 'ai' | 'info';
+  count: number;
+  children: React.ReactNode;
 }) {
+  const colorClass = tone === 'ai' ? 'text-ai-soft' : 'text-info-soft';
+  return (
+    <div>
+      <div className="sticky top-0 z-10 bg-canvas-sunken/95 backdrop-blur-sm flex items-center justify-between px-4 py-1.5 border-b border-rule">
+        <div className={`flex items-center gap-2 ${colorClass}`}>
+          {icon}
+          <span className="kicker" style={{ color: 'inherit' }}>{title}</span>
+        </div>
+        <span className="mono text-[10px] text-ink-dim">{count}</span>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function SupervisorCallCard({ call, onClick }: { call: Call; onClick: () => void }) {
   const isAI = call.status === 'ai_active';
   const contactName = call.contact?.displayName || call.from_number || 'Unknown';
   const company = call.contact?.company;
   const isVip = call.contact?.isVip;
 
-  // Determine sentiment indicator
   const getSentimentIndicator = () => {
     if (call.sentiment === undefined) return null;
-    if (call.sentiment > 0.3)
-      return { icon: TrendingUp, color: 'text-green-400', label: 'Positive' };
-    if (call.sentiment < -0.3)
-      return { icon: TrendingDown, color: 'text-red-400', label: 'Negative' };
-    return { icon: Minus, color: 'text-gray-400', label: 'Neutral' };
+    if (call.sentiment > 0.3) return { icon: TrendingUp, color: 'text-live-soft', label: 'Positive' };
+    if (call.sentiment < -0.3) return { icon: TrendingDown, color: 'text-urgent-soft', label: 'Negative' };
+    return { icon: Minus, color: 'text-ink-dim', label: 'Neutral' };
   };
 
   const sentiment = getSentimentIndicator();
-
-  // Check if needs attention
   const needsAttention =
     (call.sentiment !== undefined && call.sentiment < -0.3) ||
     (call.duration && call.duration > 600);
 
-  // Format duration
   const formatDuration = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}:${String(secs).padStart(2, '0')}`;
   };
 
+  const railColor = needsAttention ? 'border-l-urgent' : isAI ? 'border-l-ai' : 'border-l-live';
+
   return (
     <button
       onClick={onClick}
-      className={`w-full px-3 py-3 text-left hover:bg-gray-700/50 transition-colors border-l-2 ${
-        needsAttention ? 'border-red-500 bg-red-900/10' : 'border-transparent'
-      }`}
+      className={`w-full px-4 py-3 text-left hover:bg-canvas-hover/40 transition-colors border-b border-rule/60 border-l-[2px] ${railColor}`}
     >
       <div className="flex items-start gap-3">
-        {/* Avatar */}
-        <div
-          className={`w-10 h-10 rounded-full flex items-center justify-center text-white font-medium flex-shrink-0 ${
-            isAI ? 'bg-purple-600' : 'bg-blue-600'
-          }`}
-        >
-          {isAI ? <Bot className="w-5 h-5" /> : contactName.charAt(0).toUpperCase()}
+        <div className={`w-9 h-9 rounded flex items-center justify-center text-[13px] font-semibold shrink-0 ${
+          isAI ? 'bg-ai/15 text-ai-soft border border-ai/30' : 'bg-live/15 text-live-soft border border-live/30'
+        }`}>
+          {isAI ? <Bot className="w-4 h-4" /> : contactName.charAt(0).toUpperCase()}
         </div>
 
-        {/* Info */}
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="font-medium text-white truncate">{contactName}</span>
-            {isVip && (
-              <Star className="w-3 h-3 text-yellow-400 fill-yellow-400 flex-shrink-0" />
-            )}
-            {needsAttention && (
-              <AlertTriangle className="w-3 h-3 text-red-400 flex-shrink-0" />
-            )}
+          <div className="flex items-center gap-1.5">
+            <span className="font-medium text-ink truncate text-[13.5px]">{contactName}</span>
+            {isVip && <Star className="w-3 h-3 text-wait fill-wait flex-shrink-0" />}
+            {needsAttention && <AlertTriangle className="w-3 h-3 text-urgent-soft flex-shrink-0" />}
           </div>
 
-          <div className="flex items-center gap-2 text-xs text-gray-400 mt-0.5">
+          <div className="flex items-center gap-1.5 text-[11.5px] text-ink-dim mt-0.5">
             {isAI && call.ai_agent_name && (
               <>
                 <Bot className="w-3 h-3" />
-                <span>{call.ai_agent_name}</span>
-                <span>•</span>
+                <span className="truncate mono">{call.ai_agent_name}</span>
+                <span className="text-ink-faint">·</span>
               </>
             )}
             {company && (
               <>
                 <Building2 className="w-3 h-3" />
                 <span className="truncate">{company}</span>
-                <span>•</span>
+                <span className="text-ink-faint">·</span>
               </>
             )}
-            <Clock className="w-3 h-3" />
-            <span>{formatDuration(call.duration || 0)}</span>
+            <span className="mono">{formatDuration(call.duration || 0)}</span>
           </div>
 
-          {/* Last transcript snippet */}
           {call.ai_summary && (
-            <div className="mt-1 text-xs text-gray-500 truncate">
+            <div className="mt-1 text-[11.5px] text-ink-dim truncate italic">
               "{call.ai_summary}"
             </div>
           )}
         </div>
 
-        {/* Sentiment and Actions */}
-        <div className="flex flex-col items-end gap-2">
+        <div className="flex flex-col items-end gap-1.5 shrink-0">
           {sentiment && (
-            <div className={`flex items-center gap-1 text-xs ${sentiment.color}`}>
+            <div className={`flex items-center gap-1 text-[10.5px] font-medium ${sentiment.color}`}>
               <sentiment.icon className="w-3 h-3" />
-              <span>{sentiment.label}</span>
+              <span className="uppercase tracking-wider">{sentiment.label}</span>
             </div>
           )}
-
           {isAI && (
-            <div className="flex items-center gap-1">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClick();
-                }}
-                className="p-1 bg-purple-600/30 hover:bg-purple-600/50 text-purple-400 rounded transition-colors"
-                title="Inject Message"
-              >
-                <MessageSquare className="w-3 h-3" />
-              </button>
-            </div>
+            <button
+              onClick={(e) => { e.stopPropagation(); onClick(); }}
+              className="p-1 rounded bg-ai/10 hover:bg-ai/20 text-ai-soft transition-colors border border-ai/25"
+              title="Inject message"
+            >
+              <MessageSquare className="w-3 h-3" />
+            </button>
           )}
         </div>
       </div>

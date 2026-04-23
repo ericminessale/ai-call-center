@@ -13,14 +13,11 @@ RUN apt-get update && apt-get install -y \
 
 # Copy requirements first for better caching
 COPY requirements.txt .
-
-# Install SignalWire Agents SDK from the local copy if available
-# Otherwise install from PyPI
 RUN pip install --no-cache-dir -r requirements.txt
 
-# If you have the signalwire-agents SDK locally, uncomment:
-# COPY ../signalwire-agents /signalwire-agents
-# RUN pip install -e /signalwire-agents
+# Install SignalWire SDK from local copy (repo is private, can't clone in Docker)
+COPY signalwire-sdk /signalwire-sdk
+RUN pip install --no-cache-dir /signalwire-sdk
 
 # Copy application code
 COPY . .

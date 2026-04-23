@@ -484,13 +484,13 @@ def post_prompt():
                 queue_svc = QueueService(redis_client)
                 queue_svc.remove_call_from_all_queues(call_id)
 
-            # post_prompt fires when the AI conversation ends — mark the call as ended
-            # so the frontend can clean up, even if the call-status webhook is delayed
-            if call.status not in ('ended', 'completed'):
-                call.status = 'completed'
-                call.ended_at = call.ended_at or datetime.utcnow()
-                if call.answered_at:
-                    call.duration = int((call.ended_at - call.answered_at).total_seconds())
+            # post_prompt fires when the AI conversation ends, NOT when the phone call ends.
+            # The caller may still be on the line (e.g., waiting in queue for a human agent).
+            # Do NOT mark as 'completed' here — let the call-status webhook handle final status.
+            # Instead, transition active calls back to 'waiting' so agents can take them.
+            if call.status in ('answered', 'ai_active'):
+                call.status = 'waiting'
+                logger.info(f"Call {call_id} AI session ended — set to 'waiting' for human pickup")
 
             db.session.commit()
             logger.info(f"✓ Updated call {call.id} with post_prompt data (status: {call.status})")
@@ -502,19 +502,21 @@ def post_prompt():
                 call_id=call.id
             )
 
-            # Emit full call_update so frontend can remove from active calls
+            # Emit call_update so frontend sees the status change
             from app.services.callcenter_socketio import emit_call_update
             emit_call_update(call)
 
-            # Emit call_ended for UI cleanup (matches the pattern in call-status webhook)
-            call_ended_data = {
-                'callId': call.id,
-                'call_sid': call_id,
-                'reset_ui': True
-            }
-            if call.user_id:
-                socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
-            socketio.emit('call_ended', call_ended_data)
+            # Only emit call_ended if the call is actually ended/completed
+            # If status is 'waiting', the call is still active and should stay in the queue
+            if call.status in ('ended', 'completed'):
+                call_ended_data = {
+                    'callId': call.id,
+                    'call_sid': call_id,
+                    'reset_ui': True
+                }
+                if call.user_id:
+                    socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
+                socketio.emit('call_ended', call_ended_data)
 
             # Also emit to call room
             socketio.emit('post_prompt_received', {

@@ -3,21 +3,25 @@ import { QueueConfig } from '../types/callcenter';
 /**
  * Shared queue badge color utility.
  * Colors are derived from a slug hash so the same queue always gets the same color.
+ * Tuned to match the "OPERATOR" palette — desaturated, warm, readable over the canvas.
  */
 
 interface QueueBadgeColor {
-  bg: string;    // Tailwind bg class  e.g. "bg-blue-900/40"
-  text: string;  // Tailwind text class e.g. "text-blue-300"
+  bg: string;    // Tailwind bg class
+  text: string;  // Tailwind text class
   pill: string;  // Combined classes for a pill badge
+  dot: string;   // Matching dot color (hex)
 }
 
+// Brand-palette only: blue / turquoise / gold / neutrals.
+// Fuchsia is reserved per brand 10% rule. Queues are internal data buckets, so we
+// intentionally rotate through non-accent brand colors + neutrals.
 const PALETTE: QueueBadgeColor[] = [
-  { bg: 'bg-blue-900/40',    text: 'text-blue-300',    pill: 'bg-blue-900/40 text-blue-300' },
-  { bg: 'bg-emerald-900/40', text: 'text-emerald-300', pill: 'bg-emerald-900/40 text-emerald-300' },
-  { bg: 'bg-amber-900/40',   text: 'text-amber-300',   pill: 'bg-amber-900/40 text-amber-300' },
-  { bg: 'bg-violet-900/40',  text: 'text-violet-300',  pill: 'bg-violet-900/40 text-violet-300' },
-  { bg: 'bg-rose-900/40',    text: 'text-rose-300',    pill: 'bg-rose-900/40 text-rose-300' },
-  { bg: 'bg-cyan-900/40',    text: 'text-cyan-300',    pill: 'bg-cyan-900/40 text-cyan-300' },
+  { bg: 'bg-ai/10',     text: 'text-ai-soft',     pill: 'bg-ai/10 text-ai-soft border border-ai/25',           dot: '#40E0D0' },
+  { bg: 'bg-info/10',   text: 'text-info-soft',   pill: 'bg-info/10 text-info-soft border border-info/25',     dot: '#044EF4' },
+  { bg: 'bg-wait/10',   text: 'text-wait-soft',   pill: 'bg-wait/10 text-wait-soft border border-wait/25',     dot: '#FFD700' },
+  { bg: 'bg-live/10',   text: 'text-live-soft',   pill: 'bg-live/10 text-live-soft border border-live/25',     dot: '#22c55e' },
+  { bg: 'bg-canvas-elevated', text: 'text-ink-muted', pill: 'bg-canvas-elevated text-ink-muted border border-rule', dot: '#a0a0aa' },
 ];
 
 /** Simple string hash — deterministic for the same slug. */

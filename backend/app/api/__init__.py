@@ -13,3 +13,4 @@ from app.api import auth, calls, swml, webhooks, admin
 # Import blueprints defined in their own modules
 from app.api.contacts import contacts_bp
 from app.api.conferences import conferences_bp
+from app.api.call_control import call_control_bp

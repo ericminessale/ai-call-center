@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { X } from 'lucide-react';
 import { Contact } from '../../types/callcenter';
 import { contactsApi } from '../../services/api';
 import { logger } from '../../lib/logger';
@@ -47,168 +48,185 @@ export function EditContactModal({ contact, onClose, onSave }: EditContactModalP
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-gray-800 rounded-lg p-6 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
-        <h2 className="text-lg font-semibold text-white mb-4">Edit Contact</h2>
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-canvas-raised rounded-md w-full max-w-lg max-h-[90vh] overflow-y-auto shadow-panel">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-rule">
+          <div>
+            <div className="kicker mb-0.5">Edit</div>
+            <h2 className="font-heading text-[20px] font-semibold text-ink leading-none tracking-heading">
+              Contact
+            </h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="btn-ghost !p-1.5"
+            aria-label="Close"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={handleSubmit} className="px-6 py-5 space-y-4">
           <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">First Name</label>
+            <Field label="First name">
               <input
                 type="text"
                 value={formData.firstName}
                 onChange={(e) => setFormData({ ...formData, firstName: e.target.value })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+                className="input"
               />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">Last Name</label>
+            </Field>
+            <Field label="Last name">
               <input
                 type="text"
                 value={formData.lastName}
                 onChange={(e) => setFormData({ ...formData, lastName: e.target.value })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+                className="input"
               />
-            </div>
+            </Field>
           </div>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Display Name</label>
+          <Field label="Display name" required>
             <input
               type="text"
               value={formData.displayName}
               onChange={(e) => setFormData({ ...formData, displayName: e.target.value })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+              className="input"
               required
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Phone</label>
+          <Field label="Phone" required>
             <input
               type="tel"
               value={formData.phone}
               onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+              className="input mono"
               required
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Email</label>
+          <Field label="Email">
             <input
               type="email"
               value={formData.email}
               onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+              className="input"
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Company</label>
+          <Field label="Company">
             <input
               type="text"
               value={formData.company}
               onChange={(e) => setFormData({ ...formData, company: e.target.value })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+              className="input"
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Job Title</label>
+          <Field label="Job title">
             <input
               type="text"
               value={formData.jobTitle}
               onChange={(e) => setFormData({ ...formData, jobTitle: e.target.value })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+              className="input"
             />
-          </div>
+          </Field>
 
           <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">Account Tier</label>
+            <Field label="Account tier">
               <select
                 value={formData.accountTier}
                 onChange={(e) => setFormData({ ...formData, accountTier: e.target.value as any })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+                className="input"
               >
                 <option value="prospect">Prospect</option>
                 <option value="free">Free</option>
                 <option value="pro">Pro</option>
                 <option value="enterprise">Enterprise</option>
               </select>
-            </div>
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">Account Status</label>
+            </Field>
+            <Field label="Account status">
               <select
                 value={formData.accountStatus}
                 onChange={(e) => setFormData({ ...formData, accountStatus: e.target.value as any })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+                className="input"
               >
                 <option value="active">Active</option>
                 <option value="inactive">Inactive</option>
                 <option value="suspended">Suspended</option>
               </select>
-            </div>
+            </Field>
           </div>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Tags (comma separated)</label>
+          <Field label="Tags">
             <input
               type="text"
               value={formData.tags}
               onChange={(e) => setFormData({ ...formData, tags: e.target.value })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+              className="input"
               placeholder="vip, priority, enterprise"
             />
-          </div>
+          </Field>
 
-          <div className="flex items-center gap-6">
-            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <div className="flex items-center gap-6 pt-1">
+            <label className="flex items-center gap-2 text-[13px] text-ink cursor-pointer select-none">
               <input
                 type="checkbox"
                 checked={formData.isVip}
                 onChange={(e) => setFormData({ ...formData, isVip: e.target.checked })}
-                className="rounded bg-gray-700 border-gray-600"
+                className="w-3.5 h-3.5 rounded-sm accent-sw-blue"
               />
               VIP
             </label>
-            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+            <label className="flex items-center gap-2 text-[13px] text-ink cursor-pointer select-none">
               <input
                 type="checkbox"
                 checked={formData.isBlocked}
                 onChange={(e) => setFormData({ ...formData, isBlocked: e.target.checked })}
-                className="rounded bg-gray-700 border-gray-600"
+                className="w-3.5 h-3.5 rounded-sm accent-sw-blue"
               />
               Blocked
             </label>
           </div>
 
           {error && (
-            <div className="p-3 bg-red-500/20 border border-red-500 rounded-lg text-red-400 text-sm">
+            <div className="px-3 py-2 bg-urgent/10 border border-urgent/30 rounded text-urgent-soft text-[12.5px]">
               {error}
             </div>
           )}
 
           <div className="flex justify-end gap-2 pt-2">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
-            >
+            <button type="button" onClick={onClose} className="btn-ghost">
               Cancel
             </button>
-            <button
-              type="submit"
-              disabled={isSaving}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
-            >
-              {isSaving ? 'Saving...' : 'Save Changes'}
+            <button type="submit" disabled={isSaving} className="btn-primary">
+              {isSaving ? 'Saving…' : 'Save changes'}
             </button>
           </div>
         </form>
       </div>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  required,
+  children,
+}: {
+  label: string;
+  required?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <label className="block kicker mb-1.5">
+        {label}{required && <span className="text-sw-fuchsia ml-0.5">*</span>}
+      </label>
+      {children}
     </div>
   );
 }

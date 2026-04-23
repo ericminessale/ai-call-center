@@ -32,8 +32,12 @@ eventlet==0.33.3
 python-dotenv==1.0.0
 Faker==20.1.0
 
-# HTTP Requests 
-requests==2.31.0 
+# WebSocket (for SignalWire tap audio relay)
+flask-sock==0.7.0
+simple-websocket==1.0.0
+
+# HTTP Requests
+requests==2.31.0
 marshmallow==3.20.1 
 python-dateutil==2.8.2 
  

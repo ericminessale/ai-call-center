@@ -1,4 +1,5 @@
-signalwire-agents @ git+https://github.com/signalwire/signalwire-agents.git@main
+# signalwire-sdk installed from local copy via Dockerfile
+# signalwire-sdk @ git+https://github.com/signalwire/signalwire-agents.git@main
 fastapi
 uvicorn[standard]
 python-dotenv

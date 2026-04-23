@@ -131,12 +131,24 @@ export const callsApi = {
   // Get all queued calls (waiting, assigned, urgent) sorted by urgency
   getQueuedCalls: () =>
     api.get<{ calls: Call[]; total: number }>('/api/queues/all/calls'),
+
+  // Get real-time agent stats for header bar
+  getMyStats: () =>
+    api.get<{ success: boolean; stats: { callsToday: number; avgHandleTime: number; queueDepth: number; longestWait: number } }>('/api/calls/my-stats'),
 };
 
 export const conferencesApi = {
   // Prepare a conference join - stores params in Redis and returns a token
   // This is called BEFORE dialing to ensure params are reliably passed
-  prepareJoin: (params: { agent_id: number; conference_name: string; call_id?: number | string }) =>
+  prepareJoin: (params: {
+    agent_id: number;
+    conference_name: string;
+    call_id?: number | string;
+    type?: 'monitor' | 'backup' | 'escalation';
+    context?: Record<string, any>;
+    whisper_mode?: boolean;
+    agent_call_sid?: string;
+  }) =>
     api.post<{ token: string; dial_address: string; conference_name: string }>(
       '/api/conferences/prepare-join',
       params
@@ -239,6 +251,8 @@ export const adminApi = {
   // User management
   listUsers: () =>
     api.get('/api/admin/users'),
+  updateUserRole: (id: number, role: 'admin' | 'supervisor' | 'agent') =>
+    api.put(`/api/admin/users/${id}`, { role }),
   deleteUser: (id: number) =>
     api.delete(`/api/admin/users/${id}`),
 
@@ -263,6 +277,43 @@ export const adminApi = {
     api.get(`/api/admin/queues/${queueId}/agents`),
   updateQueueAgents: (queueId: number, assignments: Array<{ user_id: number; skill_level?: number }>) =>
     api.put(`/api/admin/queues/${queueId}/agents`, { assignments }),
+};
+
+// Real-time call control
+export const callControlApi = {
+  // Hold/Resume
+  hold: (callId: number | string) =>
+    api.post<{ success: boolean; call_id: number; status: string }>(`/api/call-control/${callId}/hold`),
+  unhold: (callId: number | string) =>
+    api.post<{ success: boolean; call_id: number; status: string }>(`/api/call-control/${callId}/unhold`),
+
+  // Play audio/TTS into call
+  playTts: (callId: number | string, text: string, voice?: string) =>
+    api.post<{ success: boolean; call_id: number }>(`/api/call-control/${callId}/play`, { type: 'tts', text, voice }),
+  playAudio: (callId: number | string, url: string) =>
+    api.post<{ success: boolean; call_id: number }>(`/api/call-control/${callId}/play`, { type: 'audio', url }),
+
+  // Recording
+  startRecording: (callId: number | string) =>
+    api.post<{ success: boolean; call_id: number; recording: boolean; control_id?: string }>(`/api/call-control/${callId}/record/start`),
+  stopRecording: (callId: number | string) =>
+    api.post<{ success: boolean; call_id: number; recording: boolean }>(`/api/call-control/${callId}/record/stop`),
+
+  // DTMF
+  sendDtmf: (callId: number | string, digits: string) =>
+    api.post<{ success: boolean; call_id: number; digits: string }>(`/api/call-control/${callId}/dtmf`, { digits }),
+
+  // Monitoring (supervisor/admin only)
+  startMonitor: (callId: number | string) =>
+    api.post<{ success: boolean; monitor_type: 'tap' | 'conference'; dial_address?: string; token?: string; control_id?: string; conference_name?: string }>(`/api/call-control/${callId}/monitor/start`),
+  stopMonitor: (callId: number | string) =>
+    api.post<{ success: boolean; monitor_type: string }>(`/api/call-control/${callId}/monitor/stop`),
+
+  // Multi-agent conferencing
+  requestBackup: (callId: number | string, queueId?: string) =>
+    api.post<{ success: boolean; selected_agent_id: number; selected_agent_name: string; leg_id: number }>(`/api/call-control/${callId}/request-backup`, { queue_id: queueId }),
+  escalate: (callId: number | string, whisper?: boolean) =>
+    api.post<{ success: boolean; supervisor_id: number; supervisor_name: string; leg_id: number; whisper_mode: boolean }>(`/api/call-control/${callId}/escalate`, { whisper }),
 };
 
 // Agent-facing queue operations

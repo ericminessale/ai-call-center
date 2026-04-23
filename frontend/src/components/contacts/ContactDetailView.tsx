@@ -684,44 +684,44 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   };
 
   return (
-    <div className="h-full flex flex-col">
-      {/* Header */}
-      <div className="bg-gray-800 border-b border-gray-700 p-4">
+    <div className="h-full flex flex-col bg-canvas">
+      {/* Header — subtle raised band, distinct from page */}
+      <div className="bg-canvas-raised border-b border-rule p-5">
         <div className="flex items-start gap-4">
-          {/* Avatar */}
-          <div className="w-16 h-16 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-2xl font-bold">
+          {/* Avatar — flat, monogram */}
+          <div className="w-14 h-14 rounded bg-canvas-raised border border-rule-strong flex items-center justify-center text-ink text-[22px] font-semibold tracking-tight">
             {contact.displayName.charAt(0).toUpperCase()}
           </div>
 
           {/* Basic Info */}
-          <div className="flex-1">
+          <div className="flex-1 min-w-0">
+            <div className="kicker mb-1">Contact</div>
             <div className="flex items-center gap-2">
-              <h2 className="text-xl font-semibold text-white">{contact.displayName}</h2>
+              <h2 className="font-display text-[32px] leading-none text-ink tracking-tightest truncate">
+                {contact.displayName}
+              </h2>
               {contact.isVip && (
-                <Star className="w-5 h-5 text-yellow-400 fill-yellow-400" />
+                <Star className="w-4 h-4 text-wait fill-wait flex-shrink-0" />
               )}
               {contact.isBlocked && (
-                <Ban className="w-5 h-5 text-red-500" />
+                <span className="chip chip-urgent"><Ban className="w-2.5 h-2.5" />Blocked</span>
               )}
             </div>
-            <div className="flex items-center gap-4 mt-1 text-sm text-gray-400">
-              {contact.company && (
-                <span className="flex items-center gap-1">
-                  <Building2 className="w-4 h-4" />
-                  {contact.company}
-                  {contact.jobTitle && ` - ${contact.jobTitle}`}
-                </span>
-              )}
-            </div>
-            <div className="flex items-center gap-4 mt-1 text-sm text-gray-400">
-              <span className="flex items-center gap-1">
-                <Phone className="w-4 h-4" />
-                {contact.phone}
+            <div className="flex items-center gap-4 mt-2 text-[13px]">
+              <span className="flex items-center gap-1.5 text-ink-muted">
+                <Phone className="w-3.5 h-3.5 text-ink-dim" />
+                <span className="mono">{contact.phone}</span>
               </span>
               {contact.email && (
-                <span className="flex items-center gap-1">
-                  <Mail className="w-4 h-4" />
+                <span className="flex items-center gap-1.5 text-ink-muted">
+                  <Mail className="w-3.5 h-3.5 text-ink-dim" />
                   {contact.email}
+                </span>
+              )}
+              {contact.company && (
+                <span className="flex items-center gap-1.5 text-ink-muted">
+                  <Building2 className="w-3.5 h-3.5 text-ink-dim" />
+                  {contact.company}{contact.jobTitle && <span className="text-ink-dim"> · {contact.jobTitle}</span>}
                 </span>
               )}
             </div>
@@ -730,67 +730,61 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
           {/* Edit Button */}
           <button
             onClick={() => setIsEditing(true)}
-            className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded-lg transition-colors"
+            className="btn-ghost !p-2"
+            title="Edit contact"
           >
-            <Edit2 className="w-5 h-5" />
+            <Edit2 className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Queue Status Banner - Shows when contact has a call waiting in queue */}
+        {/* Queue Status Banner */}
         {isCallInQueue && (
-          <div className={`mt-4 p-3 rounded-lg border ${
+          <div className={`mt-4 p-3 rounded border ${
             isUrgent
-              ? 'bg-red-900/30 border-red-500/50'
+              ? 'bg-urgent/10 border-urgent/30'
               : queueStatus === 'assigned'
-              ? 'bg-blue-900/30 border-blue-500/50'
-              : 'bg-orange-900/30 border-orange-500/50'
+              ? 'bg-info/10 border-info/30'
+              : 'bg-wait/10 border-wait/30'
           }`}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <div className={`w-10 h-10 rounded-full flex items-center justify-center ${
-                  isUrgent ? 'bg-red-500/20' : 'bg-orange-500/20'
+                <div className={`w-9 h-9 rounded flex items-center justify-center ${
+                  isUrgent ? 'bg-urgent/15 border border-urgent/30' : 'bg-wait/15 border border-wait/30'
                 }`}>
-                  <Users className={`w-5 h-5 ${isUrgent ? 'text-red-400' : 'text-orange-400'}`} />
+                  <Users className={`w-4 h-4 ${isUrgent ? 'text-urgent-soft' : 'text-wait-soft'}`} />
                 </div>
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className={`font-medium ${isUrgent ? 'text-red-400' : 'text-orange-400'}`}>
-                      {isUrgent ? '⚠️ Urgent - ' : ''}
-                      {queueStatus === 'assigned' ? 'Assigned to you' : 'In Queue'}
+                    <span className={`font-medium text-[13px] ${isUrgent ? 'text-urgent-soft' : queueStatus === 'assigned' ? 'text-info-soft' : 'text-wait-soft'}`}>
+                      {isUrgent ? 'Urgent · ' : ''}
+                      {queueStatus === 'assigned' ? 'Assigned to you' : 'In queue'}
                     </span>
                     {activeCallForContact?.queue_id && (
-                      <span className="px-2 py-0.5 bg-gray-700 text-gray-300 text-xs rounded">
-                        {activeCallForContact.queue_id}
-                      </span>
+                      <span className="chip chip-muted">{activeCallForContact.queue_id}</span>
                     )}
                   </div>
-                  <div className="flex items-center gap-3 text-sm text-gray-400">
+                  <div className="flex items-center gap-3 text-[12px] text-ink-dim mt-0.5">
                     {waitTime !== undefined && waitTime > 0 && (
                       <span className="flex items-center gap-1">
                         <Clock className="w-3 h-3" />
-                        Waiting {formatWaitTime(waitTime)}
+                        <span className="mono">Waiting {formatWaitTime(waitTime)}</span>
                       </span>
                     )}
-                    <span className="capitalize">{queueStatus}</span>
                   </div>
                 </div>
               </div>
               <button
                 onClick={handleTakeQueuedCall}
                 disabled={isTakingCall || !isClientReady}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors font-medium ${
-                  isUrgent
-                    ? 'bg-red-600 hover:bg-red-700 disabled:bg-gray-600'
-                    : 'bg-green-600 hover:bg-green-700 disabled:bg-gray-600'
-                } text-white`}
+                className="btn-primary"
               >
-                <PhoneCall className="w-4 h-4" />
-                {isTakingCall ? 'Connecting...' : 'Take Call'}
+                <PhoneCall className="w-3.5 h-3.5" />
+                {isTakingCall ? 'Connecting…' : 'Take call'}
               </button>
             </div>
             {takeCallError && (
-              <div className="mt-2 p-2 bg-red-500/20 border border-red-500/50 rounded text-red-400 text-sm flex items-center gap-2">
-                <AlertCircle className="w-4 h-4" />
+              <div className="mt-2 p-2 bg-urgent/15 border border-urgent/30 rounded text-urgent-soft text-[12px] flex items-center gap-2">
+                <AlertCircle className="w-3.5 h-3.5" />
                 {takeCallError}
               </div>
             )}
@@ -800,66 +794,55 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         {/* Action Buttons / Call Controls */}
         <div className="flex items-center gap-2 mt-4">
           {hasAnyActiveCall ? (
-            // Active call controls (browser outbound, AI outbound, or inbound)
             <>
-              <div className={`flex items-center gap-3 px-4 py-2 rounded-lg border ${
+              {/* Live duration pill */}
+              <div className={`flex items-center gap-2.5 px-3 py-1.5 rounded border ${
                 isAICall || isInboundAICall
-                  ? 'bg-purple-600/20 border-purple-500'
+                  ? 'bg-ai/10 border-ai/30'
                   : callState === 'ringing'
-                  ? 'bg-yellow-600/20 border-yellow-500'
-                  : 'bg-green-600/20 border-green-500'
+                  ? 'bg-wait/10 border-wait/30'
+                  : 'bg-live/10 border-live/30'
               }`}>
-                <div className={`w-2 h-2 rounded-full animate-pulse ${
-                  isAICall || isInboundAICall ? 'bg-purple-500' : callState === 'ringing' ? 'bg-yellow-500' : 'bg-green-500'
+                <span className={`dot ${
+                  isAICall || isInboundAICall ? 'dot-ai' : callState === 'ringing' ? 'dot-wait' : 'dot-live'
                 }`} />
-                <span className={`font-medium ${
-                  isAICall || isInboundAICall ? 'text-purple-400' : callState === 'ringing' ? 'text-yellow-400' : 'text-green-400'
+                <span className={`mono text-[13px] font-medium ${
+                  isAICall || isInboundAICall ? 'text-ai-soft' : callState === 'ringing' ? 'text-wait-soft' : 'text-live-soft'
                 }`}>
-                  {/* Show call state for outbound calls, duration when connected */}
                   {isOutboundCallInProgress && callState !== 'active'
                     ? getOutboundCallStatus()
                     : formatCallDuration(activeCallForContact?.duration || callDuration)
                   }
                 </span>
                 {(isAICall || isInboundAICall) && (
-                  <span className="flex items-center gap-1 px-2 py-0.5 bg-purple-500/30 text-purple-300 text-xs rounded-full">
-                    <Bot className="w-3 h-3" />
-                    AI Agent
-                  </span>
+                  <span className="chip chip-ai"><Bot className="w-2.5 h-2.5" />AI Agent</span>
                 )}
               </div>
 
-              {/* Mute button only for human browser calls */}
               {!isAICall && !isInboundAICall && activeCall && (
                 <button
                   onClick={() => isMuted ? unmute() : mute()}
-                  className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
-                    isMuted ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-gray-700 hover:bg-gray-600'
-                  } text-white`}
+                  className={`btn-secondary ${isMuted ? '!bg-wait/15 !border-wait/30 !text-wait-soft' : ''}`}
                 >
-                  {isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                  {isMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
                   {isMuted ? 'Unmute' : 'Mute'}
                 </button>
               )}
 
-              {/* Take Over button for AI calls */}
               {(isAICall || isInboundAICall) && (
                 <button
                   onClick={handleTakeOver}
                   disabled={isInitializing}
-                  className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
+                  className="btn-secondary !border-info/30 !text-info-soft hover:!bg-info/10"
                 >
-                  <Phone className="w-4 h-4" />
-                  Take Over
+                  <Phone className="w-3.5 h-3.5" />
+                  Take over
                 </button>
               )}
 
-              <button
-                onClick={handleEndCall}
-                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors"
-              >
-                <PhoneOff className="w-4 h-4" />
-                End Call
+              <button onClick={handleEndCall} className="btn-danger">
+                <PhoneOff className="w-3.5 h-3.5" />
+                End call
               </button>
               <CallControlPanel
                 callId={activeCallForContact?.id || currentCallSid || ''}
@@ -873,7 +856,6 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
                 onHoldChange={setIsOnHold}
                 onRecordingChange={setIsRecording}
               />
-              {/* Conference Participants */}
               {isInConference && conferenceParticipants.length > 0 && (
                 <ConferenceParticipants
                   participants={conferenceParticipants}
@@ -882,137 +864,118 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
               )}
             </>
           ) : (
-            // Idle state - show call buttons
             <>
-              <button
-                onClick={handleCall}
-                disabled={isInitializing}
-                className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
-              >
-                <Phone className="w-4 h-4" />
-                {isInitializing ? 'Connecting...' : 'Call'}
+              <button onClick={handleCall} disabled={isInitializing} className="btn-primary">
+                <Phone className="w-3.5 h-3.5" />
+                {isInitializing ? 'Connecting…' : 'Call'}
               </button>
-              <button
-                onClick={handleSendAI}
-                className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors"
-              >
-                <Bot className="w-4 h-4" />
-                Send AI Agent
+              <button onClick={handleSendAI} className="btn-secondary !border-ai/30 !text-ai-soft hover:!bg-ai/10">
+                <Bot className="w-3.5 h-3.5" />
+                Send AI agent
               </button>
               {contact.email && (
                 <button
                   onClick={() => window.open(`mailto:${contact.email}`)}
-                  className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
+                  className="btn-ghost"
                 >
-                  <Mail className="w-4 h-4" />
+                  <Mail className="w-3.5 h-3.5" />
                   Email
                 </button>
               )}
             </>
           )}
-          {/* Dial Error Display */}
+
           {dialError && (
-            <div className="flex items-center gap-2 px-3 py-1 bg-red-600/20 border border-red-600 rounded text-red-400 text-sm">
-              <span>⚠️ {dialError}</span>
-              <button onClick={() => setDialError(null)} className="ml-2 hover:text-white">✕</button>
+            <div className="flex items-center gap-2 px-3 py-1 bg-urgent/10 border border-urgent/30 rounded text-urgent-soft text-[12px]">
+              <span>{dialError}</span>
+              <button onClick={() => setDialError(null)} className="ml-1 hover:text-ink">✕</button>
             </div>
           )}
-          {/* More Menu */}
+
           <div className="relative ml-auto" ref={moreMenuRef}>
             <button
               onClick={() => setShowMoreMenu(!showMoreMenu)}
-              className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded-lg transition-colors"
+              className="btn-ghost !p-2"
             >
-              <MoreHorizontal className="w-5 h-5" />
+              <MoreHorizontal className="w-4 h-4" />
             </button>
             {showMoreMenu && (
-              <div className="absolute right-0 mt-1 w-48 bg-gray-800 border border-gray-700 rounded-lg shadow-lg z-50">
+              <div className="absolute right-0 mt-1 w-48 panel-raised rounded-md shadow-panel z-50 animate-fade-up overflow-hidden">
                 <button
                   onClick={handleDeleteContact}
                   disabled={isDeleting}
-                  className="w-full flex items-center gap-2 px-4 py-2 text-red-400 hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
+                  className="w-full flex items-center gap-2 px-3 py-2 text-urgent-soft hover:bg-canvas-hover transition-colors disabled:opacity-50 text-[13px]"
                 >
                   <Trash2 className="w-4 h-4" />
-                  {isDeleting ? 'Deleting...' : 'Delete Contact'}
+                  {isDeleting ? 'Deleting…' : 'Delete contact'}
                 </button>
               </div>
             )}
           </div>
         </div>
 
-        {/* Call Error */}
         {callError && (
-          <div className="mt-2 p-2 bg-red-500/20 border border-red-500 rounded-lg text-red-400 text-sm flex items-center gap-2">
-            <AlertCircle className="w-4 h-4" />
+          <div className="mt-2 p-2 bg-urgent/10 border border-urgent/30 rounded text-urgent-soft text-[12px] flex items-center gap-2">
+            <AlertCircle className="w-3.5 h-3.5" />
             {callError}
           </div>
         )}
 
         {/* AI Agent Configuration Form */}
         {showAIForm && !hasAnyActiveCall && (
-          <div className="mt-4 p-4 bg-purple-900/20 border border-purple-500/30 rounded-lg">
+          <div className="mt-4 p-4 bg-ai/5 border border-ai/25 rounded">
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-semibold text-purple-300 flex items-center gap-2">
-                <Bot className="w-4 h-4" />
-                Configure AI Agent Call
-              </h3>
+              <div className="flex items-center gap-2">
+                <Bot className="w-3.5 h-3.5 text-ai-soft" />
+                <span className="kicker" style={{ color: '#B0A4FF' }}>Dispatch AI agent</span>
+              </div>
               <button
                 onClick={() => setShowAIForm(false)}
-                className="p-1 text-gray-400 hover:text-white rounded"
+                className="btn-ghost !p-1"
               >
-                <X className="w-4 h-4" />
+                <X className="w-3.5 h-3.5" />
               </button>
             </div>
 
-            {/* Agent Selection */}
             <div className="mb-3">
-              <label className="block text-xs text-gray-400 mb-1">AI Agent</label>
+              <label className="block kicker mb-1">Agent</label>
               <select
                 value={aiFormData.agentType}
                 onChange={(e) => setAiFormData({ ...aiFormData, agentType: e.target.value })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:border-purple-500"
+                className="input"
               >
                 {availableAgents.map(agent => (
-                  <option key={agent.id} value={agent.id}>
-                    {agent.name}
-                  </option>
+                  <option key={agent.id} value={agent.id}>{agent.name}</option>
                 ))}
               </select>
               {availableAgents.find(a => a.id === aiFormData.agentType)?.description && (
-                <p className="text-xs text-gray-500 mt-1">
+                <p className="text-[11.5px] text-ink-dim mt-1">
                   {availableAgents.find(a => a.id === aiFormData.agentType)?.description}
                 </p>
               )}
             </div>
 
-            {/* Editable Context Fields */}
-            <div className="mb-3 space-y-2">
-              <label className="block text-xs text-gray-400">Context sent to AI agent</label>
+            <div className="mb-3">
+              <label className="block kicker mb-2">Context sent to AI</label>
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-xs text-gray-500 mb-0.5">Name</label>
-                  <input
-                    type="text"
+                  <label className="block text-[10.5px] text-ink-dim mb-1 uppercase tracking-wider">Name</label>
+                  <input type="text" className="input !py-1.5"
                     value={aiFormData.contactName}
-                    onChange={(e) => setAiFormData({ ...aiFormData, contactName: e.target.value })}
-                    className="w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-purple-500"
-                  />
+                    onChange={(e) => setAiFormData({ ...aiFormData, contactName: e.target.value })} />
                 </div>
                 <div>
-                  <label className="block text-xs text-gray-500 mb-0.5">Company</label>
-                  <input
-                    type="text"
+                  <label className="block text-[10.5px] text-ink-dim mb-1 uppercase tracking-wider">Company</label>
+                  <input type="text" className="input !py-1.5"
                     value={aiFormData.company}
-                    onChange={(e) => setAiFormData({ ...aiFormData, company: e.target.value })}
-                    className="w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-purple-500"
-                  />
+                    onChange={(e) => setAiFormData({ ...aiFormData, company: e.target.value })} />
                 </div>
                 <div>
-                  <label className="block text-xs text-gray-500 mb-0.5">Account Tier</label>
+                  <label className="block text-[10.5px] text-ink-dim mb-1 uppercase tracking-wider">Tier</label>
                   <select
                     value={aiFormData.accountTier}
                     onChange={(e) => setAiFormData({ ...aiFormData, accountTier: e.target.value })}
-                    className="w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-purple-500"
+                    className="input !py-1.5"
                   >
                     <option value="prospect">Prospect</option>
                     <option value="free">Free</option>
@@ -1021,62 +984,46 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
                   </select>
                 </div>
                 <div className="flex items-end pb-1">
-                  <label className="flex items-center gap-2 cursor-pointer text-sm">
-                    <input
-                      type="checkbox"
+                  <label className="flex items-center gap-2 cursor-pointer text-[13px]">
+                    <input type="checkbox" className="w-3.5 h-3.5 rounded-sm accent-sw-blue"
                       checked={aiFormData.isVip}
-                      onChange={(e) => setAiFormData({ ...aiFormData, isVip: e.target.checked })}
-                      className="w-4 h-4 rounded bg-gray-700 border-gray-600"
-                    />
-                    <span className={aiFormData.isVip ? 'text-yellow-400' : 'text-gray-300'}>
-                      <Star className="w-3 h-3 inline mr-1" />
-                      VIP
+                      onChange={(e) => setAiFormData({ ...aiFormData, isVip: e.target.checked })} />
+                    <span className={aiFormData.isVip ? 'text-wait-soft' : 'text-ink-muted'}>
+                      <Star className="w-3 h-3 inline mr-1" />VIP
                     </span>
                   </label>
                 </div>
               </div>
             </div>
 
-            {/* Additional Context */}
             <div className="mb-3">
-              <label className="block text-xs text-gray-400 mb-1">Additional Context (optional)</label>
+              <label className="block kicker mb-1">Additional context (optional)</label>
               <textarea
                 value={aiFormData.additionalContext}
                 onChange={(e) => setAiFormData({ ...aiFormData, additionalContext: e.target.value })}
                 placeholder="e.g., Follow up on previous quote, ask about renewal..."
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm placeholder-gray-500 resize-none focus:outline-none focus:border-purple-500"
+                className="input resize-none"
                 rows={2}
               />
             </div>
 
-            {/* Error */}
             {aiFormError && (
-              <div className="mb-3 p-2 bg-red-500/20 border border-red-500/50 rounded text-red-400 text-xs flex items-center gap-2">
+              <div className="mb-3 p-2 bg-urgent/10 border border-urgent/30 rounded text-urgent-soft text-[11.5px] flex items-center gap-2">
                 <AlertCircle className="w-3 h-3" />
                 {aiFormError}
               </div>
             )}
 
-            {/* Actions */}
             <div className="flex gap-2">
               <button
                 onClick={handleSubmitAIForm}
                 disabled={isSubmittingAI}
-                className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-white rounded-lg text-sm transition-colors"
+                className="btn-secondary !border-ai/30 !text-ai-soft hover:!bg-ai/10"
               >
-                {isSubmittingAI ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Bot className="w-4 h-4" />
-                )}
-                {isSubmittingAI ? 'Sending...' : 'Send Agent'}
+                {isSubmittingAI ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Bot className="w-3.5 h-3.5" />}
+                {isSubmittingAI ? 'Sending…' : 'Send agent'}
               </button>
-              <button
-                onClick={() => setShowAIForm(false)}
-                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors"
-              >
-                Cancel
-              </button>
+              <button onClick={() => setShowAIForm(false)} className="btn-ghost">Cancel</button>
             </div>
           </div>
         )}
@@ -1084,141 +1031,85 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         {/* Tags */}
         {contact.tags && contact.tags.length > 0 && (
           <div className="flex items-center gap-2 mt-4">
-            <Tag className="w-4 h-4 text-gray-400" />
+            <Tag className="w-3.5 h-3.5 text-ink-dim" />
             <div className="flex flex-wrap gap-1">
               {contact.tags.map((tag, index) => (
-                <span
-                  key={index}
-                  className="px-2 py-0.5 bg-gray-700 text-gray-300 text-xs rounded-full"
-                >
-                  {tag}
-                </span>
+                <span key={index} className="chip chip-muted">{tag}</span>
               ))}
             </div>
           </div>
         )}
 
-        {/* Quick Stats */}
-        <div className="grid grid-cols-4 gap-4 mt-4 pt-4 border-t border-gray-700">
-          <div className="text-center">
-            <div className="text-2xl font-bold text-white">{contact.totalCalls}</div>
-            <div className="text-xs text-gray-400">Total Calls</div>
-          </div>
-          <div className="text-center">
-            <div className={`text-2xl font-bold ${
+        {/* Quick Stats — inline, no grid cells, no dividers. Pure typography rhythm. */}
+        <div className="mt-6 flex items-baseline gap-10 flex-wrap">
+          <HeroStat kicker="Total calls" value={String(contact.totalCalls)} />
+          <HeroStat
+            kicker="Avg sentiment"
+            value={contact.averageSentiment != null ? (contact.averageSentiment > 0 ? '+' : '') + contact.averageSentiment.toFixed(1) : '—'}
+            tone={
               contact.averageSentiment != null
-                ? contact.averageSentiment > 0.3 ? 'text-green-400'
-                  : contact.averageSentiment < -0.3 ? 'text-red-400'
-                  : 'text-gray-300'
-                : 'text-white'
-            }`}>
-              {contact.averageSentiment != null ?
-                (contact.averageSentiment > 0 ? '+' : '') + contact.averageSentiment.toFixed(1) : '--'}
-            </div>
-            <div className="text-xs text-gray-400">Avg Sentiment</div>
-          </div>
-          <div className="text-center">
-            <div className="text-lg font-bold text-white capitalize">
-              {contact.accountTier}
-            </div>
-            <div className="text-xs text-gray-400">Account Tier</div>
-          </div>
-          <div className="text-center">
-            <div className="text-lg font-bold text-white">
-              {formatDate(contact.lastInteractionAt)}
-            </div>
-            <div className="text-xs text-gray-400">Last Contact</div>
-          </div>
+                ? contact.averageSentiment > 0.3 ? 'live'
+                  : contact.averageSentiment < -0.3 ? 'urgent'
+                  : 'default'
+                : 'default'
+            }
+          />
+          <HeroStat kicker="Tier" value={contact.accountTier} isTier />
+          <HeroStat kicker="Last contact" value={formatDate(contact.lastInteractionAt)} isSmall />
         </div>
       </div>
 
       {/* Tabs */}
-      <div className="flex border-b border-gray-700 bg-gray-800">
-        {/* Live Call tab - shown during any active call (browser outbound, AI, or inbound) */}
+      <div className="flex items-center px-5 h-11 gap-1">
         {hasAnyActiveCall && (
-          <button
+          <DetailTab
+            active={activeTab === 'live'}
             onClick={() => setActiveTab('live' as any)}
-            className={`px-4 py-3 text-sm font-medium transition-colors ${
-              activeTab === 'live'
-                ? (isInboundAICall || isAICall ? 'text-purple-400 border-b-2 border-purple-400' : callState === 'ringing' ? 'text-yellow-400 border-b-2 border-yellow-400' : 'text-green-400 border-b-2 border-green-400')
-                : (isInboundAICall || isAICall ? 'text-purple-400/70 hover:text-purple-400' : callState === 'ringing' ? 'text-yellow-400/70 hover:text-yellow-400' : 'text-green-400/70 hover:text-green-400')
-            }`}
-          >
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full animate-pulse ${isInboundAICall || isAICall ? 'bg-purple-500' : callState === 'ringing' ? 'bg-yellow-500' : 'bg-green-500'}`} />
-              {isInboundAICall || isAICall ? (
-                <>
-                  <Bot className="w-4 h-4" />
-                  AI Call
-                </>
-              ) : isOutboundCallInProgress && callState !== 'active' ? (
-                <>
-                  <PhoneOutgoing className="w-4 h-4" />
-                  {getOutboundCallStatus()}
-                </>
-              ) : (
-                'Live Call'
-              )}
-            </div>
-          </button>
+            tone={isInboundAICall || isAICall ? 'ai' : callState === 'ringing' ? 'wait' : 'live'}
+            label={
+              isInboundAICall || isAICall
+                ? 'AI Call'
+                : isOutboundCallInProgress && callState !== 'active'
+                  ? getOutboundCallStatus()
+                  : 'Live Call'
+            }
+            icon={
+              isInboundAICall || isAICall
+                ? <Bot className="w-3.5 h-3.5" />
+                : isOutboundCallInProgress && callState !== 'active'
+                  ? <PhoneOutgoing className="w-3.5 h-3.5" />
+                  : <span className={`dot ${callState === 'ringing' ? 'dot-wait' : 'dot-live'}`} />
+            }
+          />
         )}
-        <button
+        <DetailTab
+          active={activeTab === 'history'}
           onClick={() => setActiveTab('history')}
-          className={`px-4 py-3 text-sm font-medium transition-colors ${
-            activeTab === 'history'
-              ? 'text-blue-400 border-b-2 border-blue-400'
-              : 'text-gray-400 hover:text-white'
-          }`}
-        >
-          <Clock className="w-4 h-4 inline-block mr-2" />
-          Call History
-        </button>
-        {/* Call Detail tab - only shown when a historical call is selected */}
+          label="Call History"
+          icon={<Clock className="w-3.5 h-3.5" />}
+        />
         {selectedHistoryCall && (
-          <div
+          <DetailTab
+            active={activeTab === 'callDetail'}
             onClick={() => setActiveTab('callDetail')}
-            className={`px-4 py-3 text-sm font-medium transition-colors flex items-center gap-2 cursor-pointer ${
-              activeTab === 'callDetail'
-                ? 'text-orange-400 border-b-2 border-orange-400'
-                : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            <FileText className="w-4 h-4" />
-            Call Detail
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                handleCloseCallDetail();
-              }}
-              className="ml-1 p-0.5 hover:bg-gray-700 rounded"
-              title="Close"
-            >
-              <X className="w-3 h-3" />
-            </button>
-          </div>
+            tone="signal"
+            label="Call Detail"
+            icon={<FileText className="w-3.5 h-3.5" />}
+            onClose={handleCloseCallDetail}
+          />
         )}
-        <button
+        <DetailTab
+          active={activeTab === 'notes'}
           onClick={() => setActiveTab('notes')}
-          className={`px-4 py-3 text-sm font-medium transition-colors ${
-            activeTab === 'notes'
-              ? 'text-blue-400 border-b-2 border-blue-400'
-              : 'text-gray-400 hover:text-white'
-          }`}
-        >
-          <MessageSquare className="w-4 h-4 inline-block mr-2" />
-          Notes
-        </button>
-        <button
+          label="Notes"
+          icon={<MessageSquare className="w-3.5 h-3.5" />}
+        />
+        <DetailTab
+          active={activeTab === 'details'}
           onClick={() => setActiveTab('details')}
-          className={`px-4 py-3 text-sm font-medium transition-colors ${
-            activeTab === 'details'
-              ? 'text-blue-400 border-b-2 border-blue-400'
-              : 'text-gray-400 hover:text-white'
-          }`}
-        >
-          <User className="w-4 h-4 inline-block mr-2" />
-          Details
-        </button>
+          label="Details"
+          icon={<User className="w-3.5 h-3.5" />}
+        />
       </div>
 
       {/* Tab Content */}
@@ -1271,6 +1162,85 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   );
 }
 
+function HeroStat({
+  kicker,
+  value,
+  tone = 'default',
+  isTier,
+  isSmall,
+}: {
+  kicker: string;
+  value: string;
+  tone?: 'default' | 'live' | 'urgent';
+  isTier?: boolean;
+  isSmall?: boolean;
+}) {
+  const color = tone === 'live' ? 'text-live-soft' : tone === 'urgent' ? 'text-urgent-soft' : 'text-ink';
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="kicker">{kicker}</span>
+      {isTier ? (
+        <span className={`font-heading font-semibold text-[20px] capitalize leading-none ${color}`}>{value}</span>
+      ) : isSmall ? (
+        <span className={`font-heading font-semibold text-[17px] leading-none mono ${color}`}>{value}</span>
+      ) : (
+        <span className={`font-heading font-semibold text-[26px] leading-none tabular-nums ${color}`}>{value}</span>
+      )}
+    </div>
+  );
+}
+
+function DetailTab({
+  active,
+  onClick,
+  label,
+  icon,
+  tone = 'default',
+  onClose,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  icon?: React.ReactNode;
+  tone?: 'default' | 'live' | 'ai' | 'wait' | 'signal';
+  onClose?: () => void;
+}) {
+  const activeColor =
+    tone === 'live'   ? 'text-live-soft'   :
+    tone === 'ai'     ? 'text-ai-soft'     :
+    tone === 'wait'   ? 'text-wait-soft'   :
+    tone === 'signal' ? 'text-sw-turquoise' :
+    'text-ink';
+  const underline =
+    tone === 'live'   ? 'bg-live'   :
+    tone === 'ai'     ? 'bg-ai'     :
+    tone === 'wait'   ? 'bg-wait'   :
+    'bg-sw-turquoise';
+  return (
+    <button
+      onClick={onClick}
+      className={`relative h-10 px-3 flex items-center gap-1.5 text-[12.5px] font-medium transition-colors ${
+        active ? activeColor : 'text-ink-dim hover:text-ink-muted'
+      }`}
+    >
+      {icon}
+      <span>{label}</span>
+      {onClose && (
+        <span
+          onClick={(e) => { e.stopPropagation(); onClose(); }}
+          className="ml-1 p-0.5 hover:bg-canvas-hover rounded-sm cursor-pointer"
+          title="Close"
+        >
+          <X className="w-2.5 h-2.5" />
+        </span>
+      )}
+      {active && (
+        <span className={`absolute -bottom-[1px] left-2 right-2 h-[2px] ${underline} rounded-sm`} />
+      )}
+    </button>
+  );
+}
+
 function InteractionHistory({
   interactions,
   isLoading,
@@ -1286,157 +1256,138 @@ function InteractionHistory({
 }) {
   if (isLoading) {
     return (
-      <div className="p-8 text-center text-gray-400">
-        <div className="animate-spin w-6 h-6 border-2 border-gray-400 border-t-transparent rounded-full mx-auto mb-2" />
-        Loading history...
+      <div className="p-8 text-center text-ink-dim">
+        <Loader2 className="w-5 h-5 mx-auto mb-2 animate-spin" />
+        <span className="text-[12px]">Loading history…</span>
       </div>
     );
   }
 
   if (interactions.length === 0) {
     return (
-      <div className="p-8 text-center text-gray-400">
-        <Clock className="w-12 h-12 mx-auto mb-2 opacity-50" />
-        <p>No call history yet</p>
+      <div className="p-10 text-center">
+        <Clock className="w-5 h-5 mx-auto mb-3 text-ink-faint" />
+        <p className="font-display text-[20px] text-ink-muted mb-1">No history yet</p>
+        <p className="text-[12px] text-ink-dim">Calls with this contact will show up here.</p>
       </div>
     );
   }
 
-  // Helper to render handler chain from legs
   const renderHandlerChain = (interaction: Interaction) => {
     const legs = interaction.legs;
     if (!legs || legs.length === 0) {
-      // Fallback to single handler display
       if (interaction.handlerType === 'ai') {
         return (
-          <span className="flex items-center gap-1 px-2 py-0.5 bg-purple-500/20 text-purple-400 text-xs rounded-full">
-            <Bot className="w-3 h-3" />
-            {interaction.aiAgentName || 'AI'}
+          <span className="inline-flex items-center gap-1 text-[11px]">
+            <Bot className="w-3 h-3 text-ai-soft" />
+            <span className="text-ink-muted">{interaction.aiAgentName || 'AI'}</span>
           </span>
         );
       }
       return null;
     }
-
-    // Multiple legs - show chain
     if (legs.length === 1) {
       const leg = legs[0];
+      const isAI = leg.legType === 'ai_agent';
       return (
-        <span className={`flex items-center gap-1 px-2 py-0.5 text-xs rounded-full ${
-          leg.legType === 'ai_agent' ? 'bg-purple-500/20 text-purple-400' : 'bg-green-500/20 text-green-400'
-        }`}>
-          {leg.legType === 'ai_agent' ? <Bot className="w-3 h-3" /> : <User className="w-3 h-3" />}
-          {leg.legType === 'ai_agent' ? (leg.aiAgentName || 'AI') : (leg.userName || 'Agent')}
+        <span className="inline-flex items-center gap-1 text-[11px]">
+          {isAI ? <Bot className="w-3 h-3 text-ai-soft" /> : <User className="w-3 h-3 text-live-soft" />}
+          <span className="text-ink-muted">{isAI ? (leg.aiAgentName || 'AI') : (leg.userName || 'Agent')}</span>
         </span>
       );
     }
-
-    // Multiple handlers - show chain
     return (
-      <div className="flex items-center gap-1">
-        {legs.map((leg, idx) => (
-          <div key={leg.id} className="flex items-center">
-            <span className={`flex items-center gap-0.5 px-1.5 py-0.5 text-xs rounded ${
-              leg.legType === 'ai_agent' ? 'bg-purple-500/20 text-purple-400' : 'bg-green-500/20 text-green-400'
-            }`}>
-              {leg.legType === 'ai_agent' ? <Bot className="w-3 h-3" /> : <User className="w-3 h-3" />}
-              <span className="hidden sm:inline">
-                {leg.legType === 'ai_agent' ? (leg.aiAgentName || 'AI') : (leg.userName || 'Agent')}
-              </span>
+      <span className="inline-flex items-center gap-1 text-[11px]">
+        {legs.map((leg, idx) => {
+          const isAI = leg.legType === 'ai_agent';
+          return (
+            <span key={leg.id} className="inline-flex items-center gap-1">
+              {isAI ? <Bot className="w-3 h-3 text-ai-soft" /> : <User className="w-3 h-3 text-live-soft" />}
+              <span className="text-ink-muted">{isAI ? (leg.aiAgentName || 'AI') : (leg.userName || 'Agent')}</span>
+              {idx < legs.length - 1 && <span className="text-ink-faint mx-1">→</span>}
             </span>
-            {idx < legs.length - 1 && (
-              <span className="text-gray-500 mx-0.5">→</span>
-            )}
-          </div>
-        ))}
-      </div>
+          );
+        })}
+      </span>
     );
   };
 
   return (
-    <div className="divide-y divide-gray-700">
-      {interactions.map((interaction) => (
-        <div
-          key={interaction.id}
-          className="p-4 hover:bg-gray-800/50 transition-colors cursor-pointer"
-          onClick={() => onSelectCall(interaction)}
-        >
-          <div className="flex items-start gap-3">
-            {/* Direction Icon */}
-            <div className={`w-10 h-10 rounded-full flex items-center justify-center ${
-              interaction.direction === 'inbound' ? 'bg-blue-500/20' : 'bg-green-500/20'
-            }`}>
-              {interaction.direction === 'inbound' ? (
-                <PhoneIncoming className={`w-5 h-5 ${
-                  interaction.direction === 'inbound' ? 'text-blue-400' : 'text-green-400'
-                }`} />
-              ) : (
-                <PhoneOutgoing className="w-5 h-5 text-green-400" />
-              )}
-            </div>
-
-            {/* Call Info */}
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="font-medium text-white">
-                  {interaction.direction === 'inbound' ? 'Inbound' : 'Outbound'} Call
-                </span>
-                {/* Handler chain or single handler badge */}
-                {renderHandlerChain(interaction)}
-                <span className={`px-2 py-0.5 text-xs rounded-full ${
-                  interaction.status === 'completed' ? 'bg-green-500/20 text-green-400' :
-                  interaction.status === 'active' || interaction.status === 'ai_active' ? 'bg-blue-500/20 text-blue-400' :
-                  'bg-gray-500/20 text-gray-400'
-                }`}>
-                  {interaction.status}
-                </span>
-              </div>
-
-              <div className="flex items-center gap-4 mt-1 text-sm text-gray-400">
-                <span>{formatDate(interaction.createdAt)}</span>
-                {interaction.duration && (
-                  <span className="flex items-center gap-1">
-                    <Clock className="w-3 h-3" />
-                    {formatDuration(interaction.duration)}
-                  </span>
-                )}
-                {interaction.transcriptionActive && (
-                  <span className="flex items-center gap-1 text-green-400">
-                    <Mic className="w-3 h-3" />
-                    Transcribed
-                  </span>
-                )}
-                {/* Show handler count if multiple */}
-                {interaction.legs && interaction.legs.length > 1 && (
-                  <span className="flex items-center gap-1 text-orange-400">
-                    <User className="w-3 h-3" />
-                    {interaction.legs.length} handlers
-                  </span>
-                )}
-              </div>
-
-              {/* AI Summary */}
-              {interaction.summary && (
-                <div className="mt-2 p-2 bg-gray-700/50 rounded-lg text-sm text-gray-300">
-                  <FileText className="w-4 h-4 inline-block mr-1 text-gray-400" />
-                  <AISummaryDisplay summary={interaction.summary} />
+    <div>
+      {interactions.map((interaction, idx) => {
+        const sentimentTone =
+          interaction.sentimentScore == null ? null :
+          interaction.sentimentScore > 0.3 ? 'text-live-soft' :
+          interaction.sentimentScore < -0.3 ? 'text-urgent-soft' :
+          'text-ink-muted';
+        return (
+          <div key={interaction.id}>
+            <div
+              className="px-5 py-5 hover:bg-canvas-raised/40 transition-colors cursor-pointer"
+              onClick={() => onSelectCall(interaction)}
+            >
+              <div className="flex items-start gap-3">
+                {/* Direction glyph — minimal, muted */}
+                <div className="mt-0.5 text-ink-dim flex-shrink-0">
+                  {interaction.direction === 'inbound' ? (
+                    <PhoneIncoming className="w-4 h-4" />
+                  ) : (
+                    <PhoneOutgoing className="w-4 h-4" />
+                  )}
                 </div>
-              )}
-            </div>
 
-            {/* Sentiment indicator */}
-            {interaction.sentimentScore != null && (
-              <div className={`text-sm font-medium ${
-                interaction.sentimentScore > 0.3 ? 'text-green-400' :
-                interaction.sentimentScore < -0.3 ? 'text-red-400' :
-                'text-gray-400'
-              }`}>
-                {interaction.sentimentScore > 0 ? '+' : ''}{interaction.sentimentScore.toFixed(1)}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-medium text-ink text-[13.5px]">
+                      {interaction.direction === 'inbound' ? 'Inbound' : 'Outbound'}
+                    </span>
+                    <span className="text-ink-dim text-[12px]">·</span>
+                    <span className="mono text-[11.5px] text-ink-muted">{formatDate(interaction.createdAt)}</span>
+                    {interaction.duration && (
+                      <>
+                        <span className="text-ink-dim text-[12px]">·</span>
+                        <span className="mono text-[11.5px] text-ink-muted">{formatDuration(interaction.duration)}</span>
+                      </>
+                    )}
+                    {sentimentTone && (
+                      <>
+                        <span className="text-ink-dim text-[12px]">·</span>
+                        <span className={`mono text-[11.5px] font-medium tabular-nums ${sentimentTone}`}>
+                          {interaction.sentimentScore! > 0 ? '+' : ''}{interaction.sentimentScore!.toFixed(1)}
+                        </span>
+                      </>
+                    )}
+                    {interaction.status && interaction.status !== 'completed' && (
+                      <>
+                        <span className="text-ink-dim text-[12px]">·</span>
+                        <span className="text-[11.5px] text-ink-muted capitalize">{interaction.status.replace('_', ' ')}</span>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Handler chain — only if multi-leg, thin line */}
+                  {interaction.legs && interaction.legs.length > 1 && (
+                    <div className="mt-1.5 flex items-center gap-1 text-[11px] text-ink-muted">
+                      {renderHandlerChain(interaction)}
+                    </div>
+                  )}
+
+                  {/* Description — flows as paragraph, no box */}
+                  {interaction.summary && (
+                    <div className="mt-2 text-[12.5px] text-ink-muted leading-relaxed pr-8">
+                      <AISummaryDisplay summary={interaction.summary} />
+                    </div>
+                  )}
+                </div>
               </div>
+            </div>
+            {/* Short divider between entries — fixed left offset, consistent width */}
+            {idx < interactions.length - 1 && (
+              <div className="ml-[272px] h-px w-32 rule-fade" aria-hidden />
             )}
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -1464,20 +1415,21 @@ function NotesTab({
   };
 
   return (
-    <div className="p-4">
+    <div className="p-5">
+      <div className="kicker mb-2">Notes</div>
       <textarea
         value={notes}
         onChange={(e) => setNotes(e.target.value)}
-        placeholder="Add notes about this contact..."
-        className="w-full h-48 p-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 resize-none focus:outline-none focus:border-blue-500"
+        placeholder="What should the next person who talks to this contact know?"
+        className="input h-56 resize-none leading-relaxed"
       />
-      <div className="flex justify-end mt-2">
+      <div className="flex justify-end mt-3">
         <button
           onClick={handleSave}
           disabled={isSaving || notes === (contact.notes || '')}
-          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+          className="btn-primary"
         >
-          {isSaving ? 'Saving...' : 'Save Notes'}
+          {isSaving ? 'Saving…' : 'Save notes'}
         </button>
       </div>
     </div>
@@ -1486,39 +1438,46 @@ function NotesTab({
 
 function DetailsTab({ contact }: { contact: Contact }) {
   return (
-    <div className="p-4 space-y-4">
-      <DetailRow label="First Name" value={contact.firstName} />
-      <DetailRow label="Last Name" value={contact.lastName} />
-      <DetailRow label="Display Name" value={contact.displayName} />
-      <DetailRow label="Phone" value={contact.phone} />
-      <DetailRow label="Email" value={contact.email} />
-      <DetailRow label="Company" value={contact.company} />
-      <DetailRow label="Job Title" value={contact.jobTitle} />
-      <DetailRow label="Account Tier" value={contact.accountTier} />
-      <DetailRow label="Account Status" value={contact.accountStatus} />
-      <DetailRow label="External ID" value={contact.externalId} />
-      <DetailRow label="VIP" value={contact.isVip ? 'Yes' : 'No'} />
-      <DetailRow label="Blocked" value={contact.isBlocked ? 'Yes' : 'No'} />
-      <DetailRow label="Created" value={new Date(contact.createdAt).toLocaleString()} />
-      <DetailRow label="Updated" value={new Date(contact.updatedAt).toLocaleString()} />
+    <div className="p-5">
+      <div className="kicker mb-3">Details</div>
+      <div className="panel rounded-md">
+        <DetailRow label="First name"    value={contact.firstName} />
+        <DetailRow label="Last name"     value={contact.lastName} />
+        <DetailRow label="Display name"  value={contact.displayName} />
+        <DetailRow label="Phone"         value={contact.phone} mono />
+        <DetailRow label="Email"         value={contact.email} />
+        <DetailRow label="Company"       value={contact.company} />
+        <DetailRow label="Job title"     value={contact.jobTitle} />
+        <DetailRow label="Account tier"  value={contact.accountTier} />
+        <DetailRow label="Status"        value={contact.accountStatus} />
+        <DetailRow label="External ID"   value={contact.externalId} mono />
+        <DetailRow label="VIP"           value={contact.isVip ? 'Yes' : 'No'} />
+        <DetailRow label="Blocked"       value={contact.isBlocked ? 'Yes' : 'No'} />
+        <DetailRow label="Created"       value={new Date(contact.createdAt).toLocaleString()} mono />
+        <DetailRow label="Updated"       value={new Date(contact.updatedAt).toLocaleString()} mono />
+      </div>
 
       {contact.customFields && Object.keys(contact.customFields).length > 0 && (
         <div className="mt-6">
-          <h3 className="text-sm font-semibold text-gray-400 uppercase mb-2">Custom Fields</h3>
-          {Object.entries(contact.customFields).map(([key, value]) => (
-            <DetailRow key={key} label={key} value={String(value)} />
-          ))}
+          <div className="kicker mb-3">Custom fields</div>
+          <div className="panel rounded-md">
+            {Object.entries(contact.customFields).map(([key, value]) => (
+              <DetailRow key={key} label={key} value={String(value)} />
+            ))}
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function DetailRow({ label, value }: { label: string; value?: string }) {
+function DetailRow({ label, value, mono }: { label: string; value?: string; mono?: boolean }) {
   return (
-    <div className="flex items-center py-2 border-b border-gray-700">
-      <span className="w-32 text-sm text-gray-400">{label}</span>
-      <span className="text-white">{value || '--'}</span>
+    <div className="flex items-center px-3 py-2.5 border-b border-rule last:border-b-0 text-[13px]">
+      <span className="w-36 text-ink-dim text-[11.5px] uppercase tracking-wider">{label}</span>
+      <span className={`${mono ? 'mono' : ''} ${value ? 'text-ink' : 'text-ink-faint'}`}>
+        {value || '—'}
+      </span>
     </div>
   );
 }
@@ -1564,139 +1523,104 @@ function EditContactModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-gray-800 rounded-lg p-6 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
-        <h2 className="text-lg font-semibold text-white mb-4">Edit Contact</h2>
+    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 animate-fade-in">
+      <div className="panel-raised rounded-md shadow-panel p-6 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
+        <div className="mb-5">
+          <div className="kicker mb-1">Edit</div>
+          <h2 className="font-display text-[26px] text-ink leading-none">Contact</h2>
+        </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">First Name</label>
-              <input
-                type="text"
+        <form onSubmit={handleSubmit} className="space-y-3.5">
+          <div className="grid grid-cols-2 gap-3">
+            <ModalField label="First name">
+              <input type="text" className="input"
                 value={formData.firstName}
-                onChange={(e) => setFormData({ ...formData, firstName: e.target.value })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">Last Name</label>
-              <input
-                type="text"
+                onChange={(e) => setFormData({ ...formData, firstName: e.target.value })} />
+            </ModalField>
+            <ModalField label="Last name">
+              <input type="text" className="input"
                 value={formData.lastName}
-                onChange={(e) => setFormData({ ...formData, lastName: e.target.value })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
+                onChange={(e) => setFormData({ ...formData, lastName: e.target.value })} />
+            </ModalField>
           </div>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Display Name *</label>
-            <input
-              type="text"
+          <ModalField label="Display name" required>
+            <input type="text" className="input" required
               value={formData.displayName}
-              onChange={(e) => setFormData({ ...formData, displayName: e.target.value })}
-              required
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-            />
-          </div>
+              onChange={(e) => setFormData({ ...formData, displayName: e.target.value })} />
+          </ModalField>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Phone *</label>
-            <input
-              type="tel"
+          <ModalField label="Phone" required>
+            <input type="tel" className="input mono" required
               value={formData.phone}
-              onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-              required
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-            />
-          </div>
+              onChange={(e) => setFormData({ ...formData, phone: e.target.value })} />
+          </ModalField>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Email</label>
-            <input
-              type="email"
+          <ModalField label="Email">
+            <input type="email" className="input"
               value={formData.email}
-              onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-            />
-          </div>
+              onChange={(e) => setFormData({ ...formData, email: e.target.value })} />
+          </ModalField>
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">Company</label>
-              <input
-                type="text"
+          <div className="grid grid-cols-2 gap-3">
+            <ModalField label="Company">
+              <input type="text" className="input"
                 value={formData.company}
-                onChange={(e) => setFormData({ ...formData, company: e.target.value })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">Job Title</label>
-              <input
-                type="text"
+                onChange={(e) => setFormData({ ...formData, company: e.target.value })} />
+            </ModalField>
+            <ModalField label="Job title">
+              <input type="text" className="input"
                 value={formData.jobTitle}
-                onChange={(e) => setFormData({ ...formData, jobTitle: e.target.value })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
+                onChange={(e) => setFormData({ ...formData, jobTitle: e.target.value })} />
+            </ModalField>
           </div>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Account Tier</label>
-            <select
+          <ModalField label="Account tier">
+            <select className="input"
               value={formData.accountTier}
-              onChange={(e) => setFormData({ ...formData, accountTier: e.target.value as any })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-            >
+              onChange={(e) => setFormData({ ...formData, accountTier: e.target.value as any })}>
               <option value="prospect">Prospect</option>
               <option value="free">Free</option>
               <option value="pro">Pro</option>
               <option value="enterprise">Enterprise</option>
             </select>
-          </div>
+          </ModalField>
 
-          <div className="flex items-center gap-6">
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
+          <div className="flex items-center gap-6 pt-1">
+            <label className="flex items-center gap-2 cursor-pointer text-[13px]">
+              <input type="checkbox" className="w-3.5 h-3.5 rounded-sm accent-sw-blue"
                 checked={formData.isVip}
-                onChange={(e) => setFormData({ ...formData, isVip: e.target.checked })}
-                className="w-4 h-4 rounded bg-gray-700 border-gray-600"
-              />
-              <span className="text-white">VIP Customer</span>
+                onChange={(e) => setFormData({ ...formData, isVip: e.target.checked })} />
+              <span className="text-ink">VIP customer</span>
             </label>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
+            <label className="flex items-center gap-2 cursor-pointer text-[13px]">
+              <input type="checkbox" className="w-3.5 h-3.5 rounded-sm accent-urgent"
                 checked={formData.isBlocked}
-                onChange={(e) => setFormData({ ...formData, isBlocked: e.target.checked })}
-                className="w-4 h-4 rounded bg-gray-700 border-gray-600"
-              />
-              <span className="text-white">Blocked</span>
+                onChange={(e) => setFormData({ ...formData, isBlocked: e.target.checked })} />
+              <span className="text-ink">Blocked</span>
             </label>
           </div>
 
-          <div className="flex justify-end gap-2 pt-4">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={isSaving}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
-            >
-              {isSaving ? 'Saving...' : 'Save Changes'}
+          <div className="flex justify-end gap-2 pt-4 border-t border-rule">
+            <button type="button" onClick={onClose} className="btn-ghost">Cancel</button>
+            <button type="submit" disabled={isSaving} className="btn-primary">
+              {isSaving ? 'Saving…' : 'Save changes'}
             </button>
           </div>
         </form>
       </div>
     </div>
+  );
+}
+
+function ModalField({ label, required, children }: { label: string; required?: boolean; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <span className="block kicker mb-1">
+        {label}{required && <span className="text-signal-soft ml-0.5">*</span>}
+      </span>
+      {children}
+    </label>
   );
 }
 

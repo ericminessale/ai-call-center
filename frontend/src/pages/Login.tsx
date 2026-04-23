@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
-import { Mail, Lock, AlertCircle, Eye, EyeOff, Loader2 } from 'lucide-react';
+import { AlertCircle, Eye, EyeOff, Loader2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import Logo from '../components/shared/Logo';
 
@@ -16,127 +16,139 @@ export default function Login() {
     e.preventDefault();
     try {
       await login(email, password);
-      toast.success('Login successful!');
+      toast.success('Welcome back');
       navigate('/');
-    } catch (err) {
-      toast.error('Login failed. Please check your credentials.');
+    } catch {
+      toast.error('Login failed. Check your credentials.');
     }
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 via-white to-indigo-100 py-12 px-4 sm:px-6 lg:px-8 relative overflow-hidden">
-      {/* Subtle background decoration */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute -top-40 -right-40 w-80 h-80 bg-blue-100 rounded-full opacity-40 blur-3xl" />
-        <div className="absolute -bottom-40 -left-40 w-80 h-80 bg-indigo-100 rounded-full opacity-40 blur-3xl" />
-      </div>
+    <div className="relative min-h-screen bg-canvas flex items-center justify-center p-6 overflow-hidden">
+      {/* Atmospheric background — subtle blue glow (brand structural accent) */}
+      <div className="absolute -top-40 -right-40 w-[520px] h-[520px] rounded-full opacity-[0.18] blur-[140px] pointer-events-none"
+           style={{ background: 'radial-gradient(closest-side, #044EF4, transparent 70%)' }} />
+      <div className="absolute -bottom-40 -left-40 w-[520px] h-[520px] rounded-full opacity-[0.10] blur-[160px] pointer-events-none"
+           style={{ background: 'radial-gradient(closest-side, #F72A72, transparent 70%)' }} />
 
-      <div className="max-w-md w-full space-y-8 relative z-10">
-        <div>
-          <div className="flex justify-center">
-            <Logo size="lg" />
+      {/* Corner crosshairs */}
+      <div className="absolute top-6 left-6 kicker text-ink-faint pointer-events-none">signalwire / cf</div>
+      <div className="absolute top-6 right-6 mono text-[9.5px] text-ink-faint uppercase tracking-[0.3em] pointer-events-none">
+        <span className="inline-flex items-center gap-1.5">
+          <span className="w-1 h-1 rounded-full bg-live animate-pulse" />
+          ready
+        </span>
+      </div>
+      <div className="absolute bottom-6 left-6 mono text-[9.5px] text-ink-faint uppercase tracking-[0.3em] pointer-events-none">v1.0</div>
+      <div className="absolute bottom-6 right-6 mono text-[9.5px] text-ink-faint uppercase tracking-[0.3em] pointer-events-none">secure channel</div>
+
+      {/* Card */}
+      <div className="relative z-10 w-full max-w-md animate-fade-up">
+        <div className="flex items-center gap-3 mb-8">
+          <Logo size="lg" />
+          <div className="leading-none">
+            <div className="font-heading text-[26px] text-ink font-semibold tracking-heading">SignalWire</div>
+            <div className="kicker mt-1">Call Center</div>
           </div>
-          <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
-            Sign in to your account
-          </h2>
-          <p className="mt-2 text-center text-sm text-gray-600">
-            Or{' '}
-            <Link to="/register" className="font-medium text-blue-600 hover:text-blue-500 transition-colors">
-              create a new account
-            </Link>
-          </p>
         </div>
 
-        <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
-          <div className="bg-white p-8 rounded-xl shadow-lg border border-gray-100">
-            {error && (
-              <div className="mb-4 flex items-center p-4 bg-red-50 rounded-lg border border-red-100">
-                <AlertCircle className="h-5 w-5 text-red-400 mr-2 flex-shrink-0" />
-                <span className="text-sm text-red-800">{error}</span>
-              </div>
-            )}
-
-            <div className="space-y-4">
-              <div>
-                <label htmlFor="email" className="block text-sm font-medium text-gray-700">
-                  Email address
-                </label>
-                <div className="mt-1 relative">
-                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                    <Mail className="h-5 w-5 text-gray-400" />
-                  </div>
-                  <input
-                    id="email"
-                    name="email"
-                    type="email"
-                    autoComplete="email"
-                    required
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    className="appearance-none block w-full pl-10 pr-3 py-2.5 border border-gray-300 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:text-sm transition-colors"
-                    placeholder="you@example.com"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label htmlFor="password" className="block text-sm font-medium text-gray-700">
-                  Password
-                </label>
-                <div className="mt-1 relative">
-                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                    <Lock className="h-5 w-5 text-gray-400" />
-                  </div>
-                  <input
-                    id="password"
-                    name="password"
-                    type={showPassword ? 'text' : 'password'}
-                    autoComplete="current-password"
-                    required
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    className="appearance-none block w-full pl-10 pr-10 py-2.5 border border-gray-300 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:text-sm transition-colors"
-                    placeholder="••••••••"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-600 transition-colors"
-                    tabIndex={-1}
-                  >
-                    {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-4 flex justify-end">
-              <Link
-                to="/forgot-password"
-                className="text-sm font-medium text-blue-600 hover:text-blue-500 transition-colors"
-              >
-                Forgot your password?
-              </Link>
-            </div>
-
-            <div className="mt-4">
-              <button
-                type="submit"
-                disabled={isLoading}
-                className="w-full flex justify-center items-center py-2.5 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                {isLoading ? (
-                  <>
-                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                    Signing in...
-                  </>
-                ) : (
-                  'Sign in'
-                )}
-              </button>
-            </div>
+        <div className="panel rounded-md shadow-panel p-8">
+          <div className="mb-6">
+            <div className="kicker mb-1">Sign in</div>
+            <h2 className="font-heading text-[30px] text-ink font-semibold leading-[1.1] tracking-heading">
+              Welcome back.
+            </h2>
+            <p className="text-[13px] text-ink-muted mt-2">
+              Sign in to take calls, monitor queues, and configure the fabric.
+            </p>
           </div>
-        </form>
+
+          {error && (
+            <div className="mb-5 flex items-center gap-2 p-3 bg-urgent/10 border border-urgent/30 rounded">
+              <AlertCircle className="h-4 w-4 text-urgent-soft flex-shrink-0" />
+              <span className="text-[12.5px] text-urgent-soft">{error}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label htmlFor="email" className="block kicker mb-1.5">Email</label>
+              <input
+                id="email"
+                name="email"
+                type="email"
+                autoComplete="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="input mono"
+                placeholder="you@signalwire.com"
+              />
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label htmlFor="password" className="block kicker">Password</label>
+                <Link
+                  to="/forgot-password"
+                  className="text-[11.5px] text-sw-turquoise hover:text-sw-fuchsia transition-colors"
+                >
+                  Forgot?
+                </Link>
+              </div>
+              <div className="relative">
+                <input
+                  id="password"
+                  name="password"
+                  type={showPassword ? 'text' : 'password'}
+                  autoComplete="current-password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="input pr-10 mono"
+                  placeholder="••••••••"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute inset-y-0 right-0 pr-2.5 flex items-center text-ink-dim hover:text-ink transition-colors"
+                  tabIndex={-1}
+                >
+                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="btn-primary w-full justify-center !py-2.5 mt-2"
+            >
+              {isLoading ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Signing in…
+                </>
+              ) : (
+                'Sign in'
+              )}
+            </button>
+          </form>
+
+          <div className="mt-6 pt-5 border-t border-rule text-center">
+            <span className="text-[12.5px] text-ink-dim">
+              New here?{' '}
+              <Link to="/register" className="text-sw-turquoise hover:text-sw-fuchsia font-medium transition-colors">
+                Create an account
+              </Link>
+            </span>
+          </div>
+        </div>
+
+        {/* Tagline */}
+        <p className="text-center mt-6 text-[11.5px] text-ink-dim">
+          AI-first voice. Humans when it matters.
+        </p>
       </div>
     </div>
   );

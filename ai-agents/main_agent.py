@@ -458,7 +458,76 @@ def add_sentiment_tool(agent):
     )
 
 
-class CallCenterTriageAgent(AgentBase):
+class CallCenterAgent(AgentBase):
+    """Project-wide base for every agent class in this file.
+
+    Centralizes the bits that were previously duplicated across all five
+    agents — the basic-auth bypass, and the queue-transfer helper that
+    every ``transfer_to_human`` / ``escalate_to_human`` tool ends up
+    calling. Per-agent tools just describe what's specific (department,
+    spoken response, source label, extra context fields).
+    """
+
+    def _check_basic_auth(self, request) -> bool:
+        # Agents are only reachable via nginx, which has already terminated
+        # the basic-auth layer SignalWire was configured with. Skipping the
+        # SDK's inner check avoids a double prompt without removing real auth.
+        return True
+
+    def _transfer_to_human_queue(
+        self,
+        *,
+        department: str,
+        spoken_response: str,
+        context_data: dict,
+        raw_data: dict,
+    ) -> FunctionResult:
+        """Hand the caller off to ``/api/queues/<department>/route``.
+
+        The caller passes the agent-specific bits (``customer_name``,
+        ``reason``, ``source_agent``, etc.) in ``context_data``; this
+        method merges in the standard fields, base64-encodes, builds the
+        URL with conf/call_db_id wiring, signs it with WEBHOOK_AUTH
+        creds, and returns a ready-to-return ``FunctionResult``.
+        """
+        base_url = get_base_url_from_global_data(raw_data)
+        global_data = raw_data.get('global_data', {})
+        conf = global_data.get('conf', '')
+        call_db_id = global_data.get('call_db_id', '')
+
+        # Standard fields every queue transfer includes.
+        context_data.setdefault('department', department)
+        context_data.setdefault('preferred_handling', 'human')
+        context_data.setdefault(
+            'caller_language', global_data.get('caller_language', 'en-US')
+        )
+
+        context_b64 = base64.urlsafe_b64encode(
+            json.dumps(context_data).encode()
+        ).decode()
+        queue_url = f"{base_url}/api/queues/{department}/route?ctx={context_b64}"
+        if conf:
+            queue_url += f"&conf={conf}"
+        if call_db_id:
+            queue_url += f"&call_db_id={call_db_id}"
+
+        result = FunctionResult(spoken_response, post_process=True)
+        result.update_global_data(context_data)
+        result.action.append({
+            "SWML": {
+                "version": "1.0.0",
+                "sections": {
+                    "main": [
+                        {"transfer": {"dest": _signed_webhook_url(queue_url)}}
+                    ]
+                },
+            },
+            "transfer": "true",
+        })
+        return result
+
+
+class CallCenterTriageAgent(CallCenterAgent):
     """
     Call Center TRIAGE Agent - Information gathering ONLY.
 
@@ -670,10 +739,6 @@ class CallCenterTriageAgent(AgentBase):
 
         # Tools registered via @AgentBase.tool() decorators below
 
-    def _check_basic_auth(self, request) -> bool:
-        """Override to disable auth - agents are behind nginx"""
-        return True
-
     @AgentBase.tool(
         name="set_caller_language",
         description=(
@@ -712,59 +777,22 @@ class CallCenterTriageAgent(AgentBase):
         fillers=["I'm connecting you now.", "One moment, I'll get you to the right person."],
     )
     def transfer_to_human(self, args, raw_data):
-        """Transfer to human representative queue"""
-        customer_name = args.get("customer_name", "")
-        reason = args.get("reason", "")
-        department = args.get("department", "support").lower()
+        """Triage agent's transfer — department comes from caller intent."""
         urgency = args.get("urgency", "medium")
-        additional_info = args.get("additional_info", "")
-
-        base_url = get_base_url_from_global_data(raw_data)
-        global_data = raw_data.get('global_data', {})
-
-        # Get conference name and call DB ID (conference-first architecture)
-        conf = global_data.get('conf', '')
-        call_db_id = global_data.get('call_db_id', '')
-
-        # Map urgency to priority
         urgency_map = {'high': 2, 'medium': 5, 'low': 8}
-        priority = urgency_map.get(urgency.lower(), 5)
-
-        context_data = {
-            'customer_name': customer_name,
-            'reason': reason,
-            'department': department,
-            'urgency': urgency,
-            'priority': priority,
-            'additional_info': additional_info,
-            'preferred_handling': 'human',
-            'source_agent': 'call_center_triage',
-            'caller_language': global_data.get('caller_language', 'en-US'),
-        }
-
-        # Encode context as base64 JSON for URL
-        context_json = json.dumps(context_data)
-        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
-        # Include conference name and call DB ID for conference-first flow
-        queue_url = f"{base_url}/api/queues/{department}/route?ctx={context_b64}"
-        if conf:
-            queue_url += f"&conf={conf}"
-        if call_db_id:
-            queue_url += f"&call_db_id={call_db_id}"
-
-        result = FunctionResult(
-            "I'll connect you with a representative right now.",
-            post_process=True,
-        )
-        result.update_global_data(context_data)
-        result.action.append({
-            "SWML": {
-                "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
+        return self._transfer_to_human_queue(
+            department=args.get("department", "support").lower(),
+            spoken_response="I'll connect you with a representative right now.",
+            context_data={
+                'customer_name': args.get("customer_name", ""),
+                'reason': args.get("reason", ""),
+                'urgency': urgency,
+                'priority': urgency_map.get(urgency.lower(), 5),
+                'additional_info': args.get("additional_info", ""),
+                'source_agent': 'call_center_triage',
             },
-            "transfer": "true"
-        })
-        return result
+            raw_data=raw_data,
+        )
 
     @AgentBase.tool(
         name="transfer_to_ai_specialist",
@@ -824,7 +852,7 @@ class CallCenterTriageAgent(AgentBase):
         return result
 
 
-class SalesAISpecialist(AgentBase):
+class SalesAISpecialist(CallCenterAgent):
     """
     AI Sales Specialist - This agent DOES help with sales inquiries.
     Only reached after customer explicitly chooses AI assistance.
@@ -923,9 +951,6 @@ class SalesAISpecialist(AgentBase):
 
         # Tool registered via @AgentBase.tool() decorator below
 
-    def _check_basic_auth(self, request) -> bool:
-        return True
-
     @AgentBase.tool(
         name="escalate_to_human",
         description=(
@@ -938,52 +963,26 @@ class SalesAISpecialist(AgentBase):
         fillers=["Let me get a sales representative for you.", "One moment."],
     )
     def escalate_to_human(self, args, raw_data):
-        """Escalate to human sales"""
-        reason = args.get("reason", "")
-        base_url = get_base_url_from_global_data(raw_data)
+        """Sales specialist's hand-off back to a human rep."""
         global_data = raw_data.get('global_data', {})
-
-        # Get conference name and call DB ID (conference-first architecture)
-        conf = global_data.get('conf', '')
-        call_db_id = global_data.get('call_db_id', '')
-
-        context_data = {
-            'customer_name': global_data.get('customer_name', ''),
-            'reason': global_data.get('reason', ''),
-            'department': 'sales',
-            'urgency': global_data.get('urgency', 'medium'),
-            'priority': global_data.get('priority', 5),
-            'additional_info': global_data.get('additional_info', ''),
-            'escalation_reason': reason,
-            'escalated_from': 'sales_ai_specialist',
-            'preferred_handling': 'human',
-            'source_agent': 'sales_ai_specialist'
-        }
-
-        context_json = json.dumps(context_data)
-        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
-        queue_url = f"{base_url}/api/queues/sales/route?ctx={context_b64}"
-        if conf:
-            queue_url += f"&conf={conf}"
-        if call_db_id:
-            queue_url += f"&call_db_id={call_db_id}"
-
-        result = FunctionResult(
-            "I'll connect you with a sales representative who can help with that.",
-            post_process=True,
-        )
-        result.update_global_data(context_data)
-        result.action.append({
-            "SWML": {
-                "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
+        return self._transfer_to_human_queue(
+            department='sales',
+            spoken_response="I'll connect you with a sales representative who can help with that.",
+            context_data={
+                'customer_name': global_data.get('customer_name', ''),
+                'reason': global_data.get('reason', ''),
+                'urgency': global_data.get('urgency', 'medium'),
+                'priority': global_data.get('priority', 5),
+                'additional_info': global_data.get('additional_info', ''),
+                'escalation_reason': args.get("reason", ""),
+                'escalated_from': 'sales_ai_specialist',
+                'source_agent': 'sales_ai_specialist',
             },
-            "transfer": "true"
-        })
-        return result
+            raw_data=raw_data,
+        )
 
 
-class SupportAISpecialist(AgentBase):
+class SupportAISpecialist(CallCenterAgent):
     """
     AI Support Specialist - This agent DOES troubleshoot and solve problems.
     Only reached after customer explicitly chooses AI assistance.
@@ -1084,9 +1083,6 @@ class SupportAISpecialist(AgentBase):
 
         # Tool registered via @AgentBase.tool() decorator below
 
-    def _check_basic_auth(self, request) -> bool:
-        return True
-
     @AgentBase.tool(
         name="escalate_to_human",
         description=(
@@ -1100,49 +1096,23 @@ class SupportAISpecialist(AgentBase):
         fillers=["Let me get a support specialist for you.", "One moment."],
     )
     def escalate_to_human(self, args, raw_data):
-        """Escalate to human support"""
-        reason = args.get("reason", "")
-        base_url = get_base_url_from_global_data(raw_data)
+        """Support specialist's hand-off back to a human rep."""
         global_data = raw_data.get('global_data', {})
-
-        # Get conference name and call DB ID (conference-first architecture)
-        conf = global_data.get('conf', '')
-        call_db_id = global_data.get('call_db_id', '')
-
-        context_data = {
-            'customer_name': global_data.get('customer_name', ''),
-            'reason': global_data.get('reason', ''),
-            'department': 'support',
-            'urgency': global_data.get('urgency', 'medium'),
-            'priority': global_data.get('priority', 5),
-            'additional_info': global_data.get('additional_info', ''),
-            'escalation_reason': reason,
-            'escalated_from': 'support_ai_specialist',
-            'preferred_handling': 'human',
-            'source_agent': 'support_ai_specialist'
-        }
-
-        context_json = json.dumps(context_data)
-        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
-        queue_url = f"{base_url}/api/queues/support/route?ctx={context_b64}"
-        if conf:
-            queue_url += f"&conf={conf}"
-        if call_db_id:
-            queue_url += f"&call_db_id={call_db_id}"
-
-        result = FunctionResult(
-            "I'll connect you with a support specialist who can help with that.",
-            post_process=True,
-        )
-        result.update_global_data(context_data)
-        result.action.append({
-            "SWML": {
-                "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
+        return self._transfer_to_human_queue(
+            department='support',
+            spoken_response="I'll connect you with a support specialist who can help with that.",
+            context_data={
+                'customer_name': global_data.get('customer_name', ''),
+                'reason': global_data.get('reason', ''),
+                'urgency': global_data.get('urgency', 'medium'),
+                'priority': global_data.get('priority', 5),
+                'additional_info': global_data.get('additional_info', ''),
+                'escalation_reason': args.get("reason", ""),
+                'escalated_from': 'support_ai_specialist',
+                'source_agent': 'support_ai_specialist',
             },
-            "transfer": "true"
-        })
-        return result
+            raw_data=raw_data,
+        )
 
 
 # ============================================================
@@ -1152,7 +1122,7 @@ class SupportAISpecialist(AgentBase):
 # global_data, set from the ?ctx= query param.
 # ============================================================
 
-class OutboundSalesAgent(AgentBase):
+class OutboundSalesAgent(CallCenterAgent):
     """
     Outbound AI Sales Agent - proactively calls customers for sales outreach.
     Receives customer context from the call center dashboard.
@@ -1250,9 +1220,6 @@ class OutboundSalesAgent(AgentBase):
 
         # Tool registered via @AgentBase.tool() decorator below
 
-    def _check_basic_auth(self, request) -> bool:
-        return True
-
     @AgentBase.tool(
         name="transfer_to_human",
         description=(
@@ -1265,52 +1232,26 @@ class OutboundSalesAgent(AgentBase):
         fillers=["Let me connect you with a sales representative.", "One moment."],
     )
     def transfer_to_human(self, args, raw_data):
-        """Transfer to human sales rep"""
-        reason = args.get("reason", "")
-        base_url = get_base_url_from_global_data(raw_data)
+        """Outbound sales agent's hand-off to a human rep."""
         global_data = raw_data.get('global_data', {})
-
-        # Get conference name if available (conference-first architecture)
-        conf = global_data.get('conf', '')
-        call_db_id = global_data.get('call_db_id', '')
-
-        context_data = {
-            'customer_name': global_data.get('contact_name', ''),
-            'company': global_data.get('company', ''),
-            'department': 'sales',
-            'reason': reason,
-            'urgency': 'medium',
-            'priority': 5,
-            'additional_info': global_data.get('additional_context', ''),
-            'escalated_from': 'outbound_sales_agent',
-            'preferred_handling': 'human',
-            'source_agent': 'outbound_sales_agent'
-        }
-
-        context_json = json.dumps(context_data)
-        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
-        queue_url = f"{base_url}/api/queues/sales/route?ctx={context_b64}"
-        if conf:
-            queue_url += f"&conf={conf}"
-        if call_db_id:
-            queue_url += f"&call_db_id={call_db_id}"
-
-        result = FunctionResult(
-            "I'll connect you with a sales representative right away.",
-            post_process=True,
-        )
-        result.update_global_data(context_data)
-        result.action.append({
-            "SWML": {
-                "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
+        return self._transfer_to_human_queue(
+            department='sales',
+            spoken_response="I'll connect you with a sales representative right away.",
+            context_data={
+                'customer_name': global_data.get('contact_name', ''),
+                'company': global_data.get('company', ''),
+                'reason': args.get("reason", ""),
+                'urgency': 'medium',
+                'priority': 5,
+                'additional_info': global_data.get('additional_context', ''),
+                'escalated_from': 'outbound_sales_agent',
+                'source_agent': 'outbound_sales_agent',
             },
-            "transfer": "true"
-        })
-        return result
+            raw_data=raw_data,
+        )
 
 
-class OutboundSupportAgent(AgentBase):
+class OutboundSupportAgent(CallCenterAgent):
     """
     Outbound AI Support Agent - proactively calls customers for support follow-ups.
     Receives customer context from the call center dashboard.
@@ -1409,9 +1350,6 @@ class OutboundSupportAgent(AgentBase):
 
         # Tool registered via @AgentBase.tool() decorator below
 
-    def _check_basic_auth(self, request) -> bool:
-        return True
-
     @AgentBase.tool(
         name="transfer_to_human",
         description=(
@@ -1424,49 +1362,23 @@ class OutboundSupportAgent(AgentBase):
         fillers=["Let me connect you with a support specialist.", "One moment."],
     )
     def transfer_to_human(self, args, raw_data):
-        """Transfer to human support"""
-        reason = args.get("reason", "")
-        base_url = get_base_url_from_global_data(raw_data)
+        """Outbound support agent's hand-off to a human rep."""
         global_data = raw_data.get('global_data', {})
-
-        # Get conference name if available (conference-first architecture)
-        conf = global_data.get('conf', '')
-        call_db_id = global_data.get('call_db_id', '')
-
-        context_data = {
-            'customer_name': global_data.get('contact_name', ''),
-            'company': global_data.get('company', ''),
-            'department': 'support',
-            'reason': reason,
-            'urgency': 'medium',
-            'priority': 5,
-            'additional_info': global_data.get('additional_context', ''),
-            'escalated_from': 'outbound_support_agent',
-            'preferred_handling': 'human',
-            'source_agent': 'outbound_support_agent'
-        }
-
-        context_json = json.dumps(context_data)
-        context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
-        queue_url = f"{base_url}/api/queues/support/route?ctx={context_b64}"
-        if conf:
-            queue_url += f"&conf={conf}"
-        if call_db_id:
-            queue_url += f"&call_db_id={call_db_id}"
-
-        result = FunctionResult(
-            "I'll connect you with a support specialist right away.",
-            post_process=True,
-        )
-        result.update_global_data(context_data)
-        result.action.append({
-            "SWML": {
-                "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
+        return self._transfer_to_human_queue(
+            department='support',
+            spoken_response="I'll connect you with a support specialist right away.",
+            context_data={
+                'customer_name': global_data.get('contact_name', ''),
+                'company': global_data.get('company', ''),
+                'reason': args.get("reason", ""),
+                'urgency': 'medium',
+                'priority': 5,
+                'additional_info': global_data.get('additional_context', ''),
+                'escalated_from': 'outbound_support_agent',
+                'source_agent': 'outbound_support_agent',
             },
-            "transfer": "true"
-        })
-        return result
+            raw_data=raw_data,
+        )
 
 
 if __name__ == '__main__':

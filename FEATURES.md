@@ -342,7 +342,7 @@ The Settings tab is the complete configuration surface. Admin-only.
 
 ### Developer experience
 
-- **ngrok auto-integration** (`start_ngrok.bat`) — one command spins up a tunnel, writes the URL into `.env`, recreates the backend containers, and syncs the Fabric resource URL so inbound webhooks resolve to the fresh tunnel.
+- **ngrok auto-integration** (`scripts/dev/start_ngrok.bat`) — one command spins up a tunnel, writes the URL into `.env`, recreates the backend containers, and syncs the Fabric resource URL so inbound webhooks resolve to the fresh tunnel.
 - **Swaig-test CLI** for testing AI agents locally without deployment.
 - **Alembic migrations** apply cleanly on container boot.
 

@@ -1061,22 +1061,6 @@ def get_agent_metrics():
 
         service = get_queue_service()
         metrics = service.get_agent_metrics(agent_id, period_hours)
-
-        # Add database metrics
-        from sqlalchemy import func
-        from datetime import timedelta
-
-        since = datetime.utcnow() - timedelta(hours=period_hours)
-
-        # For now, return mock metrics since we don't have agent_id on calls
-        calls_handled = 15
-        avg_duration = 240
-
-        metrics.update({
-            'calls_handled': calls_handled,
-            'average_handle_time': avg_duration
-        })
-
         return jsonify(metrics)
 
     except Exception as e:

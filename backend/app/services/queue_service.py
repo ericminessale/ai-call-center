@@ -555,27 +555,46 @@ class QueueService:
             logger.info(f"Notified {len(available_agents)} agents about call {call_id}")
 
     def get_agent_metrics(self, agent_id: str, period_hours: int = 24) -> Dict[str, Any]:
-        """
-        Get performance metrics for an agent
+        """Get performance metrics for an agent over a window.
 
-        Args:
-            agent_id: Agent identifier
-            period_hours: Time period to calculate metrics
-
-        Returns:
-            Agent performance metrics
+        Pulls from the ``calls`` table. ``calls_handled`` counts Call rows
+        assigned to this agent within the window; ``average_handle_time``
+        is mean ``ended_at - answered_at`` in seconds for those rows.
         """
-        # In production, query from database
-        # This is a simplified version using Redis data
+        from sqlalchemy import func
+        from app import db
+        from app.models import Call
+
+        since = datetime.utcnow() - timedelta(hours=period_hours)
+        try:
+            agent_id_int = int(agent_id)
+        except (TypeError, ValueError):
+            agent_id_int = None
+
+        calls_handled = 0
+        avg_handle_time = 0.0
+        if agent_id_int is not None:
+            row = db.session.query(
+                func.count(Call.id),
+                func.avg(
+                    func.extract('epoch', Call.ended_at) -
+                    func.extract('epoch', Call.answered_at)
+                ),
+            ).filter(
+                Call.assigned_agent_id == agent_id_int,
+                Call.created_at >= since,
+                Call.answered_at.isnot(None),
+                Call.ended_at.isnot(None),
+            ).one()
+            calls_handled = int(row[0] or 0)
+            avg_handle_time = float(row[1] or 0.0)
 
         return {
             "agent_id": agent_id,
             "period_hours": period_hours,
-            "calls_handled": 0,  # Would query from database
-            "average_handle_time": 0,
-            "average_wait_time": 0,
-            "transfer_rate": 0,
-            "current_status": self.get_agent_status(agent_id)
+            "calls_handled": calls_handled,
+            "average_handle_time": round(avg_handle_time, 1),
+            "current_status": self.get_agent_status(agent_id),
         }
 
     def get_queue_metrics(self, queue_id: str) -> Dict[str, Any]:
@@ -587,13 +606,42 @@ class QueueService:
             "available_agents": len(self.get_available_agents(queue_id)),
             "busy_agents": len([
                 a for a in self.get_agents_by_status("busy")
-                # Filter by queue assignment in production
+                # Note: not yet filtered by per-agent queue assignment.
             ]),
-            "service_level": self._calculate_service_level(queue_id)
+            "service_level": self._calculate_service_level(queue_id),
         }
 
-    def _calculate_service_level(self, queue_id: str, threshold_seconds: int = 60) -> float:
-        """Calculate percentage of calls answered within threshold"""
-        # In production, query historical data from database
-        # This is a placeholder
-        return 85.0  # 85% of calls answered within threshold
+    def _calculate_service_level(
+        self,
+        queue_id: str,
+        threshold_seconds: int = 60,
+        window_hours: int = 24,
+    ) -> Optional[float]:
+        """Percentage of queue calls answered within ``threshold_seconds``.
+
+        Computed over the past ``window_hours``. Returns ``None`` when
+        there's no data in the window — callers should treat that as
+        "not enough data" rather than coerce to 0.
+        """
+        from sqlalchemy import func, case
+        from app import db
+        from app.models import Call
+
+        since = datetime.utcnow() - timedelta(hours=window_hours)
+        wait_seconds = (
+            func.extract('epoch', Call.answered_at)
+            - func.extract('epoch', Call.created_at)
+        )
+        row = db.session.query(
+            func.count(Call.id),
+            func.sum(case((wait_seconds <= threshold_seconds, 1), else_=0)),
+        ).filter(
+            Call.queue_id == queue_id,
+            Call.created_at >= since,
+            Call.answered_at.isnot(None),
+        ).one()
+
+        total, within = int(row[0] or 0), int(row[1] or 0)
+        if total == 0:
+            return None
+        return round(100.0 * within / total, 1)

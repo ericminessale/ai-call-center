@@ -1,13 +1,17 @@
 /**
- * CallControlPanel - Expanded real-time call control surface
+ * CallControlPanel — participant controls for a call the user is currently on.
  *
- * Renders hold, record, TTS, and DTMF controls for active calls.
- * Works for both AI and human agent calls.
- * Demonstrates SignalWire's real-time call control: calls are stateful objects
- * you command by UUID.
+ * Renders self actions (mute lives on the header) and participant actions
+ * (hold, record, TTS, DTMF, translate, request-backup, escalate). Demonstrates
+ * SignalWire's real-time call control: calls are stateful objects you command
+ * by UUID.
+ *
+ * Observer actions (Listen / Whisper / Barge) deliberately do NOT live here —
+ * they apply to calls you are NOT on. See ObserverControls and the architecture
+ * discussion in the call-controls refactor.
  */
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   Pause,
   Play,
@@ -15,15 +19,28 @@ import {
   Volume2,
   Hash,
   Send,
-  Headphones,
   Users,
   ShieldAlert,
   ChevronDown,
   ChevronUp,
   StopCircle,
+  Languages,
 } from 'lucide-react';
 import { callControlApi } from '../../services/api';
-import { AudioMonitor } from '../shared/AudioMonitor';
+
+// Same BCP-47 menu as the admin user editor so caller/agent vocabularies match.
+const TRANSLATE_LANGUAGES: { code: string; label: string }[] = [
+  { code: 'en-US', label: 'English (US)' },
+  { code: 'es-ES', label: 'Spanish' },
+  { code: 'fr-FR', label: 'French' },
+  { code: 'de-DE', label: 'German' },
+  { code: 'it-IT', label: 'Italian' },
+  { code: 'pt-BR', label: 'Portuguese (Brazil)' },
+  { code: 'ja-JP', label: 'Japanese' },
+  { code: 'zh-CN', label: 'Chinese (Mandarin)' },
+  { code: 'ko-KR', label: 'Korean' },
+  { code: 'ar-SA', label: 'Arabic' },
+];
 
 interface CallControlPanelProps {
   callId: number | string;
@@ -36,7 +53,6 @@ interface CallControlPanelProps {
   userRole?: string;
   onHoldChange?: (held: boolean) => void;
   onRecordingChange?: (recording: boolean) => void;
-  onMonitorStart?: (data: any) => void;
   onBackupRequested?: () => void;
   onEscalateRequested?: () => void;
 }
@@ -52,7 +68,6 @@ export default function CallControlPanel({
   userRole = 'agent',
   onHoldChange,
   onRecordingChange,
-  onMonitorStart,
   onBackupRequested,
   onEscalateRequested,
 }: CallControlPanelProps) {
@@ -62,8 +77,10 @@ export default function CallControlPanel({
   const [isLoading, setIsLoading] = useState<string | null>(null); // track which action is loading
   const [expanded, setExpanded] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [isMonitoring, setIsMonitoring] = useState(false);
-  const [monitorType, setMonitorType] = useState<'tap' | 'conference' | null>(null);
+  const [showTranslatePicker, setShowTranslatePicker] = useState(false);
+  const [translateActive, setTranslateActive] = useState(false);
+  const [translateFromLang, setTranslateFromLang] = useState<string>('es-ES');
+  const [translateToLang, setTranslateToLang] = useState<string>('en-US');
 
   const isSupervisor = userRole === 'supervisor' || userRole === 'admin';
 
@@ -129,37 +146,6 @@ export default function CallControlPanel({
     }
   }, [callId]);
 
-  const handleMonitor = useCallback(async () => {
-    console.log('[CallControl] handleMonitor called, callId:', callId, 'isMonitoring:', isMonitoring);
-    if (isMonitoring) {
-      // Stop monitoring
-      try {
-        await callControlApi.stopMonitor(callId);
-      } catch (e: any) {
-        // Ignore stop errors
-      }
-      setIsMonitoring(false);
-      setMonitorType(null);
-      return;
-    }
-
-    setIsLoading('monitor');
-    clearError();
-    try {
-      console.log('[CallControl] Starting monitor for callId:', callId);
-      const res = await callControlApi.startMonitor(callId);
-      console.log('[CallControl] Monitor response:', res.data);
-      setIsMonitoring(true);
-      setMonitorType(res.data.monitor_type === 'tap' ? 'tap' : 'conference');
-      onMonitorStart?.(res.data);
-    } catch (e: any) {
-      console.error('[CallControl] Monitor error:', e.response?.status, e.response?.data, e.message);
-      setError(e.response?.data?.error || 'Failed to start monitoring');
-    } finally {
-      setIsLoading(null);
-    }
-  }, [callId, isMonitoring, onMonitorStart]);
-
   const handleRequestBackup = useCallback(async () => {
     setIsLoading('backup');
     clearError();
@@ -172,6 +158,72 @@ export default function CallControlPanel({
       setIsLoading(null);
     }
   }, [callId, onBackupRequested]);
+
+  // Hydrate translate state from backend so the panel reflects auto-started
+  // translations and survives reloads / takeovers.
+  useEffect(() => {
+    let cancelled = false;
+    callControlApi
+      .getTranslateStatus(callId)
+      .then((res) => {
+        if (cancelled) return;
+        setTranslateActive(res.data.active);
+        if (res.data.from_lang) setTranslateFromLang(res.data.from_lang);
+        if (res.data.to_lang) setTranslateToLang(res.data.to_lang);
+        // Pre-fill from caller_language if no active session
+        if (!res.data.active && res.data.caller_language) {
+          setTranslateFromLang(res.data.caller_language);
+        }
+      })
+      .catch(() => {
+        // Silent — endpoint may 404 for non-conference calls; just leave defaults.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [callId]);
+
+  const handleStartTranslate = useCallback(async () => {
+    if (translateFromLang === translateToLang) {
+      setError('Pick two different languages to translate between');
+      return;
+    }
+    setIsLoading('translate');
+    clearError();
+    try {
+      await callControlApi.startTranslate(callId, translateFromLang, translateToLang);
+      setTranslateActive(true);
+      setShowTranslatePicker(false);
+    } catch (e: any) {
+      setError(e.response?.data?.error || 'Failed to start translation');
+    } finally {
+      setIsLoading(null);
+    }
+  }, [callId, translateFromLang, translateToLang]);
+
+  const handleStopTranslate = useCallback(async () => {
+    setIsLoading('translate');
+    clearError();
+    try {
+      await callControlApi.stopTranslate(callId);
+      setTranslateActive(false);
+    } catch (e: any) {
+      setError(e.response?.data?.error || 'Failed to stop translation');
+    } finally {
+      setIsLoading(null);
+    }
+  }, [callId]);
+
+  const handleToggleTranslate = useCallback(() => {
+    if (translateActive) {
+      handleStopTranslate();
+    } else {
+      // Open picker to choose languages first
+      setShowTranslatePicker((s) => !s);
+      setShowTtsInput(false);
+      setShowDtmfPad(false);
+    }
+  }, [translateActive, handleStopTranslate]);
 
   const handleEscalate = useCallback(async () => {
     setIsLoading('escalate');
@@ -219,7 +271,9 @@ export default function CallControlPanel({
               </button>
             )}
 
-            {/* Record - only for human agent calls (AI calls auto-record via SWML) */}
+            {/* Record — only for human agent calls (AI calls auto-record via SWML).
+                Button state is hydrated from GET /record/status on mount so it
+                accurately reflects whether a manual recording session is live. */}
             {isHumanCall && (
               <button
                 onClick={handleRecord}
@@ -229,6 +283,11 @@ export default function CallControlPanel({
                     ? 'bg-red-600 hover:bg-red-700 text-white'
                     : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
                 } disabled:opacity-50`}
+                title={
+                  isRecording
+                    ? 'Stop the manual recording session'
+                    : 'Start recording this call on demand. AI calls already record by default via SWML.'
+                }
               >
                 {isRecording ? (
                   <>
@@ -256,6 +315,7 @@ export default function CallControlPanel({
                     ? 'bg-blue-600 hover:bg-blue-700 text-white'
                     : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
                 }`}
+                title="Speak a synthesized message into the call. Useful for canned greetings or reading back data hands-free."
               >
                 <Volume2 className="w-3.5 h-3.5" />
                 TTS
@@ -271,28 +331,41 @@ export default function CallControlPanel({
                     ? 'bg-blue-600 hover:bg-blue-700 text-white'
                     : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
                 }`}
+                title="Send touch-tone digits into the call. Use when the caller has been transferred to an external IVR (e.g. a bank) and needs navigation."
               >
                 <Hash className="w-3.5 h-3.5" />
                 DTMF
               </button>
             )}
 
+            {/* Live Translate toggle - only for human agent calls */}
+            {isHumanCall && (
+              <button
+                onClick={handleToggleTranslate}
+                disabled={isLoading === 'translate'}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
+                  translateActive
+                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white ring-1 ring-emerald-400'
+                    : showTranslatePicker
+                      ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                      : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                }`}
+                title={translateActive ? `Translating ${translateFromLang} ↔ ${translateToLang}` : 'Start live translation'}
+              >
+                <Languages className="w-3.5 h-3.5" />
+                {isLoading === 'translate'
+                  ? '...'
+                  : translateActive
+                    ? `${translateFromLang.split('-')[0]}↔${translateToLang.split('-')[0]}`
+                    : 'Translate'}
+              </button>
+            )}
+
             {/* Separator */}
             <div className="w-px h-6 bg-gray-600 mx-1" />
 
-            {/* Monitor button (TODO: re-gate to supervisor/admin in auth overhaul) */}
-            <button
-              onClick={handleMonitor}
-              disabled={isLoading === 'monitor'}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
-                isMonitoring
-                  ? 'bg-indigo-500 hover:bg-indigo-400 text-white ring-1 ring-indigo-400'
-                  : 'bg-indigo-700 hover:bg-indigo-600 text-white'
-              }`}
-            >
-              <Headphones className="w-3.5 h-3.5" />
-              {isLoading === 'monitor' ? '...' : isMonitoring ? 'Stop Listen' : 'Listen'}
-            </button>
+            {/* Listen/Whisper/Barge intentionally omitted — those are observer
+                actions for calls you are NOT on. See ObserverControls. */}
 
             {/* Request Backup (when in conference) */}
             {isInConference && isHumanCall && (
@@ -342,6 +415,79 @@ export default function CallControlPanel({
             </div>
           )}
 
+          {/* Translate language picker (shown for initial start AND mid-call language change) */}
+          {showTranslatePicker && (
+            <div className="p-3 bg-gray-800 rounded-lg border border-gray-700 space-y-2">
+              <div className="text-xs text-gray-400 uppercase tracking-wider font-medium mb-1">
+                Live Translate
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="flex-1">
+                  <label className="block text-[10px] text-gray-500 mb-1 uppercase">Caller speaks</label>
+                  <select
+                    value={translateFromLang}
+                    onChange={(e) => setTranslateFromLang(e.target.value)}
+                    className="w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-xs text-white"
+                  >
+                    {TRANSLATE_LANGUAGES.map((l) => (
+                      <option key={l.code} value={l.code}>
+                        {l.label} ({l.code})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <span className="text-gray-500 text-lg mt-4">↔</span>
+                <div className="flex-1">
+                  <label className="block text-[10px] text-gray-500 mb-1 uppercase">You speak</label>
+                  <select
+                    value={translateToLang}
+                    onChange={(e) => setTranslateToLang(e.target.value)}
+                    className="w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-xs text-white"
+                  >
+                    {TRANSLATE_LANGUAGES.map((l) => (
+                      <option key={l.code} value={l.code}>
+                        {l.label} ({l.code})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <div className="flex gap-2 pt-1">
+                <button
+                  onClick={handleStartTranslate}
+                  disabled={isLoading === 'translate' || translateFromLang === translateToLang}
+                  className="flex-1 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                >
+                  {isLoading === 'translate'
+                    ? (translateActive ? 'Updating...' : 'Starting...')
+                    : (translateActive ? 'Update languages' : 'Start translation')}
+                </button>
+                <button
+                  onClick={() => setShowTranslatePicker(false)}
+                  className="px-3 py-1.5 text-gray-400 hover:text-white text-xs"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Active translation status with change-language button */}
+          {translateActive && (
+            <div className="flex items-center justify-between p-2 bg-emerald-900/30 border border-emerald-700/50 rounded text-xs">
+              <span className="flex items-center gap-2 text-emerald-300">
+                <Languages className="w-3.5 h-3.5" />
+                Translating <span className="mono">{translateFromLang}</span> ↔ <span className="mono">{translateToLang}</span>
+              </span>
+              <button
+                onClick={() => setShowTranslatePicker(true)}
+                className="text-emerald-400 hover:text-emerald-200 underline"
+              >
+                Change languages
+              </button>
+            </div>
+          )}
+
           {/* DTMF Pad */}
           {showDtmfPad && (
             <div className="p-2 bg-gray-800 rounded-lg border border-gray-700">
@@ -359,17 +505,9 @@ export default function CallControlPanel({
             </div>
           )}
 
-          {/* Audio Monitor (shown when tap monitoring is active) */}
-          {isMonitoring && monitorType === 'tap' && (
-            <AudioMonitor
-              callId={String(callId)}
-              onClose={() => {
-                setIsMonitoring(false);
-                setMonitorType(null);
-                callControlApi.stopMonitor(callId).catch(() => {});
-              }}
-            />
-          )}
+          {/* AudioMonitor for tap-based listening lives in ObserverControls now,
+              where it rightfully belongs — you only hear audio from calls you're
+              observing, not calls you're on. */}
 
           {/* Error display */}
           {error && (

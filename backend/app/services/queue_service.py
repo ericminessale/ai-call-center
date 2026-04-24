@@ -274,8 +274,15 @@ class QueueService:
 
     def select_agent(self, queue_slug: str, routing_strategy: str,
                      available_agents: List[str], skill_levels: Dict[str, int] = None,
-                     call_priority: int = 5) -> Optional[str]:
+                     call_priority: int = 5,
+                     caller_language: Optional[str] = None,
+                     agent_languages: Optional[Dict[str, List[str]]] = None) -> Optional[str]:
         """Select the next agent based on the queue's routing strategy.
+
+        Language preference runs *before* the strategy: agents whose `languages`
+        list includes the caller's language are preferred. If none match, we fall
+        back to the full available pool — translation will then start at conference
+        join (caller is responsible for setting `needs_translation` on the Call).
 
         Args:
             queue_slug: Queue identifier for round-robin state tracking
@@ -283,6 +290,8 @@ class QueueService:
             available_agents: Sorted list of available agent ID strings
             skill_levels: Dict mapping agent_id -> skill_level (for skill_based)
             call_priority: 1-10 priority of the incoming call (for priority routing)
+            caller_language: BCP-47 code (e.g. 'es-ES') the caller speaks
+            agent_languages: Map of agent_id -> list of BCP-47 codes they speak
 
         Returns:
             Selected agent ID string, or None if no agents available
@@ -290,16 +299,35 @@ class QueueService:
         if not available_agents:
             return None
 
+        # Language-preference pass: narrow to agents who speak the caller's language
+        candidate_pool = available_agents
+        if caller_language and agent_languages:
+            matching = [
+                a for a in available_agents
+                if caller_language in (agent_languages.get(a) or [])
+            ]
+            if matching:
+                candidate_pool = matching
+                logger.info(
+                    f"Language match: {len(matching)}/{len(available_agents)} agents speak "
+                    f"{caller_language} for queue '{queue_slug}'"
+                )
+            else:
+                logger.info(
+                    f"No agents speak {caller_language} in queue '{queue_slug}' — "
+                    f"falling back to all available, translation will be needed"
+                )
+
         if routing_strategy == 'fifo':
-            return self._strategy_fifo(available_agents)
+            return self._strategy_fifo(candidate_pool)
         elif routing_strategy == 'round_robin':
-            return self._strategy_round_robin(queue_slug, available_agents)
+            return self._strategy_round_robin(queue_slug, candidate_pool)
         elif routing_strategy == 'priority':
-            return self._strategy_priority(available_agents, skill_levels or {}, call_priority)
+            return self._strategy_priority(candidate_pool, skill_levels or {}, call_priority)
         elif routing_strategy == 'skill_based':
-            return self._strategy_skill_based(available_agents, skill_levels or {})
+            return self._strategy_skill_based(candidate_pool, skill_levels or {})
         else:
-            return self._strategy_round_robin(queue_slug, available_agents)
+            return self._strategy_round_robin(queue_slug, candidate_pool)
 
     def _strategy_fifo(self, available_agents: List[str]) -> str:
         """FIFO: pick the agent who has been idle longest (oldest last_assigned timestamp)."""
@@ -373,6 +401,17 @@ class QueueService:
         ).all()
 
         return {str(a.user_id): a.skill_level for a in assignments}
+
+    def get_languages_for_agents(self, agent_ids: List[str]) -> Dict[str, List[str]]:
+        """Look up the BCP-47 languages each agent speaks, from User.languages."""
+        from app.models import User
+
+        numeric_ids = [int(a) for a in agent_ids if a.isdigit()]
+        if not numeric_ids:
+            return {}
+
+        users = User.query.filter(User.id.in_(numeric_ids)).all()
+        return {str(u.id): (u.languages or ['en-US']) for u in users}
 
     def get_agents_by_status(self, status: str) -> List[str]:
         """Get all agents with a specific status"""

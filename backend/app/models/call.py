@@ -35,6 +35,10 @@ class Call(db.Model):
     assigned_at = db.Column(db.DateTime, nullable=True)  # When agent was notified
     conference_name = db.Column(db.String(255), nullable=True)  # Interaction conference name
 
+    # Translation fields — set by AI receptionist + queue router, used at conference join
+    caller_language = db.Column(db.String(20), nullable=True)  # BCP-47 (e.g. "es-ES")
+    needs_translation = db.Column(db.Boolean, default=False, nullable=False)
+
     # Relationships
     transcriptions = db.relationship('Transcription', backref='call', lazy='dynamic', cascade='all, delete-orphan')
     webhook_events = db.relationship('WebhookEvent', backref='call', lazy='dynamic', cascade='all, delete-orphan')
@@ -121,6 +125,8 @@ class Call(db.Model):
             'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None,
             'conference_name': self.conference_name,
             'wait_time_seconds': self.wait_time_seconds,
+            'caller_language': self.caller_language,
+            'needs_translation': self.needs_translation,
         }
 
         if include_contact and self.contact:

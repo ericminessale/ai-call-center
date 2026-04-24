@@ -130,3 +130,42 @@ def get_current_user():
     return jsonify({
         'user': user.to_dict()
     }), 200
+
+
+@auth_bp.route('/me/languages', methods=['PUT'])
+def update_my_languages():
+    """Self-serve: set the languages I speak (BCP-47 codes).
+
+    Used by the routing layer to prefer language-matched agents.
+    """
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        return jsonify({'error': 'No authorization header'}), 401
+    try:
+        token = auth_header.split(' ')[1]
+    except IndexError:
+        return jsonify({'error': 'Invalid authorization header format'}), 401
+
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Invalid or expired token'}), 401
+
+    user = User.find_by_id(user_id)
+    if not user or not user.is_active:
+        return jsonify({'error': 'User not found or inactive'}), 401
+
+    data = request.get_json() or {}
+    languages = data.get('languages')
+
+    if not isinstance(languages, list) or not languages:
+        return jsonify({'error': 'languages must be a non-empty list of BCP-47 strings'}), 400
+    if not all(isinstance(l, str) and l for l in languages):
+        return jsonify({'error': 'languages must contain non-empty strings'}), 400
+
+    try:
+        user.languages = languages
+        db.session.commit()
+        return jsonify({'user': user.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500

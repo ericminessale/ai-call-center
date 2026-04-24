@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Settings,
   Database,
@@ -65,7 +65,67 @@ interface AdminUser {
   created_at: string | null;
   has_subscriber: boolean;
   signalwire_address: string | null;
+  languages: string[];
+  // Resolved permission map (role defaults merged with per-user overrides).
+  effective_permissions?: Partial<Record<PermissionKey, boolean>>;
+  // Explicit overrides only — empty means "use role defaults".
+  permission_overrides?: Partial<Record<PermissionKey, boolean>>;
 }
+
+// Keep in lockstep with PERMISSION_FLAGS in backend/app/models/user.py.
+// Order controls the order in the edit modal.
+type PermissionKey =
+  | 'can_listen_ai_calls'
+  | 'can_listen_human_calls'
+  | 'can_whisper'
+  | 'can_barge'
+  | 'can_control_recording';
+
+const PERMISSION_LABELS: Record<PermissionKey, { label: string; hint: string }> = {
+  can_listen_ai_calls: {
+    label: 'Listen to AI calls',
+    hint: 'Silently monitor calls handled by an AI agent.',
+  },
+  can_listen_human_calls: {
+    label: 'Listen to human calls',
+    hint: 'Silently join an active agent\u2019s call as an observer.',
+  },
+  can_whisper: {
+    label: 'Whisper to agent',
+    hint: 'Coach an agent mid-call; only the agent hears you.',
+  },
+  can_barge: {
+    label: 'Barge into call',
+    hint: 'Insert yourself into an active call with full audio.',
+  },
+  can_control_recording: {
+    label: 'Control recording',
+    hint: 'Start or stop recording on calls they participate in.',
+  },
+};
+
+const PERMISSION_ORDER: PermissionKey[] = [
+  'can_listen_ai_calls',
+  'can_listen_human_calls',
+  'can_whisper',
+  'can_barge',
+  'can_control_recording',
+];
+
+// BCP-47 language menu shown to admins. Keep small — these are the
+// languages SignalWire's live_translate supports out of the box.
+const SUPPORTED_LANGUAGES: { code: string; label: string }[] = [
+  { code: 'en-US', label: 'English (US)' },
+  { code: 'es-ES', label: 'Spanish' },
+  { code: 'fr-FR', label: 'French' },
+  { code: 'de-DE', label: 'German' },
+  { code: 'it-IT', label: 'Italian' },
+  { code: 'pt-BR', label: 'Portuguese (Brazil)' },
+  { code: 'ja-JP', label: 'Japanese' },
+  { code: 'zh-CN', label: 'Chinese (Mandarin)' },
+  { code: 'ko-KR', label: 'Korean' },
+  { code: 'ar-SA', label: 'Arabic' },
+];
 
 interface PhoneNumber {
   sid: string;
@@ -1396,7 +1456,7 @@ function UserManagementTab() {
   const currentUser = useAuthStore((s) => s.user);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [loading, setLoading] = useState(true);
-  const [pendingDelete, setPendingDelete] = useState<AdminUser | null>(null);
+  const [editingUser, setEditingUser] = useState<AdminUser | null>(null);
   const [savingRoleFor, setSavingRoleFor] = useState<number | null>(null);
 
   const loadUsers = useCallback(async () => {
@@ -1432,18 +1492,8 @@ function UserManagementTab() {
     }
   };
 
-  const confirmDeleteUser = async (user: AdminUser) => {
-    try {
-      const resp = await adminApi.deleteUser(user.id);
-      toast.success(`User "${user.email}" deleted`);
-      if (resp.data.sw_warning) {
-        toast(resp.data.sw_warning, { icon: '\u26a0\ufe0f' });
-      }
-      loadUsers();
-    } catch (err: any) {
-      toast.error(err.response?.data?.error || 'Failed to delete user');
-    }
-  };
+  // Delete now lives inside UserEditModal (with its own confirmation modal).
+  // The row only opens the edit surface; destructive actions are one level deeper.
 
   if (loading) return <LoadingSpinner />;
 
@@ -1463,6 +1513,7 @@ function UserManagementTab() {
             <tr className="border-b border-rule bg-canvas-sunken">
               <th className="text-left px-4 py-2.5 kicker">User</th>
               <th className="text-left px-4 py-2.5 kicker">Role</th>
+              <th className="text-left px-4 py-2.5 kicker">Languages</th>
               <th className="text-left px-4 py-2.5 kicker">Subscriber</th>
               <th className="text-left px-4 py-2.5 kicker">Created</th>
               <th className="text-right px-4 py-2.5 kicker">Actions</th>
@@ -1491,6 +1542,9 @@ function UserManagementTab() {
                   />
                 </td>
                 <td className="px-4 py-3">
+                  <LanguagesPreview codes={user.languages || ['en-US']} />
+                </td>
+                <td className="px-4 py-3">
                   {user.has_subscriber ? (
                     <span className="mono text-[11.5px] text-live-soft">{user.signalwire_address || 'Yes'}</span>
                   ) : (
@@ -1502,18 +1556,19 @@ function UserManagementTab() {
                 </td>
                 <td className="px-4 py-3 text-right">
                   <button
-                    onClick={() => setPendingDelete(user)}
-                    className="p-1.5 rounded hover:bg-urgent/10 text-ink-dim hover:text-urgent-soft transition-colors"
-                    title="Delete user"
+                    onClick={() => setEditingUser(user)}
+                    className="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-rule hover:border-rule-strong text-[11.5px] text-ink-muted hover:text-ink transition-colors"
+                    title="Edit user"
                   >
-                    <Trash2 className="w-3.5 h-3.5" />
+                    <Pencil className="w-3 h-3" />
+                    Edit
                   </button>
                 </td>
               </tr>
             ))}
             {users.length === 0 && (
               <tr>
-                <td colSpan={5} className="text-center text-ink-dim py-8 text-[13px]">
+                <td colSpan={6} className="text-center text-ink-dim py-8 text-[13px]">
                   No users found.
                 </td>
               </tr>
@@ -1522,20 +1577,591 @@ function UserManagementTab() {
         </table>
       </div>
 
-      {pendingDelete && (
-        <ConfirmModal
-          title="Delete User"
-          message={`Permanently delete "${pendingDelete.email}"${pendingDelete.has_subscriber ? ' and their SignalWire subscriber' : ''}? This will also delete all their calls and cannot be undone.`}
-          onConfirm={async () => {
-            await confirmDeleteUser(pendingDelete);
-            setPendingDelete(null);
+      {editingUser && (
+        <UserEditModal
+          user={editingUser}
+          isSelf={currentUser?.id !== undefined && String(currentUser.id) === String(editingUser.id)}
+          onClose={() => setEditingUser(null)}
+          onUpdated={(next) => {
+            setUsers((prev) => prev.map((u) => (u.id === next.id ? next : u)));
+            setEditingUser(next);
           }}
-          onCancel={() => setPendingDelete(null)}
+          onDeleted={() => {
+            setEditingUser(null);
+            loadUsers();
+          }}
         />
       )}
     </div>
   );
 }
+
+// =============================================================================
+// User edit modal
+// =============================================================================
+// Centered + blurred backdrop. Matches ConfirmModal's pattern (same backdrop,
+// same button classes, same escape-to-cancel) so the stack of two modals for
+// "edit → confirm delete" reads as one surface.
+//
+// Scope for this iteration: role, languages, permission overrides, subscriber
+// summary, delete action. Role + languages are also editable inline on the
+// row as quick-edits; the modal is the canonical deep-edit surface.
+
+function UserEditModal({
+  user,
+  isSelf,
+  onClose,
+  onUpdated,
+  onDeleted,
+}: {
+  user: AdminUser;
+  isSelf: boolean;
+  onClose: () => void;
+  onUpdated: (next: AdminUser) => void;
+  onDeleted: () => void;
+}) {
+  // Draft state for batched save. Initialized from the passed-in user.
+  const [draftRole, setDraftRole] = useState<UserRole>(user.role as UserRole);
+  const [draftLanguages, setDraftLanguages] = useState<string[]>(user.languages || ['en-US']);
+  const [draftOverrides, setDraftOverrides] = useState<Partial<Record<PermissionKey, boolean>>>(
+    user.permission_overrides || {}
+  );
+  const [saving, setSaving] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+
+  // Escape closes the modal. Don't rebind on every render.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !showDeleteConfirm) onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose, showDeleteConfirm]);
+
+  // Role defaults for display so the user knows what they're overriding.
+  const roleDefaults: Record<PermissionKey, boolean> = useMemo(() => {
+    // Mirrors ROLE_PERMISSION_DEFAULTS in backend/app/models/user.py.
+    // Kept inline to avoid a second fetch; keep in sync if backend changes.
+    if (draftRole === 'admin') {
+      return {
+        can_listen_ai_calls: true,
+        can_listen_human_calls: true,
+        can_whisper: true,
+        can_barge: true,
+        can_control_recording: true,
+      };
+    }
+    if (draftRole === 'supervisor') {
+      return {
+        can_listen_ai_calls: true,
+        can_listen_human_calls: true,
+        can_whisper: true,
+        can_barge: true,
+        can_control_recording: true,
+      };
+    }
+    // agent
+    return {
+      can_listen_ai_calls: false,
+      can_listen_human_calls: false,
+      can_whisper: false,
+      can_barge: false,
+      can_control_recording: true,
+    };
+  }, [draftRole]);
+
+  // Resolved value = override if present, else role default.
+  const resolvedFor = (flag: PermissionKey): boolean =>
+    draftOverrides[flag] !== undefined ? Boolean(draftOverrides[flag]) : Boolean(roleDefaults[flag]);
+
+  const isOverridden = (flag: PermissionKey): boolean => draftOverrides[flag] !== undefined;
+
+  const toggleFlag = (flag: PermissionKey) => {
+    const current = resolvedFor(flag);
+    const next = !current;
+    setDraftOverrides((prev) => {
+      const copy = { ...prev };
+      // If toggling back to the role default, drop the override rather than
+      // storing a redundant value. Keeps the "overridden" state meaningful.
+      if (next === Boolean(roleDefaults[flag])) {
+        delete copy[flag];
+      } else {
+        copy[flag] = next;
+      }
+      return copy;
+    });
+  };
+
+  const resetFlag = (flag: PermissionKey) => {
+    setDraftOverrides((prev) => {
+      if (!(flag in prev)) return prev;
+      const copy = { ...prev };
+      delete copy[flag];
+      return copy;
+    });
+  };
+
+  const resetAllOverrides = () => setDraftOverrides({});
+
+  // Dirty check — only hit endpoints that actually changed.
+  const dirty = {
+    role: draftRole !== user.role,
+    languages:
+      JSON.stringify((draftLanguages || []).slice().sort()) !==
+      JSON.stringify((user.languages || []).slice().sort()),
+    permissions:
+      JSON.stringify(draftOverrides) !== JSON.stringify(user.permission_overrides || {}),
+  };
+  const hasChanges = dirty.role || dirty.languages || dirty.permissions;
+
+  const save = async () => {
+    if (!hasChanges || saving) return;
+    setSaving(true);
+    try {
+      // Sequential so we surface the first error clearly. Role must land before
+      // permissions in case the role change affects role-default resolution.
+      let next: AdminUser = user;
+      if (dirty.role) {
+        if (isSelf && draftRole !== 'admin') {
+          throw new Error('You cannot change your own role away from admin');
+        }
+        const resp = await adminApi.updateUserRole(user.id, draftRole);
+        next = resp.data.user;
+      }
+      if (dirty.languages) {
+        if (draftLanguages.length === 0) {
+          throw new Error('Pick at least one language');
+        }
+        const resp = await adminApi.updateUserLanguages(user.id, draftLanguages);
+        next = resp.data.user;
+      }
+      if (dirty.permissions) {
+        // Send bool values only; the backend rejects anything else.
+        const clean: Record<string, boolean> = {};
+        for (const [k, v] of Object.entries(draftOverrides)) {
+          if (typeof v === 'boolean') clean[k] = v;
+        }
+        const resp = await adminApi.updateUserPermissions(user.id, clean);
+        next = resp.data.user;
+      }
+      toast.success('User updated');
+      onUpdated(next);
+    } catch (err: unknown) {
+      const message =
+        (err as { response?: { data?: { error?: string } } })?.response?.data?.error ||
+        (err as Error)?.message ||
+        'Failed to save changes';
+      toast.error(message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const doDelete = async () => {
+    try {
+      const resp = await adminApi.deleteUser(user.id);
+      toast.success(`User "${user.email}" deleted`);
+      if (resp.data?.sw_warning) {
+        toast(resp.data.sw_warning, { icon: '\u26a0\ufe0f' });
+      }
+      onDeleted();
+    } catch (err: unknown) {
+      const message =
+        (err as { response?: { data?: { error?: string } } })?.response?.data?.error ||
+        'Failed to delete user';
+      toast.error(message);
+    }
+  };
+
+  const toggleLanguage = (code: string) => {
+    setDraftLanguages((prev) =>
+      prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code]
+    );
+  };
+
+  return (
+    <>
+      <div className="fixed inset-0 z-40 flex items-center justify-center p-4">
+        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+
+        <div className="relative panel-raised rounded-md shadow-panel w-full max-w-[560px] max-h-[90vh] flex flex-col">
+          {/* Header */}
+          <div className="px-6 pt-5 pb-4 border-b border-rule">
+            <div className="kicker mb-1">Team member</div>
+            <h3 className="font-display text-[22px] text-ink leading-none tracking-tightest">
+              {user.email}
+            </h3>
+            {user.name && (
+              <p className="mt-1.5 text-[13px] text-ink-muted">{user.name}</p>
+            )}
+          </div>
+
+          {/* Body */}
+          <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
+            {/* Role */}
+            <section>
+              <div className="kicker mb-2">Role</div>
+              {isSelf ? (
+                <div className="flex items-center gap-2 text-[13px] text-ink-muted">
+                  <RoleSelect value={draftRole} onChange={() => {}} disabled />
+                  <span className="text-[11.5px]">You can\u2019t change your own role.</span>
+                </div>
+              ) : (
+                <RoleSelect value={draftRole} onChange={setDraftRole} />
+              )}
+            </section>
+
+            {/* Languages */}
+            <section>
+              <div className="kicker mb-2">Languages spoken</div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {SUPPORTED_LANGUAGES.map((lang) => (
+                  <label
+                    key={lang.code}
+                    className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-canvas-hover/40 cursor-pointer text-[12.5px]"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={draftLanguages.includes(lang.code)}
+                      onChange={() => toggleLanguage(lang.code)}
+                      className="accent-sw-turquoise"
+                    />
+                    <span className="mono text-[10.5px] text-ink-dim uppercase">{lang.code}</span>
+                    <span className="text-ink-muted truncate">{lang.label}</span>
+                  </label>
+                ))}
+              </div>
+            </section>
+
+            {/* Permissions */}
+            <section>
+              <div className="flex items-baseline justify-between mb-2">
+                <div className="kicker">Permissions</div>
+                {Object.keys(draftOverrides).length > 0 && (
+                  <button
+                    onClick={resetAllOverrides}
+                    className="text-[11px] text-ink-dim hover:text-ink-muted underline-offset-2 hover:underline"
+                  >
+                    Reset all to {draftRole} defaults
+                  </button>
+                )}
+              </div>
+              <div className="rounded-md border border-rule divide-y divide-rule/60">
+                {/* Listen — layered: enabling the category reveals its scopes.
+                    The parent toggle is purely a UI device; the two scope
+                    flags are the real stored permissions. */}
+                <PermissionGroup
+                  label="Listen to calls"
+                  hint="Silently monitor calls already in progress."
+                  childFlags={['can_listen_ai_calls', 'can_listen_human_calls']}
+                  resolvedFor={resolvedFor}
+                  isOverridden={isOverridden}
+                  toggleFlag={toggleFlag}
+                  resetFlag={resetFlag}
+                  roleDefaults={roleDefaults}
+                  draftRole={draftRole}
+                  setDraftOverrides={setDraftOverrides}
+                />
+
+                {/* Standalone actions. No parent grouping because each is a
+                    single discrete capability, not a scope of something else. */}
+                <PermissionRow
+                  flag="can_whisper"
+                  resolved={resolvedFor('can_whisper')}
+                  overridden={isOverridden('can_whisper')}
+                  toggle={() => toggleFlag('can_whisper')}
+                  reset={() => resetFlag('can_whisper')}
+                  roleDefault={roleDefaults.can_whisper}
+                  draftRole={draftRole}
+                />
+                <PermissionRow
+                  flag="can_barge"
+                  resolved={resolvedFor('can_barge')}
+                  overridden={isOverridden('can_barge')}
+                  toggle={() => toggleFlag('can_barge')}
+                  reset={() => resetFlag('can_barge')}
+                  roleDefault={roleDefaults.can_barge}
+                  draftRole={draftRole}
+                />
+                <PermissionRow
+                  flag="can_control_recording"
+                  resolved={resolvedFor('can_control_recording')}
+                  overridden={isOverridden('can_control_recording')}
+                  toggle={() => toggleFlag('can_control_recording')}
+                  reset={() => resetFlag('can_control_recording')}
+                  roleDefault={roleDefaults.can_control_recording}
+                  draftRole={draftRole}
+                />
+              </div>
+            </section>
+
+            {/* Subscriber */}
+            <section>
+              <div className="kicker mb-2">SignalWire subscriber</div>
+              {user.has_subscriber ? (
+                <div className="text-[12px]">
+                  <span className="mono text-live-soft">{user.signalwire_address || 'Linked'}</span>
+                </div>
+              ) : (
+                <div className="text-[12px] text-ink-dim">
+                  No subscriber linked yet. Created on first sign-in to the agent phone.
+                </div>
+              )}
+            </section>
+          </div>
+
+          {/* Footer */}
+          <div className="px-6 py-4 border-t border-rule flex items-center gap-2">
+            <button
+              onClick={() => setShowDeleteConfirm(true)}
+              disabled={isSelf || saving}
+              className="btn-danger"
+              title={isSelf ? 'You cannot delete yourself' : 'Permanently delete this user'}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Delete user
+            </button>
+            <div className="flex-1" />
+            <button onClick={onClose} className="btn-ghost" disabled={saving}>
+              Cancel
+            </button>
+            <button
+              onClick={save}
+              disabled={!hasChanges || saving}
+              className="btn-primary"
+            >
+              {saving ? 'Saving\u2026' : 'Save changes'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {showDeleteConfirm && (
+        <ConfirmModal
+          title="Delete user"
+          message={`Permanently delete "${user.email}"${user.has_subscriber ? ' and their SignalWire subscriber' : ''}? This will also delete all their calls and cannot be undone.`}
+          onConfirm={async () => {
+            await doDelete();
+            setShowDeleteConfirm(false);
+          }}
+          onCancel={() => setShowDeleteConfirm(false)}
+        />
+      )}
+    </>
+  );
+}
+
+// ── Permission row primitives ────────────────────────────────────────────────
+// Shared toggle + label + overridden-badge atom used by both flat flags and
+// group children. Keeps the visual language identical across both surfaces.
+
+function PermissionToggle({
+  on,
+  onClick,
+  label,
+}: {
+  on: boolean;
+  onClick: () => void;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`mt-0.5 w-8 h-5 rounded-full flex-shrink-0 relative transition-colors ${
+        on ? 'bg-sw-turquoise/70' : 'bg-canvas-sunken border border-rule'
+      }`}
+      aria-label={`${label} ${on ? 'on' : 'off'}`}
+    >
+      <span
+        className={`absolute top-0.5 w-3.5 h-3.5 rounded-full bg-ink transition-all ${
+          on ? 'left-4' : 'left-0.5'
+        }`}
+      />
+    </button>
+  );
+}
+
+function PermissionRow({
+  flag,
+  resolved,
+  overridden,
+  toggle,
+  reset,
+  roleDefault,
+  draftRole,
+  indent = false,
+}: {
+  flag: PermissionKey;
+  resolved: boolean;
+  overridden: boolean;
+  toggle: () => void;
+  reset: () => void;
+  roleDefault: boolean;
+  draftRole: UserRole;
+  indent?: boolean;
+}) {
+  const meta = PERMISSION_LABELS[flag];
+  return (
+    <div className={`flex items-start gap-3 px-3 py-2.5 ${indent ? 'pl-10' : ''}`}>
+      <PermissionToggle on={resolved} onClick={toggle} label={meta.label} />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-[13px] text-ink">{meta.label}</span>
+          {overridden && (
+            <span className="mono text-[9.5px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-signal/15 text-signal border border-signal/30">
+              overridden
+            </span>
+          )}
+        </div>
+        <div className="text-[11.5px] text-ink-dim mt-0.5 leading-relaxed">
+          {meta.hint}
+        </div>
+      </div>
+      {overridden && (
+        <button
+          onClick={reset}
+          className="text-[11px] text-ink-dim hover:text-ink-muted underline-offset-2 hover:underline flex-shrink-0"
+          title={`Reset to ${draftRole} default (${roleDefault ? 'on' : 'off'})`}
+        >
+          reset
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Parent toggle + child scopes. The parent is purely a UI device — stored state
+// remains at the child level. Toggling the parent OFF clears all children;
+// toggling ON (when all children are currently off) enables every child so
+// the user gets the broadest scope by default and narrows from there.
+function PermissionGroup({
+  label,
+  hint,
+  childFlags,
+  resolvedFor,
+  isOverridden,
+  toggleFlag,
+  resetFlag,
+  roleDefaults,
+  draftRole,
+  setDraftOverrides,
+}: {
+  label: string;
+  hint: string;
+  childFlags: PermissionKey[];
+  resolvedFor: (flag: PermissionKey) => boolean;
+  isOverridden: (flag: PermissionKey) => boolean;
+  toggleFlag: (flag: PermissionKey) => void;
+  resetFlag: (flag: PermissionKey) => void;
+  roleDefaults: Record<PermissionKey, boolean>;
+  draftRole: UserRole;
+  setDraftOverrides: React.Dispatch<
+    React.SetStateAction<Partial<Record<PermissionKey, boolean>>>
+  >;
+}) {
+  const parentOn = childFlags.some((f) => resolvedFor(f));
+  const anyChildOverridden = childFlags.some((f) => isOverridden(f));
+
+  const toggleParent = () => {
+    if (parentOn) {
+      // Turn category off: force every child to false. Store an override
+      // only when that differs from the role default (keep `permissions`
+      // minimal and "overridden" badges accurate).
+      setDraftOverrides((prev) => {
+        const copy = { ...prev };
+        for (const f of childFlags) {
+          if (roleDefaults[f] === false) delete copy[f];
+          else copy[f] = false;
+        }
+        return copy;
+      });
+    } else {
+      // Turn category on: broadest scope by default (every child true).
+      setDraftOverrides((prev) => {
+        const copy = { ...prev };
+        for (const f of childFlags) {
+          if (roleDefaults[f] === true) delete copy[f];
+          else copy[f] = true;
+        }
+        return copy;
+      });
+    }
+  };
+
+  return (
+    <div className="px-3 py-2.5">
+      {/* Parent row */}
+      <div className="flex items-start gap-3">
+        <PermissionToggle on={parentOn} onClick={toggleParent} label={label} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-[13px] text-ink font-medium">{label}</span>
+            {anyChildOverridden && (
+              <span className="mono text-[9.5px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-signal/15 text-signal border border-signal/30">
+                overridden
+              </span>
+            )}
+          </div>
+          <div className="text-[11.5px] text-ink-dim mt-0.5 leading-relaxed">
+            {hint}
+          </div>
+        </div>
+      </div>
+
+      {/* Scope children — only when the category is enabled. */}
+      {parentOn && (
+        <div className="mt-2 ml-10 pl-3 border-l border-rule/60">
+          <div className="kicker mb-1 text-[9.5px]">Scope</div>
+          <div className="-ml-3">
+            {childFlags.map((flag) => (
+              <PermissionRow
+                key={flag}
+                flag={flag}
+                resolved={resolvedFor(flag)}
+                overridden={isOverridden(flag)}
+                toggle={() => toggleFlag(flag)}
+                reset={() => resetFlag(flag)}
+                roleDefault={roleDefaults[flag]}
+                draftRole={draftRole}
+                indent
+              />
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Read-only language preview for the user row. Editing happens in the user
+// edit modal — the row is just scan-and-recognize. First two codes as pills,
+// then a "+N" chip for overflow (hover reveals the full list).
+function LanguagesPreview({ codes }: { codes: string[] }) {
+  const shown = codes.slice(0, 2);
+  const extra = codes.slice(2);
+  return (
+    <div className="inline-flex items-center gap-1 max-w-[200px]">
+      {shown.map((code) => (
+        <span
+          key={code}
+          className="mono text-[10.5px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-canvas-elevated border border-rule text-ink"
+        >
+          {code}
+        </span>
+      ))}
+      {extra.length > 0 && (
+        <span
+          className="mono text-[10.5px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-ai/15 border border-ai/30 text-ai-soft"
+          title={extra.join(', ')}
+        >
+          +{extra.length}
+        </span>
+      )}
+    </div>
+  );
+}
+
 
 function RoleSelect({
   value,

@@ -1,3 +1,12 @@
+// Capability flags surfaced by the backend. Adding a new flag here requires
+// adding it to PERMISSION_FLAGS in backend/app/models/user.py. Keep in sync.
+export type PermissionFlag =
+  | 'can_listen_ai_calls'
+  | 'can_listen_human_calls'
+  | 'can_whisper'
+  | 'can_barge'
+  | 'can_control_recording';
+
 export interface User {
   id: string;
   email: string;
@@ -5,6 +14,13 @@ export interface User {
   role?: string; // 'agent' | 'supervisor' | 'admin'
   is_active: boolean;
   created_at: string;
+  languages?: string[]; // BCP-47 codes (e.g. ["en-US", "es-ES"])
+  // Resolved flag map after role defaults merge with per-user overrides.
+  // UI gates observer controls off this. Shipped on every /auth/me response.
+  effective_permissions?: Partial<Record<PermissionFlag, boolean>>;
+  // Explicit per-user overrides; drives the "overridden" state in the admin
+  // user-config drawer. Empty = pure role defaults.
+  permission_overrides?: Partial<Record<PermissionFlag, boolean>>;
 }
 
 export interface AuthResponse {

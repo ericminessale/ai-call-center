@@ -69,14 +69,12 @@ export function IncomingCallBanner({
   const isEscalation = assignmentType === 'escalation';
   const isMultiAgent = isBackup || isEscalation;
 
-  // Tone sets the left rail color
-  const toneClass = isEscalation
-    ? 'border-l-wait bg-wait/5'
+  // Left rail color — single thin vertical accent, no full-width tint background
+  const railColor = isEscalation
+    ? 'bg-wait'
     : isBackup
-      ? 'border-l-sw-blue bg-sw-blue/5'
-      : 'border-l-live bg-live/5';
-
-  const iconColor = isEscalation ? 'text-wait-soft' : isBackup ? 'text-sw-blue' : 'text-live-soft';
+      ? 'bg-sw-turquoise'
+      : 'bg-live';
 
   const answerLabel = isEscalation
     ? (whisperMode ? 'Join · whisper' : 'Join call')
@@ -93,53 +91,46 @@ export function IncomingCallBanner({
 
   return (
     <div className="fixed top-0 left-0 right-0 z-50 animate-slide-down">
-      <div className={`relative ${toneClass} border-b border-rule border-l-[3px] shadow-panel`}>
-        {/* Subtle scan accent */}
-        <div className="absolute inset-x-0 top-0 h-px overflow-hidden pointer-events-none">
-          <div className="scanline" />
-        </div>
+      <div className="relative bg-canvas-raised border-b border-rule shadow-md">
+        {/* Thin colored left rail — single accent, no full-width tint */}
+        <div className={`absolute left-0 top-0 bottom-0 w-[3px] ${railColor}`} />
 
-        <div className="max-w-5xl mx-auto px-5 py-3.5">
+        <div className="max-w-5xl mx-auto px-6 py-3.5">
           <div className="flex items-center justify-between gap-4">
             {/* Left — Caller */}
             <div className="flex items-center gap-4 min-w-0">
-              <div className="relative">
-                <div className={`w-11 h-11 rounded flex items-center justify-center ${iconColor} bg-canvas-raised border border-current/30`}>
-                  {isEscalation ? <Shield className="w-5 h-5" /> :
-                   isBackup ? <UserPlus className="w-5 h-5" /> :
-                   <Phone className="w-5 h-5" />}
-                </div>
-                <span className={`absolute -top-1 -right-1 w-3 h-3 rounded-full ${
-                  isEscalation ? 'bg-wait' : isBackup ? 'bg-sw-blue' : 'bg-live'
-                } shadow-[0_0_10px_currentColor] animate-pulse`} />
+              {/* Pulse dot instead of icon box — less visual weight */}
+              <div className="relative flex items-center justify-center w-3 h-3">
+                <span className={`absolute inset-0 rounded-full ${railColor} animate-pulse`} />
+                <span className={`absolute inset-0 rounded-full ${railColor} opacity-40 animate-ping`} />
               </div>
 
               <div className="min-w-0">
-                <div className="flex items-center gap-2 mb-0.5">
+                <div className="flex items-center gap-2">
                   <span className="kicker">
                     {isEscalation ? 'Escalation' : isBackup ? 'Backup requested' : 'Incoming call'}
                   </span>
                   {isMultiAgent && requestingAgent && (
-                    <span className="text-[11px] text-ink-dim">
-                      from <span className="text-ink">{requestingAgent.name}</span>
-                      {whisperMode && <span className="ml-1 text-ink-dim">(whisper)</span>}
+                    <span className="text-[11px] text-ink-muted">
+                      · from <span className="text-ink">{requestingAgent.name}</span>
+                      {whisperMode && <span className="ml-1">· whisper</span>}
                     </span>
                   )}
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <span className="font-display text-[22px] text-ink leading-none truncate">
+                <div className="flex items-center gap-2 mt-0.5">
+                  <span className="font-heading font-semibold text-[20px] text-ink leading-none truncate">
                     {isLookingUp ? 'Looking up…' : displayName}
                   </span>
                   {contactInfo?.isVip && (
                     <Star className="w-4 h-4 text-wait fill-wait flex-shrink-0" />
                   )}
                   {!isKnown && !isLookingUp && (
-                    <span className="chip chip-muted">New</span>
+                    <span className="text-[11px] text-ink-muted">· New</span>
                   )}
                 </div>
 
-                <div className="flex items-center gap-2.5 text-[12px] text-ink-dim mt-1">
+                <div className="flex items-center gap-2 text-[12px] text-ink-muted mt-1">
                   <span className="mono">{formatPhone(phoneNumber)}</span>
                   {contactInfo?.company && (
                     <>
@@ -159,20 +150,26 @@ export function IncomingCallBanner({
                   {isFromQueue && (
                     <>
                       <span className="text-ink-faint">·</span>
-                      <span className="chip chip-muted">{queueId}</span>
+                      <span className="mono text-[11px]">{queueId}</span>
                     </>
                   )}
                 </div>
               </div>
             </div>
 
-            {/* Right — Actions */}
+            {/* Right — Actions. Solid fills, white text, no tints. */}
             <div className="flex items-center gap-2 shrink-0">
-              <button onClick={onDecline} className="btn-danger">
+              <button
+                onClick={onDecline}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-sm bg-urgent hover:bg-urgent/90 text-white font-semibold text-[13px] transition-colors"
+              >
                 <PhoneOff className="w-3.5 h-3.5" />
                 Decline
               </button>
-              <button onClick={onAnswer} className="btn-primary !py-2 !px-4">
+              <button
+                onClick={onAnswer}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-sm bg-live hover:bg-live/90 text-white font-semibold text-[13px] transition-colors"
+              >
                 {isEscalation ? <Shield className="w-3.5 h-3.5" /> :
                  isBackup ? <UserPlus className="w-3.5 h-3.5" /> :
                  <Phone className="w-3.5 h-3.5" />}

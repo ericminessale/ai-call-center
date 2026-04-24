@@ -55,6 +55,27 @@ AI_AGENTS_ADMIN_URL = os.getenv('AI_AGENTS_ADMIN_URL', 'http://ai-agents:8081')
 
 
 # =============================================================================
+# Fabric Webhook Sync
+# =============================================================================
+
+@admin_bp.route('/fabric/sync-webhooks', methods=['POST'])
+@require_auth
+def sync_fabric_webhooks():
+    """Re-point managed Fabric SWML Webhook resources at the current EXTERNAL_URL.
+
+    Runs automatically at backend startup; this endpoint exposes the same
+    operation for on-demand triggering (e.g. after a URL change without a
+    container recreate).
+    """
+    from app.services.fabric_sync import sync_all
+    result = sync_all(get_base_url())
+    status = 200 if all(
+        r.get('ok') or r.get('skipped') for r in result.values()
+    ) else 502
+    return jsonify(result), status
+
+
+# =============================================================================
 # Existing: Clear Calls
 # =============================================================================
 
@@ -723,6 +744,92 @@ def update_user(user_id):
     except Exception as e:
         db.session.rollback()
         logger.error(f"Failed to update user role: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/users/<int:user_id>/languages', methods=['PUT'])
+@require_auth
+def update_user_languages(user_id):
+    """Set the BCP-47 languages this user speaks. Admin-only.
+
+    Used by the routing layer to prefer language-matched agents and to
+    decide whether to start live_translate when a call connects.
+    """
+    data = request.get_json() or {}
+    languages = data.get('languages')
+
+    if not isinstance(languages, list) or not all(isinstance(l, str) and l for l in languages):
+        return jsonify({'error': 'languages must be a non-empty list of BCP-47 strings'}), 400
+    if not languages:
+        return jsonify({'error': 'languages cannot be empty — every agent needs at least one'}), 400
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    try:
+        user.languages = languages
+        db.session.commit()
+        logger.info(
+            f"User {user_id} ({user.email}) languages set to {languages} "
+            f"by admin {request.current_user.id}"
+        )
+        return jsonify({'user': user.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to update user languages: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/users/<int:user_id>/permissions', methods=['PUT'])
+@require_auth
+def update_user_permissions(user_id):
+    """Replace a user's per-user permission overrides. Admin-only.
+
+    Body: { "permissions": { "can_listen_ai_calls": true, ... } }
+
+    - Keys MUST be in PERMISSION_FLAGS; unknown keys are rejected.
+    - Values MUST be bool.
+    - Missing keys = no override for that flag (falls through to role default).
+    - Pass `{}` to clear all overrides and fall entirely back to role defaults.
+    """
+    from app.models.user import PERMISSION_FLAGS
+
+    data = request.get_json() or {}
+    permissions = data.get('permissions')
+
+    if not isinstance(permissions, dict):
+        return jsonify({'error': 'permissions must be an object'}), 400
+
+    # Reject unknown keys explicitly so a typo doesn't silently set a no-op.
+    unknown = [k for k in permissions.keys() if k not in PERMISSION_FLAGS]
+    if unknown:
+        return jsonify({
+            'error': f'unknown permission flags: {unknown}',
+            'valid_flags': list(PERMISSION_FLAGS),
+        }), 400
+
+    bad_values = [k for k, v in permissions.items() if not isinstance(v, bool)]
+    if bad_values:
+        return jsonify({
+            'error': f'permission values must be bool; bad keys: {bad_values}'
+        }), 400
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    try:
+        user.permissions = permissions
+        db.session.commit()
+        logger.info(
+            f"User {user_id} ({user.email}) permission overrides set to {permissions} "
+            f"by admin {request.current_user.id}"
+        )
+        return jsonify({'user': user.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to update user permissions: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 

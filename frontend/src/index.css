@@ -369,13 +369,13 @@ h1, h2, h3, h4, h5, h6 {
   .dot-wait    { background: var(--status-warning); }
   .dot-urgent  { background: var(--status-error); }
 
-  /* Legacy chip aliases — route old operational chips to brand semantic styling */
-  .chip-live   { background: var(--status-success-soft); color: #4ade80; border-color: rgba(34,197,94,0.28); }
-  .chip-ai     { background: rgba(64,224,208,0.10);      color: #7eeee3; border-color: rgba(64,224,208,0.28); }
-  .chip-wait   { background: var(--status-warning-soft); color: #fde047; border-color: rgba(255,215,0,0.28); }
-  .chip-urgent { background: var(--status-error-soft);   color: #f87171; border-color: rgba(239,68,68,0.28); }
-  .chip-info   { background: var(--status-info-soft);    color: #6e9eff; border-color: rgba(4,78,244,0.28); }
-  .chip-muted  { background: var(--bg-surface-raised);   color: var(--fg-muted); border-color: var(--border-default); }
+  /* Legacy chip aliases — neutral surface, colored text. Avoids color-on-color. */
+  .chip-live   { background: var(--bg-surface-raised); color: #4ade80; border-color: var(--border-default); }
+  .chip-ai     { background: var(--bg-surface-raised); color: #7eeee3; border-color: var(--border-default); }
+  .chip-wait   { background: var(--bg-surface-raised); color: #fde047; border-color: var(--border-default); }
+  .chip-urgent { background: var(--bg-surface-raised); color: #f87171; border-color: var(--border-default); }
+  .chip-info   { background: var(--bg-surface-raised); color: #93c5fd; border-color: var(--border-default); }
+  .chip-muted  { background: var(--bg-surface-raised); color: var(--fg-muted); border-color: var(--border-default); }
 
   /* Tab — underline pattern, active = turquoise per brand */
   .tab {

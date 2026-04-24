@@ -4,6 +4,7 @@ import { Call, QueueConfig } from '../../types/callcenter';
 import { logger } from '../../lib/logger';
 import { CallListSkeletonGroup } from '../shared/Skeleton';
 import { getQueueBadgeColor, getQueueDisplayName } from '../../lib/queueColors';
+import ObserverControls from '../shared/ObserverControls';
 
 interface ActiveCallsListProps {
   calls: Call[];
@@ -335,6 +336,16 @@ function CallCard({ call, onClick, queueConfigs }: { call: Call; onClick: () => 
         <span className="mono text-[11.5px] text-ink-muted">
           {isConnecting ? '—:—' : formatDuration(liveDuration)}
         </span>
+        {/* Observer action — only surfaces if the viewer has the right
+            listen permission (agents get null). Stops click propagation so
+            clicking it doesn't also select the row. */}
+        <div onClick={(e) => e.stopPropagation()}>
+          <ObserverControls
+            callId={call.id}
+            callType={isAI ? 'ai' : 'human'}
+            compact
+          />
+        </div>
       </div>
     </button>
   );

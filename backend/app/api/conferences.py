@@ -21,6 +21,47 @@ conferences_bp = Blueprint('conferences', __name__)
 # Helpers
 # ============================================================================
 
+def _maybe_start_live_translate(call, participant_call_sid):
+    """Start live_translate on the customer leg if the call is flagged for it.
+
+    Called when the customer joins the interaction conference. Reads
+    `call.needs_translation` (set during queue routing) and the agent's first
+    language to pick the target. Failure is logged but never raised — translation
+    is best-effort, the call should still connect.
+    """
+    if not call or not call.needs_translation or not call.caller_language:
+        return
+
+    # Pick target language from the assigned agent's profile
+    agent = User.query.get(call.assigned_agent_id) if call.assigned_agent_id else None
+    if not agent:
+        logger.warning(f"Call {call.id} flagged needs_translation but no assigned agent")
+        return
+
+    agent_langs = agent.languages or ['en-US']
+    to_lang = agent_langs[0]
+    from_lang = call.caller_language
+
+    if from_lang == to_lang:
+        # Routing flagged it but languages match — nothing to translate
+        return
+
+    try:
+        from app.services.signalwire_api import SignalWireAPI
+        sw_api = SignalWireAPI()
+        sw_api.start_live_translate(
+            call_id=participant_call_sid,
+            from_lang=from_lang,
+            to_lang=to_lang,
+        )
+        logger.info(
+            f"Started live_translate on call {call.id} (sid={participant_call_sid}): "
+            f"{from_lang} <-> {to_lang}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to start live_translate for call {call.id}: {e}")
+
+
 def build_whisper_text(context: dict) -> str:
     """Build a natural-language TTS whisper from AI-collected context.
 
@@ -1043,6 +1084,10 @@ def conference_status_callback(conference_name):
 
                 # Emit call_update so frontend gets real-time update
                 emit_call_update(call)
+
+                # Auto-start live_translate if routing flagged this call as needing it
+                # (the selected agent doesn't speak the caller's language).
+                _maybe_start_live_translate(call, participant_call_sid)
 
             # Also emit to agent room if customer joined
             # Room name must match what authenticate handler uses: str(user_id)

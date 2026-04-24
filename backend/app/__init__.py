@@ -122,4 +122,16 @@ def create_app():
     def health():
         return {'status': 'healthy'}
 
+    # Sync managed Fabric webhook URLs to current EXTERNAL_URL. Idempotent —
+    # safe to run on every worker boot; a no-op if URLs already match.
+    # Keeps the agent-conference-swml resource pointing at the live ngrok
+    # tunnel after rotation, without manual Dashboard edits.
+    try:
+        from app.services.fabric_sync import sync_all
+        result = sync_all(os.getenv('EXTERNAL_URL', ''))
+        # Warning level so it surfaces in gunicorn's default log config.
+        app.logger.warning(f"[fabric_sync] startup sync: {result}")
+    except Exception as e:
+        app.logger.warning(f"[fabric_sync] startup sync failed (non-fatal): {e}")
+
     return app

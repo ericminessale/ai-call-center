@@ -44,30 +44,108 @@ def emit_call_event(call_id, event_type, data, call_sid=None):
 
 # ==================== Call Control Endpoints ====================
 
+def _find_agent_participant(call, user_id):
+    """Locate the current agent's ConferenceParticipant in the call's conference.
+
+    Returns the ConferenceParticipant record whose call_sid we can mute/deaf,
+    or None if the call isn't in a conference or the agent isn't a member yet.
+    """
+    if not call or not call.conference_name:
+        return None
+    from app.models.conference import Conference
+    from app.models.conference_participant import ConferenceParticipant
+    conf = Conference.get_active_by_name(call.conference_name)
+    if not conf:
+        return None
+    return (
+        db.session.query(ConferenceParticipant)
+        .filter_by(
+            conference_id=conf.id,
+            participant_type='agent',
+            participant_id=str(user_id),
+            status='active',
+        )
+        .first()
+    )
+
+
 @call_control_bp.route('/<call_id>/hold', methods=['POST'])
 @require_auth
 def hold_call(call_id):
-    """Place an active call on hold."""
+    """Hold the call — cut the agent's audio both ways.
+
+    Conference-aware: if the call is bridged through a conference (the common
+    human-agent path), mute + deafen the AGENT's conference member. That
+    cleanly blocks audio in both directions, caller stays connected, and the
+    conference continues playing any configured hold media to remaining members.
+
+    Falls back to legacy `calling.hold` on the caller leg for non-conference
+    calls, with a log line so the operator knows what path was taken.
+    """
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
 
     try:
         sw_api = get_signalwire_api()
-        result = sw_api.hold_call(call.signalwire_call_sid)
+        user = request.current_user
+
+        agent_participant = _find_agent_participant(call, user.id)
+        if agent_participant and agent_participant.call_sid:
+            # Announce the hold to the caller BEFORE cutting audio both ways,
+            # so they don't hit a wall of silence. Failure is logged-not-raised
+            # — the hold itself takes priority over the announcement.
+            # TODO: localize the message based on call.caller_language when set.
+            try:
+                sw_api.play_tts(
+                    call.signalwire_call_sid,
+                    "Please hold. I'll be right back with you.",
+                )
+            except Exception as tts_err:
+                logger.warning(
+                    f"hold_call {call_id}: on-hold TTS announcement failed "
+                    f"(continuing with mute): {tts_err}"
+                )
+
+            # Conference path: mute + deaf the agent's own member so nothing
+            # crosses in either direction. Caller stays with the conference.
+            sw_api.mute_participant(
+                conference_name=call.conference_name,
+                call_id=agent_participant.call_sid,
+                muted=True,
+                deaf=True,
+            )
+            agent_participant.is_muted = True
+            agent_participant.is_deaf = True
+            agent_participant.status = 'muted'
+            path = 'conference-member'
+            result = {'participant_call_sid': agent_participant.call_sid}
+        else:
+            # Non-conference fallback — pauses media on the caller leg.
+            # Imperfect, but preserves the old behavior for call shapes we
+            # haven't modeled yet. Logged so operators can tell.
+            logger.warning(
+                f"hold_call {call_id}: no conference participant for user {user.id} — "
+                f"falling back to calling.hold on caller leg"
+            )
+            result = sw_api.hold_call(call.signalwire_call_sid)
+            path = 'legacy-caller-leg'
 
         call.status = 'on_hold'
         db.session.commit()
 
-        # Emit events
         from app.services.callcenter_socketio import emit_call_update
         emit_call_update(call)
         emit_call_event(call.id, 'hold', {
             'action': 'hold',
-            'agent': request.current_user.email
+            'path': path,
+            'agent': user.email,
         }, call.signalwire_call_sid)
 
-        return jsonify({'success': True, 'call_id': call.id, 'status': 'on_hold', 'result': result}), 200
+        return jsonify({
+            'success': True, 'call_id': call.id, 'status': 'on_hold',
+            'path': path, 'result': result,
+        }), 200
     except Exception as e:
         logger.error(f"Failed to hold call {call_id}: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -76,14 +154,31 @@ def hold_call(call_id):
 @call_control_bp.route('/<call_id>/unhold', methods=['POST'])
 @require_auth
 def unhold_call(call_id):
-    """Resume a held call."""
+    """Resume a held call. Mirrors hold_call's two paths."""
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
 
     try:
         sw_api = get_signalwire_api()
-        result = sw_api.unhold_call(call.signalwire_call_sid)
+        user = request.current_user
+
+        agent_participant = _find_agent_participant(call, user.id)
+        if agent_participant and agent_participant.call_sid:
+            sw_api.mute_participant(
+                conference_name=call.conference_name,
+                call_id=agent_participant.call_sid,
+                muted=False,
+                deaf=False,
+            )
+            agent_participant.is_muted = False
+            agent_participant.is_deaf = False
+            agent_participant.status = 'active'
+            path = 'conference-member'
+            result = {'participant_call_sid': agent_participant.call_sid}
+        else:
+            result = sw_api.unhold_call(call.signalwire_call_sid)
+            path = 'legacy-caller-leg'
 
         call.status = 'active'
         db.session.commit()
@@ -92,10 +187,14 @@ def unhold_call(call_id):
         emit_call_update(call)
         emit_call_event(call.id, 'hold', {
             'action': 'unhold',
-            'agent': request.current_user.email
+            'path': path,
+            'agent': user.email,
         }, call.signalwire_call_sid)
 
-        return jsonify({'success': True, 'call_id': call.id, 'status': 'active', 'result': result}), 200
+        return jsonify({
+            'success': True, 'call_id': call.id, 'status': 'active',
+            'path': path, 'result': result,
+        }), 200
     except Exception as e:
         logger.error(f"Failed to unhold call {call_id}: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -178,6 +277,27 @@ def start_recording(call_id):
         return jsonify({'error': str(e)}), 500
 
 
+@call_control_bp.route('/<call_id>/record/status', methods=['GET'])
+@require_auth
+def recording_status(call_id):
+    """Return whether this call currently has an active manual recording.
+
+    Reports the presence of the `recording:{call_id}` Redis key set by
+    start_recording. Does not know about default SWML-level recording — the
+    UI treats absence of a key as "not under manual control."
+    """
+    call = find_call(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+    redis_client = get_redis_client()
+    control_id = redis_client.get(f'recording:{call.id}') if redis_client else None
+    return jsonify({
+        'active': bool(control_id),
+        'control_id': control_id,
+        'recording_url': call.recording_url,
+    }), 200
+
+
 @call_control_bp.route('/<call_id>/record/stop', methods=['POST'])
 @require_auth
 def stop_recording(call_id):
@@ -209,6 +329,139 @@ def stop_recording(call_id):
     except Exception as e:
         logger.error(f"Failed to stop recording for call {call_id}: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+
+# ==================== Live Translate Endpoints ====================
+
+@call_control_bp.route('/<call_id>/translate/start', methods=['POST'])
+@require_auth
+def start_translate(call_id):
+    """Start (or change) bidirectional live_translate on a call's customer leg.
+
+    Body: { "from_lang": "es-ES", "to_lang": "en-US" }
+    If translation is already active, this updates the language pair without restarting.
+    """
+    call = find_call(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+
+    data = request.get_json() or {}
+    from_lang = (data.get('from_lang') or call.caller_language or 'en-US').strip()
+    to_lang = (data.get('to_lang') or 'en-US').strip()
+
+    if from_lang == to_lang:
+        return jsonify({'error': 'from_lang and to_lang must differ'}), 400
+
+    redis_client = get_redis_client()
+    already_active = redis_client.get(f'translate:{call.id}') if redis_client else None
+
+    try:
+        sw_api = get_signalwire_api()
+        if already_active:
+            # live_translate has no `update` action per the SWML docs — only
+            # start, stop, summarize, inject. To change languages mid-call we
+            # stop the existing session and start a fresh one with the new pair.
+            # Brief audio gap is acceptable; a silent no-op from an invented
+            # `update` action is not.
+            try:
+                sw_api.stop_live_translate(call.signalwire_call_sid)
+            except Exception as stop_err:
+                # If stop fails because no session actually exists server-side
+                # (Redis out of sync), log and proceed — start will error clearly
+                # if the session is genuinely alive.
+                logger.warning(
+                    f"stop_live_translate before restart failed on call {call.id}: {stop_err}"
+                )
+            action = 'updated'
+        else:
+            action = 'started'
+
+        result = sw_api.start_live_translate(
+            call.signalwire_call_sid,
+            from_lang=from_lang,
+            to_lang=to_lang,
+        )
+
+        # Mark translation as on so the UI + future toggles know the state
+        if redis_client:
+            redis_client.setex(f'translate:{call.id}',
+                               7200,
+                               json.dumps({'from_lang': from_lang, 'to_lang': to_lang}))
+
+        # Persist on the Call so other agents (takeovers, supervisors) see it
+        call.caller_language = from_lang
+        call.needs_translation = True
+        db.session.commit()
+
+        emit_call_event(call.id, 'translate', {
+            'action': action,
+            'from_lang': from_lang,
+            'to_lang': to_lang,
+            'agent': request.current_user.email,
+        }, call.signalwire_call_sid)
+
+        return jsonify({
+            'success': True,
+            'call_id': call.id,
+            'action': action,
+            'from_lang': from_lang,
+            'to_lang': to_lang,
+            'result': result,
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to start translate for call {call_id}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@call_control_bp.route('/<call_id>/translate/stop', methods=['POST'])
+@require_auth
+def stop_translate(call_id):
+    """Stop live_translate on a call's customer leg."""
+    call = find_call(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+
+    try:
+        sw_api = get_signalwire_api()
+        result = sw_api.stop_live_translate(call.signalwire_call_sid)
+
+        redis_client = get_redis_client()
+        if redis_client:
+            redis_client.delete(f'translate:{call.id}')
+
+        call.needs_translation = False
+        db.session.commit()
+
+        emit_call_event(call.id, 'translate', {
+            'action': 'stopped',
+            'agent': request.current_user.email,
+        }, call.signalwire_call_sid)
+
+        return jsonify({'success': True, 'call_id': call.id, 'result': result}), 200
+    except Exception as e:
+        logger.error(f"Failed to stop translate for call {call_id}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@call_control_bp.route('/<call_id>/translate/status', methods=['GET'])
+@require_auth
+def translate_status(call_id):
+    """Get current translation state for a call."""
+    call = find_call(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+
+    redis_client = get_redis_client()
+    raw = redis_client.get(f'translate:{call.id}') if redis_client else None
+    state = json.loads(raw) if raw else None
+
+    return jsonify({
+        'active': state is not None,
+        'from_lang': state.get('from_lang') if state else None,
+        'to_lang': state.get('to_lang') if state else None,
+        'caller_language': call.caller_language,
+        'needs_translation': call.needs_translation,
+    }), 200
 
 
 @call_control_bp.route('/<call_id>/dtmf', methods=['POST'])
@@ -246,18 +499,35 @@ def send_dtmf(call_id):
 
 @call_control_bp.route('/<call_id>/monitor/start', methods=['POST'])
 @require_auth
-# TODO: re-add @require_role('supervisor', 'admin') in auth overhaul
 def start_monitor(call_id):
     """Start monitoring an active call (audio tap or silent conference join).
 
     For AI calls (non-conference): uses SignalWire tap to stream audio via WebSocket.
     For human calls (conference-based): prepares a silent conference join.
+
+    Permission: `can_listen_ai_calls` or `can_listen_human_calls` depending on
+    who is handling the call. Agents must never be able to silently observe
+    arbitrary calls they're not on; gated here before any SignalWire RPC.
     """
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
 
     user = request.current_user
+
+    # Pick the right permission based on what kind of call this is.
+    # A human-handled conference call requires `can_listen_human_calls`;
+    # anything else (AI-driven, tap-based) requires `can_listen_ai_calls`.
+    is_human_call = bool(call.conference_name and call.handler_type == 'human')
+    required_flag = 'can_listen_human_calls' if is_human_call else 'can_listen_ai_calls'
+    if not user.has_permission(required_flag):
+        return jsonify({
+            'error': 'Missing required permissions',
+            'required_permissions': [required_flag],
+            'missing_permissions': [required_flag],
+            'call_type': 'human' if is_human_call else 'ai',
+        }), 403
+
     redis_client = get_redis_client()
 
     try:
@@ -326,14 +596,25 @@ def start_monitor(call_id):
 
 @call_control_bp.route('/<call_id>/monitor/stop', methods=['POST'])
 @require_auth
-# TODO: re-add @require_role('supervisor', 'admin') in auth overhaul
 def stop_monitor(call_id):
-    """Stop monitoring an active call."""
+    """Stop monitoring an active call.
+
+    Permission-wise this is the tear-down half of start_monitor. We allow it
+    whenever the user has EITHER listen permission — if they got in, they
+    must be able to get out even if their role was narrowed mid-session.
+    """
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
 
     user = request.current_user
+    if not (user.has_permission('can_listen_ai_calls')
+            or user.has_permission('can_listen_human_calls')):
+        return jsonify({
+            'error': 'Missing required permissions',
+            'required_permissions': ['can_listen_ai_calls', 'can_listen_human_calls'],
+        }), 403
+
     redis_client = get_redis_client()
 
     try:
@@ -407,7 +688,14 @@ def request_backup(call_id):
             assignments = QueueAgentAssignment.query.filter_by(queue_id=queue.id).all()
             skill_levels = {str(a.user_id): a.skill_level for a in assignments}
 
-        selected_agent_id = queue_service.select_agent(queue_slug, strategy, available, skill_levels)
+        # Match backup agent to the original caller's language when known
+        agent_languages = queue_service.get_languages_for_agents(available)
+
+        selected_agent_id = queue_service.select_agent(
+            queue_slug, strategy, available, skill_levels,
+            caller_language=call.caller_language,
+            agent_languages=agent_languages,
+        )
 
         if not selected_agent_id:
             return jsonify({'error': 'No suitable agent found'}), 404

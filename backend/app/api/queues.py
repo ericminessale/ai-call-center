@@ -94,9 +94,14 @@ def route_call_to_queue(queue_id):
             'budget': global_data.get('budget'),
             'error_message': global_data.get('error_message'),
             'source_agent': global_data.get('source_agent'),
+            'caller_language': global_data.get('caller_language'),
             # Keep full global_data as fallback
             'global_data': global_data
         }
+
+        # Caller's preferred language (BCP-47, e.g. 'es-ES'). Used by select_agent
+        # to prefer language-matched agents and decide whether translation is needed.
+        caller_language = global_data.get('caller_language') or 'en-US'
 
         # Clean up None values
         context = {k: v for k, v in context.items() if v is not None}
@@ -147,6 +152,9 @@ def route_call_to_queue(queue_id):
 
         # Store AI context (customer info collected by AI agent)
         call.ai_context = json.dumps(context) if context else None
+
+        # Persist caller's language so the agent UI + auto-start hooks can read it
+        call.caller_language = caller_language
 
         # Ensure call is marked as 'waiting' in queue
         if call.status not in ['waiting', 'assigned', 'active', 'ended']:
@@ -261,6 +269,12 @@ def route_call_to_queue(queue_id):
         if routing_strategy in ('skill_based', 'priority') and available_agents:
             skill_levels = service.get_skill_levels_for_queue(queue_id, available_agents)
 
+        # Look up languages for all available agents — used to prefer language-matched
+        # agents and to decide whether `needs_translation` should be set on the call.
+        agent_languages = {}
+        if available_agents:
+            agent_languages = service.get_languages_for_agents(available_agents)
+
         if available_agents:
             # Use configured routing strategy to select agent
             # We still need to validate agents (Call Fabric address, actual availability)
@@ -274,13 +288,15 @@ def route_call_to_queue(queue_id):
                 if not remaining:
                     break
 
-                # Select next agent via strategy
+                # Select next agent via strategy (with language-preference pass)
                 agent_id_str = service.select_agent(
                     queue_slug=queue_id,
                     routing_strategy=routing_strategy,
                     available_agents=remaining,
                     skill_levels=skill_levels,
                     call_priority=priority,
+                    caller_language=caller_language,
+                    agent_languages=agent_languages,
                 )
                 if not agent_id_str:
                     break
@@ -333,6 +349,16 @@ def route_call_to_queue(queue_id):
                     call.user_id = selected_user.id
                     call.assigned_agent_id = selected_user.id
                     call.assigned_at = datetime.utcnow()
+
+                    # Decide whether live_translate must auto-start at conference-join.
+                    # If the selected agent doesn't speak the caller's language, flag it.
+                    selected_langs = selected_user.languages or ['en-US']
+                    call.needs_translation = caller_language not in selected_langs
+                    if call.needs_translation:
+                        logger.info(
+                            f"Call {call.id} needs translation: caller={caller_language}, "
+                            f"agent {selected_user.id} speaks {selected_langs}"
+                        )
 
                 # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
                 base_url = get_base_url()

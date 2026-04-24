@@ -75,6 +75,9 @@ export const authApi = {
 
   logout: () =>
     api.post('/api/auth/logout'),
+
+  updateMyLanguages: (languages: string[]) =>
+    api.put<{ user: any }>('/api/auth/me/languages', { languages }),
 };
 
 export const callsApi = {
@@ -253,6 +256,10 @@ export const adminApi = {
     api.get('/api/admin/users'),
   updateUserRole: (id: number, role: 'admin' | 'supervisor' | 'agent') =>
     api.put(`/api/admin/users/${id}`, { role }),
+  updateUserLanguages: (id: number, languages: string[]) =>
+    api.put(`/api/admin/users/${id}/languages`, { languages }),
+  updateUserPermissions: (id: number, permissions: Record<string, boolean>) =>
+    api.put(`/api/admin/users/${id}/permissions`, { permissions }),
   deleteUser: (id: number) =>
     api.delete(`/api/admin/users/${id}`),
 
@@ -298,6 +305,8 @@ export const callControlApi = {
     api.post<{ success: boolean; call_id: number; recording: boolean; control_id?: string }>(`/api/call-control/${callId}/record/start`),
   stopRecording: (callId: number | string) =>
     api.post<{ success: boolean; call_id: number; recording: boolean }>(`/api/call-control/${callId}/record/stop`),
+  getRecordingStatus: (callId: number | string) =>
+    api.get<{ active: boolean; control_id: string | null; recording_url: string | null }>(`/api/call-control/${callId}/record/status`),
 
   // DTMF
   sendDtmf: (callId: number | string, digits: string) =>
@@ -314,6 +323,19 @@ export const callControlApi = {
     api.post<{ success: boolean; selected_agent_id: number; selected_agent_name: string; leg_id: number }>(`/api/call-control/${callId}/request-backup`, { queue_id: queueId }),
   escalate: (callId: number | string, whisper?: boolean) =>
     api.post<{ success: boolean; supervisor_id: number; supervisor_name: string; leg_id: number; whisper_mode: boolean }>(`/api/call-control/${callId}/escalate`, { whisper }),
+
+  // Live translate (bidirectional STT + translate + TTS on the customer leg)
+  startTranslate: (callId: number | string, fromLang: string, toLang: string) =>
+    api.post<{ success: boolean; call_id: number; action: string; from_lang: string; to_lang: string }>(
+      `/api/call-control/${callId}/translate/start`,
+      { from_lang: fromLang, to_lang: toLang }
+    ),
+  stopTranslate: (callId: number | string) =>
+    api.post<{ success: boolean; call_id: number }>(`/api/call-control/${callId}/translate/stop`),
+  getTranslateStatus: (callId: number | string) =>
+    api.get<{ active: boolean; from_lang: string | null; to_lang: string | null; caller_language: string | null; needs_translation: boolean }>(
+      `/api/call-control/${callId}/translate/status`
+    ),
 };
 
 // Agent-facing queue operations

@@ -63,6 +63,38 @@ def require_role(*allowed_roles):
     return decorator
 
 
+def require_permission(*required_flags):
+    """Decorator requiring one or more capability flags. Must be used AFTER @require_auth.
+
+    All listed flags must evaluate truthy for the current user (role defaults
+    merged with per-user overrides). See User.effective_permissions().
+
+    Usage:
+        @require_auth
+        @require_permission('can_listen_ai_calls')
+        def monitor_ai_call():
+            ...
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if not hasattr(request, 'current_user') or not request.current_user:
+                return jsonify({'error': 'Authentication required'}), 401
+            missing = [
+                flag for flag in required_flags
+                if not request.current_user.has_permission(flag)
+            ]
+            if missing:
+                return jsonify({
+                    'error': 'Missing required permissions',
+                    'required_permissions': list(required_flags),
+                    'missing_permissions': missing,
+                }), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+
 def validate_json(*expected_args):
     """Decorator to validate JSON request body."""
     def decorator(f):

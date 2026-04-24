@@ -456,8 +456,14 @@ class CallCenterTriageAgent(AgentBase):
         add_sentiment_tool(self)
 
         # Voice and speech configuration
+        # Multiple languages so the receptionist can greet/converse in the caller's
+        # language while we capture the preference for routing + live_translate.
         self.add_language("English", "en-US", "openai.alloy",
             function_fillers=["Bear with me one moment.", "I'm getting you connected now."])
+        self.add_language("Spanish", "es-ES", "openai.alloy",
+            function_fillers=["Un momento, por favor.", "Le estoy conectando ahora."])
+        self.add_language("French", "fr-FR", "openai.alloy",
+            function_fillers=["Un instant, s'il vous plaît.", "Je vous mets en relation."])
         self.set_prompt_llm_params(
             temperature=0.4, top_p=0.9,
             barge_confidence=0.6, frequency_penalty=0.2)
@@ -515,6 +521,23 @@ class CallCenterTriageAgent(AgentBase):
             "and move toward getting them connected."
         )
 
+        self.prompt_add_section(
+            "Language Detection",
+            body=(
+                "You can converse in English, Spanish, and French. From the caller's very first words, "
+                "detect which language they're speaking and respond in that same language. As soon as "
+                "you've confirmed which language they prefer, silently call set_caller_language with "
+                "the BCP-47 code so we can route them to a matching agent."
+            ),
+            bullets=[
+                "If the caller starts in English, call set_caller_language('en-US') silently",
+                "If the caller starts in Spanish, switch to Spanish and call set_caller_language('es-ES')",
+                "If the caller starts in French, switch to French and call set_caller_language('fr-FR')",
+                "If you can't tell, just ask once: 'Which language do you prefer — English, Spanish, or French?'",
+                "Call this tool ONCE per call, no fillers, no acknowledgment to the caller",
+            ]
+        )
+
         # Build department list for post_prompt
         dept_options = '/'.join(queue_slugs + ['unknown'])
         self.set_post_prompt(
@@ -549,17 +572,18 @@ class CallCenterTriageAgent(AgentBase):
         else:
             dept_menu = dept_names[0] if dept_names else 'general assistance'
 
-        # Step 1: Greet and get name
+        # Step 1: Greet and get name (also detects caller's language)
         triage_ctx.add_step("greeting") \
             .add_section("Goal",
                 "Welcome the caller and get their name. Introduce yourself as Sam. "
-                "Be warm but brief — this should take one exchange.") \
+                "Be warm but brief — this should take one exchange. "
+                "Detect their language from their first words and respond in kind.") \
             .add_section("Handling Eager Callers",
                 "If the caller gives you their name AND mentions what they need in the same breath, "
                 "great — note both. You can skip asking about the department in the next step.") \
-            .set_step_criteria("The customer has stated their name") \
+            .set_step_criteria("The customer has stated their name and you have called set_caller_language") \
             .set_valid_steps(["route_department"]) \
-            .set_functions(["report_sentiment"])
+            .set_functions(["report_sentiment", "set_caller_language"])
 
         # Step 2: Determine department
         triage_ctx.add_step("route_department") \
@@ -573,7 +597,7 @@ class CallCenterTriageAgent(AgentBase):
                 "Once you know the department, move to that context seamlessly:\n" + route_instructions) \
             .set_step_criteria("Customer has indicated which department they need") \
             .set_valid_contexts(queue_slugs) \
-            .set_functions(["report_sentiment"])
+            .set_functions(["report_sentiment", "set_caller_language"])
 
         # ============================================================
         # DYNAMIC QUEUE CONTEXTS - One per configured queue
@@ -625,6 +649,28 @@ class CallCenterTriageAgent(AgentBase):
         return True
 
     @AgentBase.tool(
+        name="set_caller_language",
+        description=(
+            "Silently record the caller's preferred language (BCP-47 code). "
+            "Call this once after detecting or confirming what language the caller speaks. "
+            "Used by routing to prefer language-matched agents."
+        ),
+        parameters={
+            "language": {
+                "type": "string",
+                "description": "BCP-47 code: 'en-US', 'es-ES', 'fr-FR', 'de-DE', 'pt-BR', etc.",
+            }
+        },
+        # No fillers — must be silent so it doesn't interrupt the conversation
+    )
+    def set_caller_language(self, args, raw_data):
+        """Persist caller's language preference into global_data so it flows with the call."""
+        language = (args.get("language") or "en-US").strip()
+        result = FunctionResult("")  # Silent
+        result.update_global_data({"caller_language": language})
+        return result
+
+    @AgentBase.tool(
         name="transfer_to_human",
         description=(
             "Connect the caller to a human representative in the department they need. "
@@ -666,7 +712,8 @@ class CallCenterTriageAgent(AgentBase):
             'priority': priority,
             'additional_info': additional_info,
             'preferred_handling': 'human',
-            'source_agent': 'call_center_triage'
+            'source_agent': 'call_center_triage',
+            'caller_language': global_data.get('caller_language', 'en-US'),
         }
 
         # Encode context as base64 JSON for URL
@@ -738,7 +785,8 @@ class CallCenterTriageAgent(AgentBase):
             'urgency': urgency,
             'additional_info': additional_info,
             'preferred_handling': 'ai',
-            'source_agent': 'call_center_triage'
+            'source_agent': 'call_center_triage',
+            'caller_language': global_data.get('caller_language', 'en-US'),
         })
         result.action.append({
             "SWML": {

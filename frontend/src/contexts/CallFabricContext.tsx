@@ -2108,11 +2108,26 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     hangup,
     answerCall,
     requestMicPermission,
-    mute: async () => { await activeCall?.mute(); setIsMuted(true); },
-    unmute: async () => { await activeCall?.unmute(); setIsMuted(false); },
-    hold: async () => { await activeCall?.hold(); },
-    unhold: async () => { await activeCall?.unhold(); },
-    sendDigits: async (digits: string) => { await activeCall?.sendDigits(digits); },
+    // Call-method dispatch. `activeCall` can be either (a) the raw CF SDK
+    // Call from `client.dial(...)` or (b) a wrapped shim we construct for
+    // outbound calls. The raw SDK exposes audioMute/audioUnmute; the shim
+    // exposes mute/unmute. Prefer the SDK names, fall back to the shim,
+    // so the button works regardless of which shape landed in state.
+    mute: async () => {
+      const c = activeCall as unknown as { audioMute?: () => Promise<void>; mute?: () => Promise<void> } | null;
+      if (c?.audioMute) await c.audioMute();
+      else if (c?.mute) await c.mute();
+      setIsMuted(true);
+    },
+    unmute: async () => {
+      const c = activeCall as unknown as { audioUnmute?: () => Promise<void>; unmute?: () => Promise<void> } | null;
+      if (c?.audioUnmute) await c.audioUnmute();
+      else if (c?.unmute) await c.unmute();
+      setIsMuted(false);
+    },
+    hold: async () => { await activeCall?.hold?.(); },
+    unhold: async () => { await activeCall?.unhold?.(); },
+    sendDigits: async (digits: string) => { await activeCall?.sendDigits?.(digits); },
     // Conference actions (per-interaction model)
     joinInteractionConference,
     leaveConference,

@@ -31,7 +31,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { Contact, Interaction, TranscriptionMessage, Call, CallLeg } from '../../types/callcenter';
-import { contactsApi, callsApi } from '../../services/api';
+import { contactsApi, callsApi, callControlApi } from '../../services/api';
 import api from '../../services/api';
 import { useCallFabric } from '../../hooks/useCallFabric';
 import { useCallFabricContext } from '../../contexts/CallFabricContext';
@@ -150,6 +150,29 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   const [isOnHold, setIsOnHold] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const { user: currentUser } = useAuthStore();
+
+  // Hydrate recording state from backend when a call becomes active, so the
+  // Record button reflects reality on first render instead of always showing
+  // "Record" regardless of the call's actual state.
+  useEffect(() => {
+    const callId = activeCallForContact?.id;
+    if (!callId) {
+      setIsRecording(false);
+      return;
+    }
+    let cancelled = false;
+    callControlApi
+      .getRecordingStatus(callId)
+      .then((res) => {
+        if (!cancelled) setIsRecording(Boolean(res.data.active));
+      })
+      .catch(() => {
+        // Ignore — endpoint may 404 for non-eligible call types. Default off.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeCallForContact?.id]);
   const [takeCallError, setTakeCallError] = useState<string | null>(null);
 
   // AI Agent form state

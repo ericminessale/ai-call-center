@@ -523,10 +523,13 @@ class SignalWireAPI:
             logger.error(f"Failed to remove from conference: {str(e)}")
             raise
 
-    def mute_participant(self, conference_name, call_id, muted=True):
-        """Mute or unmute a conference participant.
+    def mute_participant(self, conference_name, call_id, muted=True, deaf=None):
+        """Mute / unmute (optionally deafen) a conference participant.
 
-        Uses the calling.conference command with mute parameter.
+        `mute` blocks this member's audio from reaching the conference
+        (agent → caller). `deaf`, when provided, also blocks the conference
+        from reaching this member (caller → agent). Pair both for a proper
+        two-way hold-style cut.
         """
         try:
             headers = {
@@ -535,13 +538,17 @@ class SignalWireAPI:
                 'Authorization': self.auth_header
             }
 
+            params = {
+                "name": conference_name,
+                "mute": muted,
+            }
+            if deaf is not None:
+                params["deaf"] = deaf
+
             data = {
                 "id": call_id,
                 "command": "calling.conference",
-                "params": {
-                    "name": conference_name,
-                    "mute": muted
-                }
+                "params": params,
             }
 
             action = "Muting" if muted else "Unmuting"
@@ -749,6 +756,45 @@ class SignalWireAPI:
         if control_id:
             params["control_id"] = control_id
         return self._call_command(call_id, "calling.stop_tap", params)
+
+    # ==================== Live Translate ====================
+
+    def start_live_translate(self, call_id, from_lang, to_lang,
+                             direction=("remote-caller", "local-caller"),
+                             speech_engine="deepgram"):
+        """Start bidirectional real-time speech translation on a call leg.
+
+        Translates audio in both directions: caller speech (`from_lang`) gets
+        rendered to the other party in `to_lang`, and vice versa.
+
+        Args:
+            call_id: SignalWire call_id of the leg to attach translation to
+            from_lang: BCP-47 code of the remote caller's language (e.g. 'es-ES')
+            to_lang: BCP-47 code of the local agent's language (e.g. 'en-US')
+            direction: Tuple of directions to translate. Default is full bidirectional.
+            speech_engine: 'deepgram' or 'google'. Deepgram has lower latency.
+        """
+        return self._call_command(call_id, "calling.live_translate", {
+            "action": {
+                "start": {
+                    "from_lang": from_lang,
+                    "to_lang": to_lang,
+                    "direction": list(direction),
+                    "speech_engine": speech_engine,
+                }
+            }
+        })
+
+    def stop_live_translate(self, call_id):
+        """Stop an active live_translate session on a call leg."""
+        return self._call_command(call_id, "calling.live_translate", {
+            "action": "stop"
+        })
+
+    # NOTE: live_translate does not have an `update` action per the SWML docs
+    # (only start, stop, summarize, inject). To change languages mid-call,
+    # callers should stop_live_translate then start_live_translate with the
+    # new pair. See app/api/call_control.py:start_translate for the pattern.
 
     # ==================== Conference Dialing ====================
 

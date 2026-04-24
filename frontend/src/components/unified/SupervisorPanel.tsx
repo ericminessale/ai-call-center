@@ -12,6 +12,7 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { Call } from '../../types/callcenter';
+import ObserverControls from '../shared/ObserverControls';
 
 interface SupervisorPanelProps {
   activeCalls: Call[];
@@ -251,15 +252,22 @@ function SupervisorCallCard({ call, onClick }: { call: Call; onClick: () => void
               <span className="uppercase tracking-wider">{sentiment.label}</span>
             </div>
           )}
-          {isAI && (
-            <button
-              onClick={(e) => { e.stopPropagation(); onClick(); }}
-              className="p-1 rounded bg-ai/10 hover:bg-ai/20 text-ai-soft transition-colors border border-ai/25"
-              title="Inject message"
-            >
-              <MessageSquare className="w-3 h-3" />
-            </button>
-          )}
+          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+            <ObserverControls
+              callId={call.id}
+              callType={isAI ? 'ai' : 'human'}
+              compact
+            />
+            {isAI && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onClick(); }}
+                className="p-1 rounded bg-ai/10 hover:bg-ai/20 text-ai-soft transition-colors border border-ai/25"
+                title="Inject message"
+              >
+                <MessageSquare className="w-3 h-3" />
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </button>

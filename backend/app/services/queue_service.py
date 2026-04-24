@@ -518,8 +518,10 @@ class QueueService:
                 if data.get("call_id") == call_id:
                     self.redis.zrem(queue_key, entry)
                     removed += 1
-            except (json.JSONDecodeError, TypeError):
-                pass
+            except (json.JSONDecodeError, TypeError) as exc:
+                # Skip malformed entry — should never happen unless something
+                # else wrote raw strings to the queue. Worth knowing about.
+                logger.warning("queue entry not parseable as JSON, skipping: %s", exc)
         return removed
 
     def remove_call_from_all_queues(self, call_id: str) -> int:

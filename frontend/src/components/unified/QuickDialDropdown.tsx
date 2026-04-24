@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Phone, X, Circle } from 'lucide-react';
+import { logger } from '../../lib/logger';
 
 type AgentStatusType = 'available' | 'busy' | 'after-call' | 'break' | 'offline';
 
@@ -41,7 +42,7 @@ export function QuickDialDropdown({ callFabric, onClose, onCallStarted }: QuickD
     try {
       await callFabric.makeCall(number);
     } catch (error) {
-      console.error('Failed to dial:', error);
+      logger.error('Failed to dial:', error);
       // Error will be shown in ContactDetailView via callFabric.error
     } finally {
       setIsDialing(false);

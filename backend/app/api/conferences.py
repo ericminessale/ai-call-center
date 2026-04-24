@@ -3,7 +3,7 @@ from app import db, redis_client
 from app.models import Conference, ConferenceParticipant, Call, CallLeg, User
 from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth
-from app.utils.url_utils import get_base_url
+from app.utils.url_utils import get_base_url, signed_webhook_url
 import logging
 import json
 import os
@@ -297,8 +297,8 @@ def agent_conference_webhook():
     if sw_user_vars:
         try:
             parsed_params.update(json.loads(sw_user_vars))
-        except:
-            pass
+        except (ValueError, TypeError) as exc:
+            logger.debug("X-SignalWire-User-Variables header was not valid JSON: %s", exc)
 
     # Source 8: Form data direct fields (for url-encoded forms)
     if request.form.get('agent_id'):
@@ -914,7 +914,7 @@ def handle_call_conference_status(conference_name, event_type, participant_call_
             result = sw_api.create_call(
                 to=ai_swml_url,
                 swml_url=ai_swml_url,
-                status_callback=f"{base_url}/api/webhooks/call-status"
+                status_callback=signed_webhook_url(f"{base_url}/api/webhooks/call-status")
             )
 
             ai_call_sid = result.sid if hasattr(result, 'sid') else result.get('call_id')

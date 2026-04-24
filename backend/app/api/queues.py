@@ -8,7 +8,8 @@ from app.services.queue_service import QueueService
 from app.services.redis_service import get_redis_client
 from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth
-from app.utils.url_utils import get_base_url
+from app.utils.url_utils import get_base_url, signed_webhook_url
+from app.utils.webhook_auth import require_webhook_auth
 from app import db
 from app.models import Call, User, Conference, ConferenceParticipant, CallLeg, Contact
 from app.models.queue import Queue, QueueAgentAssignment
@@ -36,11 +37,16 @@ def get_queue_service():
 
 
 @queues_bp.route('/<queue_id>/route', methods=['POST'])
+@require_webhook_auth
 def route_call_to_queue(queue_id):
     """
     Route an incoming call to a queue
     Called by AI agents via SWML transfer
     Returns SWML to place caller on hold while waiting for agent
+
+    Auth: HTTP Basic. SignalWire calls this URL after the AI agent's
+    transfer SWML; the agent embeds WEBHOOK_AUTH_USER:WEBHOOK_AUTH_PASSWORD
+    in the URL it returns. See app.utils.webhook_auth.
     """
     try:
         logger.info(f"Queue route hit: /api/queues/{queue_id}/route")
@@ -819,7 +825,7 @@ def direct_inbound_queue(queue_slug):
                 "main": [
                     {
                         "set": {
-                            "call_state_url": f"{base_url}/api/webhooks/call-status",
+                            "call_state_url": signed_webhook_url(f"{base_url}/api/webhooks/call-status"),
                             "call_state_events": "created,ringing,answered,ended"
                         }
                     },

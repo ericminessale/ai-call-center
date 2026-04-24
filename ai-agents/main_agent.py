@@ -13,9 +13,32 @@ import json
 import base64
 import re
 import threading
+from urllib.parse import quote, urlparse, urlunparse
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _signed_webhook_url(url: str) -> str:
+    """Embed WEBHOOK_AUTH credentials into a URL the platform will call back.
+
+    The backend webhook endpoints accept HTTP Basic Auth from
+    WEBHOOK_AUTH_USER/WEBHOOK_AUTH_PASSWORD. SignalWire pulls those out of
+    the URL we hand it (``user:pass@host`` form) and replays them on the
+    callback. If the env vars aren't set, the URL is unchanged — backend
+    runs in soft mode and logs a warning instead of rejecting.
+    """
+    user = os.getenv('WEBHOOK_AUTH_USER')
+    pw = os.getenv('WEBHOOK_AUTH_PASSWORD')
+    if not user or not pw:
+        return url
+    parsed = urlparse(url)
+    host = parsed.hostname or ''
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    netloc = f"{quote(user, safe='')}:{quote(pw, safe='')}@{host}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params,
+                       parsed.query, parsed.fragment))
 
 # Configuration
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://backend:5000')
@@ -150,14 +173,16 @@ def do_reindex(collection_name, documents, connection_string):
             chunking_strategy = EXCLUDED.chunking_strategy
     """, (collection_name, EMBEDDING_MODEL_NAME, EMBEDDING_DIM, 'sentence'))
 
-    # Create text search index if not exists
+    # Create text search index if not exists. The pg_trgm extension may not
+    # be installed on every environment — that's recoverable; vector search
+    # still works without it. Log so we know.
     try:
         cur.execute(f"""
             CREATE INDEX IF NOT EXISTS idx_{collection_name}_content_trgm
             ON {table_name} USING gin (content gin_trgm_ops)
         """)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"trgm index creation skipped (non-fatal): {exc}", flush=True)
 
     conn.commit()
     cur.close()
@@ -387,8 +412,9 @@ def add_sentiment_tool(agent):
                     backend_url = os.getenv('BACKEND_URL', 'http://backend:5000')
                     url = f"{backend_url}/api/calls/{call_db_id}/sentiment"
                     http_requests.post(url, json={'score': score, 'reason': reason}, timeout=5)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Non-fatal: sentiment is decorative, never block the call.
+                    print(f"sentiment POST failed (non-fatal): {exc}", flush=True)
             threading.Thread(target=post_sentiment, daemon=True).start()
 
         return FunctionResult("ok")
@@ -734,7 +760,7 @@ class CallCenterTriageAgent(AgentBase):
         result.action.append({
             "SWML": {
                 "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
             },
             "transfer": "true"
         })
@@ -950,7 +976,7 @@ class SalesAISpecialist(AgentBase):
         result.action.append({
             "SWML": {
                 "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
             },
             "transfer": "true"
         })
@@ -1112,7 +1138,7 @@ class SupportAISpecialist(AgentBase):
         result.action.append({
             "SWML": {
                 "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
             },
             "transfer": "true"
         })
@@ -1277,7 +1303,7 @@ class OutboundSalesAgent(AgentBase):
         result.action.append({
             "SWML": {
                 "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
             },
             "transfer": "true"
         })
@@ -1436,7 +1462,7 @@ class OutboundSupportAgent(AgentBase):
         result.action.append({
             "SWML": {
                 "version": "1.0.0",
-                "sections": {"main": [{"transfer": {"dest": queue_url}}]}
+                "sections": {"main": [{"transfer": {"dest": _signed_webhook_url(queue_url)}}]}
             },
             "transfer": "true"
         })

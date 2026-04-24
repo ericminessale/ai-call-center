@@ -3,6 +3,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useSocketContext } from './SocketContext';
 import { conferencesApi, callsApi } from '../services/api';
 import type { Conference, ConferenceParticipant } from '../types/callcenter';
+import { logger } from '../lib/logger';
 
 // AI-collected context from the AI agent conversation
 export interface AICollectedContext {
@@ -182,7 +183,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   const getInitialStatus = (): AgentStatusType => {
     const persisted = sessionStorage.getItem('agent_status');
     if (persisted === 'available') {
-      console.log('📦 [CallFabric] Found persisted status in sessionStorage: available');
+      logger.debug('📦 [CallFabric] Found persisted status in sessionStorage: available');
       return 'available'; // Will trigger auto-rejoin once client is ready
     }
     return 'offline';
@@ -256,7 +257,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const data = await response.json();
       return data.token;
     } catch (error) {
-      console.error('Error getting subscriber token:', error);
+      logger.error('Error getting subscriber token:', error);
       throw error;
     }
   };
@@ -266,7 +267,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     return new Promise<void>((resolve, reject) => {
       // Check if adapter is already loaded
       if ((window as any).adapter) {
-        console.log('✅ WebRTC adapter already loaded');
+        logger.debug('✅ WebRTC adapter already loaded');
         resolve();
         return;
       }
@@ -274,11 +275,11 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       script.src = 'https://webrtc.github.io/adapter/adapter-latest.js';
       script.async = true;
       script.onload = () => {
-        console.log('✅ WebRTC adapter loaded');
+        logger.debug('✅ WebRTC adapter loaded');
         resolve();
       };
       script.onerror = (err) => {
-        console.warn('⚠️ Failed to load WebRTC adapter, continuing anyway:', err);
+        logger.warn('⚠️ Failed to load WebRTC adapter, continuing anyway:', err);
         resolve(); // Don't reject - adapter is helpful but not required
       };
       document.head.appendChild(script);
@@ -293,7 +294,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
     return new Promise((resolve, reject) => {
       if (window.SignalWire) {
-        console.log('✅ SignalWire SDK already loaded');
+        logger.debug('✅ SignalWire SDK already loaded');
         resolve(true);
         return;
       }
@@ -302,7 +303,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       script.src = 'https://unpkg.com/@signalwire/client';
       script.async = true;
       script.onload = () => {
-        console.log('✅ SignalWire SDK loaded (@signalwire/client stable)');
+        logger.debug('✅ SignalWire SDK loaded (@signalwire/client stable)');
         resolve(true);
       };
       script.onerror = reject;
@@ -318,7 +319,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     setError(null);
 
     try {
-      console.log('📱 [CallFabric] Initializing client...');
+      logger.debug('📱 [CallFabric] Initializing client...');
 
       if (!window.SignalWire) {
         await loadSignalWireSDK();
@@ -336,28 +337,30 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         // Just make it visible for debugging
         rootElementRef.current.style.cssText = 'width:320px;height:240px;background:#222;';
         document.body.appendChild(rootElementRef.current);
-        console.log('📞 [CallFabric] Created rootElement for media (matching SDK example)');
+        logger.debug('📞 [CallFabric] Created rootElement for media (matching SDK example)');
       }
 
       // Match reference implementation pattern for host parameter:
       // explicitly pass undefined when not set, rather than empty string
       const swHost = import.meta.env.VITE_SIGNALWIRE_HOST;
       const hostParam = swHost && swHost.trim().length ? swHost : undefined;
-      console.log('📱 [CallFabric] Using host:', hostParam || '(default from token)');
+      logger.debug('📱 [CallFabric] Using host:', hostParam || '(default from token)');
 
+      // Gate verbose SDK logging behind an env var so dev can opt in without
+      // shipping WebSocket frame traces to every production browser session.
+      const swDebug = import.meta.env.VITE_SW_DEBUG === 'true';
       const swClient = await SWire({
         token: token,
         host: hostParam,
-        debug: { logWsTraffic: true },
-        logLevel: 'debug'
+        ...(swDebug ? { debug: { logWsTraffic: true }, logLevel: 'debug' as const } : {}),
       });
 
       setClient(swClient);
       setIsClientReady(true);
-      console.log('✅ [CallFabric] Client initialized and ready');
+      logger.debug('✅ [CallFabric] Client initialized and ready');
 
     } catch (error) {
-      console.error('❌ [CallFabric] Failed to initialize:', error);
+      logger.error('❌ [CallFabric] Failed to initialize:', error);
       setError('Failed to initialize phone system');
       initializingRef.current = false;
     } finally {
@@ -370,15 +373,15 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     if (!client || isOnline) return;
 
     try {
-      console.log('📱 [CallFabric] Going online...');
+      logger.debug('📱 [CallFabric] Going online...');
 
       await client.online({
         incomingCallHandlers: {
           all: async (notification: any) => {
-            console.log('📞 [CallFabric] Incoming call notification:', notification);
-            console.log('📞 [CallFabric] Incoming invite object:', notification.invite);
-            console.log('📞 [CallFabric] Incoming invite details:', JSON.stringify(notification.invite?.details, null, 2));
-            console.log('📞 [CallFabric] Incoming callID:', notification.invite?.details?.callID);
+            logger.debug('📞 [CallFabric] Incoming call notification:', notification);
+            logger.debug('📞 [CallFabric] Incoming invite object:', notification.invite);
+            logger.debug('📞 [CallFabric] Incoming invite details:', JSON.stringify(notification.invite?.details, null, 2));
+            logger.debug('📞 [CallFabric] Incoming callID:', notification.invite?.details?.callID);
             inviteRef.current = notification.invite;
 
             const aiContext = notification.invite.details?.userVariables?.ai_context;
@@ -396,26 +399,26 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
               queueContext,
               answer: async () => {
                 // Match SDK example exactly - use notification.invite from closure
-                console.log('📞 [CallFabric] answer() called');
-                console.log('📞 [CallFabric] notification.invite:', notification.invite);
-                console.log('📞 [CallFabric] notification.invite.details:', notification.invite?.details);
-                console.log('📞 [CallFabric] callID:', notification.invite?.details?.callID);
-                console.log('📞 [CallFabric] from:', notification.invite?.details?.from);
-                console.log('📞 [CallFabric] rootElement:', rootElementRef.current);
+                logger.debug('📞 [CallFabric] answer() called');
+                logger.debug('📞 [CallFabric] notification.invite:', notification.invite);
+                logger.debug('📞 [CallFabric] notification.invite.details:', notification.invite?.details);
+                logger.debug('📞 [CallFabric] callID:', notification.invite?.details?.callID);
+                logger.debug('📞 [CallFabric] from:', notification.invite?.details?.from);
+                logger.debug('📞 [CallFabric] rootElement:', rootElementRef.current);
 
                 try {
                   // Call accept() with audio-only (no video) since this is a voice call center
-                  console.log('📞 [CallFabric] Calling notification.invite.accept() with audio-only...');
+                  logger.debug('📞 [CallFabric] Calling notification.invite.accept() with audio-only...');
                   const call = await notification.invite.accept({
                     rootElement: rootElementRef.current,
                     audio: true,
                     video: false,  // Voice-only call - don't request camera
                   });
 
-                  console.log('📞 [CallFabric] accept() returned:', call);
-                  console.log('📞 [CallFabric] call.id:', call?.id);
-                  console.log('📞 [CallFabric] call.state:', call?.state);
-                  console.log('📞 [CallFabric] MISMATCH CHECK - invite callID:', notification.invite?.details?.callID, 'vs call.id:', call?.id);
+                  logger.debug('📞 [CallFabric] accept() returned:', call);
+                  logger.debug('📞 [CallFabric] call.id:', call?.id);
+                  logger.debug('📞 [CallFabric] call.state:', call?.state);
+                  logger.debug('📞 [CallFabric] MISMATCH CHECK - invite callID:', notification.invite?.details?.callID, 'vs call.id:', call?.id);
 
                   // Set up comprehensive event handlers to debug
                   if (call) {
@@ -424,7 +427,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
                     (window as any).__swInvite = notification.invite;
 
                     call.on('destroy', () => {
-                      console.warn('📞 [CallFabric] Inbound call destroyed');
+                      logger.warn('📞 [CallFabric] Inbound call destroyed');
                       setCallState('idle');
                       setActiveCall(null);
                       activeCallRef.current = null;
@@ -432,27 +435,27 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
                     // Add more event listeners to debug
                     call.on('call.state', (state: any) => {
-                      console.log('📞 [CallFabric] call.state event:', state);
+                      logger.debug('📞 [CallFabric] call.state event:', state);
                     });
 
                     call.on('room.joined', (params: any) => {
-                      console.log('📞 [CallFabric] room.joined event:', params);
+                      logger.debug('📞 [CallFabric] room.joined event:', params);
                     });
 
                     call.on('media.connected', () => {
-                      console.log('📞 [CallFabric] media.connected event');
+                      logger.debug('📞 [CallFabric] media.connected event');
                     });
 
                     call.on('media.disconnected', () => {
-                      console.log('📞 [CallFabric] media.disconnected event');
+                      logger.debug('📞 [CallFabric] media.disconnected event');
                     });
                   }
 
                   setCallState('active');
                   return call;
                 } catch (acceptError) {
-                  console.error('❌ [CallFabric] accept() threw error:', acceptError);
-                  console.error('❌ [CallFabric] Error details:', JSON.stringify(acceptError, null, 2));
+                  logger.error('❌ [CallFabric] accept() threw error:', acceptError);
+                  logger.error('❌ [CallFabric] Error details:', JSON.stringify(acceptError, null, 2));
                   throw acceptError;
                 }
               },
@@ -469,11 +472,11 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
             setActiveCall(incomingCall);
             activeCallRef.current = incomingCall;  // Update ref for answerCall
-            console.log('📞 [CallFabric] ActiveCall set:', incomingCall.id);
+            logger.debug('📞 [CallFabric] ActiveCall set:', incomingCall.id);
 
             const autoAnswer = localStorage.getItem('auto_answer') === 'true';
             if (autoAnswer) {
-              console.log('📞 [CallFabric] Auto-answer enabled, answering in 1s...');
+              logger.debug('📞 [CallFabric] Auto-answer enabled, answering in 1s...');
               setTimeout(() => incomingCall.answer(), 1000);
             }
           }
@@ -481,10 +484,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       });
 
       setIsOnline(true);
-      console.log('✅ [CallFabric] Now online and ready to receive calls');
+      logger.debug('✅ [CallFabric] Now online and ready to receive calls');
 
     } catch (error) {
-      console.error('❌ [CallFabric] Failed to go online:', error);
+      logger.error('❌ [CallFabric] Failed to go online:', error);
       setError('Failed to go online');
       throw error;
     }
@@ -495,12 +498,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     if (!client || !isOnline) return;
 
     try {
-      console.log('📱 [CallFabric] Going offline...');
+      logger.debug('📱 [CallFabric] Going offline...');
       await client.offline();
       setIsOnline(false);
-      console.log('✅ [CallFabric] Now offline');
+      logger.debug('✅ [CallFabric] Now offline');
     } catch (error) {
-      console.error('❌ [CallFabric] Failed to go offline:', error);
+      logger.error('❌ [CallFabric] Failed to go offline:', error);
       throw error;
     }
   }, [client, isOnline]);
@@ -508,32 +511,32 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // Update Redis status via socket
   const updateRedisStatus = useCallback((status: AgentStatusType) => {
     if (!socket) {
-      console.log('❌ [CallFabric] No socket for Redis update');
+      logger.debug('❌ [CallFabric] No socket for Redis update');
       return;
     }
 
     const token = localStorage.getItem('access_token');
     if (token) {
-      console.log('📤 [CallFabric] Updating Redis status:', status);
+      logger.debug('📤 [CallFabric] Updating Redis status:', status);
       socket.emit('set_agent_status', { token, status });
     }
   }, [socket]);
 
   // UNIFIED: Set agent status (controls both Call Fabric and Redis)
   const setAgentStatus = useCallback(async (newStatus: AgentStatusType) => {
-    console.log('🔄 [CallFabric] setAgentStatus called:', newStatus);
-    console.log('  - client:', !!client, 'isOnline:', isOnline);
-    console.log('  - socket:', !!socket, 'connected:', connectionStatus);
+    logger.debug('🔄 [CallFabric] setAgentStatus called:', newStatus);
+    logger.debug('  - client:', !!client, 'isOnline:', isOnline);
+    logger.debug('  - socket:', !!socket, 'connected:', connectionStatus);
 
     // If client isn't initialized yet, handle gracefully
     if (!client) {
       if (newStatus === 'available') {
-        console.log('⏳ [CallFabric] Client not initialized, cannot go available yet');
+        logger.debug('⏳ [CallFabric] Client not initialized, cannot go available yet');
         setError('Phone system not initialized yet - please wait');
         return;
       } else {
         // For offline/break, just update Redis without Call Fabric
-        console.log('📤 [CallFabric] Client not ready, updating Redis only for:', newStatus);
+        logger.debug('📤 [CallFabric] Client not ready, updating Redis only for:', newStatus);
         updateRedisStatus(newStatus);
         setAgentStatusState(newStatus);
         return;
@@ -555,7 +558,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           await goOnline();
         }
         // No conference join - agent just becomes available to receive call assignments
-        console.log('✅ [CallFabric] Agent available - ready to receive call assignments');
+        logger.debug('✅ [CallFabric] Agent available - ready to receive call assignments');
       } else if (newStatus === 'offline' || newStatus === 'break') {
         if (isOnline) {
           await goOffline();
@@ -565,7 +568,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           try {
             await leaveAgentConferenceRef.current();
           } catch (confError) {
-            console.error('⚠️ [CallFabric] Failed to leave conference:', confError);
+            logger.error('⚠️ [CallFabric] Failed to leave conference:', confError);
           }
         }
         // Clear any pending call assignment
@@ -582,17 +585,17 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       // Update local state
       setAgentStatusState(newStatus);
       setConferenceJoinError(null);
-      console.log('✅ [CallFabric] Status changed to:', newStatus);
+      logger.debug('✅ [CallFabric] Status changed to:', newStatus);
 
     } catch (error: any) {
-      console.error('❌ [CallFabric] Failed to change status:', error);
+      logger.error('❌ [CallFabric] Failed to change status:', error);
       const errorMsg = error?.message || 'Failed to change status';
       setError(errorMsg);
       setConferenceJoinError(errorMsg);
 
       // If going available failed, revert to offline
       if (newStatus === 'available') {
-        console.log('⚠️ [CallFabric] Reverting to offline due to error');
+        logger.debug('⚠️ [CallFabric] Reverting to offline due to error');
         setAgentStatusState('offline');
         sessionStorage.setItem('agent_status', 'offline');
         updateRedisStatus('offline');
@@ -627,7 +630,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     // Call state updates will come via Socket.IO 'call_update' events which update
     // the activeCallForContact prop in the UI components.
     const dialOutToConference = async (conferenceName: string, contactId?: number) => {
-      console.log('📞 [CallFabric] Dial-out via conference:', conferenceName);
+      logger.debug('📞 [CallFabric] Dial-out via conference:', conferenceName);
 
       const response = await fetch(`/api/conferences/${conferenceName}/dial-out`, {
         method: 'POST',
@@ -648,7 +651,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       }
 
       const data = await response.json();
-      console.log('✅ [CallFabric] Dial-out initiated:', data);
+      logger.debug('✅ [CallFabric] Dial-out initiated:', data);
 
       // Track the outbound call DB ID for cleanup (in case SDK destroy fires
       // before the backend's call_state_webhook delivers the 'ended' event)
@@ -671,7 +674,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const currentAgentConference = agentConferenceRef.current;
       const currentAgentStatus = agentStatusRef.current;
 
-      console.log('📞 [CallFabric] makeCall called:', {
+      logger.debug('📞 [CallFabric] makeCall called:', {
         phoneNumber,
         currentIsInConference,
         currentAgentStatus,
@@ -680,7 +683,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
       // Case 1: Agent already in a conference - dial out directly
       if (currentAgentConference && currentIsInConference) {
-        console.log('📞 [CallFabric] Case 1: Already in conference, using dial-out API');
+        logger.debug('📞 [CallFabric] Case 1: Already in conference, using dial-out API');
         const result = await dialOutToConference(
           currentAgentConference.conferenceName,
           context?.contact_id
@@ -691,19 +694,19 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       // Case 2: Agent is available (or offline) but not in a conference
       // Create an outbound conference on-the-fly, join it, then dial out
       if (currentAgentStatus === 'available' || currentAgentStatus === 'offline') {
-        console.log(`📞 [CallFabric] Case 2: Agent ${currentAgentStatus}, creating outbound conference...`);
+        logger.debug(`📞 [CallFabric] Case 2: Agent ${currentAgentStatus}, creating outbound conference...`);
         setIsChangingStatus(true);
 
         try {
           // If offline, go available first
           if (currentAgentStatus === 'offline') {
-            console.log('📞 [CallFabric] Going available...');
+            logger.debug('📞 [CallFabric] Going available...');
             await setAgentStatusRef.current('available');
           }
 
           // Create an outbound conference name
           const confName = `outbound-${user?.id}-${Date.now()}`;
-          console.log('📞 [CallFabric] Creating outbound conference:', confName);
+          logger.debug('📞 [CallFabric] Creating outbound conference:', confName);
 
           // Prepare the conference join (stores params in Redis, returns dial address)
           const prepareResponse = await conferencesApi.prepareJoin({
@@ -711,7 +714,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
             conference_name: confName
           });
           const dialAddress = prepareResponse.data.dial_address;
-          console.log('📞 [CallFabric] Got dial address:', dialAddress);
+          logger.debug('📞 [CallFabric] Got dial address:', dialAddress);
 
           // Dial the conference resource (agent joins conference)
           const currentClient = clientRef.current;
@@ -739,7 +742,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           const markActive = () => {
             if (hasMarkedActive) return;
             hasMarkedActive = true;
-            console.log('✅ [CallFabric] Outbound conference ACTIVE');
+            logger.debug('✅ [CallFabric] Outbound conference ACTIVE');
             setCallState('active');
             setIsInConference(true);
             isInConferenceRef.current = true;
@@ -748,7 +751,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           const connectedStates = ['active', 'answered', 'answering', 'early', 'trying'];
 
           call.on('call.state', (state: any) => {
-            console.log('📞 [CallFabric] Outbound conf call state:', state);
+            logger.debug('📞 [CallFabric] Outbound conf call state:', state);
             if (connectedStates.includes(state)) markActive();
             else if (state === 'ended' || state === 'hangup' || state === 'destroy') {
               setCallState('idle');
@@ -763,7 +766,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
               // Ensure backend marks the outbound call as ended
               const callId = outboundCallDbId || outboundDialCallIdRef.current;
               if (callId) {
-                console.log('📞 [CallFabric] Marking outbound call as ended in backend:', callId);
+                logger.debug('📞 [CallFabric] Marking outbound call as ended in backend:', callId);
                 callsApi.updateStatus(callId, 'ended').catch(() => {});
               }
             }
@@ -775,7 +778,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           });
 
           call.on('destroy', () => {
-            console.log('📞 [CallFabric] Outbound conference call destroyed');
+            logger.debug('📞 [CallFabric] Outbound conference call destroyed');
             setCallState('idle');
             setActiveCall(null);
             activeCallRef.current = null;
@@ -790,7 +793,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
             // The call_state_webhook from SignalWire may be delayed or not arrive.
             const callId = outboundCallDbId || outboundDialCallIdRef.current;
             if (callId) {
-              console.log('📞 [CallFabric] Marking outbound call as ended in backend:', callId);
+              logger.debug('📞 [CallFabric] Marking outbound call as ended in backend:', callId);
               callsApi.updateStatus(callId, 'ended').catch(() => {});
             }
           });
@@ -834,7 +837,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           // Fallback: mark active after start
           setTimeout(() => {
             if (!hasMarkedActive) {
-              console.log('📞 [CallFabric] Fallback: marking outbound conf active');
+              logger.debug('📞 [CallFabric] Fallback: marking outbound conf active');
               markActive();
             }
           }, 1000);
@@ -851,7 +854,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
             throw new Error('Failed to join conference - please try again');
           }
 
-          console.log('✅ [CallFabric] In conference, dialing out...');
+          logger.debug('✅ [CallFabric] In conference, dialing out...');
           const result = await dialOutToConference(confName, context?.contact_id);
           outboundCallDbId = result.call_id; // Store for cleanup in destroy handler
           return result;
@@ -862,7 +865,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       }
 
       // Case 3: Agent is in some other state (busy, break, after-call)
-      console.error('❌ [CallFabric] Case 3: Invalid state for outbound call:', {
+      logger.error('❌ [CallFabric] Case 3: Invalid state for outbound call:', {
         status: currentAgentStatus,
         isInConference: currentIsInConference,
         hasConference: !!currentAgentConference,
@@ -872,7 +875,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       throw new Error(`Cannot make outbound call while in ${currentAgentStatus} status. Please go available first.`);
 
     } catch (error: any) {
-      console.error('❌ [CallFabric] Failed to make call:', error);
+      logger.error('❌ [CallFabric] Failed to make call:', error);
       setError(error?.message || 'Failed to make call');
       setCallState('idle');
       throw error; // Re-throw so caller knows it failed
@@ -887,7 +890,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       setActiveCall(null);
       setCallState('idle');
     } catch (error) {
-      console.error('Failed to hang up:', error);
+      logger.error('Failed to hang up:', error);
     }
   }, [activeCall]);
 
@@ -897,38 +900,38 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   const answerCall = useCallback(async () => {
     const currentCall = activeCallRef.current;
 
-    console.log('📞 [CallFabric] answerCall called');
-    console.log('📞 [CallFabric] activeCall (from ref):', currentCall?.id);
+    logger.debug('📞 [CallFabric] answerCall called');
+    logger.debug('📞 [CallFabric] activeCall (from ref):', currentCall?.id);
 
     if (!currentCall || currentCall.direction !== 'inbound') {
-      console.log('⚠️ [CallFabric] No inbound call to answer');
+      logger.debug('⚠️ [CallFabric] No inbound call to answer');
       return;
     }
 
     try {
       // Ensure microphone permission before accepting - this triggers the browser prompt
       // if permission hasn't been granted yet
-      console.log('📞 [CallFabric] Requesting microphone permission...');
+      logger.debug('📞 [CallFabric] Requesting microphone permission...');
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         stream.getTracks().forEach(track => track.stop()); // Release immediately
-        console.log('✅ [CallFabric] Microphone permission granted');
+        logger.debug('✅ [CallFabric] Microphone permission granted');
       } catch (micError) {
-        console.error('❌ [CallFabric] Microphone permission denied:', micError);
+        logger.error('❌ [CallFabric] Microphone permission denied:', micError);
         setError('Microphone access required to answer calls');
         return;
       }
 
-      console.log('📞 [CallFabric] Accepting incoming call...');
+      logger.debug('📞 [CallFabric] Accepting incoming call...');
       const call = await currentCall.answer();
-      console.log('✅ [CallFabric] Call answered, call object:', call);
+      logger.debug('✅ [CallFabric] Call answered, call object:', call);
 
       setCallState('active');
 
       // If we have a pending assignment, set up conference tracking
       const assignment = pendingCallAssignmentRef.current;
       if (assignment) {
-        console.log('📞 [CallFabric] Setting conference state from assignment:', assignment.conferenceName);
+        logger.debug('📞 [CallFabric] Setting conference state from assignment:', assignment.conferenceName);
         const conferenceInfo: Conference = {
           id: 0,
           conferenceName: assignment.conferenceName,
@@ -947,7 +950,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         pendingCallAssignmentRef.current = null;
       }
     } catch (error) {
-      console.error('❌ [CallFabric] Failed to answer call:', error);
+      logger.error('❌ [CallFabric] Failed to answer call:', error);
     }
   }, [user]);
 
@@ -956,18 +959,18 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // where the customer is already waiting
   const joinInteractionConference = useCallback(async (dialAddress: string, conferenceName: string) => {
     if (!client || !user) {
-      console.log('⚠️ [CallFabric] Cannot join conference - client or user not ready');
+      logger.debug('⚠️ [CallFabric] Cannot join conference - client or user not ready');
       throw new Error('Client or user not ready');
     }
 
     if (isInConference) {
-      console.log('⚠️ [CallFabric] Already in a conference');
+      logger.debug('⚠️ [CallFabric] Already in a conference');
       throw new Error('Already in a conference');
     }
 
     try {
-      console.log('📞 [CallFabric] Joining interaction conference:', conferenceName);
-      console.log('📞 [CallFabric] Dialing:', dialAddress);
+      logger.debug('📞 [CallFabric] Joining interaction conference:', conferenceName);
+      logger.debug('📞 [CallFabric] Dialing:', dialAddress);
 
       // Dial the resource address (e.g., /public/join-conference?conf=interaction-abc123&agent_id=4)
       const call = await client.dial({
@@ -996,7 +999,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       setAgentConferenceSync(conferenceInfo);
 
       call.on('call.state', (state: any) => {
-        console.log('📞 [CallFabric] Interaction conference call state:', state);
+        logger.debug('📞 [CallFabric] Interaction conference call state:', state);
         if (state === 'active' || state === 'answered') {
           setIsInConferenceSync(true);
           setConferenceJoinError(null);
@@ -1009,7 +1012,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       });
 
       call.on('destroy', () => {
-        console.log('📞 [CallFabric] Interaction conference call destroyed');
+        logger.debug('📞 [CallFabric] Interaction conference call destroyed');
         setIsInConferenceSync(false);
         conferenceCallRef.current = null;
       });
@@ -1023,10 +1026,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         socket.emit('join_conference', { conference_name: conferenceName, token });
       }
 
-      console.log('✅ [CallFabric] Joined interaction conference:', conferenceName);
+      logger.debug('✅ [CallFabric] Joined interaction conference:', conferenceName);
 
     } catch (error) {
-      console.error('❌ [CallFabric] Failed to join interaction conference:', error);
+      logger.error('❌ [CallFabric] Failed to join interaction conference:', error);
       setError('Failed to join conference');
       throw error;
     }
@@ -1040,13 +1043,13 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     }
 
     try {
-      console.log('📞 [CallFabric] Making SWML call to:', swmlUrl);
+      logger.debug('📞 [CallFabric] Making SWML call to:', swmlUrl);
       setCallState('ringing');
 
       // Track the original call SID for socket-based cleanup
       if (context?.original_call_sid) {
         takeoverCallSidRef.current = context.original_call_sid;
-        console.log('📞 [CallFabric] Tracking takeover for call SID:', context.original_call_sid);
+        logger.debug('📞 [CallFabric] Tracking takeover for call SID:', context.original_call_sid);
       }
 
       const call = await client.dial({
@@ -1068,12 +1071,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const markCallActive = () => {
         if (hasMarkedActive) return;
         hasMarkedActive = true;
-        console.log('✅ [CallFabric] Takeover call ACTIVE');
+        logger.debug('✅ [CallFabric] Takeover call ACTIVE');
         setCallState('active');
       };
 
       const cleanupCall = () => {
-        console.log('📞 [CallFabric] SWML call cleanup');
+        logger.debug('📞 [CallFabric] SWML call cleanup');
         setActiveCall(null);
         activeCallRef.current = null;
         setCallState('idle');
@@ -1083,7 +1086,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const connectedStates = ['active', 'answered', 'answering', 'early', 'trying'];
 
       call.on('call.state', (state: any) => {
-        console.log('📞 [CallFabric] SWML call state:', state);
+        logger.debug('📞 [CallFabric] SWML call state:', state);
         if (connectedStates.includes(state)) {
           markCallActive();
         } else if (state === 'ended' || state === 'hangup' || state === 'destroy') {
@@ -1092,12 +1095,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       });
 
       call.on('call.joined', () => {
-        console.log('📞 [CallFabric] SWML call joined');
+        logger.debug('📞 [CallFabric] SWML call joined');
         markCallActive();
       });
 
       call.on('destroy', () => {
-        console.log('📞 [CallFabric] SWML call destroyed');
+        logger.debug('📞 [CallFabric] SWML call destroyed');
         cleanupCall();
       });
 
@@ -1105,10 +1108,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       activeCallRef.current = call;
       await call.start();
 
-      console.log('✅ [CallFabric] SWML call started');
+      logger.debug('✅ [CallFabric] SWML call started');
       return call;
     } catch (error) {
-      console.error('❌ [CallFabric] Failed to make SWML call:', error);
+      logger.error('❌ [CallFabric] Failed to make SWML call:', error);
       setError('Failed to connect to call');
       setCallState('idle');
       throw error;
@@ -1122,7 +1125,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     }
 
     try {
-      console.log('📞 [CallFabric] Leaving conference...');
+      logger.debug('📞 [CallFabric] Leaving conference...');
 
       // Leave socket room first
       if (socket && agentConference?.conferenceName) {
@@ -1137,9 +1140,9 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       setAgentConference(null);
       setConferenceParticipants([]);
       conferenceCallRef.current = null;
-      console.log('✅ [CallFabric] Left conference');
+      logger.debug('✅ [CallFabric] Left conference');
     } catch (error) {
-      console.error('❌ [CallFabric] Failed to leave conference:', error);
+      logger.error('❌ [CallFabric] Failed to leave conference:', error);
       // Still clear state even if hangup fails
       isInConferenceRef.current = false;
       agentConferenceRef.current = null;
@@ -1159,21 +1162,21 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // This avoids the SignalWire SDK bug where inbound call answering fails due to connection pooling.
   const acceptCallAssignment = useCallback(async () => {
     if (!pendingCallAssignment) {
-      console.log('⚠️ [CallFabric] No pending call assignment to accept');
+      logger.debug('⚠️ [CallFabric] No pending call assignment to accept');
       throw new Error('No pending call assignment to accept');
     }
 
     if (!client || !user) {
-      console.log('⚠️ [CallFabric] Cannot accept assignment - client or user not ready');
+      logger.debug('⚠️ [CallFabric] Cannot accept assignment - client or user not ready');
       throw new Error(`Cannot accept: ${!client ? 'Call Fabric client not connected' : 'user not loaded'}`);
     }
 
     const { conferenceName, callDbId, assignmentType, context, whisperMode, targetAgentCallSid } = pendingCallAssignment;
-    console.log(`📞 [CallFabric] Accepting ${assignmentType || 'normal'} call assignment via DIAL-OUT:`, conferenceName);
+    logger.debug(`📞 [CallFabric] Accepting ${assignmentType || 'normal'} call assignment via DIAL-OUT:`, conferenceName);
 
     try {
       // Step 1: Prepare the join by storing params in Redis (more reliable than query params)
-      console.log('📞 [CallFabric] Preparing conference join via API...');
+      logger.debug('📞 [CallFabric] Preparing conference join via API...');
       const prepareParams: Parameters<typeof conferencesApi.prepareJoin>[0] = {
         agent_id: user.id,
         conference_name: conferenceName,
@@ -1200,7 +1203,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const prepareResponse = await conferencesApi.prepareJoin(prepareParams);
 
       const dialAddress = prepareResponse.data.dial_address;
-      console.log('📞 [CallFabric] Got dial address from API:', dialAddress);
+      logger.debug('📞 [CallFabric] Got dial address from API:', dialAddress);
 
       // Capture callDbId for status updates in event handlers
       const dbCallIdForHandlers = callDbId;
@@ -1226,22 +1229,22 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const markCallActive = async () => {
         if (hasMarkedActive) return;
         hasMarkedActive = true;
-        console.log('✅ [CallFabric] Marking call as ACTIVE');
+        logger.debug('✅ [CallFabric] Marking call as ACTIVE');
         setCallState('active');
         // Update backend call status to 'active'
         if (dbCallIdForHandlers) {
           try {
             await callsApi.updateStatus(dbCallIdForHandlers, 'active');
-            console.log('✅ [CallFabric] Updated call status to active in backend');
+            logger.debug('✅ [CallFabric] Updated call status to active in backend');
           } catch (err) {
-            console.error('❌ [CallFabric] Failed to update call status:', err);
+            logger.error('❌ [CallFabric] Failed to update call status:', err);
           }
         }
       };
 
       // Set up call event handlers
       call.on('call.state', async (state: any) => {
-        console.log('📞 [CallFabric] Conference call state:', state);
+        logger.debug('📞 [CallFabric] Conference call state:', state);
         // Check for various "connected" states - SignalWire may use different values
         const connectedStates = ['active', 'answered', 'answering', 'early', 'trying'];
         if (connectedStates.includes(state)) {
@@ -1266,12 +1269,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
       // Also listen for media/connect events that indicate connection
       call.on('call.joined', async () => {
-        console.log('📞 [CallFabric] Call joined event');
+        logger.debug('📞 [CallFabric] Call joined event');
         await markCallActive();
       });
 
       call.on('call.updated', async (params: any) => {
-        console.log('📞 [CallFabric] Call updated:', params);
+        logger.debug('📞 [CallFabric] Call updated:', params);
         // If we get updated event, call is likely connected
         if (params?.state === 'active' || params?.node_id) {
           await markCallActive();
@@ -1279,7 +1282,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       });
 
       call.on('destroy', async () => {
-        console.log('📞 [CallFabric] Conference call destroyed');
+        logger.debug('📞 [CallFabric] Conference call destroyed');
         setCallState('idle');
         setActiveCall(null);
         activeCallRef.current = null;
@@ -1329,7 +1332,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       // Give it a moment then mark as active if not already
       setTimeout(async () => {
         if (!hasMarkedActive) {
-          console.log('📞 [CallFabric] Fallback: marking call active after start() completed');
+          logger.debug('📞 [CallFabric] Fallback: marking call active after start() completed');
           await markCallActive();
         }
       }, 1000);
@@ -1350,7 +1353,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           connectedAt: new Date()
         };
         setConnectedCustomer(customer);
-        console.log('📋 [CallFabric] Set connectedCustomer with AI context:', pendingCallAssignment.context);
+        logger.debug('📋 [CallFabric] Set connectedCustomer with AI context:', pendingCallAssignment.context);
 
         // Also call the callback if set (for navigation/additional handling)
         if (onCustomerConnectedRef.current) {
@@ -1358,12 +1361,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         }
       }
 
-      console.log('✅ [CallFabric] Dialing out to conference...');
+      logger.debug('✅ [CallFabric] Dialing out to conference...');
 
       // Clear the pending assignment
       setPendingCallAssignment(null);
     } catch (error) {
-      console.error('❌ [CallFabric] Failed to accept call assignment:', error);
+      logger.error('❌ [CallFabric] Failed to accept call assignment:', error);
       throw error;
     }
   }, [pendingCallAssignment, user, client, socket]);
@@ -1371,21 +1374,21 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // Accept a call assignment with explicit data (for taking calls from queue)
   const acceptCallAssignmentWithData = useCallback(async (assignment: Partial<CallAssignment>) => {
     if (!assignment.conferenceName) {
-      console.log('⚠️ [CallFabric] No conference name in assignment data');
+      logger.debug('⚠️ [CallFabric] No conference name in assignment data');
       return;
     }
 
     if (!client || !user) {
-      console.log('⚠️ [CallFabric] Cannot accept assignment - client or user not ready');
+      logger.debug('⚠️ [CallFabric] Cannot accept assignment - client or user not ready');
       return;
     }
 
     const conferenceName = assignment.conferenceName;
-    console.log('📞 [CallFabric] Accepting call assignment with data via DIAL-OUT:', conferenceName);
+    logger.debug('📞 [CallFabric] Accepting call assignment with data via DIAL-OUT:', conferenceName);
 
     try {
       // Step 1: Prepare the join by storing params in Redis (more reliable than query params)
-      console.log('📞 [CallFabric] Preparing conference join via API...');
+      logger.debug('📞 [CallFabric] Preparing conference join via API...');
       const prepareResponse = await conferencesApi.prepareJoin({
         agent_id: user.id,
         conference_name: conferenceName,
@@ -1393,7 +1396,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       });
 
       const dialAddress = prepareResponse.data.dial_address;
-      console.log('📞 [CallFabric] Got dial address from API:', dialAddress);
+      logger.debug('📞 [CallFabric] Got dial address from API:', dialAddress);
 
       // Capture callDbId for status updates in event handlers
       const dbCallIdForStatusUpdate = assignment.callDbId;
@@ -1419,22 +1422,22 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       const markCallActive = async () => {
         if (hasMarkedActive) return;
         hasMarkedActive = true;
-        console.log('✅ [CallFabric] Marking call as ACTIVE (with data)');
+        logger.debug('✅ [CallFabric] Marking call as ACTIVE (with data)');
         setCallState('active');
         // Update backend call status to 'active'
         if (dbCallIdForStatusUpdate) {
           try {
             await callsApi.updateStatus(dbCallIdForStatusUpdate, 'active');
-            console.log('✅ [CallFabric] Updated call status to active in backend');
+            logger.debug('✅ [CallFabric] Updated call status to active in backend');
           } catch (err) {
-            console.error('❌ [CallFabric] Failed to update call status:', err);
+            logger.error('❌ [CallFabric] Failed to update call status:', err);
           }
         }
       };
 
       // Set up call event handlers
       call.on('call.state', async (state: any) => {
-        console.log('📞 [CallFabric] Conference call state:', state);
+        logger.debug('📞 [CallFabric] Conference call state:', state);
         // Check for various "connected" states - SignalWire may use different values
         const connectedStates = ['active', 'answered', 'answering', 'early', 'trying'];
         if (connectedStates.includes(state)) {
@@ -1459,12 +1462,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
       // Also listen for media/connect events that indicate connection
       call.on('call.joined', async () => {
-        console.log('📞 [CallFabric] Call joined event');
+        logger.debug('📞 [CallFabric] Call joined event');
         await markCallActive();
       });
 
       call.on('call.updated', async (params: any) => {
-        console.log('📞 [CallFabric] Call updated:', params);
+        logger.debug('📞 [CallFabric] Call updated:', params);
         // If we get updated event, call is likely connected
         if (params?.state === 'active' || params?.node_id) {
           await markCallActive();
@@ -1472,7 +1475,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       });
 
       call.on('destroy', async () => {
-        console.log('📞 [CallFabric] Conference call destroyed');
+        logger.debug('📞 [CallFabric] Conference call destroyed');
         setCallState('idle');
         setActiveCall(null);
         activeCallRef.current = null;
@@ -1522,7 +1525,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       // Give it a moment then mark as active if not already
       setTimeout(async () => {
         if (!hasMarkedActive) {
-          console.log('📞 [CallFabric] Fallback: marking call active after start() completed');
+          logger.debug('📞 [CallFabric] Fallback: marking call active after start() completed');
           await markCallActive();
         }
       }, 1000);
@@ -1543,7 +1546,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           connectedAt: new Date()
         };
         setConnectedCustomer(customer);
-        console.log('📋 [CallFabric] Set connectedCustomer with AI context:', assignment.context);
+        logger.debug('📋 [CallFabric] Set connectedCustomer with AI context:', assignment.context);
 
         // Also call the callback if set (for navigation/additional handling)
         if (onCustomerConnectedRef.current) {
@@ -1551,12 +1554,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         }
       }
 
-      console.log('✅ [CallFabric] Dialing out to conference...');
+      logger.debug('✅ [CallFabric] Dialing out to conference...');
 
       // Clear any pending assignment
       setPendingCallAssignment(null);
     } catch (error) {
-      console.error('❌ [CallFabric] Failed to accept call assignment:', error);
+      logger.error('❌ [CallFabric] Failed to accept call assignment:', error);
       throw error;
     }
   }, [user, client, socket]);
@@ -1567,7 +1570,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       return;
     }
 
-    console.log('📞 [CallFabric] Rejecting call assignment:', pendingCallAssignment.conferenceName);
+    logger.debug('📞 [CallFabric] Rejecting call assignment:', pendingCallAssignment.conferenceName);
 
     // Notify backend that agent rejected the assignment
     if (socket) {
@@ -1633,10 +1636,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // available → busy when call connects, busy → after-call when call ends
   useEffect(() => {
     if (callState === 'active' && agentStatus === 'available') {
-      console.log('🔄 [CallFabric] Auto-transition: available → busy (call active)');
+      logger.debug('🔄 [CallFabric] Auto-transition: available → busy (call active)');
       setAgentStatus('busy');
     } else if (callState === 'idle' && agentStatus === 'busy') {
-      console.log('🔄 [CallFabric] Auto-transition: busy → after-call (call ended)');
+      logger.debug('🔄 [CallFabric] Auto-transition: busy → after-call (call ended)');
       setAgentStatus('after-call');
     }
   }, [callState, agentStatus]);
@@ -1650,11 +1653,11 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     }
 
     if (agentStatus !== 'available') {
-      console.log('📦 [CallFabric] Client ready, no auto-restore needed (status:', agentStatus, ')');
+      logger.debug('📦 [CallFabric] Client ready, no auto-restore needed (status:', agentStatus, ')');
       return;
     }
 
-    console.log('🔄 [CallFabric] Client ready, auto-restoring available status...');
+    logger.debug('🔄 [CallFabric] Client ready, auto-restoring available status...');
     hasAttemptedAutoRejoinRef.current = true;
 
     // Perform the auto-restore (just go online, no conference join)
@@ -1668,10 +1671,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         }
         // Update Redis status to available
         updateRedisStatus('available');
-        console.log('✅ [CallFabric] Auto-restore successful - now available for call assignments');
+        logger.debug('✅ [CallFabric] Auto-restore successful - now available for call assignments');
         setConferenceJoinError(null);
       } catch (error: any) {
-        console.error('❌ [CallFabric] Auto-restore failed:', error);
+        logger.error('❌ [CallFabric] Auto-restore failed:', error);
         setError('Failed to go online');
         setConferenceJoinError('Failed to connect - please try going available again');
         // Revert status since we couldn't go online
@@ -1691,7 +1694,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     if (!socket) return;
 
     const handleAgentStatus = (data: { status: AgentStatusType }) => {
-      console.log('📥 [CallFabric] Status from server:', data);
+      logger.debug('📥 [CallFabric] Status from server:', data);
       // Only update if not currently changing
       if (!isChangingStatus) {
         setAgentStatusState(data.status);
@@ -1701,7 +1704,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     };
 
     const handleAgentStatusUpdated = (data: { status: AgentStatusType }) => {
-      console.log('✅ [CallFabric] Status confirmed:', data);
+      logger.debug('✅ [CallFabric] Status confirmed:', data);
       setAgentStatusState(data.status);
       setIsChangingStatus(false);
     };
@@ -1714,7 +1717,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     if (connectionStatus === 'connected') {
       const token = localStorage.getItem('access_token');
       if (token) {
-        console.log('🔄 [CallFabric] Socket connected, fetching persisted status...');
+        logger.debug('🔄 [CallFabric] Socket connected, fetching persisted status...');
         socket.emit('get_agent_status', { token });
       }
     }
@@ -1734,7 +1737,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       conference_name: string;
       participant: ConferenceParticipant;
     }) => {
-      console.log('📥 [CallFabric] Participant joined:', data);
+      logger.debug('📥 [CallFabric] Participant joined:', data);
 
       // Use ref to avoid stale closure
       if (agentConferenceRef.current?.conferenceName === data.conference_name) {
@@ -1756,7 +1759,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       conference_name: string;
       participant_id: string;
     }) => {
-      console.log('📥 [CallFabric] Participant left:', data);
+      logger.debug('📥 [CallFabric] Participant left:', data);
 
       // Use ref to avoid stale closure
       if (agentConferenceRef.current?.conferenceName === data.conference_name) {
@@ -1786,8 +1789,8 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         contact_id?: number;
       };
     }) => {
-      console.log('📥 [CallFabric] Customer routed to conference:', data);
-      console.log('📥 [CallFabric] Current agent conference (ref):', agentConferenceRef.current?.conferenceName);
+      logger.debug('📥 [CallFabric] Customer routed to conference:', data);
+      logger.debug('📥 [CallFabric] Current agent conference (ref):', agentConferenceRef.current?.conferenceName);
 
       // Use ref to get current value (avoid stale closure)
       const currentConference = agentConferenceRef.current;
@@ -1835,10 +1838,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           onCustomerConnectedRef.current(customer);
         }
 
-        console.log('🔔 Customer connected:', data.customer_info.name || data.customer_info.phone);
-        console.log('📋 AI Context:', aiContext);
+        logger.debug('🔔 Customer connected:', data.customer_info.name || data.customer_info.phone);
+        logger.debug('📋 AI Context:', aiContext);
       } else {
-        console.log('⚠️ [CallFabric] Conference name mismatch or no conference. Expected:', currentConference?.conferenceName, 'Got:', data.conference_name);
+        logger.debug('⚠️ [CallFabric] Conference name mismatch or no conference. Expected:', currentConference?.conferenceName, 'Got:', data.conference_name);
       }
     };
 
@@ -1849,7 +1852,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       status: 'active' | 'ended';
       participant_count: number;
     }) => {
-      console.log('📥 [CallFabric] Conference update:', data);
+      logger.debug('📥 [CallFabric] Conference update:', data);
 
       // Use ref to avoid stale closure
       const currentConference = agentConferenceRef.current;
@@ -1868,7 +1871,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     // When a customer is routed to this agent, we receive a call_assignment event
     // with the dial address to join the interaction conference
     const handleCallAssignment = (data: any) => {
-      console.log('📥 [CallFabric] Call assignment received:', data);
+      logger.debug('📥 [CallFabric] Call assignment received:', data);
 
       // Detect if this is a backup/escalation assignment from call_control.py
       // vs a normal queue assignment from callcenter_socketio.py
@@ -1879,8 +1882,8 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       if (isMultiAgent) {
         // Backup or escalation assignment — different payload shape
         const callData = data.call || {};
-        console.log(`📞 [CallFabric] ${data.type} assignment: conference ${data.conference_name}`);
-        console.log('👤 Requesting agent:', data.requesting_agent);
+        logger.debug(`📞 [CallFabric] ${data.type} assignment: conference ${data.conference_name}`);
+        logger.debug('👤 Requesting agent:', data.requesting_agent);
 
         assignment = {
           callId: callData.signalwire_call_sid || callData.id?.toString() || '',
@@ -1904,9 +1907,9 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         };
       } else {
         // Normal queue assignment
-        console.log('📞 Conference:', data.conference_name);
-        console.log('👤 Customer:', data.customer_info);
-        console.log('📱 Agent call SID:', data.agent_call_sid);
+        logger.debug('📞 Conference:', data.conference_name);
+        logger.debug('👤 Customer:', data.customer_info);
+        logger.debug('📱 Agent call SID:', data.agent_call_sid);
 
         assignment = {
           callId: data.call_id,
@@ -1927,7 +1930,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
       // The incoming call from the server will trigger the 'ringing' state
       // UI will show call info from this assignment + standard answer/reject buttons
-      console.log(`🔔 [CallFabric] Call assignment received (${assignment.assignmentType || 'normal'})`);
+      logger.debug(`🔔 [CallFabric] Call assignment received (${assignment.assignmentType || 'normal'})`);
     };
 
     socket.on('conference_participant_joined', handleParticipantJoined);
@@ -1953,7 +1956,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   useEffect(() => {
     if (!isInConference && outboundDialCallIdRef.current) {
       const callId = outboundDialCallIdRef.current;
-      console.log('📞 [CallFabric] Conference ended, marking outbound dial call as ended:', callId);
+      logger.debug('📞 [CallFabric] Conference ended, marking outbound dial call as ended:', callId);
       callsApi.updateStatus(callId, 'ended').catch(() => {});
       outboundDialCallIdRef.current = null;
     }
@@ -1968,7 +1971,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
     // Shared cleanup: hang up SDK call, reset all call/conference state
     const cleanupSdkState = (reason: string) => {
-      console.log(`📞 [CallFabric] Socket cleanup (${reason}): resetting SDK state`);
+      logger.debug(`📞 [CallFabric] Socket cleanup (${reason}): resetting SDK state`);
 
       // Try to hang up the Call Fabric SDK call gracefully
       const currentCall = activeCallRef.current;
@@ -2054,7 +2057,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       // linger and cause "_sdpReady called in wrong state: closed" errors
       const currentClient = clientRef.current;
       if (currentClient) {
-        console.log('🧹 [CallFabric] Cleaning up SDK client on unmount');
+        logger.debug('🧹 [CallFabric] Cleaning up SDK client on unmount');
         try {
           currentClient.offline().catch(() => {});
         } catch (e) {

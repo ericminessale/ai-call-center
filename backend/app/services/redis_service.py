@@ -11,13 +11,15 @@ def get_redis_client():
     """Get Redis client instance with fallback."""
     from app import redis_client
 
-    # If the global client exists and can ping, use it
+    # If the global client exists and can ping, use it. A ping failure here
+    # is the expected case where we fall through to retry with a fresh
+    # connection — log at debug so we don't spam during transient outages.
     if redis_client:
         try:
             redis_client.ping()
             return redis_client
-        except:
-            pass
+        except Exception as exc:
+            logger.debug("Cached Redis client failed ping (%s); trying fresh connection", exc)
 
     # Try to create a new connection with IP fallback
     import redis

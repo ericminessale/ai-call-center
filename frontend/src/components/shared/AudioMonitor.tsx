@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Headphones, Volume2, VolumeX, X } from 'lucide-react';
 import { useSocketContext } from '../../contexts/SocketContext';
+import { logger } from '../../lib/logger';
 
 interface AudioMonitorProps {
   callId: string;
@@ -105,7 +106,7 @@ export function AudioMonitor({ callId, onClose }: AudioMonitorProps) {
 
         setFrameCount(prev => prev + 1);
       } catch (err) {
-        console.error('[AudioMonitor] Error processing audio frame:', err);
+        logger.error('[AudioMonitor] Error processing audio frame:', err);
       }
     };
 

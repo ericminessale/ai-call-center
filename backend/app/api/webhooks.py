@@ -3,6 +3,7 @@ from app import db, socketio
 from app.api import webhooks_bp
 from app.models import Call, CallLeg, Transcription, WebhookEvent
 from app.services.redis_service import publish_event
+from app.utils.webhook_auth import require_webhook_auth
 from datetime import datetime
 import logging
 import json
@@ -24,6 +25,7 @@ def map_to_dashboard_status(internal_status):
 
 
 @webhooks_bp.route('/call-status', methods=['POST'])
+@require_webhook_auth
 def call_status():
     """Handle call status webhook from SignalWire (both CallStatus and CallState events)."""
     try:
@@ -191,6 +193,7 @@ def call_status():
 
 
 @webhooks_bp.route('/transcription', methods=['POST'])
+@require_webhook_auth
 def transcription():
     """Handle live transcription webhook from SignalWire."""
     try:
@@ -308,6 +311,7 @@ def transcription():
 
 
 @webhooks_bp.route('/summary', methods=['POST'])
+@require_webhook_auth
 def summary():
     """Handle transcription summary webhook from SignalWire."""
     try:
@@ -421,6 +425,7 @@ def summary():
 
 
 @webhooks_bp.route('/post-prompt', methods=['POST'])
+@require_webhook_auth
 def post_prompt():
     """
     Handle post_prompt webhook from SignalWire AI agents.
@@ -545,6 +550,7 @@ def post_prompt():
 
 
 @webhooks_bp.route('/recording', methods=['POST'])
+@require_webhook_auth
 def recording():
     """Handle recording webhook from SignalWire."""
     try:
@@ -593,6 +599,7 @@ def recording():
 
 
 @webhooks_bp.route('/recording-status', methods=['POST'])
+@require_webhook_auth
 def recording_status():
     """Handle recording status webhook from SignalWire."""
     try:

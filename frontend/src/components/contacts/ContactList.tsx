@@ -3,6 +3,7 @@ import { Search, Plus, Star, Building2 } from 'lucide-react';
 import { ContactMinimal } from '../../types/callcenter';
 import { contactsApi } from '../../services/api';
 import { ContactListSkeletonGroup } from '../shared/Skeleton';
+import { logger } from '../../lib/logger';
 
 interface ContactListProps {
   contacts: ContactMinimal[];
@@ -279,7 +280,7 @@ function NewContactModal({
       onCreated?.(newContact);
       onClose();
     } catch (err: any) {
-      console.error('Failed to create contact:', err);
+      logger.error('Failed to create contact:', err);
       setError(err.response?.data?.error || 'Failed to create contact');
     } finally {
       setIsSaving(false);

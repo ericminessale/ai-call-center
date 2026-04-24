@@ -23,24 +23,59 @@ def create_app_context():
         raise RuntimeError("App not initialized yet")
     return _app_instance.app_context()
 
+
+def _require_env(key: str) -> str:
+    """Read a required env var or fail loudly. Beats silently running with a
+    well-known default secret in production."""
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(
+            f"Missing required environment variable: {key}. "
+            f"Set it in your .env (generate with: "
+            f"python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+        )
+    return val
+
+
+def _cors_origins() -> list[str]:
+    """Parse CORS_ORIGINS from env (comma-separated). Defaults to localhost
+    for dev. ``*`` is rejected because it's incompatible with
+    ``supports_credentials=True`` per the CORS spec."""
+    raw = os.getenv(
+        'CORS_ORIGINS',
+        'http://localhost,http://localhost:3000,http://localhost:5173',
+    )
+    origins = [o.strip() for o in raw.split(',') if o.strip()]
+    if '*' in origins:
+        raise RuntimeError(
+            "CORS_ORIGINS cannot contain '*' when credentials are enabled. "
+            "List specific origins instead (browsers reject wildcard+credentials)."
+        )
+    return origins
+
+
 def create_app():
     global _app_instance
     app = Flask(__name__)
     _app_instance = app
 
-    # Configuration
+    # Configuration — secrets are required, no fallback to a known string.
     app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret')
-    app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'jwt-secret-key')
+    app.config['SECRET_KEY'] = _require_env('SECRET_KEY')
+    app.config['JWT_SECRET_KEY'] = _require_env('JWT_SECRET_KEY')
 
     # Initialize extensions
     db.init_app(app)
     migrate.init_app(app, db)
-    CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+    cors_origins = _cors_origins()
+    CORS(app, resources={r"/*": {"origins": cors_origins}}, supports_credentials=True)
+    app.logger.info("CORS enabled for origins: %s", cors_origins)
+
     redis_url = os.getenv('REDIS_URL', 'redis://redis:6379/0')
     socketio.init_app(app,
-                     cors_allowed_origins="*",
+                     cors_allowed_origins=cors_origins,
                      message_queue=redis_url,
                      async_mode='threading',
                      ping_timeout=60,
@@ -101,21 +136,6 @@ def create_app():
 
         # Start queue monitor after imports
         callcenter_socketio.start_queue_monitor()
-
-    # Request logging disabled to reduce spam
-    # @app.before_request
-    # def log_request():
-    #     if request.path.startswith('/api/'):
-    #         print(f"🌐 [REQUEST] {request.method} {request.path}")
-    #         print(f"🌐 [REQUEST] Headers: {dict(request.headers)}")
-    #         if request.is_json:
-    #             print(f"🌐 [REQUEST] Body: {request.get_json()}")
-
-    # @app.after_request
-    # def log_response(response):
-    #     if request.path.startswith('/api/'):
-    #         print(f"🌐 [RESPONSE] {request.method} {request.path} -> {response.status_code}")
-    #     return response
 
     # Health check route
     @app.route('/health')

@@ -16,8 +16,7 @@ def handle_connect(auth=None):
     This ensures the user joins their room even if the separate 'authenticate' event fails.
     """
     client_id = request.sid
-    logger.info(f"Client connected: {client_id}")
-    print(f"🔌 SOCKET CONNECT: {client_id}, auth={auth}", flush=True)
+    logger.info(f"Socket connected: {client_id} (auth_provided={bool(auth)})")
 
     # Try to auto-authenticate from connection auth
     token = None
@@ -30,16 +29,15 @@ def handle_connect(auth=None):
             # Join user's room automatically
             join_room(str(user_id))
             add_to_set(f"user:{user_id}:clients", request.sid)
-            logger.info(f"Auto-authenticated on connect: {client_id} -> User: {user_id}, joined room '{str(user_id)}'")
-            print(f"✅ SOCKET AUTO-AUTH: {client_id} -> User {user_id}, joined room '{user_id}'", flush=True)
+            logger.info(f"Socket auto-auth: {client_id} -> user {user_id} (joined room '{user_id}')")
             emit('authenticated', {
                 'message': 'Authentication successful',
                 'user_id': user_id
             })
         else:
-            print(f"⚠️ SOCKET: Invalid token on connect", flush=True)
+            logger.warning(f"Socket {client_id}: invalid token on connect")
     else:
-        print(f"⚠️ SOCKET: No auth token on connect", flush=True)
+        logger.debug(f"Socket {client_id}: no auth token on connect")
 
     emit('connected', {'message': 'Connected to SignalWire Transcription Service'})
 
@@ -137,14 +135,13 @@ def handle_ping():
 @socketio.on('set_agent_status')
 def handle_set_agent_status(data):
     """Set agent availability status for call routing."""
-    print(f"🎯 SET_AGENT_STATUS received: {data}", flush=True)
     logger.info(f"set_agent_status received: {data}")
 
     token = data.get('token')
     status = data.get('status')  # 'available', 'busy', 'break', 'offline'
 
     if not token or not status:
-        print(f"❌ Missing token or status in set_agent_status", flush=True)
+        logger.warning("set_agent_status: missing token or status")
         emit('error', {'message': 'Missing token or status'})
         return
 
@@ -270,7 +267,7 @@ def handle_agent_answered(data):
     to the interaction conference via REST API. This is needed because
     Call Fabric subscribers don't support SWML url callbacks like phone calls do.
     """
-    print(f"📞 AGENT_ANSWERED received: {data}", flush=True)
+    logger.info(f"agent_answered received: {data}")
 
     call_id = data.get('call_id')
     conference_name = data.get('conference_name')
@@ -278,7 +275,7 @@ def handle_agent_answered(data):
     token = data.get('token')
 
     if not all([call_id, conference_name, token]):
-        print(f"❌ Missing required fields in agent_answered", flush=True)
+        logger.warning("agent_answered: missing call_id, conference_name, or token")
         emit('error', {'message': 'Missing call_id, conference_name, or token'})
         return
 
@@ -291,12 +288,12 @@ def handle_agent_answered(data):
         from app.services.signalwire_api import SignalWireAPI
         sw_api = SignalWireAPI()
 
-        print(f"📞 Joining agent call {call_id} to conference {conference_name}", flush=True)
+        logger.info(f"agent_answered: joining call {call_id} to conference {conference_name}")
 
         # Join the agent's call to the conference
         result = sw_api.add_participant_to_conference(conference_name, call_id)
 
-        print(f"✅ Agent joined conference: {result}", flush=True)
+        logger.info(f"agent_answered: joined conference: {result}")
 
         emit('agent_joined_conference', {
             'conference_name': conference_name,
@@ -305,7 +302,5 @@ def handle_agent_answered(data):
         })
 
     except Exception as e:
-        print(f"❌ Failed to join agent to conference: {str(e)}", flush=True)
-        import traceback
-        print(traceback.format_exc(), flush=True)
+        logger.exception(f"agent_answered: failed to join call {call_id} to conference {conference_name}: {e}")
         emit('error', {'message': f'Failed to join conference: {str(e)}'})

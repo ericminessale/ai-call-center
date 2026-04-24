@@ -42,6 +42,7 @@ import { CallDetailTab } from './CallDetailTab';
 import CallControlPanel from './CallControlPanel';
 import { ConferenceParticipants } from './ConferenceParticipants';
 import { useAuthStore } from '../../stores/authStore';
+import { logger } from '../../lib/logger';
 
 interface ContactDetailViewProps {
   contact: Contact;
@@ -218,7 +219,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
       // Dial into the conference
       // Pass AI context from the call so it's available for display
       const aiContext = (activeCallForContact as any).aiContext || {};
-      console.log('📋 [ContactDetail] Passing AI context to call:', aiContext);
+      logger.debug('📋 [ContactDetail] Passing AI context to call:', aiContext);
 
       await acceptCallAssignmentWithData({
         callId: String(activeCallForContact.signalwire_call_sid || activeCallForContact.call_sid || activeCallForContact.id),
@@ -234,9 +235,9 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         context: aiContext,
       });
 
-      console.log('✅ [ContactDetail] Successfully took queued call');
+      logger.debug('✅ [ContactDetail] Successfully took queued call');
     } catch (error: any) {
-      console.error('❌ [ContactDetail] Failed to take call:', error);
+      logger.error('❌ [ContactDetail] Failed to take call:', error);
       setTakeCallError(error?.response?.data?.error || error?.message || 'Failed to take call');
     } finally {
       setIsTakingCall(false);
@@ -318,7 +319,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
       if (!call) return;
       const callSid = call.call_sid || call.signalwire_call_sid || call.signalwireCallSid;
       if (callSid === currentCallSid && ['ended', 'completed', 'failed'].includes(call.status)) {
-        console.log('📞 [ContactDetail] Call ended via socket event, clearing local state');
+        logger.debug('📞 [ContactDetail] Call ended via socket event, clearing local state');
         setCurrentCallSid(null);
         setIsAICall(false);
         loadInteractions();
@@ -327,7 +328,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
     const handleCallEnded = (data: { call_sid?: string; callId?: number }) => {
       if (data.call_sid === currentCallSid) {
-        console.log('📞 [ContactDetail] call_ended event received, clearing local state');
+        logger.debug('📞 [ContactDetail] call_ended event received, clearing local state');
         setCurrentCallSid(null);
         setIsAICall(false);
         loadInteractions();
@@ -346,14 +347,14 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   useEffect(() => {
     if (!effectiveCallSid || !socket) return;
 
-    console.log('📝 [ContactDetail] Subscribing to transcription for call:', effectiveCallSid);
+    logger.debug('📝 [ContactDetail] Subscribing to transcription for call:', effectiveCallSid);
 
     // Fetch existing transcription history for this call
     api.get(`/api/calls/${effectiveCallSid}`)
       .then(res => {
         const existing = res.data.transcriptions || [];
         if (existing.length > 0) {
-          console.log(`📝 [ContactDetail] Loaded ${existing.length} existing transcriptions`);
+          logger.debug(`📝 [ContactDetail] Loaded ${existing.length} existing transcriptions`);
           setTranscription(existing.map((t: any) => ({
             id: String(t.id || t.sequence_number),
             speaker: t.speaker || 'caller',
@@ -373,13 +374,13 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         call_sid: effectiveCallSid,
         token: token
       });
-      console.log('📝 [ContactDetail] Joined call room:', effectiveCallSid);
+      logger.debug('📝 [ContactDetail] Joined call room:', effectiveCallSid);
     }
 
     const handleTranscription = (data: any) => {
       // Match by call_sid (could be SignalWire ID or our internal ID)
       if (data.call_sid === effectiveCallSid || data.call_id === effectiveCallSid) {
-        console.log('📝 [ContactDetail] Received transcription:', data);
+        logger.debug('📝 [ContactDetail] Received transcription:', data);
         // Map speaker from backend's 'speaker' field, or fallback to mapping 'role'
         // role: 'remote-caller' = caller, 'local-caller' = agent/AI
         let speaker = data.speaker;
@@ -412,7 +413,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   // Auto-switch to live tab when call starts (including inbound AI calls and outbound browser calls)
   useEffect(() => {
     if (hasAnyActiveCall) {
-      console.log('📞 [ContactDetail] Active call detected, switching to live tab. callState:', callState);
+      logger.debug('📞 [ContactDetail] Active call detected, switching to live tab. callState:', callState);
       setActiveTab('live');
     }
   }, [hasAnyActiveCall, callState]);
@@ -425,7 +426,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
     // Call just ended - show the call detail view
     if (hadActiveCall && !hasActiveCall) {
-      console.log('📞 [ContactDetail] Call ended, loading interactions and opening detail view');
+      logger.debug('📞 [ContactDetail] Call ended, loading interactions and opening detail view');
       // Reload interactions to get the just-completed call
       const loadAndSelectCall = async () => {
         try {
@@ -441,7 +442,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
             setActiveTab('history');
           }
         } catch (error) {
-          console.error('Failed to load interactions after call ended:', error);
+          logger.error('Failed to load interactions after call ended:', error);
           setActiveTab('history');
         }
       };
@@ -471,7 +472,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
           setAiFormData(prev => ({ ...prev, agentType: res.data.agents[0].id }));
         }
       })
-      .catch(err => console.error('Failed to fetch AI agents:', err));
+      .catch(err => logger.error('Failed to fetch AI agents:', err));
   }, []);
 
   const handleDeleteContact = async () => {
@@ -485,7 +486,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
       setShowMoreMenu(false);
       onContactDelete?.(contact.id);
     } catch (error) {
-      console.error('Failed to delete contact:', error);
+      logger.error('Failed to delete contact:', error);
       alert('Failed to delete contact');
     } finally {
       setIsDeleting(false);
@@ -498,7 +499,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
       const response = await contactsApi.getInteractions(contact.id, 1, 20);
       setInteractions(response.data.interactions);
     } catch (error) {
-      console.error('Failed to load interactions:', error);
+      logger.error('Failed to load interactions:', error);
     } finally {
       setIsLoadingInteractions(false);
     }
@@ -511,7 +512,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
     // If not online, need to go online first (for inbound handling)
     if (!isOnline) {
-      console.log('📞 [ContactDetail] Going online first...');
+      logger.debug('📞 [ContactDetail] Going online first...');
       await goOnline();
     }
 
@@ -526,13 +527,13 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         company: contact.company,
       };
 
-      console.log('📞 [ContactDetail] Initiating call to:', contact.phone);
+      logger.debug('📞 [ContactDetail] Initiating call to:', contact.phone);
       setIsAICall(false);
       setTranscription([]);
       const result = await makeCall(contact.phone, context);
-      console.log('📞 [ContactDetail] Call initiated:', result);
+      logger.debug('📞 [ContactDetail] Call initiated:', result);
     } catch (error: any) {
-      console.error('❌ [ContactDetail] Failed to initiate call:', error);
+      logger.error('❌ [ContactDetail] Failed to initiate call:', error);
       setDialError(error?.message || 'Failed to initiate call');
     }
   };
@@ -578,7 +579,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         setShowAIForm(false);
       }
     } catch (error: any) {
-      console.error('Failed to send AI agent:', error);
+      logger.error('Failed to send AI agent:', error);
       setAiFormError(error?.response?.data?.error || error?.message || 'Failed to initiate AI call');
     } finally {
       setIsSubmittingAI(false);
@@ -592,7 +593,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         try {
           await hangup();
         } catch (err) {
-          console.warn('📞 [ContactDetail] hangup() failed (may already be disconnected):', err);
+          logger.warn('📞 [ContactDetail] hangup() failed (may already be disconnected):', err);
         }
       }
 
@@ -604,11 +605,11 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
       const callSid = effectiveCallSid || callId;
 
       if (callSid) {
-        console.log('📞 [ContactDetail] Ending call via API:', callSid);
+        logger.debug('📞 [ContactDetail] Ending call via API:', callSid);
         await api.post(`/api/calls/${callSid}/end`);
       }
     } catch (error) {
-      console.error('Failed to end call:', error);
+      logger.error('Failed to end call:', error);
     }
     setTranscription([]);
     setCurrentCallSid(null);
@@ -621,7 +622,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   const handleTakeOver = async () => {
     const callSid = effectiveCallSid;
     if (!callSid) {
-      console.error('No call SID available for takeover');
+      logger.error('No call SID available for takeover');
       return;
     }
 
@@ -631,13 +632,13 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     }
 
     try {
-      console.log('📞 [TakeOver] Initiating takeover for call:', callSid);
+      logger.debug('📞 [TakeOver] Initiating takeover for call:', callSid);
 
       // Call the takeover API to get the resource dial address (includes token)
       const response = await api.post(`/api/calls/${callSid}/takeover`);
       const { dial_address, leg_id } = response.data;
 
-      console.log('📞 [TakeOver] Got dial address:', dial_address);
+      logger.debug('📞 [TakeOver] Got dial address:', dial_address);
 
       // Dial the resource address — token is embedded in the URL
       // The SWML will use execute_rpc to end AI + connect to call:{sid}
@@ -649,12 +650,12 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
       // Update state - no longer an AI call once we've taken over
       setIsAICall(false);
-      console.log('📞 [TakeOver] Successfully initiated takeover');
+      logger.debug('📞 [TakeOver] Successfully initiated takeover');
 
     } catch (error: any) {
-      console.error('Failed to take over call:', error);
+      logger.error('Failed to take over call:', error);
       const errorMessage = error.response?.data?.error || 'Failed to take over call';
-      console.error('Error details:', errorMessage);
+      logger.error('Error details:', errorMessage);
     }
   };
 
@@ -1431,7 +1432,7 @@ function NotesTab({
       const response = await contactsApi.update(contact.id, { notes });
       onUpdate(response.data);
     } catch (error) {
-      console.error('Failed to save notes:', error);
+      logger.error('Failed to save notes:', error);
     } finally {
       setIsSaving(false);
     }
@@ -1539,7 +1540,7 @@ function EditContactModal({
       onSave(response.data);
       onClose();
     } catch (error) {
-      console.error('Failed to update contact:', error);
+      logger.error('Failed to update contact:', error);
     } finally {
       setIsSaving(false);
     }

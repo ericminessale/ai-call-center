@@ -1,10 +1,11 @@
 from datetime import datetime
+import secrets
 from flask import request, jsonify
 from app import db, redis_client
 from app.api import swml_bp
 from app.models import Call, CallLeg, WebhookEvent, User, Conference, ConferenceParticipant
 from app.models.system_config import SystemConfig
-from app.utils.url_utils import get_base_url
+from app.utils.url_utils import get_base_url, signed_webhook_url
 import logging
 import json
 import os
@@ -16,17 +17,13 @@ logger = logging.getLogger(__name__)
 @swml_bp.route('/initial-call', methods=['POST'])
 def initial_call():
     """Return SWML for initial call setup with transcription."""
-    print("🔔 INITIAL-CALL ENDPOINT HIT!", flush=True)
-
     # Handle JSON data from SignalWire
     data = request.get_json() if request.is_json else request.form.to_dict()
 
     # Log the complete JSON received
-    logger.info("="*50)
-    logger.info("SWML REQUEST: /api/swml/initial-call")
-    logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
-    logger.info("="*50)
-    print(f"🔔 Call ID: {data.get('call', {}).get('call_id')}", flush=True)
+    logger.info("SWML REQUEST: /api/swml/initial-call call_id=%s",
+                data.get('call', {}).get('call_id'))
+    logger.debug("RAW JSON: %s", json.dumps(data, indent=2))
 
     # Extract call information from the JSON structure
     call_data = data.get('call', {})
@@ -55,7 +52,10 @@ def initial_call():
                     email='system@signalwire.local',
                     is_active=True
                 )
-                system_user.set_password('system_password_change_me')
+                # Synthetic system user satisfies the FK on Call.user_id; no
+                # one ever logs in as this user, so the password never matters.
+                # Generate something unguessable rather than ship a literal.
+                system_user.set_password(secrets.token_urlsafe(32))
                 db.session.add(system_user)
                 db.session.flush()  # Get the ID before committing
 
@@ -185,7 +185,7 @@ def initial_call():
                 # Set the call state URL to receive hangup notifications
                 {
                     "set": {
-                        "call_state_url": f"{base_url}/api/webhooks/call-status",
+                        "call_state_url": signed_webhook_url(f"{base_url}/api/webhooks/call-status"),
                         "call_state_events": "created,ringing,answered,ended"
                     }
                 },
@@ -195,14 +195,14 @@ def initial_call():
                         "format": "mp3",
                         "stereo": False,
                         "beep": False,
-                        "status_url": f"{base_url}/api/webhooks/recording-status"
+                        "status_url": signed_webhook_url(f"{base_url}/api/webhooks/recording-status")
                     }
                 },
                 {
                     "live_transcribe": {
                         "action": {
                             "start": {
-                                "webhook": f"{base_url}/api/webhooks/transcription",
+                                "webhook": signed_webhook_url(f"{base_url}/api/webhooks/transcription"),
                                 "lang": "en-US",
                                 "live_events": True,
                                 "ai_summary": True,
@@ -253,7 +253,7 @@ def start_transcription():
                     "live_transcribe": {
                         "action": {
                             "start": {
-                                "webhook": f"{base_url}/api/webhooks/transcription",
+                                "webhook": signed_webhook_url(f"{base_url}/api/webhooks/transcription"),
                                 "lang": "en-US",
                                 "live_events": True,
                                 "partial_events": False,
@@ -328,7 +328,7 @@ def summarize_transcription():
                     "live_transcribe": {
                         "action": {
                             "summarize": {
-                                "webhook": f"{base_url}/api/webhooks/summary"
+                                "webhook": signed_webhook_url(f"{base_url}/api/webhooks/summary")
                             }
                         }
                     }

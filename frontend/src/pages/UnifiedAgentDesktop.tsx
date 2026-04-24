@@ -630,7 +630,7 @@ export function UnifiedAgentDesktop() {
         if (assignedCallId) {
           try {
             await callControlApi.stopMonitor(assignedCallId);
-            console.log('[Unified] Stopped monitoring before accepting assignment');
+            logger.debug('[Unified] Stopped monitoring before accepting assignment');
           } catch {
             // Ignore - may not have been monitoring
           }

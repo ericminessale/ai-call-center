@@ -413,7 +413,7 @@ def outbound_ai_swml(call_id):
     """
     from app import db
     from app.models import Call
-    from app.utils.url_utils import get_base_url
+    from app.utils.url_utils import get_base_url, signed_webhook_url
 
     logger.info(f"Outbound AI SWML webhook called for call_id={call_id}")
 
@@ -447,7 +447,7 @@ def outbound_ai_swml(call_id):
         context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
         agent_url = f"{agent_url}?ctx={context_b64}"
 
-    status_callback = f"{base_url}/api/webhooks/call-status"
+    status_callback = signed_webhook_url(f"{base_url}/api/webhooks/call-status")
 
     logger.info(f"Outbound AI SWML: transferring to {agent_url}")
 
@@ -496,7 +496,7 @@ def initiate_outbound_ai_call():
         from app import db
         from app.models import Call
         from app.services.signalwire_api import get_signalwire_api
-        from app.utils.url_utils import get_base_url
+        from app.utils.url_utils import get_base_url, signed_webhook_url
 
         user_id = get_jwt_identity()
         data = request.get_json()
@@ -546,7 +546,10 @@ def initiate_outbound_ai_call():
         # Build the SWML webhook URL that SignalWire will fetch when the call is answered
         base_url = get_base_url()
         swml_url = f"{base_url}/api/ai/outbound-swml/{call.id}"
-        status_callback = f"{base_url}/api/webhooks/call-status"
+        # Note: swml_url itself isn't a webhook into our backend (it's an SWML
+        # script endpoint), but it does carry sensitive context — leaving it
+        # unauthenticated for now until the agents grow proper webhook auth.
+        status_callback = signed_webhook_url(f"{base_url}/api/webhooks/call-status")
 
         logger.info(f"SWML URL for outbound AI call: {swml_url}")
 

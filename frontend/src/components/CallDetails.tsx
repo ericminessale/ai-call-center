@@ -5,6 +5,7 @@ import { useSocketContext } from '../contexts/SocketContext';
 import { Call, Transcription } from '../types';
 import { ArrowLeft, Phone, Clock, Calendar, Mic, MicOff, FileText, Loader2, Play, Download, AlertCircle } from 'lucide-react';
 import { format } from 'date-fns';
+import { logger } from '../lib/logger';
 
 interface TranscriptionEvent {
   call_sid: string;
@@ -66,7 +67,7 @@ export default function CallDetails() {
       setIsTranscribing(response.data.call.transcription_active && isCallActive);
       setSummary(response.data.call.summary);
     } catch (error) {
-      console.error('Failed to load call details:', error);
+      logger.error('Failed to load call details:', error);
     } finally {
       setIsLoading(false);
     }
@@ -111,7 +112,7 @@ export default function CallDetails() {
       if (call) {
         setCall({ ...call, summary: data.summary });
       }
-      console.log('Received summary:', data.summary);
+      logger.debug('Received summary:', data.summary);
     }
   };
 
@@ -124,7 +125,7 @@ export default function CallDetails() {
       setIsTranscribing(!isTranscribing);
       setCall({ ...call, transcription_active: !isTranscribing });
     } catch (error) {
-      console.error('Failed to toggle transcription:', error);
+      logger.error('Failed to toggle transcription:', error);
     }
   };
 
@@ -134,7 +135,7 @@ export default function CallDetails() {
     try {
       await transcriptionApi.control(callSid, 'summarize');
     } catch (error) {
-      console.error('Failed to request summary:', error);
+      logger.error('Failed to request summary:', error);
     }
   };
 
@@ -146,7 +147,7 @@ export default function CallDetails() {
       setCall({ ...call, status: 'ended' });
       setIsTranscribing(false);
     } catch (error) {
-      console.error('Failed to end call:', error);
+      logger.error('Failed to end call:', error);
     }
   };
 

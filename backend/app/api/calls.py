@@ -4,7 +4,7 @@ from app.api import calls_bp
 from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth, validate_json
-from app.utils.url_utils import get_base_url
+from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.services.queue_service import QueueService
 from datetime import datetime, timedelta
 from sqlalchemy import func
@@ -42,7 +42,7 @@ def initiate_call():
         swml_url = f"{base_url}/api/swml/initial-call"
 
         # Use our own webhook endpoint for call state events
-        status_callback = f"{base_url}/api/webhooks/call-status"
+        status_callback = signed_webhook_url(f"{base_url}/api/webhooks/call-status")
 
         # Create call via SignalWire API
         logger.info(f"Calling SignalWire API with swml_url={swml_url}, status_callback={status_callback}")
@@ -118,14 +118,14 @@ def update_transcription(call_sid):
 
         if action == 'start':
             # Start transcription
-            webhook_url = f"{base_url}/api/webhooks/transcription"
+            webhook_url = signed_webhook_url(f"{base_url}/api/webhooks/transcription")
             sw_api.start_transcription(call_sid, webhook_url)
         elif action == 'stop':
             # Stop transcription
             sw_api.stop_transcription(call_sid)
         elif action == 'summarize':
             # Request summary
-            webhook_url = f"{base_url}/api/webhooks/summary"
+            webhook_url = signed_webhook_url(f"{base_url}/api/webhooks/summary")
             prompt = data.get('prompt', 'Summarize the key points of this conversation.')
             sw_api.summarize_call(call_sid, webhook_url, prompt)
 
@@ -452,7 +452,10 @@ def send_ai_message(call_id):
         if not call:
             return jsonify({'error': 'Call not found'}), 404
 
-        logger.info(f"Sending AI message to call {call_id}: role={role}, message={message_text}")
+        # Use the resolved SignalWire SID from the call record, not the
+        # caller-supplied identifier (which may be a numeric DB id).
+        call_sid = call.signalwire_call_sid
+        logger.info(f"Sending AI message to call {call_sid}: role={role}, message={message_text}")
 
         # Get SignalWire API and send message
         sw_api = get_signalwire_api()
@@ -944,8 +947,10 @@ def get_my_stats():
                 wait = call.wait_time_seconds
                 if wait > longest_wait:
                     longest_wait = wait
-        except Exception:
-            pass  # Redis may not be available
+        except Exception as exc:
+            # Redis may not be available — fall back to zero counts so the
+            # rest of the dashboard still renders. Worth knowing in logs.
+            logger.warning("queue depth lookup failed (Redis unavailable?): %s", exc)
 
         return jsonify({
             'success': True,

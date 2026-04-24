@@ -39,9 +39,10 @@ frontend/dist/
 # Claude Code local settings
 .claude/
 
-# Documentation — only README.md is tracked.
+# Documentation — only README.md + FEATURES.md are tracked.
 *.md
 !README.md
+!FEATURES.md
 docs/
 
 # Design-session artifacts and vendored SDKs

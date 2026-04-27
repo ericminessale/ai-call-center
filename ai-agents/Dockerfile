@@ -1,23 +1,19 @@
-# AI Agents Dockerfile
+# AI Agents Dockerfile — all deps come from public PyPI now.
+# (Previously vendored a local SDK copy; that's no longer needed since
+# the new SDK ships on PyPI as `signalwire-sdk`.)
 FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies including git for pip to install from GitHub
 RUN apt-get update && apt-get install -y \
     gcc \
-    git \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install SignalWire SDK from local copy (repo is private, can't clone in Docker)
-COPY signalwire-sdk /signalwire-sdk
-RUN pip install --no-cache-dir /signalwire-sdk
 
 # Copy application code
 COPY . .

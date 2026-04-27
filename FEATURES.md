@@ -255,6 +255,8 @@ Bridge customer-owned MCP (Model Context Protocol) servers into agents. Each row
 - Encrypted at rest — passwords and bearer tokens stored via the same Fernet helper as other secrets.
 - Loaded at agent boot via the SDK's `mcp_gateway` skill — no code changes, no rebuild. Restart the agent to pick up new gateways or binding changes.
 
+**Bundled "DemoShop" gateway** ships in docker-compose so the feature works the moment the cloner runs `docker-compose up`. A small SQLite-backed e-commerce backend exposes six tools: `find_customer_by_phone`, `get_order`, `list_recent_orders`, `track_shipment`, `start_return`, `check_inventory`. Pre-seeded customers, products, and orders. Pre-bound to the sales + support AI specialists. The cloner sees a working "Test" button on first login. Replace with a real gateway when ready (see `demo-mcp/README.md`).
+
 The pitch: every CCaaS says "we integrate with Salesforce." That took them 18 months and breaks when Salesforce changes. We say: paste your gateway URL. Your AI has whatever tools you exposed, in production, today.
 
 ### User Management
@@ -376,7 +378,6 @@ The items below are on the roadmap but not yet live. Listed here for completenes
 - **Routing Profiles** — named entry-point flows per phone number (beyond the single default).
 - **Admin AI workflow editor** — in-UI prompt/tool/KB editor per agent.
 - **Outbound campaigns** — answering-machine detection, list upload, power dialer.
-- **Bundled demo MCP Gateway** — a pre-configured gateway service running in docker-compose so the External Tools feature demos out-of-the-box without any external setup. The configuration UI works today; the demo container is the missing piece.
 - **Whisper** and **Barge** observer actions.
 - **Visual SWML Builder** — drag-and-drop IVR flow editor. Deferred until the Tier 2 CCaaS gaps close.
 

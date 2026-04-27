@@ -1,0 +1,8 @@
+# All public PyPI deps — fresh clone of the repo can build this image.
+# signalwire-sdk provides the new SignalWire SDK (the `signalwire`
+# import name with AgentBase, etc.) — distinct from the legacy
+# `signalwire` package on PyPI which maxes out at 2.x. The
+# [mcp-gateway] extra brings in the flask + flask-limiter deps the
+# gateway CLI needs.
+mcp>=1.0.0
+signalwire-sdk[mcp-gateway]>=3.0.1

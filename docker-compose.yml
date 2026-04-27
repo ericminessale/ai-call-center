@@ -149,6 +149,14 @@ services:
       SWML_BASIC_AUTH_USER: ${SWML_BASIC_AUTH_USER}
       SWML_BASIC_AUTH_PASSWORD: ${SWML_BASIC_AUTH_PASSWORD}
 
+      # The mcp_gateway skill's SSRF protection blocks RFC1918 hosts by
+      # default. The bundled demo-mcp-gateway is reachable via its
+      # docker-network hostname (172.x.x.x), which trips that check.
+      # Set this to allow private URLs so the demo works out of the
+      # box; remove or override in production if you only ever point
+      # at public gateway URLs.
+      SWML_ALLOW_PRIVATE_URLS: ${SWML_ALLOW_PRIVATE_URLS:-true}
+
       PYTHONUNBUFFERED: 1
     volumes:
       - ./ai-agents:/app
@@ -160,6 +168,31 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
+      retries: 3
+
+  # DemoShop MCP Gateway — bundled demo for the External Tools feature.
+  # Runs the SDK's mcp-gateway CLI in front of a small SQLite-backed
+  # MCP server with seeded e-commerce data (customers, orders, returns).
+  # Internal-network only — no external port exposure. Cloners replace
+  # this with their own MCP gateway when they're ready.
+  demo-mcp-gateway:
+    build:
+      context: ./demo-mcp
+      dockerfile: Dockerfile
+    container_name: callcenter-demo-mcp
+    hostname: demo-mcp-gateway
+    environment:
+      DEMO_MCP_USER: ${DEMO_MCP_USER:-demo}
+      DEMO_MCP_PASSWORD: ${DEMO_MCP_PASSWORD:-demo}
+      SHOP_DB_PATH: /data/shop.db
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - demo_mcp_data:/data
+    # No ports: stanza on purpose — only ai-agents (internal) talks to this.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -u ${DEMO_MCP_USER:-demo}:${DEMO_MCP_PASSWORD:-demo} http://localhost:8100/health || exit 1"]
+      interval: 30s
+      timeout: 5s
       retries: 3
 
   # Nginx Reverse Proxy
@@ -186,6 +219,8 @@ volumes:
   postgres_data:
     driver: local
   redis_data:
+    driver: local
+  demo_mcp_data:
     driver: local
 
 networks:

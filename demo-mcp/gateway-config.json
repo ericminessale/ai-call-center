@@ -1,0 +1,35 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8100,
+    "auth_user": "${DEMO_MCP_USER|demo}",
+    "auth_password": "${DEMO_MCP_PASSWORD|demo}"
+  },
+  "services": {
+    "demoshop": {
+      "command": ["python3", "-u", "/app/shop_mcp_server.py"],
+      "description": "DemoShop — toy e-commerce backend for demonstrating the External Tools feature",
+      "enabled": true,
+      "sandbox": {
+        "enabled": true,
+        "restricted_env": false,
+        "working_dir": "/app"
+      }
+    }
+  },
+  "session": {
+    "default_timeout": 300,
+    "max_sessions_per_service": 100,
+    "cleanup_interval": 60
+  },
+  "rate_limiting": {
+    "default_limits": ["1000 per day", "200 per hour"],
+    "tools_limit": "60 per minute",
+    "call_limit": "30 per minute",
+    "session_delete_limit": "30 per minute",
+    "storage_uri": "memory://"
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}

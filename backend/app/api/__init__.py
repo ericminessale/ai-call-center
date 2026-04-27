@@ -9,6 +9,9 @@ admin_bp = Blueprint('admin', __name__)
 
 # Import routes after blueprint creation to avoid circular imports
 from app.api import auth, calls, swml, webhooks, admin
+# mcp_gateways registers its routes onto admin_bp; import after admin so
+# the admin module's @admin_bp.before_request auth gate is in place.
+from app.api import mcp_gateways  # noqa: F401
 
 # Import blueprints defined in their own modules
 from app.api.contacts import contacts_bp

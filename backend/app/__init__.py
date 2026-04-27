@@ -113,6 +113,7 @@ def create_app():
     from app.api.queues import queues_bp
     from app.api.fabric import fabric_bp
     from app.api.ai_control import ai_control_bp
+    from app.api.internal import internal_bp
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(calls_bp, url_prefix='/api/calls')
     app.register_blueprint(contacts_bp, url_prefix='/api/contacts')
@@ -124,6 +125,7 @@ def create_app():
     app.register_blueprint(admin_bp, url_prefix='/api/admin')
     app.register_blueprint(conferences_bp, url_prefix='/api/conferences')
     app.register_blueprint(call_control_bp, url_prefix='/api/call-control')
+    app.register_blueprint(internal_bp, url_prefix='/api/internal')
 
     # Initialize tap audio relay WebSocket routes
     from app.services.tap_relay import init_tap_relay

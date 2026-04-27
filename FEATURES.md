@@ -245,6 +245,18 @@ The Settings tab is the complete configuration surface. Admin-only.
 - Documents within a collection: create, edit, delete.
 - Reindex a collection to regenerate embeddings after content changes.
 
+### External Tools (MCP Gateway integrations)
+
+Bridge customer-owned MCP (Model Context Protocol) servers into agents. Each row is one configured connection to an MCP Gateway service that fronts one or more MCP servers; the tools the gateway exposes become SWAIG functions on the bound agents.
+
+- Per-gateway: name, description, gateway URL, auth (basic / bearer token / none), optional services allowlist.
+- Per-agent binding — pick which agents (receptionist, sales-ai, support-ai, outbound-sales, outbound-support) should load each gateway.
+- Connection test — probes the gateway's `/services` endpoint with the configured credentials and lists the services + tools it exposes inline. Confirms the connection is live before committing to the binding.
+- Encrypted at rest — passwords and bearer tokens stored via the same Fernet helper as other secrets.
+- Loaded at agent boot via the SDK's `mcp_gateway` skill — no code changes, no rebuild. Restart the agent to pick up new gateways or binding changes.
+
+The pitch: every CCaaS says "we integrate with Salesforce." That took them 18 months and breaks when Salesforce changes. We say: paste your gateway URL. Your AI has whatever tools you exposed, in production, today.
+
 ### User Management
 
 - List every user account with role, languages, subscriber link status, creation date.
@@ -364,7 +376,7 @@ The items below are on the roadmap but not yet live. Listed here for completenes
 - **Routing Profiles** — named entry-point flows per phone number (beyond the single default).
 - **Admin AI workflow editor** — in-UI prompt/tool/KB editor per agent.
 - **Outbound campaigns** — answering-machine detection, list upload, power dialer.
-- **MCP Gateway UI** — customer-configurable external tool integrations (Salesforce, Zendesk, custom MCP servers).
+- **Bundled demo MCP Gateway** — a pre-configured gateway service running in docker-compose so the External Tools feature demos out-of-the-box without any external setup. The configuration UI works today; the demo container is the missing piece.
 - **Whisper** and **Barge** observer actions.
 - **Visual SWML Builder** — drag-and-drop IVR flow editor. Deferred until the Tier 2 CCaaS gaps close.
 

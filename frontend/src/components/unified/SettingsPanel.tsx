@@ -21,11 +21,13 @@ import {
   Pencil,
   PhoneOutgoing,
   Upload,
+  Plug,
 } from 'lucide-react';
 import { adminApi } from '../../services/api';
 import { useAuthStore } from '../../stores/authStore';
 import toast from 'react-hot-toast';
 import { ConfirmModal } from '../shared/ConfirmModal';
+import { ExternalToolsTab } from './ExternalToolsTab';
 
 // =============================================================================
 // Shared Types
@@ -157,7 +159,7 @@ interface QueueAgentAssignment {
   skill_level: number;
 }
 
-type SettingsTabId = 'phone-numbers' | 'queues' | 'agents' | 'knowledge' | 'users';
+type SettingsTabId = 'phone-numbers' | 'queues' | 'agents' | 'knowledge' | 'external-tools' | 'users';
 
 
 // =============================================================================
@@ -222,6 +224,13 @@ export function SettingsPanel() {
             onClick={() => handleTabChange('knowledge')}
           />
           <TabButton
+            id="external-tools"
+            icon={<Plug className="w-3.5 h-3.5" />}
+            label="External Tools"
+            active={activeTab === 'external-tools'}
+            onClick={() => handleTabChange('external-tools')}
+          />
+          <TabButton
             id="users"
             icon={<Users className="w-3.5 h-3.5" />}
             label="User Management"
@@ -237,6 +246,7 @@ export function SettingsPanel() {
         {activeTab === 'queues' && <QueuesTab />}
         {activeTab === 'agents' && <AgentsTab onNavigateToCollection={handleNavigateToCollection} />}
         {activeTab === 'knowledge' && <KnowledgeBaseTab focusCollectionId={focusCollectionId} />}
+        {activeTab === 'external-tools' && <ExternalToolsTab />}
         {activeTab === 'users' && <UserManagementTab />}
       </div>
     </div>

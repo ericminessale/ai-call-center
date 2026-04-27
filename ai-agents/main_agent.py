@@ -257,6 +257,61 @@ def add_knowledge_search(agent, agent_id, fallback_collection=None):
         print(f"Warning: Failed to add knowledge search for {agent_id}: {e}", flush=True)
 
 
+def add_mcp_gateways(agent, agent_id):
+    """Load every admin-configured MCP Gateway bound to this agent slug.
+
+    Customer-supplied external tool integrations: each McpGatewayConfig
+    row in the backend tells us a gateway URL, credentials, and which
+    agent slugs should load it. We pull the matching configs from the
+    backend's internal endpoint and register one ``mcp_gateway`` skill
+    instance per gateway. The skill itself handles tool discovery,
+    session lifecycle, and bridging MCP calls to SWAIG functions.
+
+    Failures are non-fatal — if the backend isn't reachable or auth is
+    misconfigured, we log and skip MCP rather than blocking agent boot.
+    """
+    backend_url = os.getenv('BACKEND_URL', 'http://backend:5000')
+    auth_user = os.getenv('WEBHOOK_AUTH_USER')
+    auth_password = os.getenv('WEBHOOK_AUTH_PASSWORD')
+    auth = (auth_user, auth_password) if (auth_user and auth_password) else None
+
+    try:
+        import requests as http_requests
+        resp = http_requests.get(
+            f"{backend_url}/api/internal/mcp-gateways",
+            params={'agent_id': agent_id},
+            auth=auth,
+            timeout=5,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as e:
+        print(f"Warning: Could not fetch MCP gateways for {agent_id}: {e}", flush=True)
+        return
+
+    gateways = payload.get('gateways') or []
+    if not gateways:
+        print(f"No MCP gateways bound to {agent_id}", flush=True)
+        return
+
+    for entry in gateways:
+        name = entry.get('name', '<unnamed>')
+        config = entry.get('config') or {}
+        try:
+            agent.add_skill("mcp_gateway", config)
+            print(
+                f"Added MCP gateway '{name}' to {agent_id} "
+                f"(url={config.get('gateway_url')!r})",
+                flush=True,
+            )
+        except Exception as e:
+            # One bad gateway should not poison the agent. Log + continue.
+            print(
+                f"Warning: failed to add MCP gateway '{name}' to {agent_id}: {e}",
+                flush=True,
+            )
+
+
 def start_admin_api():
     """Start a lightweight FastAPI server for admin operations (reindex)."""
     from fastapi import FastAPI, Request
@@ -549,6 +604,7 @@ class CallCenterTriageAgent(CallCenterAgent):
 
         self.set_dynamic_config_callback(capture_base_url)
         add_sentiment_tool(self)
+        add_mcp_gateways(self, 'receptionist')
 
         # Voice and speech configuration
         # Multiple languages so the receptionist can greet/converse in the caller's
@@ -888,6 +944,7 @@ class SalesAISpecialist(CallCenterAgent):
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'sales-ai', fallback_collection='sales_knowledge')
+        add_mcp_gateways(self, 'sales-ai')
 
         self.set_post_prompt(
             'Summarize this sales consultation as a JSON object: '
@@ -1018,6 +1075,7 @@ class SupportAISpecialist(CallCenterAgent):
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'support-ai', fallback_collection='support_knowledge')
+        add_mcp_gateways(self, 'support-ai')
 
         self.set_post_prompt(
             'Summarize this support consultation as a JSON object: '
@@ -1158,6 +1216,7 @@ class OutboundSalesAgent(CallCenterAgent):
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'outbound-sales', fallback_collection='sales_knowledge')
+        add_mcp_gateways(self, 'outbound-sales')
 
         self.set_post_prompt(
             'Summarize this outbound sales call as a JSON object: '
@@ -1287,6 +1346,7 @@ class OutboundSupportAgent(CallCenterAgent):
 
         # Add knowledge base search (pgvector RAG)
         add_knowledge_search(self, 'outbound-support', fallback_collection='support_knowledge')
+        add_mcp_gateways(self, 'outbound-support')
 
         self.set_post_prompt(
             'Summarize this outbound support call as a JSON object: '

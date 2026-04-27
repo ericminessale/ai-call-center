@@ -9,6 +9,7 @@ from .conference_participant import ConferenceParticipant
 from .system_config import SystemConfig
 from .document import DocumentCollection, Document, AgentCollectionAssignment
 from .queue import Queue, QueueAgentAssignment
+from .mcp_gateway_config import McpGatewayConfig
 
 __all__ = [
     'User',
@@ -25,4 +26,5 @@ __all__ = [
     'AgentCollectionAssignment',
     'Queue',
     'QueueAgentAssignment',
+    'McpGatewayConfig',
 ]

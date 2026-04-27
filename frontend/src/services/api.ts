@@ -284,7 +284,60 @@ export const adminApi = {
     api.get(`/api/admin/queues/${queueId}/agents`),
   updateQueueAgents: (queueId: number, assignments: Array<{ user_id: number; skill_level?: number }>) =>
     api.put(`/api/admin/queues/${queueId}/agents`, { assignments }),
+
+  // MCP Gateway management — customer-configurable external tool integrations
+  // (Salesforce, Zendesk, custom MCP servers, etc.) per agent.
+  listMcpGateways: () =>
+    api.get('/api/admin/mcp-gateways'),
+  createMcpGateway: (data: McpGatewayInput) =>
+    api.post('/api/admin/mcp-gateways', data),
+  updateMcpGateway: (id: number, data: McpGatewayInput) =>
+    api.put(`/api/admin/mcp-gateways/${id}`, data),
+  deleteMcpGateway: (id: number) =>
+    api.delete(`/api/admin/mcp-gateways/${id}`),
+  testMcpGateway: (id: number) =>
+    api.post<{ ok: boolean; services?: McpGatewayService[]; error?: string }>(
+      `/api/admin/mcp-gateways/${id}/test`
+    ),
 };
+
+export type McpGatewayAuthType = 'none' | 'basic' | 'bearer';
+
+export interface McpGatewayInput {
+  name: string;
+  description?: string;
+  gateway_url: string;
+  auth_type: McpGatewayAuthType;
+  auth_user?: string;
+  auth_password?: string;
+  auth_token?: string;
+  services_filter?: Array<string | { name: string; tools?: string | string[] }>;
+  bound_agent_ids: string[];
+  enabled?: boolean;
+}
+
+export interface McpGateway {
+  id: number;
+  name: string;
+  description: string | null;
+  gateway_url: string;
+  auth_type: McpGatewayAuthType;
+  auth_user: string | null;
+  has_auth_password: boolean;
+  has_auth_token: boolean;
+  services_filter: Array<string | { name: string; tools?: string | string[] }>;
+  bound_agent_ids: string[];
+  enabled: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface McpGatewayService {
+  name: string;
+  description?: string | null;
+  enabled?: boolean;
+  tools: string[];
+}
 
 // Real-time call control
 export const callControlApi = {

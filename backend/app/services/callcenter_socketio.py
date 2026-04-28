@@ -19,12 +19,27 @@ logger = logging.getLogger(__name__)
 # Agent status tracking
 agent_statuses: Dict[str, dict] = {}
 
-def is_demo_mode():
-    """Check if system is in demo mode."""
+def _skip_auto_queue_assign() -> bool:
+    """Whether to suppress auto-assigning queued calls when an agent goes
+    available (they'd then claim manually via the request_next_call event).
+
+    This used to be wired to ``DEMO_MODE`` under a function called
+    ``is_demo_mode()``. That conflated two unrelated concepts:
+      - ``DEMO_MODE`` (in app.utils.demo_config) = "this instance is the
+        public hosted demo" — landing card, lease pool, etc.
+      - This switch = "this instance is somebody's local sandbox; don't
+        aggressively shove queued calls at them when they go available."
+
+    For the hosted public demo we actually WANT auto-assign (otherwise a
+    visitor who goes online sits there with nothing happening — bad demo).
+    So the two are independent and the old shared name was wrong.
+
+    Default ``false`` — production and the hosted demo both auto-assign.
+    Operators running a local sandbox who want the old behavior set
+    ``SKIP_AUTO_QUEUE_ASSIGN=true``.
+    """
     import os
-    # Demo mode is enabled by default for development
-    # Set DEMO_MODE=false in production
-    return os.getenv('DEMO_MODE', 'true').lower() == 'true'
+    return os.getenv('SKIP_AUTO_QUEUE_ASSIGN', '').strip().lower() == 'true'
 
 
 def emit_call_update(call):
@@ -121,13 +136,13 @@ def handle_agent_status_change(data):
 
     logger.info(f"Agent {user_id} status changed to: {status}")
 
-    # If agent is available, check for queued calls
-    # NOTE: In production, this auto-assigns real calls from the queue
-    # For demo mode, we only auto-assign if there are demo calls in the queue
-    if status == 'available':
-        # Only auto-assign if not in demo mode or if explicitly requested
-        if not is_demo_mode():
-            check_and_assign_queued_call(user_id)
+    # When an agent goes available, optionally auto-assign the next
+    # queued call. The opt-out (``SKIP_AUTO_QUEUE_ASSIGN=true``) exists
+    # for local-sandbox runs where the developer doesn't want a stale
+    # queued call thrown at them as soon as they flip online — they'll
+    # claim manually via the request_next_call event instead.
+    if status == 'available' and not _skip_auto_queue_assign():
+        check_and_assign_queued_call(user_id)
 
 
 @socketio.on('request_next_call')

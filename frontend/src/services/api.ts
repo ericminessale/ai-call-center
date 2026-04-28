@@ -38,6 +38,28 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
+    // Hosted-demo soft-blocks return 403 with code 'demo_blocked'.
+    // Surface a single user-visible toast and re-reject so callers
+    // can short-circuit cleanly (the request was intentionally
+    // refused, not a transient failure to retry).
+    if (
+      error.response?.status === 403 &&
+      error.response?.data?.code === 'demo_blocked'
+    ) {
+      // Lazy import to avoid circular dep on the toast lib at module
+      // load. Only fires for users actually in demo mode.
+      try {
+        const { default: toast } = await import('react-hot-toast');
+        toast.error(
+          error.response.data.error ||
+            'That action is not available in demo mode.'
+        );
+      } catch {
+        // Toast lib unavailable — error still bubbles via the reject below.
+      }
+      return Promise.reject(error);
+    }
+
     if (error.response?.status === 401 && error.config && !error.config._retry) {
       error.config._retry = true;
       const refreshToken = localStorage.getItem('refresh_token');

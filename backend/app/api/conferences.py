@@ -4,6 +4,7 @@ from app.models import Conference, ConferenceParticipant, Call, CallLeg, User
 from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth
 from app.utils.url_utils import get_base_url, signed_webhook_url
+from app.utils.demo_config import block_in_demo_mode
 import logging
 import json
 import os
@@ -1344,11 +1345,14 @@ def get_active_conferences():
 
 @conferences_bp.route('/<conference_name>/dial-out', methods=['POST'])
 @require_auth
+@block_in_demo_mode
 def dial_out_to_conference(conference_name):
     """Initiate an outbound call and connect them to the agent's conference.
 
     This is used when an agent (already in their conference) wants to call someone.
     The called party, when they answer, is connected into the agent's conference.
+
+    Soft-blocked in DEMO_MODE.
     """
     data = request.get_json()
     phone_number = data.get('phone_number')

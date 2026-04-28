@@ -6,6 +6,7 @@ from app.api import swml_bp
 from app.models import Call, CallLeg, WebhookEvent, User, Conference, ConferenceParticipant
 from app.models.system_config import SystemConfig
 from app.utils.url_utils import get_base_url, signed_webhook_url
+from app.utils.demo_config import is_demo_mode
 import logging
 import json
 import os
@@ -36,6 +37,19 @@ def initial_call():
     direction = call_data.get('direction')
 
     logger.info(f"Extracted - Call ID: {call_id}, From: {from_number}, To: {to_number}, State: {call_state}")
+
+    # Hosted demo only: per-caller-ID inbound ratelimit. If this
+    # number has hit its hourly cap, return a polite "try later" SWML
+    # before we provision any DB rows or kick off the AI agent.
+    from app.services.demo_inbound_ratelimit import (
+        reject_swml as demo_reject_swml,
+        should_reject_inbound,
+    )
+    if should_reject_inbound(from_number):
+        logger.info(
+            "Inbound call from %s rejected by demo ratelimit", from_number,
+        )
+        return jsonify(demo_reject_swml())
 
     # Store or update call in database
     call = Call.find_by_sid(call_id)
@@ -178,47 +192,55 @@ def initial_call():
     # Transfer to admin-configured AI agent
     # The caller's A-leg is transferred directly to the AI agent's SWML
     # No conference at this stage - conference is only created when AI transfers to human
-    swml_response = {
-        "version": "1.0.0",
-        "sections": {
-            "main": [
-                # Set the call state URL to receive hangup notifications
-                {
-                    "set": {
-                        "call_state_url": signed_webhook_url(f"{base_url}/api/webhooks/call-status"),
-                        "call_state_events": "created,ringing,answered,ended"
-                    }
-                },
-                "answer",
-                {
-                    "record_call": {
-                        "format": "mp3",
-                        "stereo": False,
-                        "beep": False,
-                        "status_url": signed_webhook_url(f"{base_url}/api/webhooks/recording-status")
-                    }
-                },
-                {
-                    "live_transcribe": {
-                        "action": {
-                            "start": {
-                                "webhook": signed_webhook_url(f"{base_url}/api/webhooks/transcription"),
-                                "lang": "en-US",
-                                "live_events": True,
-                                "ai_summary": True,
-                                "direction": ["remote-caller", "local-caller"]
-                            }
-                        }
-                    }
-                },
-                # Transfer to AI agent — caller's A-leg runs the AI agent's SWML directly
-                {
-                    "transfer": {
-                        "dest": f"{base_url}{initial_handler}?call_db_id={call.id}"
+    main_section: list = [
+        # Set the call state URL to receive hangup notifications
+        {
+            "set": {
+                "call_state_url": signed_webhook_url(f"{base_url}/api/webhooks/call-status"),
+                "call_state_events": "created,ringing,answered,ended"
+            }
+        },
+        "answer",
+    ]
+
+    # Recording is OFF by default in DEMO_MODE — visitors might say
+    # sensitive things in the public sandbox; sidesteps the consent
+    # question entirely. Production-shape deployments record as before.
+    if not is_demo_mode():
+        main_section.append({
+            "record_call": {
+                "format": "mp3",
+                "stereo": False,
+                "beep": False,
+                "status_url": signed_webhook_url(f"{base_url}/api/webhooks/recording-status"),
+            }
+        })
+
+    main_section.extend([
+        {
+            "live_transcribe": {
+                "action": {
+                    "start": {
+                        "webhook": signed_webhook_url(f"{base_url}/api/webhooks/transcription"),
+                        "lang": "en-US",
+                        "live_events": True,
+                        "ai_summary": True,
+                        "direction": ["remote-caller", "local-caller"],
                     }
                 }
-            ]
-        }
+            }
+        },
+        # Transfer to AI agent — caller's A-leg runs the AI agent's SWML directly
+        {
+            "transfer": {
+                "dest": f"{base_url}{initial_handler}?call_db_id={call.id}"
+            }
+        },
+    ])
+
+    swml_response = {
+        "version": "1.0.0",
+        "sections": {"main": main_section},
     }
 
     # Log the SWML response

@@ -13,6 +13,8 @@ import base64
 from datetime import datetime
 from base64 import b64encode
 
+from app.utils.demo_config import block_in_demo_mode
+
 logger = logging.getLogger(__name__)
 
 ai_control_bp = Blueprint('ai_control', __name__)
@@ -476,9 +478,12 @@ def outbound_ai_swml(call_id):
 
 @ai_control_bp.route('/outbound-call', methods=['POST'])
 @jwt_required()
+@block_in_demo_mode
 def initiate_outbound_ai_call():
     """
     Initiate an outbound call handled by an AI agent.
+
+    Soft-blocked in DEMO_MODE — see calls.initiate_call comment.
 
     Request body:
     {

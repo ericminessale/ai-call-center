@@ -95,3 +95,40 @@ def runtime_config() -> dict:
         'demo_mode': is_demo_mode(),
         'demo_phone_numbers': demo_phone_numbers() if is_demo_mode() else [],
     }
+
+
+# Standard 403 body emitted when an outbound-dial endpoint is hit in
+# demo mode. Frontend keys off ``code: demo_blocked`` to render a
+# specific toast rather than a generic error.
+DEMO_BLOCKED_RESPONSE = {
+    'error': 'Outbound dialing is not available in demo mode.',
+    'code': 'demo_blocked',
+}
+
+
+def block_in_demo_mode(f):
+    """Decorator that refuses the request with 403 when DEMO_MODE=true.
+
+    Apply to outbound-call-initiating endpoints so a demo visitor
+    can't dial real phone numbers from the public sandbox. The form
+    is still allowed to render (per the demo's transparency goal —
+    show what the feature does), but submission gets blocked here.
+
+    Production-shape clone-and-own deployments are unaffected: the
+    decorator passes through when ``is_demo_mode()`` is false.
+
+    NOTE: this only catches server-mediated outbound dial. Browser-
+    direct WebRTC dial via the Call Fabric SDK token bypasses the
+    backend entirely — defense for that path lives in the frontend
+    UI layer (the dial button shows a toast instead of firing) plus
+    SignalWire-project-level policy (out of scope for this app).
+    """
+    from functools import wraps
+
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if is_demo_mode():
+            from flask import jsonify
+            return jsonify(DEMO_BLOCKED_RESPONSE), 403
+        return f(*args, **kwargs)
+    return wrapped

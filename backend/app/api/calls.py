@@ -4,6 +4,7 @@ from app.api import calls_bp
 from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth, validate_json
+from app.utils.demo_config import block_in_demo_mode
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.services.queue_service import QueueService
 from datetime import datetime, timedelta
@@ -18,9 +19,15 @@ logger = logging.getLogger(__name__)
 
 @calls_bp.route('/initiate', methods=['POST'])
 @require_auth
+@block_in_demo_mode
 @validate_json('destination', 'destination_type')
 def initiate_call():
-    """Initiate a new outbound call."""
+    """Initiate a new outbound call.
+
+    Soft-blocked in DEMO_MODE — visitors see the dial form but submit
+    returns 403 with code 'demo_blocked' so the UI can render a clear
+    "not available in demo" toast.
+    """
     logger.info("INITIATE CALL REQUEST")
     try:
         data = request.get_json()

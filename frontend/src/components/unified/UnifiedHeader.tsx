@@ -174,15 +174,34 @@ export function UnifiedHeader({
             <ChevronDown className="w-3.5 h-3.5 text-ink-dim" />
           </button>
 
-          {/* Demo-only nudge: when a fresh visitor lands they're
-              offline by default and won't get any calls. Surface
-              the next step. Auto-hides once they go non-offline OR
-              dismiss it. */}
+          {/* Demo-only nudges: a small state machine that walks a
+              fresh visitor from "I just landed" → "I'm online and on
+              a queue" without leaving them stuck.
+                1. Offline               → "Set yourself available"
+                2. Available + 0 queues  → "Pick a queue"
+                3. Available + ≥1 queue  → silent
+              Both fire in the same spot below the status pill (the
+              two states are mutually exclusive). Each has its own
+              dismissal id so individual dismissals don't bleed
+              across states. Hidden whenever the dropdown is open
+              (the inline note inside the dropdown takes over). */}
           <DemoTip
             id="demo-go-available"
             show={agentStatus === 'offline' && !showStatusDropdown}
             title="Set yourself available"
             body="Click here and switch to Available to enter the queue and start receiving calls."
+            placement="bottom-start"
+          />
+          <DemoTip
+            id="demo-pick-a-queue"
+            show={
+              agentStatus === 'available' &&
+              activeQueueCount === 0 &&
+              availableQueues.length > 0 &&
+              !showStatusDropdown
+            }
+            title="Almost there — pick a queue"
+            body="You're available but not signed up for any queues, so calls won't route to you. Click your status pill and check at least one."
             placement="bottom-start"
           />
 

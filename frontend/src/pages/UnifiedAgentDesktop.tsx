@@ -5,6 +5,7 @@ import { useCallFabricContext, ConnectedCustomer } from '../contexts/CallFabricC
 import { useSocket } from '../hooks/useSocket';
 import { UnifiedHeader } from '../components/unified/UnifiedHeader';
 import { DemoBanner } from '../components/shared/DemoBanner';
+import { useDemoLeaseHeartbeat } from '../hooks/useDemoLeaseHeartbeat';
 import { LeftPanel } from '../components/unified/LeftPanel';
 import { IncomingCallBanner } from '../components/unified/IncomingCallBanner';
 import { SettingsPanel } from '../components/unified/SettingsPanel';
@@ -30,6 +31,11 @@ export function UnifiedAgentDesktop() {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, logout } = useAuthStore();
+
+  // Hosted-demo only: keep the visitor's persona lease alive while
+  // the dashboard is open, release it on tab close. No-op outside
+  // demo mode.
+  useDemoLeaseHeartbeat();
 
   // Determine initial view mode from URL
   const getInitialViewMode = (): ViewMode => {

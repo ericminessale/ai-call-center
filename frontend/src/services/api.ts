@@ -13,6 +13,10 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
+  // Required so the demo session cookie (HttpOnly, set by /api/demo/start)
+  // round-trips on subsequent requests like /heartbeat. Same-origin so
+  // CORS isn't a concern; this is just the cookie include flag.
+  withCredentials: true,
 });
 
 // Add auth token to requests
@@ -99,8 +103,16 @@ export const runtimeApi = {
 // Demo session — only succeeds when DEMO_MODE=true on the server.
 // Returns the same shape as authApi.login (JWT + user) so the frontend
 // can hand the response straight to the existing auth handlers.
+//
+// /start carries a session cookie set by the backend (HttpOnly,
+// SameSite=Lax). withCredentials must be true on the axios instance
+// for the cookie to roundtrip — verified in the api client config.
 export const demoApi = {
   start: () => api.post<AuthResponse>('/api/demo/start'),
+  heartbeat: () => api.post<{ ok: boolean }>('/api/demo/heartbeat'),
+  end: () => api.post<{ ok: boolean; released: boolean }>('/api/demo/end'),
+  status: () =>
+    api.get<{ leased: boolean; persona: any | null }>('/api/demo/status'),
 };
 
 export const callsApi = {

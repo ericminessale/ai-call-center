@@ -1,0 +1,3 @@
+# Daily demo reset at 00:00 UTC. Output appears in `docker-compose
+# logs demo-reset` because we run crond with the foreground flag.
+0 0 * * * /usr/local/bin/demo-reset.sh > /proc/1/fd/1 2>&1

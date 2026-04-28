@@ -178,6 +178,22 @@ services:
       timeout: 10s
       retries: 3
 
+  # demo-reset — daily cron that fires the backend's demo-reset
+  # endpoint at 00:00 UTC. Self-gates on DEMO_MODE; safe to leave
+  # running on a clone-and-own deployment (endpoint will no-op).
+  demo-reset:
+    build:
+      context: ./demo-reset
+      dockerfile: Dockerfile
+    container_name: callcenter-demo-reset
+    depends_on:
+      - backend
+    environment:
+      BACKEND_URL: http://backend:5000
+      WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER:-}
+      WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD:-}
+      TZ: UTC
+
   # DemoShop MCP Gateway — bundled demo for the External Tools feature.
   # Runs the SDK's mcp-gateway CLI in front of a small SQLite-backed
   # MCP server with seeded e-commerce data (customers, orders, returns).

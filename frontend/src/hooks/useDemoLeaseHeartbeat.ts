@@ -1,5 +1,7 @@
 import { useEffect } from 'react';
+import toast from 'react-hot-toast';
 import { demoApi } from '../services/api';
+import { useSocketContext } from '../contexts/SocketContext';
 import { useAuthStore } from '../stores/authStore';
 import { logger } from '../lib/logger';
 
@@ -23,6 +25,7 @@ import { logger } from '../lib/logger';
 export function useDemoLeaseHeartbeat() {
   const isDemo = useAuthStore((s) => s.runtimeConfig?.demo_mode);
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const { socket } = useSocketContext();
 
   useEffect(() => {
     if (!isDemo || !isAuthenticated) return;
@@ -58,4 +61,23 @@ export function useDemoLeaseHeartbeat() {
       window.removeEventListener('beforeunload', handleUnload);
     };
   }, [isDemo, isAuthenticated]);
+
+  // Listen for the nightly reset broadcast. The backend wipes mutable
+  // state including this visitor's lease, so we show a polite toast
+  // and reload to re-land on the demo landing card. Reload (rather
+  // than soft re-route) is intentional — clears any stale in-memory
+  // state too (active call mocks, AI context, etc.).
+  useEffect(() => {
+    if (!isDemo || !socket) return;
+    const onReset = (payload: { message?: string } = {}) => {
+      const msg = payload.message ?? 'Demo refreshing — reloading…';
+      toast(msg, { icon: '↻', duration: 4000 });
+      // Small delay so the toast renders before the reload kills it.
+      window.setTimeout(() => window.location.reload(), 1500);
+    };
+    socket.on('demo:reset', onReset);
+    return () => {
+      socket.off('demo:reset', onReset);
+    };
+  }, [isDemo, socket]);
 }

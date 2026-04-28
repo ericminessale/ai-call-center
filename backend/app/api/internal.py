@@ -24,7 +24,10 @@ import logging
 
 from flask import Blueprint, jsonify, request
 
+from app import socketio
 from app.models import McpGatewayConfig
+from app.services.demo_reset import reset_demo_state
+from app.utils.demo_config import is_demo_mode
 from app.utils.webhook_auth import require_webhook_auth
 
 logger = logging.getLogger(__name__)
@@ -64,3 +67,44 @@ def list_mcp_gateways_for_agent():
         agent_id, len(matched),
     )
     return jsonify({'gateways': matched})
+
+
+@internal_bp.route('/demo-reset', methods=['POST'])
+@require_webhook_auth
+def trigger_demo_reset():
+    """Run the daily demo wipe + reseed.
+
+    Refuses outright in production (``DEMO_MODE`` unset). When DEMO
+    mode is on:
+      1. Truncate mutable per-day tables (calls, contacts, etc.) —
+         users + queues + KB + MCP config preserved.
+      2. ``FLUSHDB`` the Redis namespace (leases, queue state,
+         ratelimits — all ephemeral demo state).
+      3. Defensively re-run the idempotent persona seed.
+      4. Broadcast a ``demo:reset`` SocketIO event so active visitor
+         tabs reload cleanly rather than running on dead lease state.
+
+    Triggered by the ``demo-reset`` cron container at 00:00 UTC.
+    Available for manual operator-side testing too — just call it
+    yourself (you'll need ``WEBHOOK_AUTH_USER`` / ``..._PASSWORD`` in
+    the request URL).
+    """
+    if not is_demo_mode():
+        # Ignore silently — the cron may fire against a production
+        # backend if someone misconfigures, and we'd rather no-op
+        # than half-wipe.
+        return jsonify({'skipped': 'DEMO_MODE not set'}), 200
+
+    summary = reset_demo_state()
+    logger.warning("demo_reset: completed: %s", summary)
+
+    # Broadcast to every connected socket so any visitor mid-session
+    # can show a "demo refreshing" toast and reload. Frontend handles
+    # the UX; this is fire-and-forget on the backend.
+    try:
+        socketio.emit('demo:reset', {'message': 'Demo refresh — please reload'})
+    except Exception as exc:
+        # Reset already succeeded; broadcast failure is cosmetic.
+        logger.warning("demo_reset: socket broadcast failed: %s", exc)
+
+    return jsonify({'ok': True, 'summary': summary}), 200

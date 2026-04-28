@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
 from typing import Optional
 
 import requests
@@ -109,6 +110,51 @@ def _normalize_leet(text: str) -> str:
     return text.lower().translate(_LEET_TABLE)
 
 
+# Match runs of two or more single-letter "words" separated by any
+# whitespace, e.g. 'p u s s y', 'f u c k', 'k i l l   m e'. The
+# replacement collapses them so the blocklist regex can match the
+# concatenated form. Limited to runs of 2+ to avoid eating
+# legitimate text like 'I a m here' (only matches 2+ in a row).
+_LETTER_SPACING_PATTERN = re.compile(
+    r'(?:\b[a-z]\b\s+){1,}\b[a-z]\b',  # 'a b c d' style — 2+ singles
+    re.IGNORECASE,
+)
+
+
+def _collapse_letter_spacing(text: str) -> str:
+    """Mash runs of space-separated single letters back together.
+
+    'p u s s y' → 'pussy'. Used as a normalization layer before the
+    blocklist regex check so per-letter-spacing bypasses don't slip
+    through.
+    """
+    def _collapse(match: re.Match) -> str:
+        # Strip every whitespace char from the matched run.
+        return re.sub(r'\s+', '', match.group(0))
+    return _LETTER_SPACING_PATTERN.sub(_collapse, text)
+
+
+_ZERO_WIDTH_CHARS = re.compile(
+    '[​‌‍‎‏‪-‮⁠﻿]'
+)
+
+
+def _normalize_unicode(text: str) -> str:
+    """NFKC-normalize + strip zero-width / bidi format characters.
+
+    NFKC handles compatibility decomposition — fullwidth chars
+    become ASCII, ligatures like 'ﬁ' decompose to 'fi'. (Note: NFKC
+    does NOT map cross-script homoglyphs like Cyrillic 'а' to Latin
+    'a' — those have separate codepoints in the same Unicode
+    category. Cross-script homoglyph attacks remain a known gap;
+    OpenAI catches most of them at the semantic layer.)
+    Then strip zero-width + bidi-format characters that visitors
+    paste in to break up words invisibly.
+    """
+    normalized = unicodedata.normalize('NFKC', text)
+    return _ZERO_WIDTH_CHARS.sub('', normalized)
+
+
 def is_text_acceptable(text: Optional[str]) -> tuple[bool, str]:
     """Return ``(ok, reason)``.
 
@@ -136,13 +182,23 @@ def is_text_acceptable(text: Optional[str]) -> tuple[bool, str]:
             # law; a missed flag from a transient outage is fine.
             logger.warning("moderation: OpenAI check errored, falling back: %s", exc)
 
-    # Layer 2: local blocklist (always runs as a baseline). Match
-    # against both the raw text AND the leet-normalized version so
-    # common script-kiddie bypasses ('pu$$y', 'sh1t') get caught
-    # even when OpenAI's threshold considers them ambiguous.
+    # Layer 2: local blocklist. Run the regex against several
+    # normalized projections of the input so common bypass families
+    # all collapse onto the canonical blocklist words.
+    #
+    # Pipeline order matters: leet substitution runs BEFORE the
+    # letter-spacing collapse so combined bypasses like 'p u $ $ y'
+    # become 'p u s s y' (leet) → 'pussy' (collapse). We also keep
+    # earlier projections in the check set so isolated bypasses get
+    # caught at the right layer.
+    unicode_clean = _normalize_unicode(text)
+    leet_normalized = _normalize_leet(unicode_clean)
+    spacing_collapsed = _collapse_letter_spacing(leet_normalized)
     if (
         _FALLBACK_REGEX.search(text)
-        or _FALLBACK_REGEX.search(_normalize_leet(text))
+        or _FALLBACK_REGEX.search(unicode_clean)
+        or _FALLBACK_REGEX.search(leet_normalized)
+        or _FALLBACK_REGEX.search(spacing_collapsed)
     ):
         return False, 'Your input contains language we don\'t allow in this demo.'
 

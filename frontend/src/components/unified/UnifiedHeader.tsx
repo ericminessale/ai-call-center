@@ -9,12 +9,15 @@ import {
   PhoneCall,
   Settings,
   AlertTriangle,
+  Sparkles,
+  X as XIcon,
 } from 'lucide-react';
 import { ViewMode, AgentStatus } from '../../pages/UnifiedAgentDesktop';
 import Logo from '../shared/Logo';
 import { QuickDialDropdown } from './QuickDialDropdown';
 import { queueApi } from '../../services/api';
 import toast from 'react-hot-toast';
+import { DemoTip, useDemoTip } from '../shared/DemoTip';
 
 interface UnifiedHeaderProps {
   user: { email: string; role?: string } | null;
@@ -86,6 +89,11 @@ export function UnifiedHeader({
   const [showQuickDial, setShowQuickDial] = useState(false);
   const statusRef = useRef<HTMLDivElement>(null);
   const userRef = useRef<HTMLDivElement>(null);
+
+  // Demo-only nudge inside the queue dropdown — tells visitors what
+  // the checkboxes do. Dismissal is sticky via localStorage; the
+  // hook returns shouldShow=false outside demo mode entirely.
+  const queueTip = useDemoTip('demo-queue-checkboxes');
 
   const [availableQueues, setAvailableQueues] = useState<AvailableQueue[]>([]);
 
@@ -166,6 +174,18 @@ export function UnifiedHeader({
             <ChevronDown className="w-3.5 h-3.5 text-ink-dim" />
           </button>
 
+          {/* Demo-only nudge: when a fresh visitor lands they're
+              offline by default and won't get any calls. Surface
+              the next step. Auto-hides once they go non-offline OR
+              dismiss it. */}
+          <DemoTip
+            id="demo-go-available"
+            show={agentStatus === 'offline' && !showStatusDropdown}
+            title="Set yourself available"
+            body="Click here and switch to Available to enter the queue and start receiving calls."
+            placement="bottom-start"
+          />
+
           {callFabric.conferenceJoinError && (
             <div className="ml-2 flex items-center gap-1.5 px-2 py-1 rounded bg-urgent/10 border border-urgent/30" title={callFabric.conferenceJoinError}>
               <AlertTriangle className="w-3.5 h-3.5 text-urgent-soft" />
@@ -204,9 +224,31 @@ export function UnifiedHeader({
 
               {availableQueues.length > 0 && (
                 <>
-                  <div className="px-3 py-2 border-t border-rule mt-1">
+                  <div className="px-3 py-2 border-t border-rule mt-1 flex items-center justify-between">
                     <span className="kicker">My queues</span>
                   </div>
+                  {queueTip.shouldShow && (
+                    <div className="mx-3 mb-1 px-2.5 py-2 rounded border border-ai/40 bg-ai/10">
+                      <div className="flex items-start gap-1.5">
+                        <Sparkles className="w-3 h-3 mt-0.5 text-ai-soft shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[11.5px] text-ink leading-snug">
+                            <span className="text-ai-soft font-medium">Activate a queue</span>{' '}
+                            to start receiving calls from it. You can be on
+                            multiple queues at once.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={(e) => { e.preventDefault(); queueTip.dismiss(); }}
+                          aria-label="Dismiss tip"
+                          className="-mt-0.5 -mr-0.5 p-0.5 rounded text-ink-dim hover:text-ink"
+                        >
+                          <XIcon className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <div className="max-h-48 overflow-y-auto pb-1">
                     {availableQueues.map(queue => (
                       <label

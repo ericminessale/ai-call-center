@@ -4,7 +4,8 @@ from app.api import calls_bp
 from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth, validate_json
-from app.utils.demo_config import block_in_demo_mode
+from app.utils.demo_config import block_in_demo_mode, is_demo_mode
+from app.utils.moderation import is_text_acceptable
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.services.queue_service import QueueService
 from datetime import datetime, timedelta
@@ -449,6 +450,19 @@ def send_ai_message(call_id):
         data = request.get_json()
         message_text = data.get('message')
         role = data.get('role', 'system')
+
+        # Hosted-demo content moderation: visitor types this text and
+        # the AI agent immediately speaks/acts on it. A slur or threat
+        # would be heard by anyone on the call. Reject before it
+        # reaches the AI.
+        if is_demo_mode():
+            ok, reason = is_text_acceptable(message_text)
+            if not ok:
+                return jsonify({
+                    'error': reason,
+                    'code': 'moderation_blocked',
+                    'field': 'message',
+                }), 422
 
         # Try to find by database ID first (if numeric), then by SignalWire SID
         call = None

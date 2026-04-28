@@ -159,6 +159,16 @@ Adds when M2 ships.
 - [ ] **Per-caller-ID inbound ratelimit enforced.** Spam an inbound
       from one phone number; verify the Nth call gets a polite reject
       SWML, not a successful agent connection.
+- [ ] **Visitor-typed content moderated.** Try to set a Contact
+      first/last/displayName, company, jobTitle, notes, or email field
+      to obvious profanity / a slur — both via POST /api/contacts and
+      PUT /api/contacts/<id>. Server returns 422 with
+      `code: 'moderation_blocked'`; frontend toast fires; nothing
+      persisted. Same for POST /api/calls/<id>/ai-message — message
+      text rejected before the AI sees it.
+- [ ] **Contact DELETE blocked in demo.** DELETE /api/contacts/<id>
+      returns 403 demo_blocked. Visitors can't griefingly nuke the
+      seeded contact list. (Production deletes normally.)
 
 ---
 

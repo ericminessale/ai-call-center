@@ -39,21 +39,25 @@ api.interceptors.response.use(
   (response) => response,
   async (error) => {
     // Hosted-demo soft-blocks return 403 with code 'demo_blocked'.
-    // Surface a single user-visible toast and re-reject so callers
-    // can short-circuit cleanly (the request was intentionally
-    // refused, not a transient failure to retry).
+    // Content-moderation rejections return 422 with code
+    // 'moderation_blocked'. Both surface a single user-visible toast
+    // and re-reject so callers can short-circuit cleanly (the
+    // request was intentionally refused, not a transient failure
+    // to retry).
+    const code = error.response?.data?.code;
     if (
-      error.response?.status === 403 &&
-      error.response?.data?.code === 'demo_blocked'
+      (error.response?.status === 403 && code === 'demo_blocked') ||
+      (error.response?.status === 422 && code === 'moderation_blocked')
     ) {
       // Lazy import to avoid circular dep on the toast lib at module
       // load. Only fires for users actually in demo mode.
       try {
         const { default: toast } = await import('react-hot-toast');
-        toast.error(
-          error.response.data.error ||
-            'That action is not available in demo mode.'
-        );
+        const fallback =
+          code === 'moderation_blocked'
+            ? 'Your input was flagged. Please rephrase.'
+            : 'That action is not available in demo mode.';
+        toast.error(error.response.data.error || fallback);
       } catch {
         // Toast lib unavailable — error still bubbles via the reject below.
       }

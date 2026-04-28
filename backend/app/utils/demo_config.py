@@ -97,11 +97,13 @@ def runtime_config() -> dict:
     }
 
 
-# Standard 403 body emitted when an outbound-dial endpoint is hit in
-# demo mode. Frontend keys off ``code: demo_blocked`` to render a
-# specific toast rather than a generic error.
+# Standard 403 body emitted when an action is refused in demo mode
+# (outbound dial, destructive deletes, etc.). Frontend keys off
+# ``code: demo_blocked`` to render a generic "not available in demo"
+# toast — verb-specific phrasing isn't needed because the user
+# already knows what action they tried to take.
 DEMO_BLOCKED_RESPONSE = {
-    'error': 'Outbound dialing is not available in demo mode.',
+    'error': 'That action is not available in demo mode.',
     'code': 'demo_blocked',
 }
 
@@ -109,19 +111,23 @@ DEMO_BLOCKED_RESPONSE = {
 def block_in_demo_mode(f):
     """Decorator that refuses the request with 403 when DEMO_MODE=true.
 
-    Apply to outbound-call-initiating endpoints so a demo visitor
-    can't dial real phone numbers from the public sandbox. The form
-    is still allowed to render (per the demo's transparency goal —
-    show what the feature does), but submission gets blocked here.
+    Use on any endpoint that should soft-fail in the public demo:
+    outbound dial (so visitors can't ring real phone numbers),
+    destructive deletes against seed fixtures (so visitors can't
+    nuke the demo for everyone else), etc.
 
-    Production-shape clone-and-own deployments are unaffected: the
-    decorator passes through when ``is_demo_mode()`` is false.
+    The form/UI is still allowed to render — per the demo's
+    transparency goal we show what the feature does, then refuse
+    only the actual server-side mutation. The frontend axios
+    interceptor catches the 403 and toasts.
 
-    NOTE: this only catches server-mediated outbound dial. Browser-
-    direct WebRTC dial via the Call Fabric SDK token bypasses the
-    backend entirely — defense for that path lives in the frontend
-    UI layer (the dial button shows a toast instead of firing) plus
-    SignalWire-project-level policy (out of scope for this app).
+    Production-shape clone-and-own deployments pass through
+    unchanged when ``is_demo_mode()`` is false.
+
+    NOTE on the WebRTC gap: this only catches server-mediated
+    actions. Browser-direct Call Fabric SDK dial bypasses the
+    backend entirely — frontend UI gating
+    (CallFabricContext.makeCall) handles that path.
     """
     from functools import wraps
 

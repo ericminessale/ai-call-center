@@ -4,8 +4,46 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
 from app.models import Contact, Call, CallLeg
+from app.utils.demo_config import block_in_demo_mode, is_demo_mode
+from app.utils.moderation import is_text_acceptable
 
 contacts_bp = Blueprint('contacts', __name__)
+
+
+# Fields a public demo visitor can type free-form text into. We
+# moderate every one before persisting in DEMO_MODE so a slur or
+# similar doesn't sit on a contact card until midnight reset.
+_MODERATED_CONTACT_FIELDS = (
+    'firstName', 'lastName', 'displayName',
+    'company', 'jobTitle', 'notes',
+    'email',  # cheap address-shaped sanity, mostly to catch slurs in
+              # the local-part — real validation should already block
+              # malformed addresses elsewhere.
+)
+
+
+def _check_contact_payload_moderation(data: dict):
+    """In demo mode, moderate every free-form text field on a contact
+    payload. Returns ``(body, status)`` tuple to bubble up on the
+    first flagged field, or ``None`` when everything passed.
+    """
+    if not is_demo_mode():
+        return None
+    for key in _MODERATED_CONTACT_FIELDS:
+        value = data.get(key)
+        if value is None:
+            continue
+        ok, reason = is_text_acceptable(str(value))
+        if not ok:
+            return (
+                {
+                    'error': reason,
+                    'code': 'moderation_blocked',
+                    'field': key,
+                },
+                422,
+            )
+    return None
 
 
 @contacts_bp.route('', methods=['GET'])
@@ -80,6 +118,10 @@ def create_contact():
     if not phone:
         return jsonify({'error': 'Phone number is required'}), 400
 
+    flagged = _check_contact_payload_moderation(data)
+    if flagged:
+        return jsonify(flagged[0]), flagged[1]
+
     # Check if contact already exists
     normalized_phone = Contact.normalize_phone(phone)
     existing = Contact.find_by_phone(normalized_phone)
@@ -122,6 +164,10 @@ def update_contact(contact_id):
 
     if not data:
         return jsonify({'error': 'No data provided'}), 400
+
+    flagged = _check_contact_payload_moderation(data)
+    if flagged:
+        return jsonify(flagged[0]), flagged[1]
 
     # Update fields if provided
     if 'firstName' in data:
@@ -168,8 +214,15 @@ def update_contact(contact_id):
 
 @contacts_bp.route('/<int:contact_id>', methods=['DELETE'])
 @jwt_required()
+@block_in_demo_mode
 def delete_contact(contact_id):
-    """Delete a contact."""
+    """Delete a contact.
+
+    Soft-blocked in DEMO_MODE — visitors otherwise could nuke the
+    seeded contact list one row at a time, breaking the demo for
+    everyone until the nightly reset. Production-shape deployments
+    delete normally.
+    """
     contact = Contact.query.get_or_404(contact_id)
 
     # Soft delete by blocking, or hard delete based on preference

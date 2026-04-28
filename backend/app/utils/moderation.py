@@ -40,8 +40,11 @@ logger = logging.getLogger(__name__)
 
 
 # Tight blocklist used as the offline fallback. Word boundaries on
-# both sides so 'class' doesn't match 'ass'. Lowercased before match.
-# Not exhaustive — for serious moderation, set OPENAI_API_KEY.
+# both sides so 'class' doesn't match 'ass'. Lowercased + leet-
+# normalized before match. Focus is canonical profanity + slurs that
+# OpenAI's moderation threshold sometimes lets through under
+# obfuscation (e.g. 'pu$$y', 'sh1t', 'f@ck'). Not exhaustive — for
+# serious moderation, set OPENAI_API_KEY for the semantic layer.
 _FALLBACK_BLOCKLIST = (
     # generic profanity (sample, lowercase)
     'fuck', 'shit', 'bitch', 'cunt', 'cock', 'dick', 'pussy', 'asshole',
@@ -51,10 +54,59 @@ _FALLBACK_BLOCKLIST = (
     'gook', 'wetback', 'beaner', 'kraut',
 )
 
-_FALLBACK_REGEX = re.compile(
-    r'\b(' + '|'.join(re.escape(w) for w in _FALLBACK_BLOCKLIST) + r')\b',
-    re.IGNORECASE,
-)
+# Word-boundary match against a leet-normalized haystack. We build
+# the pattern dynamically so each vowel position in a blocklist word
+# is treated as a tolerant class — matching the canonical vowel,
+# common censor characters ('*', '@', '!'), or nothing at all. That
+# catches a few obfuscation families at once:
+#   - 'f@ck' / 'f*ck'  (vowel replaced by censor mark)
+#   - 'fck' / 'sht'    (vowel deleted entirely)
+#   - 'fuck' / 'shit'  (canonical spelling)
+# Trickier bypasses (zero-width spaces, homoglyphs, per-letter
+# spacing like 'p u s s y') aren't handled here — that's the
+# OpenAI semantic layer's job.
+_VOWEL_CLASS = '[aeiou*@!]?'
+
+def _build_blocklist_regex(words: tuple[str, ...]) -> re.Pattern:
+    patterns = []
+    for word in words:
+        chars = []
+        for ch in word.lower():
+            if ch in 'aeiou':
+                chars.append(_VOWEL_CLASS)
+            else:
+                chars.append(re.escape(ch))
+        patterns.append(''.join(chars))
+    return re.compile(r'\b(' + '|'.join(patterns) + r')\b', re.IGNORECASE)
+
+
+_FALLBACK_REGEX = _build_blocklist_regex(_FALLBACK_BLOCKLIST)
+
+# Common leetspeak substitutions used to obfuscate blocklisted words.
+# Mapped 1:1 — covers the most frequent bypasses ('$' for 's', '@'
+# for 'a', '0' for 'o', etc.) without trying to be exhaustive.
+# Lowercase keys; the input is lowered before translation runs.
+_LEET_TABLE = str.maketrans({
+    '$': 's',
+    '5': 's',
+    '@': 'a',
+    '4': 'a',
+    '0': 'o',
+    '1': 'i',  # could equally map to 'l'; 'i' wins for our blocklist
+    '3': 'e',
+    '7': 't',
+    '!': 'i',
+    '|': 'i',
+})
+
+
+def _normalize_leet(text: str) -> str:
+    """Return the input lowercased and leet-substituted.
+
+    Applied before the local blocklist regex so 'pu$$y' / 'sh1t' /
+    'f@ck' get caught alongside their canonical spellings.
+    """
+    return text.lower().translate(_LEET_TABLE)
 
 
 def is_text_acceptable(text: Optional[str]) -> tuple[bool, str]:
@@ -84,9 +136,14 @@ def is_text_acceptable(text: Optional[str]) -> tuple[bool, str]:
             # law; a missed flag from a transient outage is fine.
             logger.warning("moderation: OpenAI check errored, falling back: %s", exc)
 
-    # Layer 2: local blocklist (always runs as a baseline).
-    match = _FALLBACK_REGEX.search(text)
-    if match:
+    # Layer 2: local blocklist (always runs as a baseline). Match
+    # against both the raw text AND the leet-normalized version so
+    # common script-kiddie bypasses ('pu$$y', 'sh1t') get caught
+    # even when OpenAI's threshold considers them ambiguous.
+    if (
+        _FALLBACK_REGEX.search(text)
+        or _FALLBACK_REGEX.search(_normalize_leet(text))
+    ):
         return False, 'Your input contains language we don\'t allow in this demo.'
 
     return True, ''

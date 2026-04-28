@@ -80,6 +80,29 @@ export const authApi = {
     api.put<{ user: any }>('/api/auth/me/languages', { languages }),
 };
 
+// Runtime config — public endpoint, fetched on app boot to decide
+// whether to render the production login or the hosted-demo landing.
+export interface DemoPhoneNumber {
+  label: string;
+  number: string;
+}
+
+export interface RuntimeConfig {
+  demo_mode: boolean;
+  demo_phone_numbers: DemoPhoneNumber[];
+}
+
+export const runtimeApi = {
+  get: () => api.get<RuntimeConfig>('/api/config/runtime'),
+};
+
+// Demo session — only succeeds when DEMO_MODE=true on the server.
+// Returns the same shape as authApi.login (JWT + user) so the frontend
+// can hand the response straight to the existing auth handlers.
+export const demoApi = {
+  start: () => api.post<AuthResponse>('/api/demo/start'),
+};
+
 export const callsApi = {
   initiate: (destination: string, destination_type: 'phone' | 'sip', auto_transcribe: boolean = false) =>
     api.post<{ success: boolean; call_id: string; call_sid: string; destination: string; status: string }>(

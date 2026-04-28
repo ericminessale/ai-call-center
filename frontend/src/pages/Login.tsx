@@ -4,13 +4,21 @@ import { useAuthStore } from '../stores/authStore';
 import { AlertCircle, Eye, EyeOff, Loader2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import Logo from '../components/shared/Logo';
+import DemoLanding from './DemoLanding';
 
 export default function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const { login, isLoading, error } = useAuthStore();
+  const { login, isLoading, error, runtimeConfig } = useAuthStore();
   const navigate = useNavigate();
+
+  // Hosted-demo deployment: render the no-signup landing card instead
+  // of the login form. Production-shape deployments fall through to
+  // the normal login flow below.
+  if (runtimeConfig?.demo_mode) {
+    return <DemoLanding />;
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

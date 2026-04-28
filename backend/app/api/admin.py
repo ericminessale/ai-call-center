@@ -10,7 +10,30 @@ from app.utils.jwt_utils import verify_token
 from app.utils.url_utils import get_base_url
 from app.services import signalwire_client as sw_client
 
+from app.utils.demo_config import DEMO_AGENT_ROLE
+
+# Roles a real admin is allowed to assign via the User Management UI.
+# ``demo_agent`` is intentionally NOT in this set: the role is reserved
+# for hosted-demo personas seeded at boot (see services/demo_seed.py),
+# never something an admin should grant manually.
 VALID_USER_ROLES = ('admin', 'supervisor', 'agent')
+
+
+def _refuse_if_demo_persona(user) -> tuple[dict, int] | None:
+    """Refuse mutation on a hosted-demo persona row.
+
+    Demo agents are pool fixtures owned by the seed layer, not human
+    team members. The admin UI never lists them and these endpoints
+    won't touch them either, so a curl-with-the-id attempt also fails.
+    Returns a (body, status) error tuple to bubble up, or None when the
+    user is a real teammate that can be modified normally.
+    """
+    if user is not None and user.role == DEMO_AGENT_ROLE:
+        return (
+            {'error': 'Demo personas cannot be modified through admin endpoints'},
+            403,
+        )
+    return None
 
 
 @admin_bp.before_request
@@ -699,9 +722,19 @@ def update_agent_assignments():
 @admin_bp.route('/users', methods=['GET'])
 @require_auth
 def list_users():
-    """List all users for admin management."""
+    """List all users for admin management.
+
+    Demo personas (``role='demo_agent'``) are filtered out — they're
+    pool fixtures, not human team members. The admin doesn't manage
+    them through this view.
+    """
     try:
-        users = User.query.order_by(User.created_at.desc()).all()
+        users = (
+            User.query
+            .filter(User.role != DEMO_AGENT_ROLE)
+            .order_by(User.created_at.desc())
+            .all()
+        )
         return jsonify({
             'users': [u.to_dict() for u in users]
         }), 200
@@ -725,6 +758,10 @@ def update_user(user_id):
     user = User.query.get(user_id)
     if not user:
         return jsonify({'error': 'User not found'}), 404
+
+    refused = _refuse_if_demo_persona(user)
+    if refused:
+        return jsonify(refused[0]), refused[1]
 
     # Prevent admins from demoting themselves — avoids lockout when there is
     # only one admin left.
@@ -766,6 +803,10 @@ def update_user_languages(user_id):
     user = User.query.get(user_id)
     if not user:
         return jsonify({'error': 'User not found'}), 404
+
+    refused = _refuse_if_demo_persona(user)
+    if refused:
+        return jsonify(refused[0]), refused[1]
 
     try:
         user.languages = languages
@@ -819,6 +860,10 @@ def update_user_permissions(user_id):
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
+    refused = _refuse_if_demo_persona(user)
+    if refused:
+        return jsonify(refused[0]), refused[1]
+
     try:
         user.permissions = permissions
         db.session.commit()
@@ -845,6 +890,10 @@ def delete_user(user_id):
         user = User.query.get(user_id)
         if not user:
             return jsonify({'error': 'User not found'}), 404
+
+        refused = _refuse_if_demo_persona(user)
+        if refused:
+            return jsonify(refused[0]), refused[1]
 
         user_email = user.email
 

@@ -12,11 +12,15 @@ import CallDetails from './components/CallDetails';
 import ProtectedRoute from './components/ProtectedRoute';
 
 function App() {
-  const { checkAuth } = useAuthStore();
+  const { checkAuth, fetchRuntimeConfig } = useAuthStore();
 
   useEffect(() => {
+    // Fetch runtime config first so the Login route knows whether to
+    // show the production form or the hosted-demo landing card. Both
+    // calls run in parallel; neither blocks the other.
+    fetchRuntimeConfig();
     checkAuth();
-  }, [checkAuth]);
+  }, [checkAuth, fetchRuntimeConfig]);
 
   return (
     <SocketProvider>

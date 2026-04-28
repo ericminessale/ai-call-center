@@ -114,6 +114,7 @@ def create_app():
     from app.api.fabric import fabric_bp
     from app.api.ai_control import ai_control_bp
     from app.api.internal import internal_bp
+    from app.api.demo import demo_bp
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(calls_bp, url_prefix='/api/calls')
     app.register_blueprint(contacts_bp, url_prefix='/api/contacts')
@@ -126,6 +127,10 @@ def create_app():
     app.register_blueprint(conferences_bp, url_prefix='/api/conferences')
     app.register_blueprint(call_control_bp, url_prefix='/api/call-control')
     app.register_blueprint(internal_bp, url_prefix='/api/internal')
+    # Demo blueprint mounts at /api (so config/runtime + demo/start sit
+    # cleanly under their respective paths); it self-gates on DEMO_MODE
+    # internally — registering it on every deployment is safe.
+    app.register_blueprint(demo_bp, url_prefix='/api')
 
     # Initialize tap audio relay WebSocket routes
     from app.services.tap_relay import init_tap_relay
@@ -155,5 +160,18 @@ def create_app():
         app.logger.warning(f"[fabric_sync] startup sync: {result}")
     except Exception as e:
         app.logger.warning(f"[fabric_sync] startup sync failed (non-fatal): {e}")
+
+    # Top up the demo-persona pool when DEMO_MODE is on. Idempotent —
+    # no-op on production-shape clone-and-own deployments.
+    try:
+        from app.utils.demo_config import is_demo_mode
+        if is_demo_mode():
+            with app.app_context():
+                from app.services.demo_seed import seed_demo_personas
+                seed_result = seed_demo_personas()
+                app.logger.warning(f"[demo_seed] startup: {seed_result}")
+    except Exception as e:
+        # Don't crash the app for a seed failure — log loudly so it gets fixed.
+        app.logger.error(f"[demo_seed] startup failed (non-fatal): {e}")
 
     return app

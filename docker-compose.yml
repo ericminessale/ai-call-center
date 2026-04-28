@@ -77,7 +77,13 @@ services:
       # Application
       FLASK_APP: app
       FLASK_ENV: ${FLASK_ENV:-production}
-      DEMO_MODE: ${DEMO_MODE:-true}  # Set to false in production
+      # DEMO_MODE gates the hosted-demo behavior (landing card, demo
+      # personas, /api/demo/start). Defaults OFF — clone-and-own
+      # deployments stay in production shape. Set DEMO_MODE=true in
+      # .env (and DEMO_PHONE_NUMBERS=...) to flip to demo mode.
+      DEMO_MODE: ${DEMO_MODE:-false}
+      DEMO_PHONE_NUMBERS: ${DEMO_PHONE_NUMBERS:-}
+      DEMO_POOL_SIZE: ${DEMO_POOL_SIZE:-20}
       PYTHONUNBUFFERED: 1
     volumes:
       - ./backend:/app

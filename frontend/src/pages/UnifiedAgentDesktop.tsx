@@ -4,6 +4,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useCallFabricContext, ConnectedCustomer } from '../contexts/CallFabricContext';
 import { useSocket } from '../hooks/useSocket';
 import { UnifiedHeader } from '../components/unified/UnifiedHeader';
+import { DemoBanner } from '../components/shared/DemoBanner';
 import { LeftPanel } from '../components/unified/LeftPanel';
 import { IncomingCallBanner } from '../components/unified/IncomingCallBanner';
 import { SettingsPanel } from '../components/unified/SettingsPanel';
@@ -652,6 +653,10 @@ export function UnifiedAgentDesktop() {
 
   return (
     <div className="h-screen flex flex-col bg-canvas">
+      {/* Hosted-demo strip — renders only when DEMO_MODE=true on the
+          backend. No-op in production-shape deployments. */}
+      <DemoBanner />
+
       {/* Incoming Call Banner - show for inbound calls */}
       {callFabric.callState === 'ringing' && callFabric.activeCall && callFabric.activeCall.direction === 'inbound' && (
         <IncomingCallBanner

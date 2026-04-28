@@ -623,6 +623,27 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // If agent is in conference (available), use server-side dial-out to add to conference
   // If agent is offline, auto-switch to available first, then dial-out
   const makeCall = useCallback(async (phoneNumber: string, context?: any) => {
+    // Hosted-demo lockdown: refuse all outbound dial at the source
+    // before any backend call or WebRTC session setup. The user-
+    // facing toast shows immediately; the form/buttons that called
+    // us still render normally per the demo's "show what the
+    // platform does, just don't let it dial out" approach.
+    //
+    // Defense in depth: backend endpoints
+    // (/api/conferences/<n>/dial-out, /api/calls/initiate,
+    // /api/ai/outbound-call) also return 403 demo_blocked. This
+    // frontend gate exists because the agent-joins-outbound-
+    // conference path uses the Call Fabric SDK directly browser→SW,
+    // bypassing the backend entirely on the WebRTC half.
+    const isDemo = useAuthStore.getState().runtimeConfig?.demo_mode;
+    if (isDemo) {
+      const { default: toast } = await import('react-hot-toast');
+      toast.error('Outbound dialing is not available in demo mode.');
+      const err: any = new Error('Outbound dialing not available in demo mode.');
+      err.code = 'demo_blocked';
+      throw err;
+    }
+
     const token = localStorage.getItem('access_token');
 
     // Helper function to dial out via backend API (joins call to agent's conference)

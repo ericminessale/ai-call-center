@@ -139,9 +139,17 @@ Adds when M2 ships.
 ## M3 — Lockdowns
 
 - [ ] **All universal + M1 + M2 items still pass.**
-- [ ] **Outbound dial blocked.** Any code path that calls
-      `client.calling.create_call()` (outbound) returns a "demo mode"
-      error in `DEMO_MODE=true`. Verify by tracing every call site.
+- [ ] **Outbound dial blocked at the frontend (primary gate).** The
+      Call Fabric SDK's browser-direct WebRTC dial bypasses the
+      backend entirely on the WebRTC half, so the *primary* gate is
+      `CallFabricContext.makeCall` refusing immediately when
+      `runtimeConfig.demo_mode === true`. Verify clicking any dial
+      button (contact "Call", QuickDialDropdown, etc.) shows a toast
+      and the network tab shows zero outbound API calls.
+- [ ] **Outbound dial blocked at the backend (defense in depth).** Any
+      code path that calls `client.calling.create_call()` (outbound)
+      returns a "demo mode" error in `DEMO_MODE=true`. Verify by
+      tracing every call site.
 - [ ] **Subscriber CRUD blocked.** Even a real admin JWT cannot
       create/update/delete `demo_agent` users while in demo mode. The
       pool is operator-only, not user-editable.

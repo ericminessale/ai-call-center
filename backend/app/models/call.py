@@ -39,6 +39,12 @@ class Call(db.Model):
     caller_language = db.Column(db.String(20), nullable=True)  # BCP-47 (e.g. "es-ES")
     needs_translation = db.Column(db.Boolean, default=False, nullable=False)
 
+    # Wrap-up fields (Tier 2a) — set by the human agent (or supervisor) once the call ends.
+    # `summary` and `ai_context` above are AI-generated; these columns are the agent's record.
+    disposition_code = db.Column(db.String(50), nullable=True)  # e.g. "resolved", "callback-scheduled"
+    agent_notes = db.Column(db.Text, nullable=True)  # free-text wrap-up notes
+    wrapped_up_at = db.Column(db.DateTime, nullable=True)  # timestamp the wrap-up was finalized
+
     # Relationships
     transcriptions = db.relationship('Transcription', backref='call', lazy='dynamic', cascade='all, delete-orphan')
     webhook_events = db.relationship('WebhookEvent', backref='call', lazy='dynamic', cascade='all, delete-orphan')
@@ -127,6 +133,10 @@ class Call(db.Model):
             'wait_time_seconds': self.wait_time_seconds,
             'caller_language': self.caller_language,
             'needs_translation': self.needs_translation,
+            # Wrap-up
+            'dispositionCode': self.disposition_code,
+            'agentNotes': self.agent_notes,
+            'wrappedUpAt': self.wrapped_up_at.isoformat() if self.wrapped_up_at else None,
         }
 
         if include_contact and self.contact:

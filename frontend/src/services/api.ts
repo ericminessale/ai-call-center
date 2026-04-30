@@ -199,6 +199,107 @@ export const callsApi = {
   // Get real-time agent stats for header bar
   getMyStats: () =>
     api.get<{ success: boolean; stats: { callsToday: number; avgHandleTime: number; queueDepth: number; longestWait: number } }>('/api/calls/my-stats'),
+
+  // Wrap-up (Tier 2a) — disposition codes + agent notes for ended calls.
+  listDispositions: () =>
+    api.get<{
+      dispositions: Array<{ code: string; label: string; description: string }>;
+    }>('/api/calls/dispositions'),
+  saveWrapUp: (
+    call_id: number | string,
+    payload: { disposition_code?: string | null; agent_notes?: string | null }
+  ) =>
+    api.put<{
+      success: boolean;
+      call: {
+        id: number;
+        disposition_code: string | null;
+        agent_notes: string | null;
+        wrapped_up_at: string | null;
+      };
+    }>(`/api/calls/${call_id}/wrap-up`, payload),
+};
+
+// =============================================================================
+// Callbacks API (Tier 2r)
+// =============================================================================
+
+export type CallbackStatus = 'pending' | 'claimed' | 'completed' | 'expired';
+export type CallbackOutcome =
+  | 'success'
+  | 'no-answer'
+  | 'voicemail'
+  | 'declined'
+  | 'wrong-number'
+  | 'expired';
+
+export interface Callback {
+  id: number;
+  callId: number | null;
+  contactId: number | null;
+  queueId: string | null;
+  phoneNumber: string;
+  callerName: string | null;
+  reason: string | null;
+  aiContext: Record<string, unknown>;
+  requestedAt: string;
+  expiresAt: string;
+  claimedByAgentId: number | null;
+  claimedAt: string | null;
+  completedAt: string | null;
+  attempts: number;
+  outcome: CallbackOutcome | null;
+  notes: string | null;
+  status: CallbackStatus;
+  isExpired: boolean;
+  waitMinutes: number | null;
+  contact?: ContactMinimal;
+}
+
+export const callbacksApi = {
+  list: (params?: { queue_id?: string; status?: CallbackStatus | 'all'; mine?: boolean; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.queue_id) qs.set('queue_id', params.queue_id);
+    if (params?.status) qs.set('status', params.status);
+    if (params?.mine) qs.set('mine', 'true');
+    if (params?.limit) qs.set('limit', String(params.limit));
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return api.get<{ callbacks: Callback[]; total: number }>(`/api/callbacks${suffix}`);
+  },
+
+  pendingCount: (queue_id?: string) => {
+    const suffix = queue_id ? `?queue_id=${encodeURIComponent(queue_id)}` : '';
+    return api.get<{ pending: number }>(`/api/callbacks/pending-count${suffix}`);
+  },
+
+  get: (id: number) => api.get<{ callback: Callback }>(`/api/callbacks/${id}`),
+
+  forContact: (contactId: number) =>
+    api.get<{ callback: Callback | null }>(`/api/callbacks/for-contact/${contactId}`),
+
+  create: (payload: {
+    phone_number: string;
+    call_id?: number | string;
+    contact_id?: number;
+    queue_id?: string;
+    caller_name?: string;
+    reason?: string;
+    ai_context?: Record<string, unknown>;
+    expiry_hours?: number;
+  }) => api.post<{ callback: Callback }>('/api/callbacks', payload),
+
+  claim: (id: number) => api.put<{ callback: Callback }>(`/api/callbacks/${id}/claim`, {}),
+  release: (id: number) => api.put<{ callback: Callback }>(`/api/callbacks/${id}/release`, {}),
+  recordOutcome: (
+    id: number,
+    payload: { outcome: CallbackOutcome; notes?: string; retry?: boolean }
+  ) =>
+    api.put<{ callback: Callback; retry?: Callback }>(`/api/callbacks/${id}/outcome`, payload),
+
+  dial: (id: number) =>
+    api.post<{ callback: Callback; call_id: string; outbound_call_db_id: number }>(
+      `/api/callbacks/${id}/dial`
+    ),
 };
 
 export const conferencesApi = {
@@ -345,6 +446,41 @@ export const adminApi = {
     api.get(`/api/admin/queues/${queueId}/agents`),
   updateQueueAgents: (queueId: number, assignments: Array<{ user_id: number; skill_level?: number }>) =>
     api.put(`/api/admin/queues/${queueId}/agents`, { assignments }),
+
+  // Webhook event log — every signed callback we accept is recorded for
+  // post-hoc debugging (Tier 2i). UI paginates; backend defaults page=1, per_page=50.
+  listWebhookEvents: (params?: {
+    event_type?: string;
+    call_id?: number;
+    processed?: boolean;
+    page?: number;
+    per_page?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params?.event_type) qs.set('event_type', params.event_type);
+    if (params?.call_id) qs.set('call_id', String(params.call_id));
+    if (typeof params?.processed === 'boolean') qs.set('processed', String(params.processed));
+    if (params?.page) qs.set('page', String(params.page));
+    if (params?.per_page) qs.set('per_page', String(params.per_page));
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return api.get<{
+      events: Array<{
+        id: number;
+        call_id: number | null;
+        event_type: string;
+        payload: unknown;
+        processed: boolean;
+        error_message: string | null;
+        created_at: string | null;
+      }>;
+      page: number;
+      per_page: number;
+      total: number;
+      has_more: boolean;
+    }>(`/api/admin/webhook-events${suffix}`);
+  },
+  listWebhookEventTypes: () =>
+    api.get<{ event_types: string[] }>('/api/admin/webhook-events/event-types'),
 
   // MCP Gateway management — customer-configurable external tool integrations
   // (Salesforce, Zendesk, custom MCP servers, etc.) per agent.

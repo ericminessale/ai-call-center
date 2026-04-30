@@ -533,43 +533,65 @@ def route_call_to_queue(queue_id):
         if call and call.created_at:
             wait_time_seconds = (datetime.utcnow() - call.created_at).total_seconds()
 
-        # After 2 minutes, offer to go back to AI
-        MAX_WAIT_BEFORE_AI_OFFER = 120  # 2 minutes
-        offer_ai_fallback = wait_time_seconds > MAX_WAIT_BEFORE_AI_OFFER
+        # IVR-fallback threshold (Tier 1c) — read from per-queue config when present.
+        # Above this, the caller has waited long enough that we proactively offer the
+        # IVR menu (Press 1 AI / 2 callback / 3 hold). Falls back to 120s if the
+        # queue config row is missing or doesn't override it.
+        queue_config = Queue.find_by_slug(queue_id)
+        fallback_threshold = (
+            queue_config.max_wait_before_ai_fallback
+            if queue_config and queue_config.max_wait_before_ai_fallback
+            else 120
+        )
 
-        logger.info(f"Call {call_id} wait time: {wait_time_seconds:.0f}s, offer AI: {offer_ai_fallback}")
+        # Once the IVR menu has been offered to a caller, don't re-show it on every
+        # 30-second route loop — that would be infuriating. We track whether the
+        # menu has already been played in Redis (per-call ephemeral state, 1h TTL).
+        ivr_shown_key = f"ivr_shown:{call_id}" if call_id else None
+        ivr_already_shown = False
+        if ivr_shown_key:
+            try:
+                redis = get_redis_client()
+                ivr_already_shown = bool(redis.get(ivr_shown_key))
+            except Exception as exc:
+                # Redis being down shouldn't break call routing — fail safe to "not shown"
+                # so the menu plays at most an extra time, which is recoverable.
+                logger.warning("Could not read IVR-shown flag from Redis: %s", exc)
+
+        offer_ivr_menu = wait_time_seconds > fallback_threshold and not ivr_already_shown
+
+        logger.info(
+            "Call %s wait=%.0fs threshold=%ds ivr_shown=%s offer_menu=%s",
+            call_id, wait_time_seconds, fallback_threshold, ivr_already_shown, offer_ivr_menu,
+        )
 
         # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
         base_url = get_base_url()
 
-        # Build appropriate SWML response based on wait time
-        if offer_ai_fallback:
-            # Offer AI fallback after waiting too long
-            # Look up AI agent fallback from queue config
-            queue_config = Queue.find_by_slug(queue_id)
-            ai_agent = queue_config.ai_agent_route.lstrip('/') if queue_config and queue_config.ai_agent_route else 'receptionist'
-
+        # Build appropriate SWML response based on wait time + IVR-shown state
+        if offer_ivr_menu:
+            # Past the threshold and the menu hasn't been shown yet — transfer to
+            # the IVR. /hold-menu will play the prompt, capture the DTMF, and
+            # branch into AI-transfer / callback / continued-hold accordingly.
             swml_response = {
                 "version": "1.0.0",
                 "sections": {
                     "main": [
                         {
                             "play": {
-                                "url": f"say:We apologize for the extended wait. "
-                                       f"All our specialists are still assisting other customers. "
-                                       f"Let me connect you with our AI assistant who may be able to help you right away."
+                                "url": "say:We apologize for the extended wait. "
+                                       "All our specialists are still assisting other customers."
                             }
                         },
-                        # Transfer to AI agent
                         {
                             "transfer": {
-                                "dest": f"{base_url}/{ai_agent}"
+                                "dest": f"{base_url}/api/queues/{queue_id}/hold-menu"
                             }
                         }
                     ]
                 }
             }
-            logger.info(f"Transferring call {call_id} to AI fallback: {ai_agent}")
+            logger.info(f"Routing call {call_id} to IVR fallback menu (queue={queue_id})")
         else:
             # Normal hold message
             swml_response = {
@@ -629,8 +651,14 @@ def queue_hold_menu(queue_id):
     Hold menu with DTMF options for callers waiting in queue.
     Options:
     - Press 1: Speak with AI specialist
-    - Press 2: Request callback
+    - Press 2: Request callback (Tier 2r — not yet wired up)
     - Press 3: Stay on hold
+
+    Reached from /route once a caller has been waiting longer than the
+    queue's `max_wait_before_ai_fallback` threshold. We also set an
+    "ivr_shown" flag in Redis so /route's hold-message loop doesn't
+    re-trigger this menu every 30 seconds — once the caller has heard
+    their options, they keep waiting in peace.
     """
     try:
         data = request.json or {}
@@ -638,6 +666,18 @@ def queue_hold_menu(queue_id):
         call_id = call_data.get('call_id') or data.get('CallSid') or data.get('call_id')
 
         logger.info(f"Hold menu for call {call_id} in queue {queue_id}")
+
+        # Mark this call as having seen the IVR menu so /route falls through
+        # to the normal hold-loop on subsequent ticks. 1h TTL is generous —
+        # any call that's still alive after that has worse problems than
+        # menu-replay.
+        if call_id:
+            try:
+                redis = get_redis_client()
+                redis.setex(f"ivr_shown:{call_id}", 3600, "1")
+            except Exception as exc:
+                # Worst case: the menu plays once more. Not catastrophic.
+                logger.warning("Could not record IVR-shown flag in Redis: %s", exc)
 
         # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
         base_url = get_base_url()
@@ -685,15 +725,17 @@ def queue_hold_menu(queue_id):
                                     }
                                 ],
                                 "2": [
+                                    # Press 2 — request callback. We bounce to a
+                                    # dedicated SWML endpoint that records the
+                                    # Callback row server-side, then plays the
+                                    # confirmation. Keeping the recording in a
+                                    # follow-up SWML lets us return a sensible
+                                    # message even if the DB write fails.
                                     {
-                                        "play": {
-                                            "url": "say:We have added you to our callback list. "
-                                                   "An agent will call you back as soon as one becomes available. "
-                                                   "Thank you for calling. Goodbye."
+                                        "transfer": {
+                                            "dest": f"{base_url}/api/queues/{queue_id}/callback-request"
                                         }
-                                    },
-                                    # TODO: Implement callback registration
-                                    "hangup"
+                                    }
                                 ],
                                 "3": [
                                     # Stay on hold - go to hold loop
@@ -737,6 +779,89 @@ def queue_hold_menu(queue_id):
                             "dest": f"{base_url}/api/queues/{queue_id}/route"
                         }
                     }
+                ]
+            }
+        })
+
+
+@queues_bp.route('/<queue_id>/callback-request', methods=['POST'])
+def queue_callback_request(queue_id):
+    """SWML endpoint hit when a hold-menu caller presses 2 (request callback).
+
+    Records a Callback row from the originating Call's context, then
+    plays the confirmation message and hangs up. We deliberately do
+    the DB write here (not from the AI agent) so the row exists even
+    if the SWML chain is interrupted afterwards.
+    """
+    try:
+        # Lazy import to avoid circular import at module load time.
+        from app.models.callback import Callback as CallbackModel
+
+        data = request.json or {}
+        call_data = data.get('call', {})
+        call_id = call_data.get('call_id') or data.get('CallSid') or data.get('call_id')
+
+        logger.info(f"Callback request for call {call_id} in queue {queue_id}")
+
+        call = Call.find_by_sid(call_id) if call_id else None
+        callback_row = None
+        if call:
+            try:
+                callback_row = CallbackModel.create_from_call(call=call, queue_id=queue_id)
+                db.session.add(callback_row)
+                db.session.commit()
+                logger.info(
+                    'Created callback %s for call %s (phone=%s, queue=%s)',
+                    callback_row.id, call.id, callback_row.phone_number, queue_id,
+                )
+                # Notify the agent dashboard so the pending-callback badge
+                # increments without a polling round-trip.
+                try:
+                    from app import socketio as _socketio
+                    _socketio.emit('callback_event', {
+                        'event': 'created',
+                        'callback': callback_row.to_dict(include_contact=True),
+                    })
+                except Exception as exc:
+                    logger.warning('Failed to emit callback_event(created): %s', exc)
+            except Exception as exc:
+                # Don't propagate the DB error to the caller — they should
+                # still hear a graceful confirmation. We log + fall through.
+                logger.error('Failed to create callback row from /callback-request: %s', exc)
+                callback_row = None
+        else:
+            logger.warning(f'/callback-request: no Call row found for call_id={call_id}')
+
+        # Branching message — admit it if we couldn't actually record the request,
+        # rather than promising a callback we won't deliver.
+        if callback_row is not None:
+            confirmation = (
+                "say:Thank you. We've added you to the callback list. "
+                "An agent will reach out as soon as one becomes available. Goodbye."
+            )
+        else:
+            confirmation = (
+                "say:We're sorry, we couldn't record your callback request. "
+                "Please call us back shortly. Goodbye."
+            )
+
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": confirmation}},
+                    "hangup",
+                ]
+            }
+        })
+    except Exception as exc:
+        logger.error('Error in /callback-request: %s', exc)
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": "say:Sorry, something went wrong. Please call back shortly. Goodbye."}},
+                    "hangup",
                 ]
             }
         })

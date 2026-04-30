@@ -877,6 +877,117 @@ def get_call_legs(call_id):
         return jsonify({'error': f'Failed to get call legs: {str(e)}'}), 500
 
 
+# =============================================================================
+# Call Wrap-up (Tier 2a)
+# =============================================================================
+
+# Disposition codes — short slugs the agent picks during wrap-up. Kept as a
+# Python constant for v1 so the list is reviewable in code; admin-configurable
+# storage can come later via system_config without breaking this contract.
+DISPOSITION_CODES = [
+    {'code': 'resolved',           'label': 'Resolved',             'description': "Caller's issue was handled."},
+    {'code': 'transferred',        'label': 'Transferred',          'description': 'Routed to another agent or department.'},
+    {'code': 'callback-scheduled', 'label': 'Callback scheduled',   'description': 'Will call the contact back later.'},
+    {'code': 'escalated',          'label': 'Escalated',            'description': 'Passed up to a supervisor.'},
+    {'code': 'sales-opportunity',  'label': 'Sales opportunity',    'description': 'Lead worth following up on.'},
+    {'code': 'technical-issue',    'label': 'Technical issue',      'description': 'Could not resolve due to a technical limitation.'},
+    {'code': 'no-answer',          'label': 'No answer / voicemail', 'description': 'Outbound only — call went unanswered or to voicemail.'},
+    {'code': 'wrong-number',       'label': 'Wrong number',         'description': 'Misrouted or invalid contact.'},
+    {'code': 'spam',               'label': 'Spam / robocall',      'description': 'Unsolicited or automated.'},
+    {'code': 'abandoned',          'label': 'Abandoned',            'description': 'Caller dropped before resolution.'},
+    {'code': 'other',              'label': 'Other',                'description': 'Something else — see notes.'},
+]
+DISPOSITION_CODE_SET = {d['code'] for d in DISPOSITION_CODES}
+
+
+@calls_bp.route('/dispositions', methods=['GET'])
+@require_auth
+def list_dispositions():
+    """Return the disposition code dictionary for the wrap-up dropdown."""
+    return jsonify({'dispositions': DISPOSITION_CODES}), 200
+
+
+@calls_bp.route('/<call_id>/wrap-up', methods=['PUT'])
+@require_auth
+def update_wrap_up(call_id):
+    """Save the agent's wrap-up — disposition code and / or notes.
+
+    Either field is optional individually; sending neither is a no-op
+    (still returns 200 so a debounced UI doesn't churn). The first time
+    *anything* is saved we stamp `wrapped_up_at`; subsequent edits update
+    the values but leave the original timestamp alone so reporting can
+    answer "when was wrap-up first completed."
+    """
+    try:
+        data = request.get_json() or {}
+        disposition_code = data.get('disposition_code')
+        agent_notes = data.get('agent_notes')
+
+        # Validate disposition early — reject anything we don't recognise so
+        # we don't pollute reporting with typos. None / empty string clears.
+        if disposition_code is not None and disposition_code != '' \
+                and disposition_code not in DISPOSITION_CODE_SET:
+            return jsonify({
+                'error': f'Unknown disposition code: {disposition_code}',
+                'valid_codes': sorted(DISPOSITION_CODE_SET),
+            }), 400
+
+        # Notes have a generous size cap to prevent abuse / accidents.
+        if agent_notes is not None and len(agent_notes) > 5000:
+            return jsonify({'error': 'agent_notes must be 5000 characters or fewer'}), 400
+
+        # Look up by numeric ID first, then SignalWire call_sid.
+        call = None
+        if str(call_id).isdigit():
+            call = db.session.query(Call).filter_by(id=int(call_id)).first()
+        if not call:
+            call = Call.find_by_sid(call_id)
+        if not call:
+            return jsonify({'error': 'Call not found'}), 404
+
+        changed = False
+        if 'disposition_code' in data:
+            new_disp = disposition_code or None  # treat empty string as clear
+            if call.disposition_code != new_disp:
+                call.disposition_code = new_disp
+                changed = True
+        if 'agent_notes' in data:
+            new_notes = agent_notes or None
+            if call.agent_notes != new_notes:
+                call.agent_notes = new_notes
+                changed = True
+
+        if changed and not call.wrapped_up_at:
+            call.wrapped_up_at = datetime.utcnow()
+
+        if changed:
+            db.session.commit()
+            logger.info(
+                "Wrap-up saved for call %s: disposition=%s notes_len=%s",
+                call.id,
+                call.disposition_code,
+                len(call.agent_notes) if call.agent_notes else 0,
+            )
+
+            # Notify other clients viewing this contact / call so the panel updates live.
+            from app.services.callcenter_socketio import emit_call_update
+            emit_call_update(call)
+
+        return jsonify({
+            'success': True,
+            'call': {
+                'id': call.id,
+                'disposition_code': call.disposition_code,
+                'agent_notes': call.agent_notes,
+                'wrapped_up_at': call.wrapped_up_at.isoformat() if call.wrapped_up_at else None,
+            },
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to save wrap-up: {str(e)}")
+        return jsonify({'error': f'Failed to save wrap-up: {str(e)}'}), 500
+
+
 @calls_bp.route('/cleanup-stale', methods=['POST'])
 @require_auth
 def cleanup_stale_calls():

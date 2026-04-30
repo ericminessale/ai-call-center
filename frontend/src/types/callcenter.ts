@@ -117,6 +117,10 @@ export interface Interaction {
   endedAt?: string;
   contact?: ContactMinimal;
   legs?: CallLeg[];  // Call legs for tracking handler transitions
+  // Wrap-up (Tier 2a) — set by the human agent post-call.
+  dispositionCode?: string | null;
+  agentNotes?: string | null;
+  wrappedUpAt?: string | null;
 }
 
 export interface ContactsListResponse {

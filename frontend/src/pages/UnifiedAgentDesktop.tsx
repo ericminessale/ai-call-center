@@ -10,8 +10,9 @@ import { LeftPanel } from '../components/unified/LeftPanel';
 import { IncomingCallBanner } from '../components/unified/IncomingCallBanner';
 import { SettingsPanel } from '../components/unified/SettingsPanel';
 import { ContactDetailView } from '../components/contacts/ContactDetailView';
-import { contactsApi, callsApi, queueApi, callControlApi } from '../services/api';
+import { contactsApi, callsApi, queueApi, callControlApi, Callback } from '../services/api';
 import { Contact, ContactMinimal, Call, QueueConfig } from '../types/callcenter';
+import { CallbackDetail } from '../components/unified/CallbackDetail';
 import type { SentimentData } from '../components/contacts/LiveCallTab';
 import { Users, Phone, ListTodo } from 'lucide-react';
 import { ContactDetailSkeleton } from '../components/shared/Skeleton';
@@ -21,7 +22,7 @@ import { logger } from '../lib/logger';
 import { mapCall, mapCalls } from '../lib/mapCall';
 
 // View modes for the unified interface
-export type ViewMode = 'contacts' | 'calls' | 'queue' | 'supervisor' | 'settings';
+export type ViewMode = 'contacts' | 'calls' | 'queue' | 'callbacks' | 'supervisor' | 'settings';
 
 // Agent status options
 export type AgentStatus = 'available' | 'busy' | 'after-call' | 'break' | 'offline';
@@ -41,6 +42,7 @@ export function UnifiedAgentDesktop() {
   const getInitialViewMode = (): ViewMode => {
     if (location.pathname.startsWith('/calls')) return 'calls';
     if (location.pathname.startsWith('/queue')) return 'queue';
+    if (location.pathname.startsWith('/callbacks')) return 'callbacks';
     if (location.pathname.startsWith('/supervisor')) return 'supervisor';
     if (location.pathname.startsWith('/settings')) return 'settings';
     return 'contacts';
@@ -77,6 +79,10 @@ export function UnifiedAgentDesktop() {
 
   // Queue configs for filter pills + badges
   const [queueConfigs, setQueueConfigs] = useState<QueueConfig[]>([]);
+
+  // Callback System (Tier 2r) — selected row + pending-count for header badge.
+  const [selectedCallback, setSelectedCallback] = useState<Callback | null>(null);
+  const [pendingCallbackCount, setPendingCallbackCount] = useState(0);
 
   // Live sentiment from AI agents, keyed by call ID
   const [liveSentimentMap, setLiveSentimentMap] = useState<Record<number, SentimentData>>({});
@@ -480,6 +486,9 @@ export function UnifiedAgentDesktop() {
       case 'queue':
         navigate('/queue');
         break;
+      case 'callbacks':
+        navigate('/callbacks');
+        break;
       case 'supervisor':
         navigate('/supervisor');
         break;
@@ -696,6 +705,7 @@ export function UnifiedAgentDesktop() {
         viewMode={viewMode}
         onViewModeChange={handleViewModeChange}
         callCounts={callCounts}
+        callbacksPending={pendingCallbackCount}
         onLogout={logout}
         callFabric={callFabric}
         onOutboundCallStarted={handleOutboundCallStarted}
@@ -728,12 +738,22 @@ export function UnifiedAgentDesktop() {
                 isLoadingCalls={isLoadingCalls}
                 isLoadingQueue={isLoadingQueue}
                 queueConfigs={queueConfigs}
+                selectedCallbackId={selectedCallback?.id}
+                onSelectCallback={(cb) => setSelectedCallback(cb)}
+                onPendingCallbackCountChange={setPendingCallbackCount}
               />
             </div>
 
-            {/* Right Panel - 360 Contact Detail */}
+            {/* Right Panel - 360 Contact Detail (or Callback detail when in callbacks view) */}
             <div className="flex-1 bg-canvas overflow-hidden">
-              {isLoadingContactDetail && !selectedContact ? (
+              {viewMode === 'callbacks' && selectedCallback ? (
+                <CallbackDetail
+                  callback={selectedCallback}
+                  currentUserId={user?.id ? Number(user.id) : -1}
+                  onUpdated={(updated) => setSelectedCallback(updated)}
+                  onClose={() => setSelectedCallback(null)}
+                />
+              ) : isLoadingContactDetail && !selectedContact ? (
                 <ContactDetailSkeleton />
               ) : selectedContact ? (
                 (() => {
@@ -795,6 +815,12 @@ function EmptyStage({ viewMode }: { viewMode: ViewMode }) {
       title: 'Queue is clear.',
       body: 'When customers are waiting, they\u2019ll show up on the left — urgent calls first, sorted by the routing strategy of their queue.',
       Icon: ListTodo,
+    },
+    callbacks: {
+      kicker: 'Callbacks',
+      title: 'No callback selected.',
+      body: 'Pending callbacks live on the left. Claim one to lock it for yourself, then dial when ready.',
+      Icon: Phone,
     },
     supervisor: { kicker: '', title: '', body: '', Icon: Users },
     settings:   { kicker: '', title: '', body: '', Icon: Users },

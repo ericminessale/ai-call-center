@@ -115,6 +115,7 @@ def create_app():
     from app.api.ai_control import ai_control_bp
     from app.api.internal import internal_bp
     from app.api.demo import demo_bp
+    from app.api.callbacks import callbacks_bp
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(calls_bp, url_prefix='/api/calls')
     app.register_blueprint(contacts_bp, url_prefix='/api/contacts')
@@ -127,6 +128,7 @@ def create_app():
     app.register_blueprint(conferences_bp, url_prefix='/api/conferences')
     app.register_blueprint(call_control_bp, url_prefix='/api/call-control')
     app.register_blueprint(internal_bp, url_prefix='/api/internal')
+    app.register_blueprint(callbacks_bp, url_prefix='/api/callbacks')
     # Demo blueprint mounts at /api (so config/runtime + demo/start sit
     # cleanly under their respective paths); it self-gates on DEMO_MODE
     # internally — registering it on every deployment is safe.

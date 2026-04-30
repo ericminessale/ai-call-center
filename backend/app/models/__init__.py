@@ -10,6 +10,7 @@ from .system_config import SystemConfig
 from .document import DocumentCollection, Document, AgentCollectionAssignment
 from .queue import Queue, QueueAgentAssignment
 from .mcp_gateway_config import McpGatewayConfig
+from .callback import Callback
 
 __all__ = [
     'User',
@@ -27,4 +28,5 @@ __all__ = [
     'Queue',
     'QueueAgentAssignment',
     'McpGatewayConfig',
+    'Callback',
 ]

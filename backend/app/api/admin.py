@@ -1,7 +1,7 @@
 from flask import request, jsonify
 from app import db
 from app.api import admin_bp
-from app.models import Call, Transcription, User
+from app.models import Call, Transcription, User, WebhookEvent
 from app.models.system_config import SystemConfig
 from app.models.document import DocumentCollection, Document, AgentCollectionAssignment
 from app.models.queue import Queue, QueueAgentAssignment
@@ -1077,3 +1077,79 @@ def get_webhook_url():
         'webhook_url': f"{base_url}/api/swml/initial-call" if base_url else '',
         'is_configured': bool(base_url),
     }), 200
+
+
+# =============================================================================
+# Webhook Event Log (Tier 2i)
+# =============================================================================
+
+# Soft cap on page size to keep payload small — UI paginates on top of this.
+_WEBHOOK_PAGE_LIMIT_DEFAULT = 50
+_WEBHOOK_PAGE_LIMIT_MAX = 200
+
+
+@admin_bp.route('/webhook-events', methods=['GET'])
+def list_webhook_events():
+    """List webhook events with optional filtering.
+
+    Query params:
+        event_type: Substring match against event_type (case-insensitive).
+        call_id:    Filter to a specific Call.id.
+        processed:  'true' / 'false' to filter by processed flag.
+        page:       1-indexed page number (default 1).
+        per_page:   Items per page, capped at _WEBHOOK_PAGE_LIMIT_MAX.
+
+    Returns total + page metadata so the UI can paginate. The events
+    are returned newest-first to match how a developer would scan a
+    log in real time.
+    """
+    event_type_filter = (request.args.get('event_type') or '').strip()
+    call_id_filter = request.args.get('call_id', type=int)
+    processed_arg = request.args.get('processed')
+    page = max(1, request.args.get('page', default=1, type=int) or 1)
+    per_page = min(
+        _WEBHOOK_PAGE_LIMIT_MAX,
+        max(1, request.args.get('per_page', default=_WEBHOOK_PAGE_LIMIT_DEFAULT, type=int) or _WEBHOOK_PAGE_LIMIT_DEFAULT),
+    )
+
+    query = db.session.query(WebhookEvent)
+
+    if event_type_filter:
+        query = query.filter(WebhookEvent.event_type.ilike(f"%{event_type_filter}%"))
+    if call_id_filter:
+        query = query.filter(WebhookEvent.call_id == call_id_filter)
+    if processed_arg in ('true', 'false'):
+        query = query.filter(WebhookEvent.processed == (processed_arg == 'true'))
+
+    total = query.count()
+    events = (
+        query.order_by(WebhookEvent.created_at.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+
+    return jsonify({
+        'events': [e.to_dict() for e in events],
+        'page': page,
+        'per_page': per_page,
+        'total': total,
+        'has_more': (page * per_page) < total,
+    }), 200
+
+
+@admin_bp.route('/webhook-events/event-types', methods=['GET'])
+def list_webhook_event_types():
+    """Return distinct event_type values for the dropdown filter.
+
+    Capped at 200 to bound the response — if a deployment ever sees
+    more distinct types than that, the UI's free-text filter still works.
+    """
+    rows = (
+        db.session.query(WebhookEvent.event_type)
+        .distinct()
+        .order_by(WebhookEvent.event_type.asc())
+        .limit(200)
+        .all()
+    )
+    return jsonify({'event_types': [r[0] for r in rows if r[0]]}), 200

@@ -3,7 +3,9 @@ import { ContactList } from '../contacts/ContactList';
 import { ActiveCallsList } from './ActiveCallsList';
 import { QueueList } from './QueueList';
 import { SupervisorPanel } from './SupervisorPanel';
+import { CallbacksList } from './CallbacksList';
 import { ContactMinimal, Call, QueueConfig } from '../../types/callcenter';
+import { Callback } from '../../services/api';
 
 interface LeftPanelProps {
   viewMode: ViewMode;
@@ -24,6 +26,10 @@ interface LeftPanelProps {
   isLoadingQueue?: boolean;
   // Queue configs for filter pills + badges
   queueConfigs?: QueueConfig[];
+  // Callback System (Tier 2r)
+  selectedCallbackId?: number | null;
+  onSelectCallback?: (callback: Callback) => void;
+  onPendingCallbackCountChange?: (count: number) => void;
 }
 
 export function LeftPanel({
@@ -42,6 +48,9 @@ export function LeftPanel({
   isLoadingCalls,
   isLoadingQueue,
   queueConfigs,
+  selectedCallbackId,
+  onSelectCallback,
+  onPendingCallbackCountChange,
 }: LeftPanelProps) {
   switch (viewMode) {
     case 'contacts':
@@ -75,6 +84,15 @@ export function LeftPanel({
           onTakeCall={onTakeCall}
           isLoading={isLoadingQueue}
           queueConfigs={queueConfigs}
+        />
+      );
+
+    case 'callbacks':
+      return (
+        <CallbacksList
+          selectedId={selectedCallbackId ?? null}
+          onSelect={(cb) => onSelectCallback?.(cb)}
+          onPendingCountChange={onPendingCallbackCountChange}
         />
       );
 

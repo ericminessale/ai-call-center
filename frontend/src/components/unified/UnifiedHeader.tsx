@@ -11,6 +11,7 @@ import {
   AlertTriangle,
   Sparkles,
   X as XIcon,
+  PhoneOutgoing,
 } from 'lucide-react';
 import { ViewMode, AgentStatus } from '../../pages/UnifiedAgentDesktop';
 import Logo from '../shared/Logo';
@@ -36,6 +37,8 @@ interface UnifiedHeaderProps {
     queue: number;
     aiActive: number;
   };
+  /** Pending callbacks count — drives the badge on the Callbacks tab (Tier 2r). */
+  callbacksPending?: number;
   onLogout: () => void;
   callFabric: any;
   onOutboundCallStarted?: (phoneNumber: string) => void;
@@ -79,6 +82,7 @@ export function UnifiedHeader({
   stats,
   viewMode,
   onViewModeChange,
+  callbacksPending = 0,
   callCounts,
   onLogout,
   callFabric,
@@ -390,6 +394,14 @@ export function UnifiedHeader({
             tone={callCounts.queue > 0 ? 'wait' : 'default'}
             active={viewMode === 'queue'}
             onClick={() => onViewModeChange('queue')}
+          />
+          <ViewTab
+            icon={<PhoneOutgoing className="w-3.5 h-3.5" />}
+            label="Callbacks"
+            count={callbacksPending}
+            tone={callbacksPending > 0 ? 'wait' : 'default'}
+            active={viewMode === 'callbacks'}
+            onClick={() => onViewModeChange('callbacks')}
           />
           {(user?.role === 'admin' || user?.role === 'supervisor') && (
             <ViewTab

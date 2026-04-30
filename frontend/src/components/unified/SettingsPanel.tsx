@@ -22,12 +22,14 @@ import {
   PhoneOutgoing,
   Upload,
   Plug,
+  Activity,
 } from 'lucide-react';
 import { adminApi } from '../../services/api';
 import { useAuthStore } from '../../stores/authStore';
 import toast from 'react-hot-toast';
 import { ConfirmModal } from '../shared/ConfirmModal';
 import { ExternalToolsTab } from './ExternalToolsTab';
+import { WebhookLogTab } from './WebhookLogTab';
 
 // =============================================================================
 // Shared Types
@@ -159,7 +161,7 @@ interface QueueAgentAssignment {
   skill_level: number;
 }
 
-type SettingsTabId = 'phone-numbers' | 'queues' | 'agents' | 'knowledge' | 'external-tools' | 'users';
+type SettingsTabId = 'phone-numbers' | 'queues' | 'agents' | 'knowledge' | 'external-tools' | 'users' | 'webhooks';
 
 
 // =============================================================================
@@ -237,6 +239,13 @@ export function SettingsPanel() {
             active={activeTab === 'users'}
             onClick={() => handleTabChange('users')}
           />
+          <TabButton
+            id="webhooks"
+            icon={<Activity className="w-3.5 h-3.5" />}
+            label="Webhook Log"
+            active={activeTab === 'webhooks'}
+            onClick={() => handleTabChange('webhooks')}
+          />
         </nav>
       </div>
 
@@ -248,6 +257,7 @@ export function SettingsPanel() {
         {activeTab === 'knowledge' && <KnowledgeBaseTab focusCollectionId={focusCollectionId} />}
         {activeTab === 'external-tools' && <ExternalToolsTab />}
         {activeTab === 'users' && <UserManagementTab />}
+        {activeTab === 'webhooks' && <WebhookLogTab />}
       </div>
     </div>
   );

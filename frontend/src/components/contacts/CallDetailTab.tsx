@@ -1,23 +1,29 @@
 import { useState, useEffect, useRef } from 'react';
-import { PhoneIncoming, PhoneOutgoing, Bot, Mic, Play } from 'lucide-react';
+import { PhoneIncoming, PhoneOutgoing, Bot, Mic, Play, Download } from 'lucide-react';
 import { Interaction, CallLeg } from '../../types/callcenter';
 import api from '../../services/api';
 import { logger } from '../../lib/logger';
 import { CallTimeline } from './CallTimeline';
 import { AISummaryDisplay } from './ContactDetailView';
+import { SentimentArc, SentimentSegment } from './SentimentArc';
+import { WrapUpPanel } from './WrapUpPanel';
 
 interface CallDetailTabProps {
   interaction: Interaction;
   formatDate: (date?: string) => string;
   formatDuration: (seconds?: number) => string;
+  /** Optional: parent passes a callback so wrap-up edits propagate to the
+   *  surrounding interaction list without a full refetch. */
+  onInteractionPatch?: (patch: Partial<Interaction>) => void;
 }
 
 export function CallDetailTab({
   interaction,
   formatDate,
   formatDuration,
+  onInteractionPatch,
 }: CallDetailTabProps) {
-  const [transcriptions, setTranscriptions] = useState<{ speaker: string; text: string; timestamp: string }[]>([]);
+  const [transcriptions, setTranscriptions] = useState<{ speaker: string; text: string; timestamp: string; sentiment?: string | null }[]>([]);
   const [legs, setLegs] = useState<CallLeg[]>([]);
   const [isLoadingTranscriptions, setIsLoadingTranscriptions] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -33,6 +39,7 @@ export function CallDetailTab({
           speaker: t.speaker || 'caller',
           text: t.transcript || t.text,
           timestamp: t.createdAt || t.created_at,
+          sentiment: t.sentiment ?? null,
         })));
 
         try {
@@ -130,6 +137,21 @@ export function CallDetailTab({
         {legs.length > 0 && (
           <CallTimeline legs={legs} />
         )}
+
+        {/* Sentiment Arc — only render once we have segments to map */}
+        {!isLoadingTranscriptions && (
+          <div className="mt-4">
+            <SentimentArc
+              segments={transcriptions as SentimentSegment[]}
+              overallScore={interaction.sentimentScore}
+            />
+          </div>
+        )}
+
+        {/* Wrap-up panel — only renders for ended/wrapping calls (Tier 2a) */}
+        <div className="mt-4">
+          <WrapUpPanel interaction={interaction} onUpdate={onInteractionPatch} />
+        </div>
       </div>
 
       {/* Transcription Section */}
@@ -172,18 +194,36 @@ export function CallDetailTab({
         </div>
       </div>
 
-      {/* Recording link if available */}
+      {/* Recording playback if available */}
       {interaction.recordingUrl && (
-        <div className="p-4 border-t border-gray-700">
-          <a
-            href={interaction.recordingUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-2 text-blue-400 hover:text-blue-300 text-sm"
+        <div className="p-4 border-t border-gray-700 bg-gray-800/30">
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="text-sm font-semibold text-white flex items-center gap-2">
+              <Play className="w-4 h-4 text-blue-400" />
+              Call Recording
+            </h4>
+            <a
+              href={interaction.recordingUrl}
+              download
+              className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-blue-300 transition-colors"
+              title="Download recording"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Download
+            </a>
+          </div>
+          <audio
+            controls
+            preload="metadata"
+            className="w-full h-10 [&::-webkit-media-controls-panel]:bg-gray-900"
           >
-            <Play className="w-4 h-4" />
-            Listen to Recording
-          </a>
+            <source src={interaction.recordingUrl} type="audio/mpeg" />
+            <source src={interaction.recordingUrl} type="audio/wav" />
+            Your browser doesn&apos;t support audio playback.
+          </audio>
+          <div className="mt-2 text-xs text-gray-500">
+            Duration: {formatDuration(interaction.duration)}
+          </div>
         </div>
       )}
     </div>

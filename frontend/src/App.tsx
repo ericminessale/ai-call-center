@@ -89,6 +89,16 @@ function App() {
             }
           />
 
+          {/* Callbacks View (Tier 2r) */}
+          <Route
+            path="/callbacks"
+            element={
+              <ProtectedRoute>
+                <UnifiedAgentDesktop />
+              </ProtectedRoute>
+            }
+          />
+
           {/* Supervisor View (integrated) */}
           <Route
             path="/supervisor"

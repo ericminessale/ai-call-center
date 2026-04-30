@@ -40,6 +40,7 @@ import { CallTimeline } from './CallTimeline';
 import { LiveCallTab, SentimentData } from './LiveCallTab';
 import { CallDetailTab } from './CallDetailTab';
 import CallControlPanel from './CallControlPanel';
+import { PendingCallbackBanner } from './PendingCallbackBanner';
 import { ConferenceParticipants } from './ConferenceParticipants';
 import { useAuthStore } from '../../stores/authStore';
 import { logger } from '../../lib/logger';
@@ -814,6 +815,9 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
             )}
           </div>
         )}
+
+        {/* Pending callback banner (Tier 2r) */}
+        <PendingCallbackBanner contactId={contact.id} />
 
         {/* Action Buttons / Call Controls */}
         <div className="flex items-center gap-2 mt-4">

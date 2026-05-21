@@ -80,6 +80,11 @@ interface CallFabricContextType {
   isInitializing: boolean;
   isClientReady: boolean; // True when client is initialized and usable
   error: string | null;
+  // Set when client.online() fails with code -32603 ("WebRTC endpoint
+  // registration failed"). Distinct from generic `error` because it has a
+  // specific recovery path (clear cached SDK state + reload). Header
+  // surfaces this with a dedicated "Reset" button. See `resetCallFabricState`.
+  registrationError: string | null;
   callState: 'idle' | 'ringing' | 'active' | 'ending';
   isMuted: boolean;
   micPermission: 'granted' | 'denied' | 'prompt' | 'unknown';
@@ -117,6 +122,13 @@ interface CallFabricContextType {
   joinInteractionConference: (dialAddress: string, conferenceName: string) => Promise<void>;
   leaveConference: () => Promise<void>;
 
+  // Recovery: nuke cached Call Fabric state in the browser and reload.
+  // Targets the recurring "WebRTC endpoint registration failed" SDK error
+  // that surfaces when a previous session left a stale subscriber binding
+  // in the SDK's localStorage (`sw:*` keys) or when push registration
+  // conflicts with the new online() call. Pretty much always fixes it.
+  resetCallFabricState: () => Promise<void>;
+
   // Takeover calls (connect to existing call via SWML)
   makeCallToSwml: (swmlUrl: string, context?: any) => Promise<any>;
 
@@ -151,6 +163,11 @@ export interface CallAssignment {
   whisperMode?: boolean;
   targetAgentCallSid?: string;  // For coach/whisper mode — the agent's call SID to coach
   legId?: number;
+  // Call transport (M1+). Conference mode dial-into-conf flow is the legacy
+  // default; bridge mode means the agent's SDK already has a native invite
+  // ringing (from queue-pickup SWML), so the accept handler must `invite.accept()`
+  // instead of joining a conference. See CALL_TRANSPORT.md.
+  transport?: 'conference' | 'bridge';
 }
 
 const CallFabricContext = createContext<CallFabricContextType | null>(null);
@@ -173,6 +190,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   const [isOnline, setIsOnline] = useState(false);
   const [isInitializing, setIsInitializing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [registrationError, setRegistrationError] = useState<string | null>(null);
   const [callState, setCallState] = useState<'idle' | 'ringing' | 'active' | 'ending'>('idle');
   const [isMuted, setIsMuted] = useState(false);
   const [micPermission, setMicPermission] = useState<'granted' | 'denied' | 'prompt' | 'unknown'>('unknown');
@@ -299,11 +317,25 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         return;
       }
       const script = document.createElement('script');
-      // Use stable @signalwire/client release
-      script.src = 'https://unpkg.com/@signalwire/client';
+      // Pin to the @dev channel (1.0.0-dev.* prereleases) rather than the
+      // npm `latest` tag. `latest` currently points at 0.0.1 — a placeholder
+      // release predating the actual Call Fabric subscriber surface; real
+      // active development (where the `verto.answer` accept fix lives) is
+      // on the @dev track. Git history (commit 06d5073) confirms the
+      // pre-conference working setup also used @dev — switching to
+      // `latest` happened AFTER the conference migration when inbound
+      // accept was no longer load-bearing for us.
+      //
+      // Pin to the @dev channel (1.0.0-dev.* prereleases). The npm `latest`
+      // tag points at 0.0.1 — a placeholder release predating the actual
+      // Call Fabric subscriber surface; real active development lives on
+      // @dev. Cache-buster (yyyy-mm-dd) keeps daily builds fresh without
+      // the user having to clear their browser cache.
+      const cacheBuster = new Date().toISOString().split('T')[0];
+      script.src = `https://unpkg.com/@signalwire/client@dev?v=${cacheBuster}`;
       script.async = true;
       script.onload = () => {
-        logger.debug('✅ SignalWire SDK loaded (@signalwire/client stable)');
+        logger.debug('✅ SignalWire SDK loaded (@signalwire/client@dev)');
         resolve(true);
       };
       script.onerror = reject;
@@ -484,12 +516,26 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       });
 
       setIsOnline(true);
+      setRegistrationError(null);  // success path — any prior reg error is stale
       logger.debug('✅ [CallFabric] Now online and ready to receive calls');
 
-    } catch (error) {
-      logger.error('❌ [CallFabric] Failed to go online:', error);
-      setError('Failed to go online');
-      throw error;
+    } catch (err: any) {
+      logger.error('❌ [CallFabric] Failed to go online:', err);
+      // SignalWire code -32603 (WebRTC endpoint registration failed) means
+      // the SDK couldn't register the device — usually because a previous
+      // session left a stale subscriber binding. Surface a dedicated error
+      // state so the header can show a "Reset" button targeting this exact
+      // class of failure. Other errors fall through to the generic banner.
+      const code = err?.code ?? err?.original_error?.code;
+      const msg = err?.message ?? err?.original_error?.message ?? '';
+      if (code === -32603 || /registration failed/i.test(msg)) {
+        setRegistrationError(
+          'Call Fabric registration failed. Click Reset to clear cached SDK state and reload.'
+        );
+      } else {
+        setError('Failed to go online');
+      }
+      throw err;
     }
   }, [client, isOnline]);
 
@@ -1192,7 +1238,79 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       throw new Error(`Cannot accept: ${!client ? 'Call Fabric client not connected' : 'user not loaded'}`);
     }
 
-    const { conferenceName, callDbId, assignmentType, context, whisperMode, targetAgentCallSid } = pendingCallAssignment;
+    const { conferenceName, callDbId, assignmentType, context, whisperMode, targetAgentCallSid, transport } = pendingCallAssignment;
+
+    // Bridge mode: the backend has already initiated a server-side dial
+    // TO our subscriber resource (via dial_to_queue_pickup). The SDK's
+    // `incomingCallHandlers.all` should have already fired and stashed
+    // the invite in `inviteRef.current`. Accept that — DO NOT call
+    // prepareJoin or dial out to a conference (there is no conference in
+    // bridge mode; conferenceName is empty here). See CALL_TRANSPORT.md.
+    if (transport === 'bridge') {
+      // Bridge mode timing: the Socket.IO `call_assignment` event reaches the
+      // browser the moment the backend builds the SWML response, but the
+      // SWML still has to traverse:
+      //   SignalWire receives SWML → parses connect verb → starts dial →
+      //   reaches subscriber's WebRTC binding → SDK fires
+      //   incomingCallHandlers.all → inviteRef.current is set
+      // Real-world this is 500ms–3s. Throwing "click again" when the user
+      // clicks Accept faster than the SDK invite arrives is bad UX.
+      // Instead, await the invite with a short timeout; if it never shows,
+      // THEN surface the error.
+      const WAIT_TIMEOUT_MS = 5000;
+      const POLL_MS = 100;
+      let waited = 0;
+      while (!inviteRef.current && waited < WAIT_TIMEOUT_MS) {
+        await new Promise((r) => setTimeout(r, POLL_MS));
+        waited += POLL_MS;
+      }
+      const invite = inviteRef.current;
+      if (!invite) {
+        // After 5s of waiting the SDK still hasn't seen an invite — most
+        // likely the server-side dial failed (unresolvable Fabric address,
+        // SignalWire 422, network) so no real call ever rang the device.
+        // Surface a clear error rather than silent-fail.
+        throw new Error(
+          `Incoming call invite never arrived from SignalWire (waited ${WAIT_TIMEOUT_MS}ms). ` +
+          'The server-side dial likely failed. Check backend logs for the connect target.'
+        );
+      }
+      logger.debug(`📞 [CallFabric] Accepting BRIDGE invite (waited ${waited}ms for SDK invite)`);
+      try {
+        const call = await invite.accept({
+          rootElement: rootElementRef.current,
+          audio: true,
+          video: false,
+        });
+        // Mirror what the SDK's own incomingCallHandlers.all does on accept,
+        // so downstream state is consistent regardless of whether the
+        // agent clicked the SDK's native UI or our banner.
+        if (call) {
+          (window as any).__swCall = call;
+          (window as any).__swInvite = invite;
+          activeCallRef.current = call as any;
+          setActiveCall(call as any);
+          setCallState('active');
+          // Promote the backend Call row to 'active' so dashboards reflect
+          // the live state. callDbId is the integer DB id.
+          if (callDbId) {
+            try {
+              await callsApi.updateStatus(callDbId, 'active');
+            } catch (err) {
+              logger.warn('Failed to update bridge call status to active:', err);
+            }
+          }
+          // Clear the pending assignment + invite refs — accepted.
+          setPendingCallAssignment(null);
+          inviteRef.current = null;
+        }
+      } catch (err) {
+        logger.error('❌ [CallFabric] Bridge invite accept failed:', err);
+        throw err;
+      }
+      return;
+    }
+
     logger.debug(`📞 [CallFabric] Accepting ${assignmentType || 'normal'} call assignment via DIAL-OUT:`, conferenceName);
 
     try {
@@ -1944,6 +2062,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           agentCallSid: data.agent_call_sid,
           customerInfo: data.customer_info,
           assignmentType: 'normal',
+          // Bridge mode emits transport='bridge' so the accept handler
+          // can take the SDK-invite path instead of the conference dial-in
+          // path. Defaults to 'conference' for backward compat.
+          transport: (data.transport === 'bridge' ? 'bridge' : 'conference'),
         };
       }
 
@@ -2072,7 +2194,31 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       initializeClient();
     }
 
+    // Hard-refresh / tab close cleanup. React unmount alone isn't enough —
+    // Ctrl+Shift+R kills the page synchronously before lifecycle hooks fire,
+    // leaving SignalWire's side still considering the subscriber registered.
+    // The next page load fails to register with "device already registered
+    // for push notifications" until SignalWire's session timeout elapses.
+    // beforeunload fires BEFORE the page navigates away, giving us a chance
+    // to tell SignalWire we're going. Best-effort — the request may not
+    // complete before the page dies, but it's strictly better than nothing.
+    const onBeforeUnload = () => {
+      const c = clientRef.current;
+      if (c) {
+        try {
+          // Don't await — page is about to die. Just kick off the request.
+          c.offline().catch(() => {});
+        } catch {
+          // Ignore
+        }
+      }
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    window.addEventListener('pagehide', onBeforeUnload); // mobile/iOS fallback
+
     return () => {
+      window.removeEventListener('beforeunload', onBeforeUnload);
+      window.removeEventListener('pagehide', onBeforeUnload);
       // Properly disconnect the SDK client to prevent orphaned WebRTC connections
       // This is critical during Vite HMR — without cleanup, old RTCPeerConnections
       // linger and cause "_sdpReady called in wrong state: closed" errors
@@ -2103,6 +2249,45 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     setConnectedCustomer(null);
   }, []);
 
+  // Recovery for "WebRTC endpoint registration failed" (SignalWire error
+  // -32603). Clears the SDK's persisted subscriber state in localStorage
+  // (it stores everything under `sw:*` keys per the registration-runtime
+  // spec), tries to politely offline any still-connected client, and
+  // reloads the page so the next mount gets a fresh `initializeClient` →
+  // `getSubscriberToken` → `client.online()` sequence.
+  //
+  // Surfaced in the agent header as a "Reset" button when
+  // `registrationError` is set.
+  const resetCallFabricState = useCallback(async () => {
+    logger.warn('🔄 [CallFabric] resetCallFabricState invoked — clearing cached SDK state');
+    // Best-effort offline. The SDK's offline() can hang if the WebSocket
+    // is already dead, so race it against a short timeout.
+    try {
+      const c = clientRef.current;
+      if (c) {
+        await Promise.race([
+          c.offline().catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 800)),
+        ]);
+      }
+    } catch (e) {
+      logger.debug('🔄 [CallFabric] offline() during reset failed (non-fatal):', e);
+    }
+    // Nuke every SDK-owned localStorage key. The SDK stores its protocol-
+    // type binding under `sw:{subscriberId}:pt`; clearing all `sw:` keys
+    // ensures a clean slate even across subscriber switches.
+    try {
+      const keys = Object.keys(localStorage).filter((k) => k.startsWith('sw:'));
+      for (const k of keys) localStorage.removeItem(k);
+      logger.warn(`🔄 [CallFabric] Cleared ${keys.length} sw:* localStorage keys`);
+    } catch (e) {
+      logger.warn('🔄 [CallFabric] localStorage clear failed:', e);
+    }
+    // Hard reload bypasses any in-memory module caches and forces a fresh
+    // SDK initialization + token mint.
+    window.location.reload();
+  }, []);
+
   const value: CallFabricContextType = {
     client,
     activeCall,
@@ -2110,6 +2295,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     isInitializing,
     isClientReady,
     error,
+    registrationError,
     callState,
     isMuted,
     micPermission,
@@ -2155,6 +2341,8 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     // Conference actions (per-interaction model)
     joinInteractionConference,
     leaveConference,
+    // Recovery
+    resetCallFabricState,
     // Takeover calls
     makeCallToSwml,
     // Pending call assignment

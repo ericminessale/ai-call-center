@@ -1,16 +1,18 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { PhoneOutgoing, Clock, ChevronRight } from 'lucide-react';
+import { PhoneOutgoing, Clock, ChevronRight, UserCheck } from 'lucide-react';
 import { callbacksApi, Callback } from '../../services/api';
 import { useSocketContext } from '../../contexts/SocketContext';
 import { logger } from '../../lib/logger';
 
 // =============================================================================
-// PendingCallbackBanner — shown atop the Contact detail when there's a
-// pending callback for this contact (Tier 2r).
+// PendingCallbackBanner — shown atop the Contact detail when there's an
+// outstanding callback for this contact.
 //
-// Click "Open" to jump straight to the Callbacks view with this row
-// pre-selected; agents don't have to hunt through the queue list.
+// Distinguishes "pending" (unclaimed, waiting for any agent) from "claimed"
+// (someone is actively working it). Click "Open" jumps to the Callbacks
+// view with this row pre-selected and the appropriate filter pre-applied,
+// so the agent never lands on an empty list.
 // =============================================================================
 
 interface PendingCallbackBannerProps {
@@ -58,37 +60,86 @@ export function PendingCallbackBanner({ contactId }: PendingCallbackBannerProps)
 
   const wait = callback.waitMinutes ?? 0;
   const reasonSummary = (callback.reason || '').slice(0, 90);
+  const isClaimed = callback.status === 'claimed';
+
+  // Color + label vary by lifecycle state. Pending stays orange (alerting,
+  // someone needs to act); claimed flips to blue (informational, agent X is
+  // already on it).
+  const tone = isClaimed
+    ? {
+        border: 'border-blue-500/30',
+        bg: 'bg-blue-500/10',
+        iconBg: 'bg-blue-500/15',
+        iconText: 'text-blue-300',
+        label: 'text-blue-200',
+        meta: 'text-blue-300/80',
+        metaDim: 'text-blue-300/70',
+        body: 'text-blue-100/80',
+        btnBg: 'bg-blue-500/20 hover:bg-blue-500/30 text-blue-100',
+        Icon: UserCheck,
+      }
+    : {
+        border: 'border-orange-500/30',
+        bg: 'bg-orange-500/10',
+        iconBg: 'bg-orange-500/15',
+        iconText: 'text-orange-300',
+        label: 'text-orange-200',
+        meta: 'text-orange-300/80',
+        metaDim: 'text-orange-300/70',
+        body: 'text-orange-100/80',
+        btnBg: 'bg-orange-500/20 hover:bg-orange-500/30 text-orange-100',
+        Icon: PhoneOutgoing,
+      };
+
+  const headline = isClaimed ? 'Callback in progress' : 'Awaiting callback';
+
+  // Pass the callback id + suggested filter via router state so the
+  // Callbacks page can pre-select the row and switch to a tab that
+  // actually contains it.
+  const handleOpen = () => {
+    navigate('/callbacks', {
+      state: {
+        callbackId: callback.id,
+        suggestedFilter: isClaimed ? 'mine' : 'pending',
+      },
+    });
+  };
 
   return (
-    <div className="mt-4 rounded-lg border border-orange-500/30 bg-orange-500/10 px-4 py-3 flex items-center gap-3">
-      <div className="w-9 h-9 rounded-full flex items-center justify-center bg-orange-500/15 flex-shrink-0">
-        <PhoneOutgoing className="w-4 h-4 text-orange-300" />
+    <div className={`mt-4 rounded-lg border ${tone.border} ${tone.bg} px-4 py-3 flex items-center gap-3`}>
+      <div className={`w-9 h-9 rounded-full flex items-center justify-center ${tone.iconBg} flex-shrink-0`}>
+        <tone.Icon className={`w-4 h-4 ${tone.iconText}`} />
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-[13px] font-medium text-orange-200">
-            Awaiting callback
+          <span className={`text-[13px] font-medium ${tone.label}`}>
+            {headline}
           </span>
-          <span className="flex items-center gap-1 text-[11px] text-orange-300/80">
+          <span className={`flex items-center gap-1 text-[11px] ${tone.meta}`}>
             <Clock className="w-2.5 h-2.5" />
             requested {formatWait(wait)} ago
           </span>
+          {isClaimed && callback.claimedByAgentId !== null && (
+            <span className={`text-[11px] ${tone.metaDim} font-mono`}>
+              agent #{callback.claimedByAgentId}
+            </span>
+          )}
           {callback.attempts > 0 && (
-            <span className="text-[11px] text-orange-300/70 font-mono">
+            <span className={`text-[11px] ${tone.metaDim} font-mono`}>
               attempt #{callback.attempts + 1}
             </span>
           )}
         </div>
         {reasonSummary && (
-          <p className="text-[12px] text-orange-100/80 mt-0.5 truncate">
+          <p className={`text-[12px] ${tone.body} mt-0.5 truncate`}>
             {reasonSummary}
             {(callback.reason?.length ?? 0) > 90 ? '…' : ''}
           </p>
         )}
       </div>
       <button
-        onClick={() => navigate('/callbacks')}
-        className="flex items-center gap-1 px-3 py-1.5 text-[12px] rounded bg-orange-500/20 hover:bg-orange-500/30 text-orange-100 transition-colors flex-shrink-0"
+        onClick={handleOpen}
+        className={`flex items-center gap-1 px-3 py-1.5 text-[12px] rounded transition-colors flex-shrink-0 ${tone.btnBg}`}
       >
         Open
         <ChevronRight className="w-3.5 h-3.5" />

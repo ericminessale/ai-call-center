@@ -336,16 +336,22 @@ function CallCard({ call, onClick, queueConfigs }: { call: Call; onClick: () => 
         <span className="mono text-[11.5px] text-ink-muted">
           {isConnecting ? '—:—' : formatDuration(liveDuration)}
         </span>
-        {/* Observer action — only surfaces if the viewer has the right
-            listen permission (agents get null). Stops click propagation so
-            clicking it doesn't also select the row. */}
-        <div onClick={(e) => e.stopPropagation()}>
-          <ObserverControls
-            callId={call.id}
-            callType={isAI ? 'ai' : 'human'}
-            compact
-          />
-        </div>
+        {/* Observer action — surfaces if (a) the viewer has the right listen
+            permission (agents get null in ObserverControls itself) AND
+            (b) the call's transport supports monitor. Bridge-mode calls
+            lack monitor_listen until promote-to-conference (M4); showing
+            the button on them would 5xx the click. Stops click propagation
+            so clicking it doesn't also select the row. */}
+        {(!Array.isArray(call.capabilities)
+          || call.capabilities.includes('monitor_listen')) && (
+          <div onClick={(e) => e.stopPropagation()}>
+            <ObserverControls
+              callId={call.id}
+              callType={isAI ? 'ai' : 'human'}
+              compact
+            />
+          </div>
+        )}
       </div>
     </button>
   );

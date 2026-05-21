@@ -212,6 +212,14 @@ class QueueService:
         """
         agent_key = f"{self.agent_prefix}{agent_id}"
 
+        # Detect transition into 'available' so we can push-dispatch a waiting
+        # call instead of waiting for the next /route hold-loop iteration to
+        # poll for agents (which adds up to ~30s of avoidable lag).
+        previous_status: Optional[str] = None
+        existing = self.get_agent_status(agent_id)
+        if existing:
+            previous_status = existing.get('status')
+
         agent_data = {
             "agent_id": agent_id,
             "status": status,
@@ -231,6 +239,294 @@ class QueueService:
                 self.redis.srem(f"agents:{other_status}", agent_id)
 
         logger.info(f"Agent {agent_id} status changed to {status}")
+
+        # Push-dispatch on transition into 'available'. The caller is already
+        # in their conference (placed there by /direct-inbound), so this just
+        # notifies the agent — their frontend banner pops, on Accept their
+        # leg joins the conference. Sub-second from go-available to ring.
+        # Best-effort: failures here must NEVER break the status write above.
+        if status == 'available' and previous_status != 'available':
+            try:
+                self._push_dispatch_waiting_call(agent_id)
+            except Exception as e:
+                logger.warning(
+                    f"Push-dispatch on agent {agent_id} available failed: {e}"
+                )
+
+    # ---- decline cooldown ---------------------------------------------
+    # When an agent declines an assignment, we re-queue the call and free
+    # the agent. Without a cooldown, the freshly-available agent
+    # immediately gets push-dispatched to the SAME call (they're the only
+    # available agent in single-agent test scenarios), which retriggers
+    # their banner → infinite decline loop the user reported. Track
+    # recently-declined (agent_id, call_sid) pairs with a short TTL so
+    # push-dispatch skips them.
+    _DECLINE_COOLDOWN_SECONDS = 60
+
+    def mark_decline(self, agent_id: str, call_sid: str) -> None:
+        """Record that this agent just declined this call. Push-dispatch
+        will skip them for this call until the cooldown expires."""
+        if not (agent_id and call_sid):
+            return
+        try:
+            self.redis.setex(
+                f"decline_cooldown:{agent_id}:{call_sid}",
+                self._DECLINE_COOLDOWN_SECONDS,
+                '1',
+            )
+        except Exception as e:
+            logger.warning(f"mark_decline({agent_id}, {call_sid}) failed: {e}")
+
+    def has_recently_declined(self, agent_id: str, call_sid: str) -> bool:
+        """Was (agent_id, call_sid) recently declined? Used by
+        push-dispatch to skip recently-declined pairings."""
+        if not (agent_id and call_sid):
+            return False
+        try:
+            return bool(self.redis.exists(f"decline_cooldown:{agent_id}:{call_sid}"))
+        except Exception:
+            return False
+
+    def _push_dispatch_waiting_call(self, agent_id: str) -> None:
+        """Notify ``agent_id`` about the oldest waiting call in any queue
+        they're activated for. Caller is already in a conference; agent's
+        WebRTC leg joins it via the existing call-assignment banner flow.
+
+        No-op if the agent isn't activated for any queue, no calls are
+        waiting, or the agent doesn't have a Call Fabric subscriber address
+        the system can dial via the AGENT_CONFERENCE_RESOURCE.
+        """
+        # Find queues this agent is activated for.
+        activation_prefix = "queue_agents:"
+        activated_queues = []
+        for raw_key in self.redis.scan_iter(f"{activation_prefix}*"):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            slug = key.replace(activation_prefix, '')
+            if self.redis.sismember(key, agent_id):
+                activated_queues.append(slug)
+        if not activated_queues:
+            return
+
+        # Branch on queue transport. Bridge-mode queues use SignalWire's
+        # native enter_queue parking — the waiting callers are NOT in our
+        # Redis zset; SignalWire owns them. Pickup is a server-side dial
+        # to the agent that bridges them via `connect: queue:<slug>` SWML.
+        # Conference-mode queues use the existing Redis-zset + call_assignment
+        # pattern below.
+        try:
+            from app.models import Queue, Call
+            bridge_dispatched = False
+            for slug in activated_queues:
+                q = Queue.query.filter_by(slug=slug, is_active=True).first()
+                if not q or (q.routing_transport or 'conference') != 'bridge':
+                    continue
+                # Only dial if there's at least one waiting bridge-mode caller
+                # (mirrored from enter_queue status_url callbacks into Call.status).
+                # Without this gate we'd ring the agent every time they go
+                # available even when the queue is empty.
+                waiting = Call.query.filter_by(
+                    queue_id=slug, status='waiting', transport='bridge',
+                ).count()
+                if waiting <= 0:
+                    continue
+                if self._push_dispatch_bridge_pickup(agent_id, slug):
+                    bridge_dispatched = True
+                    break  # one pickup at a time
+            if bridge_dispatched:
+                return
+        except Exception as e:
+            logger.warning(
+                f"Push-dispatch bridge-mode check failed (non-fatal): {e}"
+            )
+
+        for slug in activated_queues:
+            queue_key = f"{self.queue_prefix}{slug}"
+            head = self.redis.zrange(queue_key, 0, 0)
+            if not head:
+                continue
+            raw = head[0]
+            try:
+                call_data = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception:
+                continue
+            call_sid = call_data.get('call_id')
+            if not call_sid:
+                continue
+
+            # Skip if this agent recently declined this specific call —
+            # prevents the infinite-banner-loop when an agent declines
+            # and is then the only available candidate.
+            if self.has_recently_declined(agent_id, call_sid):
+                logger.info(
+                    f"Push-dispatch: agent {agent_id} recently declined "
+                    f"call {call_sid}; skipping (cooldown active)"
+                )
+                continue
+
+            # Look up the Call + User ORM rows. We can't import them at module
+            # top — circular dep with app.__init__. Defer imports here.
+            try:
+                from app import db
+                from app.models import Call, User
+                from app.services.queue_dispatch import emit_call_assignment_to_agent
+                from datetime import datetime
+            except Exception as e:
+                logger.error(f"Push-dispatch: failed to import deps: {e}")
+                return
+
+            call = Call.find_by_sid(call_sid)
+            if not call:
+                logger.warning(f"Push-dispatch: call {call_sid} not in DB; skipping")
+                continue
+
+            try:
+                agent_user = User.query.filter_by(id=int(agent_id)).first()
+            except (ValueError, TypeError):
+                agent_user = None
+            if not agent_user:
+                logger.warning(f"Push-dispatch: agent {agent_id} not in DB; skipping")
+                return
+            if not agent_user.signalwire_address:
+                logger.warning(
+                    f"Push-dispatch: agent {agent_id} has no signalwire_address; "
+                    f"cannot dial. Skipping."
+                )
+                return
+
+            # Conference name is deterministic — set by /direct-inbound.
+            conference_name = call.conference_name or f"interaction-{call_sid}"
+
+            # Atomic-ish: mark assigned in DB, mark agent busy, remove from queue,
+            # then emit the notification. If any step partly fails, the next
+            # available-transition will retry on the same waiting call (if it's
+            # still in queue) — defensive but not perfect.
+            try:
+                call.assigned_agent_id = agent_user.id
+                call.assigned_at = datetime.utcnow()
+                call.status = 'assigned'
+                db.session.commit()
+            except Exception as e:
+                logger.error(f"Push-dispatch: DB update failed for call {call_sid}: {e}")
+                db.session.rollback()
+                return
+
+            # Mark agent busy on this specific call so other transitions don't
+            # also try to dispatch them.
+            try:
+                self.set_agent_status(agent_id, 'busy', current_call_id=call_sid)
+            except Exception as e:
+                logger.warning(f"Push-dispatch: set_agent_status to busy failed: {e}")
+
+            # Remove from queue zset — they're no longer waiting.
+            try:
+                self.remove_call_from_all_queues(call_sid)
+            except Exception as e:
+                logger.warning(f"Push-dispatch: remove from queue failed: {e}")
+
+            # Parse context for the banner (best-effort)
+            context = {}
+            try:
+                if call.ai_context:
+                    context = json.loads(call.ai_context)
+            except Exception:
+                context = {}
+
+            emit_call_assignment_to_agent(
+                call=call,
+                agent=agent_user,
+                conference_name=conference_name,
+                queue_slug=slug,
+                context=context,
+            )
+            logger.info(
+                f"Push-dispatched call {call_sid} (queue={slug}) → "
+                f"agent {agent_id} via conference {conference_name}"
+            )
+            return  # one dispatch per available transition
+
+    def _push_dispatch_bridge_pickup(self, agent_id: str, queue_slug: str) -> bool:
+        """Dispatch a bridge-mode pickup: server-side dial to the agent's
+        Fabric address, with the queue-pickup SWML as the dial source. When
+        the agent answers, SWML executes ``connect: queue:<slug>`` which
+        pops the next parked caller and bridges. No conference.
+
+        Returns True if the dial was issued, False on any precondition fail
+        (no User row, no signalwire_address, dial failure). Caller decides
+        whether to fall back to conference-mode dispatch on False.
+        """
+        try:
+            from app.models import User
+            from app.services.signalwire_api import get_signalwire_api
+            from app.utils.url_utils import get_base_url, signed_webhook_url
+        except Exception as e:
+            logger.error(f"Bridge pickup: import failed: {e}")
+            return False
+
+        try:
+            agent_user = User.query.filter_by(id=int(agent_id)).first()
+        except (ValueError, TypeError):
+            agent_user = None
+        if not agent_user:
+            logger.warning(f"Bridge pickup: agent {agent_id} not in DB")
+            return False
+        if not agent_user.signalwire_address:
+            logger.warning(
+                f"Bridge pickup: agent {agent_id} has no signalwire_address"
+            )
+            return False
+
+        # Mark busy BEFORE issuing the dial so a parallel transition doesn't
+        # double-dispatch the same agent. The current_call_id is blank — we
+        # won't know the popped caller's call_id until the connect resolves.
+        try:
+            self.set_agent_status(agent_id, 'busy', current_call_id=None)
+        except Exception as e:
+            logger.warning(f"Bridge pickup: set_agent_status to busy failed: {e}")
+
+        base_url = get_base_url()
+        swml_url = signed_webhook_url(
+            f"{base_url}/api/swml/queue-pickup/{queue_slug}"
+        )
+        status_callback = signed_webhook_url(
+            f"{base_url}/api/webhooks/call-status"
+        )
+        try:
+            sw_api = get_signalwire_api()
+            result = sw_api.dial_to_queue_pickup(
+                to_address=agent_user.signalwire_address,
+                queue_slug=queue_slug,
+                swml_url=swml_url,
+                status_callback=status_callback,
+            )
+            logger.info(
+                f"Bridge pickup dispatched: agent={agent_id} "
+                f"queue={queue_slug} dial_sid={getattr(result, 'sid', None)}"
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                f"Bridge pickup dial failed for agent {agent_id} queue {queue_slug}: {e}"
+            )
+            # CRITICAL: do NOT call self.set_agent_status('available') here.
+            # That helper triggers _push_dispatch_waiting_call on every
+            # transition into 'available', which re-enters this code path
+            # — infinite recursion until Python's stack limit (we hit
+            # "maximum recursion depth exceeded" on agent 1 in prod).
+            # Revert agent state directly via Redis so the flip doesn't
+            # re-fire the dispatch hook. The agent is now "available with
+            # a stuck dispatch" — they can try going offline+available
+            # again to force a fresh attempt.
+            try:
+                agent_key = f"{self.agent_prefix}{agent_id}"
+                self.redis.set(agent_key, json.dumps({
+                    'agent_id': str(agent_id),
+                    'status': 'available',
+                    'current_call_id': None,
+                    'last_status_change': datetime.utcnow().isoformat(),
+                }))
+            except Exception:
+                pass
+            return False
 
     def get_agent_status(self, agent_id: str) -> Optional[Dict[str, Any]]:
         """Get current agent status"""

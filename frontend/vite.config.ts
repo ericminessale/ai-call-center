@@ -6,7 +6,21 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 3000,
-    allowedHosts: 'all',
+    // Vite 5: must be boolean `true` to disable host check (the string 'all'
+    // is a Vite 6+ syntax — Vite 5 treats it as a literal hostname match and
+    // silently rejects everything else with a 403). Without this, SignalWire
+    // POSTs to /api/queues/... via ngrok get blocked at Vite before the
+    // /api proxy can forward them to the backend. Dev-only — production
+    // build never runs the Vite dev server.
+    allowedHosts: true,
+    // Bind-mounted source on Windows/Mac → Linux container: inotify doesn't
+    // fire reliably across the bridge, so HMR misses file changes. Polling
+    // is the standard workaround. Slight CPU cost in dev; production
+    // builds are unaffected.
+    watch: {
+      usePolling: true,
+      interval: 500,
+    },
     proxy: {
       '/api': {
         target: 'http://backend:5000',

@@ -253,11 +253,18 @@ function SupervisorCallCard({ call, onClick }: { call: Call; onClick: () => void
             </div>
           )}
           <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-            <ObserverControls
-              callId={call.id}
-              callType={isAI ? 'ai' : 'human'}
-              compact
-            />
+            {/* Hide Listen for bridge-mode calls — they lack monitor_listen
+                capability (no conference for the supervisor to silently join).
+                Legacy calls without the capabilities field default to
+                conference-era behavior. */}
+            {(!Array.isArray(call.capabilities)
+              || call.capabilities.includes('monitor_listen')) && (
+              <ObserverControls
+                callId={call.id}
+                callType={isAI ? 'ai' : 'human'}
+                compact
+              />
+            )}
             {isAI && (
               <button
                 onClick={(e) => { e.stopPropagation(); onClick(); }}

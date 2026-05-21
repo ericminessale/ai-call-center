@@ -16,6 +16,15 @@ class Queue(db.Model):
     # Routing strategy: 'fifo', 'round_robin', 'priority', 'skill_based'
     routing_strategy = db.Column(db.String(30), default='round_robin', nullable=False)
 
+    # Transport preference: 'conference' (current behavior, multi-party ready)
+    # or 'bridge' (SWML connect → two-leg, per-leg REST verbs work natively).
+    # The actual transport is decided per-call at ingress; bridge falls back to
+    # conference when no agent is available. See CALL_TRANSPORT.md.
+    routing_transport = db.Column(
+        db.String(20), default='conference', nullable=False,
+        server_default='conference',
+    )
+
     # AI agent fallback route for overflow (e.g. '/sales-ai')
     ai_agent_route = db.Column(db.String(100), nullable=True)
 
@@ -39,6 +48,7 @@ class Queue(db.Model):
             'description': self.description,
             'is_active': self.is_active,
             'routing_strategy': self.routing_strategy,
+            'routing_transport': self.routing_transport or 'conference',
             'ai_agent_route': self.ai_agent_route,
             'default_priority': self.default_priority,
             'sla_threshold_seconds': self.sla_threshold_seconds,

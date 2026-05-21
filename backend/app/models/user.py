@@ -15,6 +15,7 @@ PERMISSION_FLAGS = (
     'can_whisper',             # coach an agent on an active call (one-way audio)
     'can_barge',               # insert self into an active call (full audio)
     'can_control_recording',   # start/stop recording on calls they are participating in
+    'can_use_coach',           # attach the AI Coach sidecar to their own calls (per-call toggle)
 )
 
 ROLE_PERMISSION_DEFAULTS = {
@@ -25,13 +26,15 @@ ROLE_PERMISSION_DEFAULTS = {
         'can_whisper':            True,
         'can_barge':              True,
         'can_control_recording':  True,
+        'can_use_coach':          True,
     },
     'agent': {
         'can_listen_ai_calls':    False,
         'can_listen_human_calls': False,
         'can_whisper':            False,
         'can_barge':              False,
-        'can_control_recording':  True,  # agent can pause/resume on their own call
+        'can_control_recording':  True,   # agent can pause/resume on their own call
+        'can_use_coach':          True,   # opt-in via in-call toggle; defaults to off per-call
     },
 }
 
@@ -67,6 +70,28 @@ class User(db.Model):
     # Keys are defined in ROLE_PERMISSION_DEFAULTS below; see
     # effective_permissions() for resolution order.
     permissions = db.Column(JSON, nullable=False, default=dict)
+
+    # Agent Assist — Knowledge Factbook mode. See AGENT_ASSIST.md.
+    # 'off' hides the panel; 'manual' shows the panel with typed-query + From-transcript
+    # buttons; 'auto' additionally streams KB facts on each customer turn-end (M4).
+    kb_factbook_mode = db.Column(
+        db.String(20), nullable=False, default='manual', server_default='manual',
+    )
+
+    # Agent Assist — AI Coach (sidecar) mode. See AGENT_ASSIST.md.
+    # 'off': no sidecar attached, no billing.
+    # 'on_request': sidecar attached but defaults to sidecar_skip; agent uses
+    #               the "ask coach" button to pull suggestions.
+    # 'auto': sidecar suggests on every customer turn.
+    coach_mode = db.Column(
+        db.String(20), nullable=False, default='off', server_default='off',
+    )
+
+    # Coach prompt-tone preset. Selects which of three prompt templates feeds
+    # the sidecar's system prompt at attach time. terse → standard → verbose.
+    coach_intensity = db.Column(
+        db.String(20), nullable=False, default='standard', server_default='standard',
+    )
 
     # Relationships
     # Calls owned by this user (user_id foreign key)
@@ -156,6 +181,9 @@ class User(db.Model):
             # so the drawer can show "overridden" state distinctly.
             'effective_permissions': self.effective_permissions(),
             'permission_overrides': self.permissions or {},
+            'kb_factbook_mode': self.kb_factbook_mode or 'manual',
+            'coach_mode': self.coach_mode or 'off',
+            'coach_intensity': self.coach_intensity or 'standard',
         }
 
     @classmethod

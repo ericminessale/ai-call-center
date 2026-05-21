@@ -43,7 +43,7 @@ def _cors_origins() -> list[str]:
     ``supports_credentials=True`` per the CORS spec."""
     raw = os.getenv(
         'CORS_ORIGINS',
-        'http://localhost,http://localhost:3000,http://localhost:5173',
+        'http://localhost,http://localhost:3000,http://localhost:3100,http://localhost:5173',
     )
     origins = [o.strip() for o in raw.split(',') if o.strip()]
     if '*' in origins:
@@ -162,6 +162,16 @@ def create_app():
         app.logger.warning(f"[fabric_sync] startup sync: {result}")
     except Exception as e:
         app.logger.warning(f"[fabric_sync] startup sync failed (non-fatal): {e}")
+
+    # Start the stale-call watchdog. Background greenlet that reaps Call rows
+    # whose SWML heartbeat key has expired in Redis — our only reliable signal
+    # that a parked caller has dropped (see app/services/call_watchdog.py for
+    # full rationale).
+    try:
+        from app.services.call_watchdog import start as start_call_watchdog
+        start_call_watchdog(app)
+    except Exception as e:
+        app.logger.error(f"[call_watchdog] start failed (non-fatal): {e}")
 
     # Top up the demo-persona pool when DEMO_MODE is on. Idempotent —
     # no-op on production-shape clone-and-own deployments.

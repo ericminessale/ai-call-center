@@ -184,8 +184,13 @@ def initial_call():
     base_url = get_base_url()
     logger.info(f"Using base URL: {base_url}")
 
-    # Read routing config from database (admin-configurable)
-    initial_handler = SystemConfig.get('route.initial_handler', '/receptionist')
+    # Read routing config — the ai-specialist route (per phone-number mode) sets
+    # _target_ai_route_override via request.environ to force a specific AI agent
+    # route instead of the SystemConfig-driven default triage handler.
+    initial_handler = (
+        request.environ.get('_target_ai_route_override')
+        or SystemConfig.get('route.initial_handler', '/receptionist')
+    )
     sales_specialist = SystemConfig.get('route.sales_specialist', '/sales-ai')
     support_specialist = SystemConfig.get('route.support_specialist', '/support-ai')
 
@@ -250,6 +255,180 @@ def initial_call():
     logger.info("="*50)
 
     return jsonify(swml_response)
+
+
+@swml_bp.route('/ai-specialist/<queue_slug>', methods=['POST'])
+def ai_specialist(queue_slug):
+    """SWML entry point for phone numbers that route directly to a queue's AI
+    specialist (skipping the receptionist's triage). Targeted by Settings →
+    Phone Numbers when admin picks target_mode='ai_specialist' for a queue.
+
+    Falls back to the configured triage handler if the queue is missing,
+    inactive, or has no ai_agent_route — avoids stranding inbound calls when
+    queue config drifts.
+    """
+    from app.models import Queue
+    queue = Queue.query.filter_by(slug=queue_slug, is_active=True).first()
+    if queue and queue.ai_agent_route:
+        request.environ['_target_ai_route_override'] = queue.ai_agent_route
+        logger.info(
+            f"AI specialist routing for queue '{queue_slug}' → {queue.ai_agent_route}"
+        )
+    else:
+        logger.warning(
+            f"AI specialist route requested for queue '{queue_slug}' but "
+            f"queue/ai_agent_route missing — falling back to triage"
+        )
+    return initial_call()
+
+
+@swml_bp.route('/out-of-service', methods=['POST', 'GET'])
+def out_of_service():
+    """SWML target for unassigned phone numbers.
+
+    SignalWire's ``relay_script`` call handler rejects empty
+    ``call_relay_script_url`` with HTTP 422 ("Call relay script url must be
+    set"). So "unassign" can't just clear the URL — every assigned number
+    must point somewhere. We point unassigned numbers here, which plays a
+    polite "not in service" message and hangs up.
+
+    Our list endpoint's ``_parse_phone_routing_from_url`` does not match this
+    path, so numbers pointing here correctly read as ``is_assigned: False``
+    in the admin UI. The number stays on the SignalWire account (we don't
+    release it) but the caller hears a clean rejection instead of an error.
+    """
+    return jsonify({
+        "version": "1.0.0",
+        "sections": {
+            "main": [
+                "answer",
+                {"play": {"url": "say:This number is not currently in service. Please check the number and try again."}},
+                "hangup",
+            ]
+        }
+    })
+
+
+@swml_bp.route('/queue-pickup/<queue_slug>', methods=['POST', 'GET'])
+def queue_pickup(queue_slug):
+    """SWML executed on an agent's leg when the backend dials them to bridge
+    to the next parked caller in the named queue.
+
+    Flow:
+      1. Caller arrives, no agent available → bridge ingress places them in
+         ``enter_queue: queue_name: <slug>`` (SignalWire-side queue).
+      2. Agent goes available → backend issues an outbound dial: to=agent's
+         /private/<addr>, with THIS URL as the dial's swml. SignalWire calls
+         the agent's subscriber; their SDK rings.
+      3. Agent accepts → this SWML executes on the freshly-answered leg →
+         ``connect: to: queue:<slug>`` pops the next queued caller →
+         SignalWire bridges the two legs. Native matchmaking, no conference.
+
+    Endpoint is webhook-auth gated via signed URL. The signed URL is what
+    we pass to ``dial_to_queue_pickup`` (signalwire_api.py).
+    """
+    logger.info(f"queue-pickup SWML fetched for queue '{queue_slug}'")
+    return jsonify({
+        "version": "1.0.0",
+        "sections": {
+            "main": [
+                "answer",
+                {
+                    "connect": {
+                        # The "queue:<name>" destination format pops the next
+                        # caller from SignalWire's enter_queue. Confirmed via
+                        # Sigmond KB connect-verb reference.
+                        "to": f"queue:{queue_slug}",
+                        # answer_on_bridge so the agent isn't billed for any
+                        # tiny gap between the dial completing and the queued
+                        # caller bridging in.
+                        "answer_on_bridge": True,
+                        # Short timeout — if SignalWire can't pop a caller
+                        # quickly the queue was racy and we should fall
+                        # through instead of leaving the agent on a dead leg.
+                        "timeout": 10,
+                    }
+                },
+                "hangup",
+            ]
+        }
+    })
+
+
+@swml_bp.route('/queue-wait/<queue_slug>', methods=['POST', 'GET'])
+def queue_wait(queue_slug):
+    """SWML returned as the ``wait_url`` for SignalWire's ``enter_queue`` verb.
+
+    Bridge-mode parked callers hit this endpoint repeatedly while they wait.
+    Each fetch returns one cycle of the hold experience (position announcement
+    + a chunk of hold media); SignalWire calls us again when that cycle
+    finishes, so position updates naturally reflect the caller advancing.
+
+    SignalWire passes the call's queue context in the request body. We read
+    `entry_position` (1-indexed) and `wait_time` (seconds elapsed) when present
+    and weave them into the announcement.
+
+    Endpoint is webhook-auth gated via the signed URL — the wait_url emitted
+    in bridge.build_ingress_swml is signed by signed_webhook_url so we know
+    the request actually came from SignalWire and not from a stray client.
+    """
+    # Parse position + wait time from SignalWire's request body. Field names
+    # come from the enter_queue output schema (entry_position, wait_time).
+    data = request.get_json(silent=True) if request.is_json else None
+    data = data or request.form.to_dict() or {}
+    position = data.get('entry_position') or data.get('position') or 0
+    waited = data.get('wait_time') or data.get('waited_seconds') or 0
+    try:
+        position = int(position)
+    except (TypeError, ValueError):
+        position = 0
+    try:
+        waited = int(waited)
+    except (TypeError, ValueError):
+        waited = 0
+
+    logger.info(
+        f"queue-wait fetch: queue={queue_slug} position={position} waited={waited}s"
+    )
+
+    # Compose the announcement. Position 1 = "you're next." Higher = "you're #N."
+    # First fetch (position 0, no data yet from SignalWire) = generic welcome.
+    if position == 1:
+        announcement = (
+            "say:You're next in line. The next available agent will be with you shortly."
+        )
+    elif position > 1:
+        announcement = (
+            f"say:You are number {position} in queue. "
+            f"Please continue to hold and we'll connect you with the next available agent."
+        )
+    else:
+        announcement = (
+            "say:Thanks for holding. We'll connect you with the next available agent shortly."
+        )
+
+    # One announcement + a chunk of silence. SignalWire calls us again once
+    # the silence finishes, giving us a chance to re-announce position.
+    #
+    # Format note: use the STRING SHORTHAND `{"play": "say:..."}` here, NOT
+    # the object form `{"play": {"url": "..."}}`. The play schema docs list
+    # `url` (singular) as an alias for `urls` (plural) but every working
+    # example uses either string shorthand or `urls` array — `url` singular
+    # appears to silently fail-parse: verb completes in ~0ms, SignalWire
+    # re-fetches wait_url immediately. That manifests as a tight loop of
+    # `/queue-wait/<slug>` hits in ngrok and the caller hearing nothing.
+    return jsonify({
+        "version": "1.0.0",
+        "sections": {
+            "main": [
+                {"play": announcement},
+                # 25 seconds between announcements feels right — frequent
+                # enough to update position, infrequent enough not to be
+                # annoying.
+                {"play": "silence:25"},
+            ]
+        }
+    })
 
 
 @swml_bp.route('/start-transcription', methods=['POST'])

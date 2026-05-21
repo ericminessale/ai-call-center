@@ -240,397 +240,84 @@ def route_call_to_queue(queue_id):
 
         db.session.commit()
 
-        # Emit queue_update so frontend shows the call immediately with 'waiting' status
-        from app import socketio
-        logger.info(f"Emitting queue_update for call {call.id} with status 'waiting' in queue '{queue_id}'")
-        socketio.emit('queue_update', {
-            'call': call.to_dict(include_contact=True),
-            'queue_id': queue_id,
-            'action': 'added'
-        })
-
-        # Enqueue the call
+        # Compute strategy params for the unified helper. /route gets richer
+        # data than /direct-inbound (skill levels for skill_based/priority
+        # routing, language-matched dispatch) — pass them through.
         service = get_queue_service()
-        queue_result = service.enqueue_call(
-            call_id=call_id,
-            queue_id=queue_id,
-            priority=priority,
-            context=context,
-            caller_info={
-                'number': caller_number,
-                'name': context.get('customer_name')
-            }
-        )
-
-        # Check for available agents (filtered by queue activation)
         available_agents = service.get_available_agents(queue_id)
-        redis_client = get_redis_client()
-
-        # Look up queue config for routing strategy
         queue_config = Queue.find_by_slug(queue_id)
         routing_strategy = queue_config.routing_strategy if queue_config else 'round_robin'
 
-        # Get skill levels if needed for routing
         skill_levels = {}
         if routing_strategy in ('skill_based', 'priority') and available_agents:
             skill_levels = service.get_skill_levels_for_queue(queue_id, available_agents)
 
-        # Look up languages for all available agents — used to prefer language-matched
-        # agents and to decide whether `needs_translation` should be set on the call.
         agent_languages = {}
         if available_agents:
             agent_languages = service.get_languages_for_agents(available_agents)
 
-        if available_agents:
-            # Use configured routing strategy to select agent
-            # We still need to validate agents (Call Fabric address, actual availability)
-            # so we try strategy-selected agents in order, falling back as needed
-            selected_user = None
-            tried_agents = set()
-
-            while len(tried_agents) < len(available_agents):
-                # Get remaining untried agents
-                remaining = [a for a in available_agents if a not in tried_agents]
-                if not remaining:
-                    break
-
-                # Select next agent via strategy (with language-preference pass)
-                agent_id_str = service.select_agent(
-                    queue_slug=queue_id,
-                    routing_strategy=routing_strategy,
-                    available_agents=remaining,
-                    skill_levels=skill_levels,
-                    call_priority=priority,
-                    caller_language=caller_language,
-                    agent_languages=agent_languages,
-                )
-                if not agent_id_str:
-                    break
-
-                tried_agents.add(agent_id_str)
-                logger.info(f"Strategy '{routing_strategy}' selected agent {agent_id_str} (attempt {len(tried_agents)})")
-
-                # Look up user by ID (agent_id is stored as string in Redis)
-                try:
-                    agent_id = int(agent_id_str)
-                    user = User.query.filter_by(id=agent_id).first()
-                except (ValueError, TypeError):
-                    # If not numeric, try lookup by email
-                    user = User.query.filter_by(email=agent_id_str).first()
-
-                if not user:
-                    logger.warning(f"Agent {agent_id_str} not found in database, trying next")
-                    continue
-
-                if not user.signalwire_address:
-                    logger.warning(f"Agent {agent_id_str} has no signalwire_address, trying next")
-                    continue
-
-                # Double-check agent is actually available in Redis
-                agent_status = service.get_agent_status(str(user.id))
-                actual_status = agent_status.get('status') if agent_status else None
-                logger.info(f"Agent {user.id} ({user.email}): Redis status = {actual_status}")
-
-                if actual_status != 'available':
-                    logger.warning(f"Agent {user.id} is in available set but actual status is '{actual_status}', removing from set and trying next")
-                    redis_client.srem('agents:available', str(user.id))
-                    continue
-
-                # Agent is valid and actually available
-                selected_user = user
-                # Track last assigned time for FIFO strategy
-                redis_client.set(f"agent_last_assigned:{user.id}", datetime.utcnow().timestamp())
-                break
-
-            if selected_user:
-                # Dequeue the call for this agent
-                dequeued_data = service.dequeue_call(queue_id, str(selected_user.id))
-
-                # Update call record to 'assigned' status
-                # Status flow: waiting → assigned → active → ended
-                # The call will show in queue with 'assigned' until agent accepts
-                if call:
-                    call.status = 'assigned'  # Changed from 'connecting'
-                    call.handler_type = 'human'
-                    call.user_id = selected_user.id
-                    call.assigned_agent_id = selected_user.id
-                    call.assigned_at = datetime.utcnow()
-
-                    # Decide whether live_translate must auto-start at conference-join.
-                    # If the selected agent doesn't speak the caller's language, flag it.
-                    selected_langs = selected_user.languages or ['en-US']
-                    call.needs_translation = caller_language not in selected_langs
-                    if call.needs_translation:
-                        logger.info(
-                            f"Call {call.id} needs translation: caller={caller_language}, "
-                            f"agent {selected_user.id} speaks {selected_langs}"
-                        )
-
-                # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
-                base_url = get_base_url()
-
-                # Use existing conference name from conference-first flow, or create new one
-                conf_name = request.args.get('conf')
-                if conf_name:
-                    conference_name = conf_name
-                    logger.info(f"Using conference-first conference: {conference_name}")
-                else:
-                    conference_name = f"interaction-{call_id}"
-                    logger.info(f"Creating new interaction conference: {conference_name}")
-
-                if call:
-                    call.conference_name = conference_name
-
-                # Get or create Conference DB record
-                conference = Conference.get_active_by_name(conference_name)
-                if not conference:
-                    conference = Conference.create_interaction_conference(
-                        call_id=call_id,
-                        queue_id=queue_id,
-                        agent_user_id=selected_user.id
-                    )
-                else:
-                    # Update existing conference with agent info
-                    conference.owner_user_id = selected_user.id
-                    conference.queue_id = queue_id
-
-                # Create call leg for human agent
-                if call:
-                    CallLeg.create_next_leg(
-                        call=call,
-                        leg_type='human_agent',
-                        user_id=selected_user.id,
-                        conference_id=conference.id,
-                        conference_name=conference_name,
-                        transition_reason='queue_routing'
-                    )
-
-                db.session.commit()
-
-                # Emit queue_update so frontend shows the call as 'assigned' in the queue
-                # The call stays in the queue list but with 'assigned' status until agent accepts
-                socketio.emit('queue_update', {
-                    'call': call.to_dict(include_contact=True),
-                    'queue_id': queue_id,
-                    'action': 'assigned',
-                    'assigned_agent_id': selected_user.id,
-                    'assigned_agent_name': selected_user.name or selected_user.email
-                })
-                logger.info(f"Emitted queue_update for call {call.id} with status 'assigned' to agent {selected_user.id}")
-
-                # Also emit call_update so frontend immediately knows this is now a human-handled call
-                emit_call_update(call)
-                logger.info(f"Emitted call_update for call {call.id} (handler_type={call.handler_type}, status={call.status})")
-
-                # SERVER-INITIATED CALL PATTERN
-                # Instead of agent dialing a resource, the backend CALLS the agent.
-                # This removes the need for any SignalWire Dashboard resource setup.
-                #
-                # Flow:
-                # 1. Backend calls agent's subscriber address via REST API
-                # 2. Agent's browser (online via Call Fabric SDK) receives inbound call
-                # 3. Agent answers -> SWML joins them to conference
-                # 4. Customer also joins same conference
-                # 5. Both parties connected
-                from app import socketio
-                from app.services.signalwire_api import SignalWireAPI
-
-                # Build agent's dial target (their subscriber address)
-                agent_address = None
-                if selected_user.signalwire_address:
-                    addr = selected_user.signalwire_address
-                    # Valid fabric addresses start with /private/ or /public/ without @
-                    if addr.startswith('/private/') or addr.startswith('/public/'):
-                        name_part = addr.split('/')[-1]
-                        if '@' not in name_part:
-                            agent_address = addr
-                        else:
-                            # Fix invalid address format
-                            agent_address = f"/private/agent-{selected_user.id}"
-                            selected_user.signalwire_address = agent_address
-                            db.session.commit()
-                    elif addr.startswith('+') or addr.startswith('sip:'):
-                        agent_address = addr
-
-                if not agent_address and selected_user.signalwire_subscriber_id:
-                    agent_address = f"/private/agent-{selected_user.id}"
-
-                # SOCKET NOTIFICATION + AGENT DIAL-OUT FLOW:
-                # We DON'T call the agent via REST API anymore. Instead:
-                # 1. Send socket notification to agent with conference info
-                # 2. Agent sees "incoming call" UI and clicks Accept
-                # 3. Agent's browser dials OUT to join the conference
-                # 4. Both parties connected in conference
-                #
-                # Why not call the agent directly?
-                # The SignalWire SDK has a bug where connection pooling breaks inbound call
-                # answering (verto.answer never gets sent). Outbound calls work fine.
-                # So we let the agent dial out instead of receiving an inbound call.
-
-                logger.info(f"Notifying agent {selected_user.id} about call assignment for conference: {conference_name}")
-
-                # Emit notification so frontend shows the incoming call UI
-                # Agent will dial out to join the conference when they click Accept
-                socketio.emit('call_assignment', {
-                    'call_id': call_id,
-                    'call_db_id': call.id if call else None,
-                    'caller_number': caller_number,
-                    'queue_id': queue_id,
-                    'context': context,
-                    'agent_id': selected_user.id,
-                    'agent_name': selected_user.name or selected_user.email,
-                    'conference_name': conference_name,
-                    'agent_call_sid': None,  # No server-initiated call anymore
-                    'customer_info': {
-                        'phone': caller_number,
-                        'name': context.get('customer_name'),
-                        'contact_id': contact_id
-                    }
-                }, room=str(selected_user.id))
-                logger.info(f"Emitted call_assignment to agent room {selected_user.id}")
-                logger.info(f"Customer will join interaction conference: {conference_name}")
-
-                # Return SWML response
-                # Conference-first: B-leg ends (hangup), customer's A-leg falls through
-                # to join_conference from initial-call SWML
-                # Legacy: put customer directly into conference via join_conference
-                if conf_name:
-                    # Conference-first: end B-leg so A-leg falls through to join_conference
-                    swml_response = {
-                        "version": "1.0.0",
-                        "sections": {
-                            "main": ["hangup"]
-                        }
-                    }
-                    logger.info(f"Conference-first: returning hangup SWML (customer joins via A-leg fallback)")
-                else:
-                    # Legacy: put caller directly into conference
-                    swml_response = {
-                        "version": "1.0.0",
-                        "sections": {
-                            "main": [
-                                "answer",
-                                {
-                                    "play": {
-                                        "url": "say:I'm connecting you to a specialist now. Please hold."
-                                    }
-                                },
-                                {"join_conference": {"name": conference_name, "end_on_exit": False}}
-                            ]
-                        }
-                    }
-                    logger.info(f"Legacy: returning join_conference SWML for {conference_name}")
-                return jsonify(swml_response)
-            else:
-                # No agents with valid Call Fabric addresses
-                logger.warning(f"No available agents with Call Fabric addresses for queue {queue_id}")
-
-        # No agents available - place in queue with hold message
-        logger.info(f"Call {call_id} queued at position {queue_result['position']}")
-
-        # Check how long the caller has been waiting
-        wait_time_seconds = 0
-        if call and call.created_at:
-            wait_time_seconds = (datetime.utcnow() - call.created_at).total_seconds()
-
-        # IVR-fallback threshold (Tier 1c) — read from per-queue config when present.
-        # Above this, the caller has waited long enough that we proactively offer the
-        # IVR menu (Press 1 AI / 2 callback / 3 hold). Falls back to 120s if the
-        # queue config row is missing or doesn't override it.
-        queue_config = Queue.find_by_slug(queue_id)
-        fallback_threshold = (
-            queue_config.max_wait_before_ai_fallback
-            if queue_config and queue_config.max_wait_before_ai_fallback
-            else 120
-        )
-
-        # Once the IVR menu has been offered to a caller, don't re-show it on every
-        # 30-second route loop — that would be infuriating. We track whether the
-        # menu has already been played in Redis (per-call ephemeral state, 1h TTL).
-        ivr_shown_key = f"ivr_shown:{call_id}" if call_id else None
-        ivr_already_shown = False
-        if ivr_shown_key:
-            try:
-                redis = get_redis_client()
-                ivr_already_shown = bool(redis.get(ivr_shown_key))
-            except Exception as exc:
-                # Redis being down shouldn't break call routing — fail safe to "not shown"
-                # so the menu plays at most an extra time, which is recoverable.
-                logger.warning("Could not read IVR-shown flag from Redis: %s", exc)
-
-        offer_ivr_menu = wait_time_seconds > fallback_threshold and not ivr_already_shown
-
-        logger.info(
-            "Call %s wait=%.0fs threshold=%ds ivr_shown=%s offer_menu=%s",
-            call_id, wait_time_seconds, fallback_threshold, ivr_already_shown, offer_ivr_menu,
-        )
-
-        # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
+        # Unified queue onboarding — same helper used by /direct-inbound. From
+        # here both ingress paths (PSTN direct + AI-agent transfer) follow the
+        # same lifecycle: enqueue in Redis, emit queue_update, immediate-
+        # dispatch if an agent is available, start announcement loop otherwise,
+        # return SWML. Transport choice (conference vs bridge) is hidden
+        # behind call_transport.build_ingress_swml. Today M0 always picks
+        # conference; M1 lets admins opt queues into bridge mode.
+        from app.services.call_transport import build_ingress_swml
         base_url = get_base_url()
-
-        # Build appropriate SWML response based on wait time + IVR-shown state
-        if offer_ivr_menu:
-            # Past the threshold and the menu hasn't been shown yet — transfer to
-            # the IVR. /hold-menu will play the prompt, capture the DTMF, and
-            # branch into AI-transfer / callback / continued-hold accordingly.
-            swml_response = {
-                "version": "1.0.0",
-                "sections": {
-                    "main": [
-                        {
-                            "play": {
-                                "url": "say:We apologize for the extended wait. "
-                                       "All our specialists are still assisting other customers."
-                            }
-                        },
-                        {
-                            "transfer": {
-                                "dest": f"{base_url}/api/queues/{queue_id}/hold-menu"
-                            }
-                        }
-                    ]
-                }
-            }
-            logger.info(f"Routing call {call_id} to IVR fallback menu (queue={queue_id})")
-        else:
-            # Normal hold message
-            swml_response = {
-                "version": "1.0.0",
-                "sections": {
-                    "main": [
-                        {
-                            "play": {
-                                "url": f"say:All of our specialists are currently helping other customers. "
-                                       f"You are number {queue_result['position']} in the queue. "
-                                       f"Please hold and an agent will be with you shortly."
-                            }
-                        },
-                        # Play silence for 30 seconds, then check for agents again
-                        {
-                            "play": {
-                                "url": "silence:30"
-                            }
-                        },
-                        {
-                            "play": {
-                                "url": "say:Thank you for your patience. You are still in the queue."
-                            }
-                        },
-                        # Transfer back to queue check (creates a loop)
-                        {
-                            "transfer": {
-                                "dest": f"{base_url}/api/queues/{queue_id}/route"
-                            }
-                        }
-                    ]
-                }
-            }
-
-        logger.info(f"Returning SWML (no agents available, AI fallback={offer_ai_fallback})")
+        swml_response = build_ingress_swml(
+            call=call,
+            queue_slug=queue_id,
+            context=context,
+            base_url=base_url,
+            routing_strategy=routing_strategy,
+            caller_language=caller_language,
+            agent_languages=agent_languages,
+            skill_levels=skill_levels,
+            priority=priority,
+            # AI agents transfer here mid-conversation. live_transcribe may
+            # already be running on the caller leg from the agent's SWML; re-
+            # starting is harmless (no-op on SignalWire's side) and ensures
+            # the post-transfer transcripts continue flowing to our webhook
+            # for the /direct-inbound case where nothing started it yet.
+            start_live_transcribe=True,
+        )
+        logger.info(f"/route call {call_id} → transport={call.transport} (conference name: interaction-{call_id})")
         return jsonify(swml_response)
+
 
     except Exception as e:
         logger.error(f"Error routing call to queue {queue_id}: {str(e)}")
+        # Critical cleanup: the exception happened AFTER enqueue_call emitted
+        # queue_update 'added' to the frontend. SignalWire is about to hang up
+        # the caller (per our 500-response SWML below) but no call_status webhook
+        # may fire to drive the normal cleanup. Without these emits, the call
+        # sits forever in the frontend's queuedCalls list as a ghost banner.
+        try:
+            call_to_end = Call.find_by_sid(call_id) if call_id else None
+            if call_to_end:
+                call_to_end.update_status('failed')
+                call_to_end.ended_at = call_to_end.ended_at or datetime.utcnow()
+                db.session.commit()
+                from app import socketio
+                socketio.emit('call_ended', {
+                    'callId': call_to_end.id,
+                    'call_sid': call_to_end.signalwire_call_sid,
+                    'reset_ui': True,
+                })
+                socketio.emit('queue_update', {
+                    'call': call_to_end.to_dict(include_contact=True),
+                    'queue_id': queue_id,
+                    'action': 'ended',
+                })
+                try:
+                    if get_redis_client():
+                        get_queue_service().remove_call_from_all_queues(call_id)
+                except Exception as cleanup_err:
+                    logger.warning(f"Redis queue cleanup failed: {cleanup_err}")
+                logger.info(f"Emitted cleanup events for failed-route call {call_id}")
+        except Exception as cleanup_err:
+            logger.error(f"Cleanup after /route failure also failed: {cleanup_err}")
         return jsonify({
             "version": "1.0.0",
             "sections": {
@@ -645,238 +332,22 @@ def route_call_to_queue(queue_id):
         }), 500
 
 
-@queues_bp.route('/<queue_id>/hold-menu', methods=['POST'])
-def queue_hold_menu(queue_id):
-    """
-    Hold menu with DTMF options for callers waiting in queue.
-    Options:
-    - Press 1: Speak with AI specialist
-    - Press 2: Request callback (Tier 2r — not yet wired up)
-    - Press 3: Stay on hold
-
-    Reached from /route once a caller has been waiting longer than the
-    queue's `max_wait_before_ai_fallback` threshold. We also set an
-    "ivr_shown" flag in Redis so /route's hold-message loop doesn't
-    re-trigger this menu every 30 seconds — once the caller has heard
-    their options, they keep waiting in peace.
-    """
-    try:
-        data = request.json or {}
-        call_data = data.get('call', {})
-        call_id = call_data.get('call_id') or data.get('CallSid') or data.get('call_id')
-
-        logger.info(f"Hold menu for call {call_id} in queue {queue_id}")
-
-        # Mark this call as having seen the IVR menu so /route falls through
-        # to the normal hold-loop on subsequent ticks. 1h TTL is generous —
-        # any call that's still alive after that has worse problems than
-        # menu-replay.
-        if call_id:
-            try:
-                redis = get_redis_client()
-                redis.setex(f"ivr_shown:{call_id}", 3600, "1")
-            except Exception as exc:
-                # Worst case: the menu plays once more. Not catastrophic.
-                logger.warning("Could not record IVR-shown flag in Redis: %s", exc)
-
-        # Get base URL for callbacks (uses EXTERNAL_URL env var if set)
-        base_url = get_base_url()
-
-        # Look up AI agent fallback from queue config
-        queue_config = Queue.find_by_slug(queue_id)
-        ai_agent = queue_config.ai_agent_route.lstrip('/') if queue_config and queue_config.ai_agent_route else 'support-ai'
-
-        # Build DTMF menu with prompt
-        swml_response = {
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    {
-                        "prompt": {
-                            "play": f"say:While you wait, you have options. "
-                                   f"Press 1 to speak with our AI specialist who can help right away. "
-                                   f"Press 2 to request a callback when an agent is available. "
-                                   f"Press 3 or stay on the line to continue waiting.",
-                            "speech": {
-                                "timeout": 10,
-                                "end_silence_timeout": 1
-                            },
-                            "digits": {
-                                "max_digits": 1,
-                                "digit_timeout": 10
-                            }
-                        }
-                    },
-                    # Handle the response with switch
-                    {
-                        "switch": {
-                            "variable": "prompt_value",
-                            "case": {
-                                "1": [
-                                    {
-                                        "play": {
-                                            "url": "say:Connecting you with our AI specialist."
-                                        }
-                                    },
-                                    {
-                                        "transfer": {
-                                            "dest": f"{base_url}/{ai_agent}"
-                                        }
-                                    }
-                                ],
-                                "2": [
-                                    # Press 2 — request callback. We bounce to a
-                                    # dedicated SWML endpoint that records the
-                                    # Callback row server-side, then plays the
-                                    # confirmation. Keeping the recording in a
-                                    # follow-up SWML lets us return a sensible
-                                    # message even if the DB write fails.
-                                    {
-                                        "transfer": {
-                                            "dest": f"{base_url}/api/queues/{queue_id}/callback-request"
-                                        }
-                                    }
-                                ],
-                                "3": [
-                                    # Stay on hold - go to hold loop
-                                    {
-                                        "transfer": {
-                                            "dest": f"{base_url}/api/queues/{queue_id}/hold-loop"
-                                        }
-                                    }
-                                ]
-                            },
-                            "default": [
-                                # No input or invalid - go to hold loop
-                                {
-                                    "transfer": {
-                                        "dest": f"{base_url}/api/queues/{queue_id}/hold-loop"
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                ]
-            }
-        }
-
-        return jsonify(swml_response)
-
-    except Exception as e:
-        logger.error(f"Error in hold menu: {str(e)}")
-        base_url = get_base_url()
-        return jsonify({
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    {
-                        "play": {
-                            "url": "say:Please hold while we connect you."
-                        }
-                    },
-                    {
-                        "transfer": {
-                            "dest": f"{base_url}/api/queues/{queue_id}/route"
-                        }
-                    }
-                ]
-            }
-        })
-
-
-@queues_bp.route('/<queue_id>/callback-request', methods=['POST'])
-def queue_callback_request(queue_id):
-    """SWML endpoint hit when a hold-menu caller presses 2 (request callback).
-
-    Records a Callback row from the originating Call's context, then
-    plays the confirmation message and hangs up. We deliberately do
-    the DB write here (not from the AI agent) so the row exists even
-    if the SWML chain is interrupted afterwards.
-    """
-    try:
-        # Lazy import to avoid circular import at module load time.
-        from app.models.callback import Callback as CallbackModel
-
-        data = request.json or {}
-        call_data = data.get('call', {})
-        call_id = call_data.get('call_id') or data.get('CallSid') or data.get('call_id')
-
-        logger.info(f"Callback request for call {call_id} in queue {queue_id}")
-
-        call = Call.find_by_sid(call_id) if call_id else None
-        callback_row = None
-        if call:
-            try:
-                callback_row = CallbackModel.create_from_call(call=call, queue_id=queue_id)
-                db.session.add(callback_row)
-                db.session.commit()
-                logger.info(
-                    'Created callback %s for call %s (phone=%s, queue=%s)',
-                    callback_row.id, call.id, callback_row.phone_number, queue_id,
-                )
-                # Notify the agent dashboard so the pending-callback badge
-                # increments without a polling round-trip.
-                try:
-                    from app import socketio as _socketio
-                    _socketio.emit('callback_event', {
-                        'event': 'created',
-                        'callback': callback_row.to_dict(include_contact=True),
-                    })
-                except Exception as exc:
-                    logger.warning('Failed to emit callback_event(created): %s', exc)
-            except Exception as exc:
-                # Don't propagate the DB error to the caller — they should
-                # still hear a graceful confirmation. We log + fall through.
-                logger.error('Failed to create callback row from /callback-request: %s', exc)
-                callback_row = None
-        else:
-            logger.warning(f'/callback-request: no Call row found for call_id={call_id}')
-
-        # Branching message — admit it if we couldn't actually record the request,
-        # rather than promising a callback we won't deliver.
-        if callback_row is not None:
-            confirmation = (
-                "say:Thank you. We've added you to the callback list. "
-                "An agent will reach out as soon as one becomes available. Goodbye."
-            )
-        else:
-            confirmation = (
-                "say:We're sorry, we couldn't record your callback request. "
-                "Please call us back shortly. Goodbye."
-            )
-
-        return jsonify({
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    {"play": {"url": confirmation}},
-                    "hangup",
-                ]
-            }
-        })
-    except Exception as exc:
-        logger.error('Error in /callback-request: %s', exc)
-        return jsonify({
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    {"play": {"url": "say:Sorry, something went wrong. Please call back shortly. Goodbye."}},
-                    "hangup",
-                ]
-            }
-        })
-
-
 @queues_bp.route('/<queue_slug>/direct-inbound', methods=['POST'])
 def direct_inbound_queue(queue_slug):
-    """
-    Direct inbound call entry point — bypasses AI, routes straight to human queue.
+    """Direct inbound call entry point — bypasses AI, routes straight to human queue.
 
-    Usage: In SignalWire Dashboard, set a phone number's webhook to:
-        POST https://your-ngrok-url/api/queues/sales/direct-inbound
+    Caller-in-conference architecture (as of 2026-05-13):
+    - Caller is placed in ``interaction-<call_sid>`` conference immediately
+    - If an agent is available at call arrival, they're notified now; their
+      WebRTC leg joins the SAME conference on Accept
+    - If no agent is available, caller stays in the conference with hold
+      media. When an agent later flips to 'available', queue_service's
+      push-dispatch hook fires the SAME notification path — no /route polling
+      needed.
 
-    This answers the call, creates a Call record, and transfers into the
-    existing queue routing machinery (agent selection, hold loop, conference).
+    Phase 2 (separate task): periodic per-caller TTS announcements via
+    `play_tts` on the participant + DTMF collection for IVR (callback / AI
+    specialist / continue holding).
     """
     try:
         logger.info(f"Direct inbound call → queue '{queue_slug}'")
@@ -888,7 +359,6 @@ def direct_inbound_queue(queue_slug):
 
         logger.info(f"Direct inbound: call_id={call_id}, from={caller_number}, to={to_number}")
 
-        # Validate queue exists
         queue = Queue.query.filter_by(slug=queue_slug).first()
         if not queue:
             logger.warning(f"Direct inbound: unknown queue '{queue_slug}'")
@@ -902,7 +372,12 @@ def direct_inbound_queue(queue_slug):
                 }
             })
 
-        # Create Call record so webhooks and dashboard can track it
+        # Caller's conference — same name used by push-dispatch when an agent
+        # later flips to available. Deterministic from call_sid so any code
+        # path can derive it without DB lookup.
+        conference_name = f"interaction-{call_id}"
+
+        # Create / hydrate Call record so webhooks + dashboard can track it
         call = Call.query.filter_by(signalwire_call_sid=call_id).first() if call_id else None
         if not call:
             system_user = User.query.filter_by(email='system@signalwire.local').first()
@@ -917,18 +392,33 @@ def direct_inbound_queue(queue_slug):
                 destination_type='phone',
                 direction='inbound',
                 handler_type='human',
+                # NOTE: 'waiting' (not 'pending') because we can't get
+                # call-state webhooks without configuring the phone
+                # number's call_status_callback_url at the SignalWire-
+                # side (TODO: do that and revert to 'pending' + promote
+                # on 'created'/'answered'). Without that, 'pending' rows
+                # would never get promoted and the call would never show
+                # in the queue UI. Carrier auto-retry storms (one failed
+                # dial → 8 webhooks in 19s) still create phantom rows
+                # here — needs a watchdog cleanup sweep.
                 status='waiting',
                 queue_id=queue_slug,
                 ai_context=json.dumps({'source': 'direct_inbound', 'queue': queue_slug}),
+                transcription_active=True,
+                conference_name=conference_name,
                 created_at=datetime.utcnow()
             )
             db.session.add(call)
+        else:
+            call.conference_name = conference_name
 
-        # Find/create Contact from caller number
+        # Contact lookup / create
+        contact_id = None
         if caller_number:
             try:
                 contact = Contact.find_or_create_by_phone(caller_number)
                 call.contact_id = contact.id
+                contact_id = contact.id
                 contact.last_interaction_at = datetime.utcnow()
                 contact.total_calls = (contact.total_calls or 0) + 1
             except Exception as e:
@@ -936,40 +426,43 @@ def direct_inbound_queue(queue_slug):
 
         db.session.commit()
 
-        # Notify dashboard of new inbound call
-        try:
-            emit_call_update(call)
-        except Exception as e:
-            logger.warning(f"Direct inbound: failed to emit call_update: {e}")
+        # NOTE: deliberately NOT emitting call_update / queue_update here.
+        # Call is in 'pending' status until SignalWire confirms the leg
+        # established (call-state 'created'/'answered' on /api/webhooks/call-status)
+        # OR the caller is actually parked in SignalWire's queue
+        # (status='entering' on /api/webhooks/queue-status). Whichever
+        # webhook fires first promotes 'pending' -> 'waiting' and emits
+        # both queue_update {action: 'added'} and call_update. Carrier
+        # auto-retry storms (8 PSTN hits in 19s from a failed dial) used
+        # to spam the queue UI here; now phantom dials stay invisible until
+        # confirmed.
 
-        # Return SWML: set up status webhooks, answer, greet, transfer to queue route
-        base_url = get_base_url()
-        swml_response = {
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    {
-                        "set": {
-                            "call_state_url": signed_webhook_url(f"{base_url}/api/webhooks/call-status"),
-                            "call_state_events": "created,ringing,answered,ended"
-                        }
-                    },
-                    "answer",
-                    {
-                        "play": {
-                            "url": "say:Thank you for calling. Please hold while we connect you with an agent."
-                        }
-                    },
-                    {
-                        "transfer": {
-                            "dest": f"{base_url}/api/queues/{queue_slug}/route"
-                        }
-                    }
-                ]
-            }
-        }
+        # Unified queue onboarding — call_transport.build_ingress_swml
+        # dispatches on the queue's routing_transport (conference today;
+        # M1 lets admins opt into bridge). Handles Conference DB row,
+        # Redis enqueue, queue_update emit, immediate dispatch + agent
+        # notification, announcement loop, and SWML build.
+        from app.services.call_transport import build_ingress_swml
+        swml_response = build_ingress_swml(
+            call=call,
+            queue_slug=queue_slug,
+            context={
+                'source': 'direct_inbound',
+                'queue': queue_slug,
+                'priority': 5,
+                'contact_id': contact_id,
+            },
+            base_url=get_base_url(),
+            routing_strategy=queue.routing_strategy if queue else 'round_robin',
+            caller_language='en-US',
+            priority=5,
+            start_live_transcribe=True,
+        )
 
-        logger.info(f"Direct inbound call {call_id} → queue '{queue_slug}', returning SWML")
+        logger.info(
+            f"Direct inbound call {call_id} → transport={call.transport} "
+            f"(conference name: {conference_name})"
+        )
         return jsonify(swml_response)
 
     except Exception as e:
@@ -983,89 +476,6 @@ def direct_inbound_queue(queue_slug):
                 ]
             }
         }), 500
-
-
-@queues_bp.route('/<queue_id>/hold-loop', methods=['POST'])
-def queue_hold_loop(queue_id):
-    """
-    Hold loop - plays hold music/messages and periodically checks for available agents.
-    """
-    try:
-        data = request.json or {}
-        call_data = data.get('call', {})
-        call_id = call_data.get('call_id') or data.get('CallSid') or data.get('call_id')
-
-        logger.info(f"Hold loop for call {call_id} in queue {queue_id}")
-
-        # Get base URL (uses EXTERNAL_URL env var if set)
-        base_url = get_base_url()
-
-        # Check queue position
-        service = get_queue_service()
-        queue_status = service.get_queue_status(queue_id)
-        position = queue_status.get('length', 0)
-
-        # Build hold loop SWML
-        swml_response = {
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    {
-                        "play": {
-                            "url": f"say:Thank you for your patience. "
-                                   f"You are currently number {max(position, 1)} in the queue. "
-                                   f"An agent will be with you shortly."
-                        }
-                    },
-                    # Play hold music (using silence for now, could be music URL)
-                    {
-                        "play": {
-                            "url": "silence:20"
-                        }
-                    },
-                    {
-                        "play": {
-                            "url": "say:We appreciate your patience. Please continue to hold."
-                        }
-                    },
-                    # Play more hold time
-                    {
-                        "play": {
-                            "url": "silence:20"
-                        }
-                    },
-                    # Check for agent again by transferring to route
-                    {
-                        "transfer": {
-                            "dest": f"{base_url}/api/queues/{queue_id}/route"
-                        }
-                    }
-                ]
-            }
-        }
-
-        return jsonify(swml_response)
-
-    except Exception as e:
-        logger.error(f"Error in hold loop: {str(e)}")
-        base_url = get_base_url()
-        return jsonify({
-            "version": "1.0.0",
-            "sections": {
-                "main": [
-                    {
-                        "play": {
-                            "url": "silence:30"
-                        }
-                    },
-                    {
-                        "transfer": {
-                            "dest": f"{base_url}/api/queues/{queue_id}/route"
-                        }
-                    }
-                ]
-            }
-        })
 
 
 @queues_bp.route('/<queue_id>/next', methods=['GET'])

@@ -2,11 +2,14 @@ from flask import request, jsonify
 from app import db, socketio
 from app.api import webhooks_bp
 from app.models import Call, CallLeg, Transcription, WebhookEvent
+from app.models.user import User
 from app.services.redis_service import publish_event
 from app.utils.webhook_auth import require_webhook_auth
 from datetime import datetime
+from typing import Optional
 import logging
 import json
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +25,70 @@ def map_to_dashboard_status(internal_status):
         'completed': 'completed'
     }
     return status_map.get(internal_status, internal_status)
+
+
+def _trigger_kb_auto_search_if_enabled(call, call_sid_str):
+    """Auto-fire a KB search when a caller's turn ends, if the assigned human
+    agent has `kb_factbook_mode='auto'`. Debounced via Redis (3s) so chained
+    caller utterances don't trigger a search per turn. Emits ``kb_fact`` via
+    Socket.IO to the call room. Best-effort — caller catches all exceptions.
+    """
+    import requests as http_requests
+    from app.services.redis_service import get_redis_client
+
+    agent = User.query.get(call.assigned_agent_id) if call.assigned_agent_id else None
+    if not agent or agent.kb_factbook_mode != 'auto':
+        return
+
+    redis_client = get_redis_client()
+    if redis_client:
+        acquired = redis_client.set(
+            f"kb_factbook_debounce:{call.id}", '1', ex=3, nx=True
+        )
+        if not acquired:
+            return
+
+    rows = (
+        db.session.query(Transcription)
+        .filter(Transcription.call_id == call.id)
+        .filter(Transcription.speaker == 'caller')
+        .filter(Transcription.is_final == True)
+        .order_by(Transcription.created_at.desc())
+        .limit(5)
+        .all()
+    )
+    utterances = [r.transcript for r in reversed(rows) if r.transcript]
+    if not utterances:
+        return
+    query = ' '.join(utterances)
+
+    ai_agents_url = os.getenv('AI_AGENTS_ADMIN_URL', 'http://ai-agents:8081')
+    try:
+        resp = http_requests.post(
+            f"{ai_agents_url}/search",
+            json={
+                'collection_name': 'sales_knowledge',  # TODO: derive from queue / agent assignment
+                'query': query,
+                'top_k': 3,
+            },
+            timeout=10,
+        )
+    except http_requests.RequestException as exc:
+        logger.warning(f"[Factbook auto] /search request failed: {exc}")
+        return
+    if not resp.ok:
+        return
+
+    payload = resp.json()
+    socketio.emit('kb_fact', {
+        'call_sid': call_sid_str,
+        'query': query,
+        'results': payload.get('results', []),
+        'collection_name': payload.get('collection_name'),
+    }, room=call_sid_str)
+    logger.info(
+        f"[Factbook auto] emitted {len(payload.get('results', []))} facts for call {call_sid_str}"
+    )
 
 
 @webhooks_bp.route('/call-status', methods=['POST'])
@@ -79,7 +146,27 @@ def call_status():
             }
 
             mapped_status = status_mapping.get(status.lower(), status)
-            call.update_status(mapped_status)
+
+            # Promotion gate for 'pending' calls.
+            # /direct-inbound writes status='pending' optimistically when its
+            # webhook hits — the call may never actually progress (carrier
+            # auto-retry storms can fire the webhook 8x in 19s from a single
+            # failed dial). Promote 'pending' -> 'waiting' only when the
+            # call leg actually establishes ('created'/'ringing'/'answered'):
+            # at that point we know the PSTN call is alive and our SWML is
+            # running. Otherwise the call stays pending and never shows in
+            # the queue UI. On 'ended', mark ended directly so the watchdog
+            # doesn't have to.
+            was_pending = (call.status == 'pending')
+            if was_pending and mapped_status in ('created', 'ringing', 'answered'):
+                call.status = 'waiting'
+                if mapped_status == 'answered' and not call.answered_at:
+                    call.answered_at = datetime.utcnow()
+                logger.info(
+                    f"Promoted pending call {call_id} -> waiting on '{mapped_status}'"
+                )
+            else:
+                call.update_status(mapped_status)
 
             # Update from_number if provided and not already set
             if from_number and not call.from_number:
@@ -87,6 +174,23 @@ def call_status():
                 logger.info(f"Updated call {call_id} with from_number: {from_number}")
 
             db.session.commit()
+
+            # On the first promotion from pending, tell the Queue tab to
+            # add this call. Queue-status webhook ('entering') would also do
+            # this — emit-or-update via the action='added' handler is
+            # idempotent (dedups by call.id) so a double-fire is harmless.
+            if was_pending and call.status == 'waiting':
+                try:
+                    socketio.emit('queue_update', {
+                        'call': call.to_dict(include_contact=True),
+                        'queue_id': call.queue_id,
+                        'action': 'added',
+                    })
+                    logger.info(
+                        f"Emitted queue_update added for promoted call {call_id}"
+                    )
+                except Exception as e:
+                    logger.warning(f"call_status: queue_update added emit failed: {e}")
 
             # Log the webhook event (using database call.id, not SignalWire call_id)
             WebhookEvent.log_event(
@@ -171,6 +275,30 @@ def call_status():
                     db.session.commit()
                     logger.info(f"Closed leg {active_leg.id} (was {active_leg.status}) for call {call.id}")
 
+                # Mark the conference row as ended too. Same negligence pattern
+                # as Bug B: prior code left Conference rows in 'active' forever
+                # because nothing wrote the terminal status on call end. The
+                # end_conference helper also cascades to participants.leave().
+                # No-op when the call had no conference (bridge mode + native
+                # enter_queue calls have conference_name=NULL).
+                if call.conference_name:
+                    try:
+                        from app.models import Conference
+                        conf = Conference.get_active_by_name(call.conference_name)
+                        if conf:
+                            conf.end_conference()
+                            db.session.commit()
+                            logger.info(
+                                f"Marked conference {call.conference_name} as ended "
+                                f"(cascaded participants.leave())"
+                            )
+                    except Exception as e:
+                        db.session.rollback()
+                        logger.warning(
+                            f"call_status: Conference end failed for "
+                            f"{call.conference_name}: {e}"
+                        )
+
                 call_ended_data = {
                     'callId': call.id,  # Use database ID
                     'call_sid': call_id,  # Also provide SignalWire ID
@@ -185,11 +313,69 @@ def call_status():
                 # And emit call_update with ended status to all
                 socketio.emit('call_update', {'call': call_data})
 
+                # Tell the Queue tab to drop this call. The frontend Queue list
+                # listens for `queue_update action='ended'` to remove rows;
+                # without this emit, callers who hung up while parked stay
+                # visible in the queue forever (Bug B, 2026-05-13).
+                # Always emit — the frontend filters by call.queue_id so
+                # un-queued calls are harmlessly ignored.
+                try:
+                    socketio.emit('queue_update', {
+                        'call': call_data,
+                        'queue_id': call.queue_id,
+                        'action': 'ended',
+                    })
+                except Exception as e:
+                    logger.warning(f"call_status: queue_update emit failed: {e}")
+
         return '', 200
 
     except Exception as e:
         logger.error(f"Error processing call status webhook: {str(e)}")
         return '', 500
+
+
+@webhooks_bp.route('/call-heartbeat', methods=['GET', 'POST'])
+def call_heartbeat():
+    """Liveness heartbeat for SWML scripts.
+
+    SignalWire's phone-number-level ``call_status_callback_url`` does not fire
+    for SWML scripts (only for cXML/laml_webhooks handlers), and the SWML
+    ``set`` verb's ``call_state_url`` is just a script variable — not a real
+    webhook subscription. With no native hangup callback we'd never know
+    when a parked caller dropped, so the bridge's hold loop fires this
+    endpoint on every iteration as a liveness signal.
+
+    Mechanism:
+    - Hold loop SWML: play TTS → silence:25 → request GET /call-heartbeat → goto wait
+    - Each request resets a Redis TTL key (``call_heartbeat:<call_sid>``, 90s)
+    - The watchdog (``app.services.call_watchdog``) scans 'waiting'/'assigned'
+      Call rows; any whose heartbeat key has expired is treated as dropped
+      and the standard end-of-call cleanup runs (mark ended, Redis dequeue,
+      release agent, emit ``queue_update action='ended'``).
+
+    Auth: intentionally none. Knowledge of the call_sid (which is opaque) is
+    the only secret. Worst-case spoof keeps a stale row alive for 90s — bad
+    actor can't actually disrupt a live call.
+    """
+    try:
+        call_sid = request.args.get('call_sid') or (
+            request.json.get('call_sid') if request.is_json else None
+        )
+        if not call_sid:
+            return jsonify({'ok': False, 'error': 'call_sid required'}), 400
+
+        from app.services.redis_service import get_redis_client
+        redis_client = get_redis_client()
+        if redis_client:
+            redis_client.set(f"call_heartbeat:{call_sid}", '1', ex=90)
+
+        # Return empty SWML so the request verb can `save_variables` cleanly
+        # and the script continues. An empty 200 also works.
+        return jsonify({'ok': True}), 200
+    except Exception as e:
+        logger.error(f"call_heartbeat error: {e}")
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 @webhooks_bp.route('/transcription', methods=['POST'])
@@ -298,6 +484,14 @@ def transcription():
                 # Emit to call room (all agents viewing this call have joined this room)
                 socketio.emit('transcription', transcription_data, room=call_id)
                 logger.info(f"✓ Emitted transcription to call room {call_id}")
+
+                # Agent Assist Factbook auto-mode (see AGENT_ASSIST.md).
+                # Best-effort; failures must never break transcription persistence.
+                if speaker == 'caller' and call.assigned_agent_id:
+                    try:
+                        _trigger_kb_auto_search_if_enabled(call, call_id)
+                    except Exception as e:
+                        logger.warning(f"[Factbook auto] trigger failed: {e}")
             else:
                 logger.warning(f"Call not found for ID: {call_id}")
 
@@ -422,6 +616,405 @@ def summary():
     except Exception as e:
         logger.error(f"Error processing summary webhook: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+
+@webhooks_bp.route('/queue-status', methods=['POST'])
+@require_webhook_auth
+def queue_status():
+    """Receive lifecycle events from SignalWire's ``enter_queue`` verb.
+
+    Bridge-mode parked callers are managed natively by SignalWire — we get
+    these callbacks (``entering / connecting / connected / leaving / timeout /
+    hangup / failed``) as the source of truth and mirror them into our Redis
+    read-model so the dashboard's Queue tab keeps working. We also forward
+    them as Socket.IO ``queue_update`` events for live UI refresh.
+
+    Payload shape (from SWML enter_queue spec): includes ``queue_result``
+    (the lifecycle state), ``queue_name``, ``entry_position``, ``entry_size``,
+    ``wait_time``, plus the standard ``call_info``/``call_id`` envelope.
+
+    Best-effort throughout — webhook ack with 200 even on internal errors so
+    SignalWire doesn't retry-storm us; the failure surfaces in our logs.
+    """
+    try:
+        data = request.get_json(silent=True) if request.is_json else None
+        data = data or request.form.to_dict() or {}
+
+        logger.info("=" * 50)
+        logger.info("WEBHOOK: /api/webhooks/queue-status")
+        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("=" * 50)
+
+        # Defensive parsing — SignalWire's exact key naming hasn't been
+        # nailed down across all SDK versions. Look in the most likely spots.
+        result = (
+            data.get('queue_result')
+            or data.get('result')
+            or data.get('state')
+            or 'unknown'
+        )
+        queue_name = (
+            data.get('queue_name')
+            or data.get('queue')
+            or 'unknown'
+        )
+        call_info = data.get('call_info') or {}
+        call_id = (
+            data.get('call_id')
+            or call_info.get('call_id')
+        )
+        position = data.get('entry_position') or data.get('position')
+        size = data.get('entry_size') or data.get('size')
+        wait_time = data.get('wait_time') or data.get('waited_seconds')
+
+        # Persist for audit.
+        call = Call.find_by_sid(call_id) if call_id else None
+        WebhookEvent.log_event(
+            event_type=f"queue_status_{result}",
+            payload=data,
+            call_id=call.id if call else None,
+        )
+
+        # Per the SWML schema for enter_queue, queue_result fires once at
+        # verb completion with one of: connected | timeout | hangup | failed.
+        # There is no 'entering' lifecycle event — promotion from 'pending'
+        # to 'waiting' happens via the call-state webhook on 'answered'
+        # instead. This handler only sees terminal states.
+        if call:
+            try:
+                if result == 'connected':
+                    # Bridge succeeded: agent picked up. Status owned by the
+                    # call-state flow from here on (will become 'active').
+                    call.status = 'assigned'
+                elif result in ('timeout', 'hangup', 'failed'):
+                    # Caller never bridged to an agent — verb ended without
+                    # success. Mark the row ended if no agent has taken it.
+                    # Includes 'pending' so a hangup before call-state
+                    # 'created' fires still closes the row.
+                    if call.status in ('pending', 'waiting', 'queued', 'assigned'):
+                        call.status = 'ended'
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                logger.warning(f"queue-status: failed to persist Call row: {e}")
+
+        # Emit Socket.IO for the dashboard. Frontend Queue tab listens for
+        # `queue_update` with action='added'/'ended'/'updated'. 'added' is
+        # emitted by the call-state webhook on promotion, not here.
+        action_map = {
+            'connected': 'updated',
+            'hangup': 'ended',
+            'timeout': 'ended',
+            'failed': 'ended',
+        }
+        action = action_map.get(result, 'updated')
+        try:
+            socketio.emit('queue_update', {
+                'call': call.to_dict() if call else {'signalwireCallSid': call_id},
+                'queue_id': queue_name,
+                'action': action,
+                'position': position,
+                'size': size,
+                'wait_time': wait_time,
+                'native_queue_event': result,
+            })
+            logger.info(
+                f"queue-status: emit queue_update action={action} "
+                f"queue={queue_name} call={call_id} pos={position}"
+            )
+        except Exception as e:
+            logger.warning(f"queue-status: socketio emit failed: {e}")
+
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        logger.error(f"Error in queue-status webhook: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        # Return 200 anyway — SignalWire shouldn't retry on our bugs.
+        return jsonify({'status': 'error', 'message': str(e)}), 200
+
+
+@webhooks_bp.route('/sidecar/events', methods=['POST'])
+@require_webhook_auth
+def sidecar_events():
+    """Consume `calling.ai.sidecar` events posted by the AI Coach sidecar.
+
+    Per the dev's Q2 answer (2026-05-13), backend-subscribable via URL
+    webhook. The sidecar verb (attached in ``app.services.coach``) configures
+    this URL, and ``global_data`` rides on every event so we don't need a
+    DB lookup to route the resulting Socket.IO emit.
+
+    Expected event shapes (sidecar API is still firming up; defensive parsing
+    here lets us absorb minor field renames without breaking the pipeline):
+      - suggestion    — sidecar emitted a tip ("auto" mode default)
+      - ask_answer    — response to an explicit agent-initiated ask (M10)
+      - skip          — sidecar deliberately stayed silent (debug only)
+      - tool_call     — sidecar invoked a SWAIG tool (M11 lookup_kb, etc.)
+
+    Routing:
+      - Emit ``coaching_suggestion`` to the call's call_sid room AND to the
+        agent's user-id room. The call room covers anyone watching the call
+        live (admin observers); the user room covers the agent themselves if
+        they happen not to be looking at the call view.
+      - For ``ask_answer``, also push to a Redis FIFO list keyed by call_sid
+        so the M10 ask-correlation shim can pop matches when the agent's UI
+        polls for their answer.
+    """
+    try:
+        data = request.get_json() if request.is_json else request.form.to_dict()
+
+        logger.info("=" * 50)
+        logger.info("WEBHOOK: /api/webhooks/sidecar/events")
+        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("=" * 50)
+
+        # global_data is set by coach.build_sidecar_start_params and rides on
+        # every event (per dev Q4). All downstream routing keys live in here.
+        global_data = data.get('global_data') or {}
+        call_sid = (
+            global_data.get('call_sid')
+            or data.get('call_id')
+            or (data.get('call_info') or {}).get('call_id')
+        )
+        agent_user_id = global_data.get('agent_user_id')
+        queue_slug = global_data.get('queue_slug')
+        coach_mode = global_data.get('coach_mode')
+        coach_intensity = global_data.get('coach_intensity')
+
+        # Persist for audit/replay regardless of whether we can route it —
+        # missing global_data shouldn't lose the event.
+        call = Call.find_by_sid(call_sid) if call_sid else None
+        WebhookEvent.log_event(
+            event_type="sidecar_event",
+            payload=data,
+            call_id=call.id if call else None,
+        )
+
+        # Classify the event. Sidecar API isn't standardized yet; check the
+        # likely field names in order. Fall back to ``kind`` for forward-compat.
+        kind = (
+            data.get('event')
+            or data.get('event_type')
+            or data.get('type')
+            or data.get('kind')
+            or 'unknown'
+        )
+
+        # Suggestion-style payloads put the human-readable text in one of
+        # these common slots. We forward whichever is present so the UI can
+        # render without caring which milestone of the sidecar API this is.
+        suggestion_text = (
+            data.get('suggestion')
+            or data.get('text')
+            or data.get('message')
+            or (data.get('content') if isinstance(data.get('content'), str) else None)
+            or ''
+        )
+
+        # ask correlation token (M10) — may not exist until SignalWire ships
+        # the ask_id field. Until then we fall back to a FIFO pop against
+        # the per-call pending_asks list that coach_ask pushes to.
+        ask_id = data.get('ask_id') or data.get('correlation_id')
+        matched_question: Optional[str] = None
+        if kind == 'ask_answer' and not ask_id and call_sid:
+            try:
+                from app.services.redis_service import get_redis_client
+                r = get_redis_client()
+                if r is not None:
+                    key = f"coach_pending_asks:{call_sid}"
+                    raw = r.lpop(key)
+                    if raw:
+                        try:
+                            pending = json.loads(raw)
+                            ask_id = pending.get('ask_id')
+                            matched_question = pending.get('question')
+                        except (TypeError, ValueError):
+                            # Corrupt FIFO entry — just drop it and move on.
+                            pass
+            except Exception as e:
+                logger.warning(
+                    f"Sidecar ask FIFO correlation failed (non-fatal): {e}"
+                )
+
+        emit_payload = {
+            'call_sid': call_sid,
+            'agent_user_id': agent_user_id,
+            'queue_slug': queue_slug,
+            'coach_mode': coach_mode,
+            'coach_intensity': coach_intensity,
+            'kind': kind,
+            'text': suggestion_text,
+            'ask_id': ask_id,
+            # Echo the matched agent question back when FIFO correlated, so the
+            # UI can pair it with the agent's optimistic "You asked" bubble.
+            'matched_question': matched_question,
+            'timestamp': data.get('timestamp') or data.get('ts'),
+            # Raw kept on the payload for debugging — the frontend ignores it
+            # unless the developer console is open.
+            'raw': data,
+        }
+
+        if call_sid:
+            socketio.emit('coaching_suggestion', emit_payload, room=call_sid)
+            logger.info(
+                f"✓ Emitted coaching_suggestion ({kind}) to call room {call_sid}"
+            )
+        if agent_user_id:
+            socketio.emit('coaching_suggestion', emit_payload, room=str(agent_user_id))
+            logger.info(
+                f"✓ Emitted coaching_suggestion ({kind}) to agent room {agent_user_id}"
+            )
+        if not call_sid and not agent_user_id:
+            logger.warning(
+                "Sidecar event arrived with no call_sid or agent_user_id in "
+                "global_data; logged but not emitted."
+            )
+
+        # ask_answer FIFO for M10 correlation — only push if we have the
+        # call_sid (no point queuing un-routable answers). Best-effort: a
+        # Redis hiccup mustn't block the webhook from acknowledging.
+        if kind in ('ask_answer', 'ask') and call_sid:
+            try:
+                from app.services.redis_service import get_redis_client
+                r = get_redis_client()
+                if r is not None:
+                    key = f"coach_ask_answers:{call_sid}"
+                    r.rpush(key, json.dumps(emit_payload))
+                    # Cap at 50 entries to avoid runaway growth on long calls,
+                    # and expire 1h after the last push so finished calls
+                    # don't leak keys indefinitely.
+                    r.ltrim(key, -50, -1)
+                    r.expire(key, 3600)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to push sidecar ask_answer to Redis FIFO "
+                    f"(non-fatal): {e}"
+                )
+
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        logger.error(f"Error processing sidecar events webhook: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        # Return 200 anyway — SignalWire retries on 5xx and we don't want a
+        # bug in our parser to cause repeated re-deliveries.
+        return jsonify({'status': 'error', 'message': str(e)}), 200
+
+
+@webhooks_bp.route('/coach/lookup_kb', methods=['POST'])
+@require_webhook_auth
+def coach_lookup_kb():
+    """SWAIG tool endpoint — the AI Coach sidecar calls this to fetch KB facts.
+
+    Defined as a SWAIG ``function`` in :func:`app.services.coach.build_sidecar_start_params`,
+    pointed at this URL via ``web_hook_url``. The sidecar invokes it when its
+    prompt determines that a knowledge-base lookup would help the agent.
+
+    Input shape (SWAIG ``function_call`` payload — keys vary slightly across
+    SignalWire releases; we read defensively):
+      {
+        "function": "lookup_kb",
+        "argument": {"parsed": [{"query": "...", "top_k": 3}]}
+                or "arguments": {"query": "...", "top_k": 3}
+                or top-level "query"/"top_k"
+        "global_data": {agent_user_id, queue_slug, ...}  // from coach.py
+      }
+
+    Returns SWAIG response: ``{response: "<text fed back to the sidecar>"}``.
+    The sidecar then folds the response into its next suggestion.
+    """
+    import requests as http_requests
+
+    try:
+        data = request.get_json(silent=True) or {}
+        logger.info("=" * 50)
+        logger.info("WEBHOOK: /api/webhooks/coach/lookup_kb")
+        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("=" * 50)
+
+        # SWAIG payload shape isn't 100% stable across SignalWire releases.
+        # Try the documented "argument.parsed[0]" path first, then a flat
+        # "arguments" dict, then top-level keys as last resort.
+        args = {}
+        argument = data.get('argument') or {}
+        parsed = argument.get('parsed') if isinstance(argument, dict) else None
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            args = parsed[0]
+        elif isinstance(data.get('arguments'), dict):
+            args = data['arguments']
+        elif isinstance(argument, dict) and 'query' in argument:
+            args = argument
+        else:
+            args = {'query': data.get('query'), 'top_k': data.get('top_k')}
+
+        query = (args.get('query') or '').strip()
+        top_k = args.get('top_k') or 3
+        if not isinstance(top_k, int) or top_k < 1 or top_k > 10:
+            top_k = 3
+
+        if not query:
+            return jsonify({
+                'response': 'No query provided — ask the agent for clarification.',
+            }), 200
+
+        # Choose the collection. For now, defaults to sales_knowledge — same
+        # placeholder as the Factbook auto-search. Once per-queue collection
+        # assignments land (roadmap), derive from global_data.queue_slug.
+        global_data = data.get('global_data') or {}
+        queue_slug = global_data.get('queue_slug')  # noqa: F841 — TODO use this
+        collection_name = 'sales_knowledge'
+
+        ai_agents_url = os.getenv('AI_AGENTS_ADMIN_URL', 'http://ai-agents:8081')
+        try:
+            resp = http_requests.post(
+                f"{ai_agents_url}/search",
+                json={
+                    'collection_name': collection_name,
+                    'query': query,
+                    'top_k': top_k,
+                },
+                timeout=10,
+            )
+        except http_requests.RequestException as exc:
+            logger.warning(f"[Coach lookup_kb] /search request failed: {exc}")
+            return jsonify({
+                'response': 'Knowledge base is temporarily unavailable.',
+            }), 200
+
+        if not resp.ok:
+            return jsonify({
+                'response': 'Knowledge base returned an error — skipping this lookup.',
+            }), 200
+
+        payload = resp.json()
+        results = payload.get('results') or []
+        if not results:
+            return jsonify({
+                'response': f'No matching facts in the knowledge base for "{query}".',
+            }), 200
+
+        # Compose a concise summary back to the sidecar. Keep it short — the
+        # sidecar's own prompt budget is finite and the agent only sees the
+        # sidecar's distilled suggestion, not these raw chunks.
+        lines = []
+        for r in results[:top_k]:
+            content = (r.get('content') or '').strip().replace('\n', ' ')
+            if len(content) > 220:
+                content = content[:220].rsplit(' ', 1)[0] + '…'
+            source = r.get('filename') or r.get('section') or 'unknown'
+            lines.append(f"- [{source}] {content}")
+        body = (
+            f"Top {len(lines)} knowledge-base facts for \"{query}\":\n"
+            + "\n".join(lines)
+        )
+
+        return jsonify({'response': body}), 200
+    except Exception as e:
+        logger.error(f"Error in coach lookup_kb: {e}")
+        # Return a soft error to the sidecar so it doesn't crash the suggestion.
+        return jsonify({
+            'response': 'Knowledge base lookup encountered an internal error.',
+        }), 200
 
 
 @webhooks_bp.route('/post-prompt', methods=['POST'])

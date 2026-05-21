@@ -312,6 +312,171 @@ class SignalWireAPI:
             logger.error(f"Failed to request summary: {str(e)}")
             raise
 
+    def start_ai_sidecar(self, call_id, params):
+        """Attach an AI sidecar (coach) to an active call.
+
+        Mirrors :meth:`start_transcription` — issues ``calling.ai_sidecar``
+        REST command with ``action.start`` wrapping the verb body. The body
+        is pre-built by ``app.services.coach.build_sidecar_start_params`` so
+        prompt composition, global_data, and webhook routing stay in one
+        place.
+
+        Args:
+            call_id: SignalWire call_id (the caller's leg).
+            params: full ``params`` dict — already has ``action.start`` shape.
+
+        Raises:
+            Exception on non-2xx; caller (typically ``coach.attach_sidecar_to_call``)
+            traps and logs so the dispatch isn't aborted.
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': self.auth_header,
+            }
+
+            data = {
+                "id": call_id,
+                "command": "calling.ai_sidecar",
+                "params": params,
+            }
+
+            logger.info("=" * 50)
+            logger.info(f"SIGNALWIRE API REQUEST: POST {self.api_url}")
+            logger.info(
+                "Headers: "
+                + json.dumps(
+                    {
+                        k: v if k != 'Authorization' else 'Bearer ***'
+                        for k, v in headers.items()
+                    },
+                    indent=2,
+                )
+            )
+            logger.info(f"JSON BODY: {json.dumps(data, indent=2)}")
+            logger.info("=" * 50)
+
+            response = requests.post(self.api_url, json=data, headers=headers)
+
+            logger.info(f"SIGNALWIRE API RESPONSE: Status {response.status_code}")
+            if response.text:
+                try:
+                    logger.info(f"JSON RESPONSE: {json.dumps(response.json(), indent=2)}")
+                except Exception:
+                    logger.info(f"RAW RESPONSE: {response.text}")
+            logger.info("=" * 50)
+
+            if 200 <= response.status_code < 300:
+                logger.info(f"AI sidecar attached for call: {call_id}")
+                return response.json() if response.text else {}
+            else:
+                logger.error(
+                    f"Failed to start AI sidecar: {response.status_code} - {response.text}"
+                )
+                raise Exception(
+                    f"Failed to start AI sidecar: {response.status_code}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to start AI sidecar: {str(e)}")
+            raise
+
+    def ask_ai_sidecar(self, call_id, text, ask_id=None):
+        """Ask the attached AI sidecar a specific question.
+
+        Translates to the ``ai-sidecar <uuid> ask <text>`` FreeSWITCH API at
+        the SignalWire layer. The answer is delivered asynchronously to our
+        sidecar webhook (M8). We pass our locally-generated ``ask_id`` so it
+        can ride on the answer event for correlation if SignalWire echoes
+        it back; if not, the M10 FIFO shim handles matching.
+
+        Args:
+            call_id: SignalWire call_id with an attached sidecar.
+            text: the agent's question. Whitespace-trimmed by the caller.
+            ask_id: optional correlation token forwarded as metadata. The
+                sidecar API may not echo it yet — see roadmap 2k Q3.
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': self.auth_header,
+            }
+
+            ask_body = {"text": text}
+            if ask_id:
+                ask_body["ask_id"] = ask_id
+
+            data = {
+                "id": call_id,
+                "command": "calling.ai_sidecar",
+                "params": {"action": {"ask": ask_body}},
+            }
+
+            logger.info("=" * 50)
+            logger.info(f"SIGNALWIRE API REQUEST: POST {self.api_url}")
+            logger.info(f"JSON BODY: {json.dumps(data, indent=2)}")
+            logger.info("=" * 50)
+
+            response = requests.post(self.api_url, json=data, headers=headers)
+
+            logger.info(
+                f"SIGNALWIRE API RESPONSE: Status {response.status_code}"
+            )
+            if response.text:
+                try:
+                    logger.info(
+                        f"JSON RESPONSE: {json.dumps(response.json(), indent=2)}"
+                    )
+                except Exception:
+                    logger.info(f"RAW RESPONSE: {response.text}")
+
+            if 200 <= response.status_code < 300:
+                return response.json() if response.text else {}
+            raise Exception(
+                f"Failed to ask sidecar: {response.status_code} - {response.text}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to ask sidecar: {str(e)}")
+            raise
+
+    def stop_ai_sidecar(self, call_id):
+        """Detach the AI sidecar from a call.
+
+        Mirrors :meth:`stop_transcription`. Idempotent: if no sidecar is
+        attached, SignalWire returns a benign error which we log and swallow
+        at the caller level (sidecar detach failures must never break
+        call teardown).
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': self.auth_header,
+            }
+
+            data = {
+                "id": call_id,
+                "command": "calling.ai_sidecar",
+                "params": {"action": "stop"},
+            }
+
+            response = requests.post(self.api_url, json=data, headers=headers)
+            logger.info(
+                f"AI sidecar stop for call {call_id}: status={response.status_code}"
+            )
+            if 200 <= response.status_code < 300:
+                return response.json() if response.text else {}
+            else:
+                logger.warning(
+                    f"AI sidecar stop returned {response.status_code} - "
+                    f"{response.text} (call may not have had a sidecar)"
+                )
+                return {}
+        except Exception as e:
+            logger.error(f"Failed to stop AI sidecar: {str(e)}")
+            raise
+
     def send_ai_message(self, call_id, message_text, role="system"):
         """Send a system message to an active AI agent during a call.
 
@@ -682,21 +847,29 @@ class SignalWireAPI:
         return self._call_command(call_id, "calling.unhold")
 
     def play_audio(self, call_id, url):
-        """Play an audio file into an active call."""
+        """Play an audio file into an active call.
+
+        Param key MUST be ``play`` (matches the command suffix
+        ``calling.play``). Earlier versions of this helper used ``media``
+        — SignalWire's REST endpoint silently accepted the request but never
+        emitted audio, which was the silent root cause of every "TTS
+        doesn't work in conferences" bug we hit.
+        """
         return self._call_command(call_id, "calling.play", {
             "control_id": str(uuid.uuid4()),
-            "media": [{"type": "audio", "url": url}]
+            "play": [{"type": "audio", "url": url}],
         })
 
     def play_tts(self, call_id, text, voice="en-US-Neural2-F"):
-        """Play text-to-speech into an active call.
+        """Play text-to-speech into an active call. See ``play_audio`` for
+        the ``play`` vs ``media`` param-key gotcha — same fix applies here.
 
         Note: calling.play may fail on AI-managed calls since the ai verb
         owns the audio pipeline. Works on human-agent or conference calls.
         """
         return self._call_command(call_id, "calling.play", {
             "control_id": str(uuid.uuid4()),
-            "media": [{"type": "tts", "text": text, "language": "en-US", "gender": "female"}]
+            "play": [{"type": "tts", "text": text, "language": "en-US", "gender": "female"}],
         })
 
     def start_recording(self, call_id, stereo=False, direction="both"):
@@ -797,6 +970,79 @@ class SignalWireAPI:
     # new pair. See app/api/call_control.py:start_translate for the pattern.
 
     # ==================== Conference Dialing ====================
+
+    def dial_to_queue_pickup(self, to_address, queue_slug, swml_url, status_callback=None):
+        """Dial an agent and execute queue-pickup SWML on the answered leg.
+
+        Bridge-mode counterpart to ``dial_to_conference``. The ``swml_url``
+        should return SWML that does ``connect: { to: "queue:<slug>" }`` —
+        when the agent answers, SignalWire executes it, pops the next caller
+        from the named queue, and bridges the two legs. No conference is
+        involved; this is the native enter_queue / connect-to-queue model.
+
+        Args:
+            to_address: agent's Fabric resource (e.g. ``/private/agent-4``)
+            queue_slug: the SignalWire queue to pull from. Used for logging
+                + the queue_pickup SWML resolves to the same slug.
+            swml_url: URL of the queue-pickup SWML resource (signed).
+            status_callback: optional URL for call-state events.
+
+        Returns: a thin Call shim with .sid, same shape as dial_to_conference.
+        """
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': self.auth_header,
+            }
+
+            params = {
+                "from": self.from_number,
+                "to": to_address,
+                "url": swml_url,
+            }
+            if status_callback:
+                params["call_state_events"] = ["created", "ringing", "answered", "ended"]
+                params["call_state_url"] = status_callback
+
+            data = {"command": "dial", "params": params}
+
+            logger.info("=" * 50)
+            logger.info(
+                f"SIGNALWIRE API: Dialing {to_address} for queue pickup '{queue_slug}'"
+            )
+            logger.info(f"SWML URL: {swml_url}")
+            logger.info(f"JSON BODY: {json.dumps(data, indent=2)}")
+            logger.info("=" * 50)
+
+            response = requests.post(self.api_url, json=data, headers=headers)
+            logger.info(f"SIGNALWIRE API RESPONSE: Status {response.status_code}")
+            if response.text:
+                try:
+                    logger.info(f"JSON RESPONSE: {json.dumps(response.json(), indent=2)}")
+                except Exception:
+                    logger.info(f"RAW RESPONSE: {response.text}")
+
+            if 200 <= response.status_code < 300:
+                result = response.json()
+                call_id = result.get('call_id', result.get('id'))
+                logger.info(
+                    f"Dial to queue pickup succeeded: {call_id} → queue:{queue_slug}"
+                )
+                return type('Call', (), {
+                    'sid': call_id,
+                    'to': to_address,
+                    'from_': self.from_number,
+                    'status': 'initiated',
+                    'queue_slug': queue_slug,
+                    'raw_response': result,
+                })()
+            raise Exception(
+                f"Failed to dial queue pickup: {response.status_code} - {response.text}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to dial queue pickup: {str(e)}")
+            raise
 
     def dial_to_conference(self, to_address, conference_name, swml_url, status_callback=None):
         """Dial an address (agent, phone, etc.) and connect them to a conference.

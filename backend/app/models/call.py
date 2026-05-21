@@ -3,6 +3,20 @@ from app import db
 import json
 
 
+def _call_capabilities(call) -> list:
+    """Return the string list of capabilities for this call.
+
+    Wraps ``app.services.call_transport.capabilities`` with import-local
+    safety: serialization shouldn't fail when capability lookup errors —
+    fall back to an empty list and let the UI hide everything optional.
+    """
+    try:
+        from app.services import call_transport
+        return [c.value for c in call_transport.capabilities(call)]
+    except Exception:
+        return []
+
+
 class Call(db.Model):
     """Call model to track SignalWire calls."""
 
@@ -33,7 +47,15 @@ class Call(db.Model):
     queue_id = db.Column(db.String(50), nullable=True, index=True)  # Which queue (sales, support, etc.)
     assigned_agent_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)  # Agent assigned to handle
     assigned_at = db.Column(db.DateTime, nullable=True)  # When agent was notified
-    conference_name = db.Column(db.String(255), nullable=True)  # Interaction conference name
+    conference_name = db.Column(db.String(255), nullable=True)  # Interaction conference name (null for bridge mode)
+
+    # Call transport: 'conference' or 'bridge'. Set once at ingress in
+    # call_transport.build_ingress_swml and used by every per-call op to
+    # dispatch to the right implementation. See CALL_TRANSPORT.md.
+    transport = db.Column(
+        db.String(20), default='conference', nullable=False,
+        server_default='conference',
+    )
 
     # Translation fields — set by AI receptionist + queue router, used at conference join
     caller_language = db.Column(db.String(20), nullable=True)  # BCP-47 (e.g. "es-ES")
@@ -130,6 +152,13 @@ class Call(db.Model):
             'assigned_agent_id': self.assigned_agent_id,
             'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None,
             'conference_name': self.conference_name,
+            'transport': self.transport or 'conference',
+            # Capability set for this call's transport. Frontend uses it to
+            # gate which control-panel buttons render (M2 of CALL_TRANSPORT.md).
+            # Source of truth lives in app.services.call_transport.<impl>.capabilities;
+            # shipping it on every Call payload means a new capability lights
+            # up in the UI as soon as the backend declares it.
+            'capabilities': sorted(_call_capabilities(self)),
             'wait_time_seconds': self.wait_time_seconds,
             'caller_language': self.caller_language,
             'needs_translation': self.needs_translation,

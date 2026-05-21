@@ -1,11 +1,12 @@
 """Callback model — Tier 2r.
 
 Tracks a caller's request to be called back rather than wait in queue.
-Two paths feed callback rows:
-  1. The IVR fallback (`/hold-menu` press 2) — caller has waited past the
-     queue threshold and chooses callback over continuing to hold.
-  2. An in-call human-agent action — agent decides to put the contact on
-     the callback list mid-call (caller can't wait, queue is jammed, etc.).
+Currently fed by:
+  - An in-call human-agent action — agent decides to put the contact on
+    the callback list mid-call (caller can't wait, queue is jammed, etc.).
+
+An IVR fallback that lets a caller opt into a callback while on hold is
+planned (roadmap Tier 1c) but not currently wired.
 
 The row carries a snapshot of everything an agent will need at dial-back
 time: the phone to call, the caller's name (best-effort), the reason

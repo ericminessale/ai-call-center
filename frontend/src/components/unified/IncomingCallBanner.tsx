@@ -90,7 +90,11 @@ export function IncomingCallBanner({
   };
 
   return (
-    <div className="fixed top-0 left-0 right-0 z-50 animate-slide-down">
+    // Renders inline at the top of the page flex container (UnifiedAgentDesktop
+    // mounts it before the header). Was previously `fixed top-0 left-0 right-0`
+    // which overlaid the header + tabs — agents couldn't navigate while a call
+    // was assigned. Inline-flow placement pushes header/content down naturally.
+    <div className="relative w-full z-40 animate-slide-down">
       <div className="relative bg-canvas-raised border-b border-rule shadow-md">
         {/* Thin colored left rail — single accent, no full-width tint */}
         <div className={`absolute left-0 top-0 bottom-0 w-[3px] ${railColor}`} />

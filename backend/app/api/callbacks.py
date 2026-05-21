@@ -9,9 +9,9 @@ Endpoints:
     PUT    /api/callbacks/<id>/outcome     record an outcome (success/no-answer/etc)
     POST   /api/callbacks/<id>/dial        initiate the outbound dial via SignalWire
 
-The IVR-driven creation path lives in app/api/queues.py (`/hold-menu`
-press-2 + a dedicated `/callback-request` SWML endpoint) — this module
-is the agent-facing surface.
+An IVR-driven creation path (caller presses a key while waiting to be
+added to the callback list) is on the roadmap (Tier 1c) but not currently
+wired — this module is the agent-facing surface.
 """
 from datetime import datetime
 import json

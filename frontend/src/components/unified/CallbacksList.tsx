@@ -28,10 +28,32 @@ interface CallbacksListProps {
   onSelect: (callback: Callback) => void;
   /** Notify parent when the pending count changes — for the header badge. */
   onPendingCountChange?: (count: number) => void;
+  /** Optional one-shot filter override (e.g. from a deep link). Applied
+   *  once on prop change, then onForceFilterAck() fires so the parent can
+   *  clear it. */
+  forceFilter?: Filter | null;
+  onForceFilterAck?: () => void;
 }
 
-export function CallbacksList({ selectedId, onSelect, onPendingCountChange }: CallbacksListProps) {
+export function CallbacksList({
+  selectedId,
+  onSelect,
+  onPendingCountChange,
+  forceFilter,
+  onForceFilterAck,
+}: CallbacksListProps) {
   const [filter, setFilter] = useState<Filter>('pending');
+
+  // Honour an external filter override from a deep link, then ack the parent.
+  useEffect(() => {
+    if (forceFilter && forceFilter !== filter) {
+      setFilter(forceFilter);
+    }
+    if (forceFilter && onForceFilterAck) {
+      onForceFilterAck();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forceFilter]);
   const [callbacks, setCallbacks] = useState<Callback[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const { socket } = useSocketContext();

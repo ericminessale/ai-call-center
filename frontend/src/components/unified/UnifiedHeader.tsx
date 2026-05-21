@@ -12,6 +12,7 @@ import {
   Sparkles,
   X as XIcon,
   PhoneOutgoing,
+  RotateCcw,
 } from 'lucide-react';
 import { ViewMode, AgentStatus } from '../../pages/UnifiedAgentDesktop';
 import Logo from '../shared/Logo';
@@ -214,6 +215,21 @@ export function UnifiedHeader({
               <AlertTriangle className="w-3.5 h-3.5 text-urgent-soft" />
               <span className="text-[11px] text-urgent-soft mono uppercase tracking-wider">Conf&nbsp;Err</span>
             </div>
+          )}
+          {/* WebRTC registration failure — surfaces the "Make sure the device
+              is not registered for Push Notifications while it is online" /
+              code -32603 class of SDK errors. The fix is to drop the SDK's
+              cached subscriber binding and reload, so we ship a one-click
+              button that does exactly that. See CallFabricContext.resetCallFabricState. */}
+          {callFabric.registrationError && (
+            <button
+              onClick={() => callFabric.resetCallFabricState()}
+              className="ml-2 flex items-center gap-1.5 px-2 py-1 rounded bg-urgent/15 border border-urgent/40 hover:bg-urgent/25 transition-colors"
+              title={callFabric.registrationError}
+            >
+              <RotateCcw className="w-3.5 h-3.5 text-urgent-soft" />
+              <span className="text-[11px] text-urgent-soft mono uppercase tracking-wider">Reset&nbsp;CF</span>
+            </button>
           )}
           {callFabric.isChangingStatus && (
             <div className="ml-2 flex items-center gap-1.5 px-2 py-1 rounded bg-info/10 border border-info/30">

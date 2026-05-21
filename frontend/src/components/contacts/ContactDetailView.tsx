@@ -42,7 +42,9 @@ import { CallDetailTab } from './CallDetailTab';
 import CallControlPanel from './CallControlPanel';
 import { PendingCallbackBanner } from './PendingCallbackBanner';
 import { ConferenceParticipants } from './ConferenceParticipants';
+import { ObserverControls } from '../shared/ObserverControls';
 import { useAuthStore } from '../../stores/authStore';
+import { useCallCapabilities } from '../../hooks/useCallCapabilities';
 import { logger } from '../../lib/logger';
 
 interface ContactDetailViewProps {
@@ -152,6 +154,12 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   const [isOnHold, setIsOnHold] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const { user: currentUser } = useAuthStore();
+
+  // Per-call capability set, used to gate transport-specific UI like
+  // ObserverControls (Listen) and ConferenceParticipants. Bridge-mode calls
+  // lack the multi-party capabilities so those surfaces auto-hide. See
+  // CALL_TRANSPORT.md.
+  const callCaps = useCallCapabilities(activeCallForContact);
 
   // Hydrate recording state from backend when a call becomes active, so the
   // Record button reflects reality on first render instead of always showing
@@ -267,8 +275,31 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   const isOutboundCallInProgress = isTrueOutboundCall ||
     (callState !== 'idle' && !isInConference);  // Only show ringing if NOT already in conference
 
-  // Any active call: browser outbound, AI outbound, inbound conference, or inbound from parent
-  const hasAnyActiveCall = !!(activeCall || currentCallSid || activeCallForContact || isOutboundCallInProgress || isInConference);
+  // Pre-take queue states: a call exists for this contact but the agent
+  // hasn't taken it yet. The Take-call banner renders in these states; call
+  // controls (End call, Hold, …) must NOT, since the agent isn't on the call.
+  const PRE_TAKE_STATUSES = ['waiting', 'assigned', 'queued', 'urgent'];
+  const contactCallIsPreTake = !!(
+    activeCallForContact &&
+    PRE_TAKE_STATUSES.includes(activeCallForContact.status || '')
+  );
+
+  // Agent is actually on (or actively dialing) a call. Used to gate the call
+  // control surface — End call / Hold / Record / mute / TTS / DTMF. Excludes
+  // pre-take queue states. Without this split, queued calls render call
+  // controls and the impossible "In queue + End call" both-at-once state.
+  const isAgentOnCall = !!(
+    activeCall ||
+    currentCallSid ||
+    isOutboundCallInProgress ||
+    isInConference ||
+    (activeCallForContact && !contactCallIsPreTake)
+  );
+
+  // Broader "is there any call activity tied to this contact" — kept for the
+  // existing places that want to hide the AI-form / call-history selector
+  // when a queued call exists for the contact.
+  const hasAnyActiveCall = !!(isAgentOnCall || activeCallForContact);
 
   // Get display status for calls
   const getOutboundCallStatus = () => {
@@ -292,9 +323,18 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     return 'Connected';
   };
 
-  // Load interactions when contact changes
+  // Load interactions when contact changes. Also reset any per-contact
+  // drill-down state — without this, switching to a new contact while the
+  // callDetail tab is active leaves the previous contact's call detail
+  // rendered against the new contact's header (state bleed bug).
   useEffect(() => {
     loadInteractions();
+    setSelectedHistoryCall(null);
+    if (activeTab === 'callDetail') {
+      setActiveTab('history');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- activeTab read for
+    // conditional reset only; we don't want to re-fire on tab changes.
   }, [contact.id]);
 
   // Track call duration
@@ -404,8 +444,30 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
     socket.on('transcription', handleTranscription);
 
+    // Recording state — backend emits `recording_status` from the SignalWire
+    // recording webhook (in-progress / completed / failed) and `recording` when
+    // a completed recording_url is available. Sync local state to whichever
+    // arrives, so the button reflects reality even when the state change wasn't
+    // initiated by this client.
+    const handleRecordingStatus = (data: { call_sid?: string; status?: string }) => {
+      if (data.call_sid !== effectiveCallSid) return;
+      const s = (data.status || '').toLowerCase();
+      if (s === 'recording' || s === 'in-progress') setIsRecording(true);
+      else if (s === 'completed' || s === 'stopped' || s === 'failed' || s === 'no-input') {
+        setIsRecording(false);
+      }
+    };
+    const handleRecordingFinished = (data: { call_sid?: string }) => {
+      if (data.call_sid !== effectiveCallSid) return;
+      setIsRecording(false);
+    };
+    socket.on('recording_status', handleRecordingStatus);
+    socket.on('recording', handleRecordingFinished);
+
     return () => {
       socket.off('transcription', handleTranscription);
+      socket.off('recording_status', handleRecordingStatus);
+      socket.off('recording', handleRecordingFinished);
       // Leave the call room when component unmounts or call changes
       socket.emit('leave_call', { call_sid: effectiveCallSid });
     };
@@ -819,9 +881,11 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         {/* Pending callback banner (Tier 2r) */}
         <PendingCallbackBanner contactId={contact.id} />
 
-        {/* Action Buttons / Call Controls */}
+        {/* Action Buttons / Call Controls — gated on isAgentOnCall (not the
+            broader hasAnyActiveCall) so they don't render for queued calls the
+            agent hasn't taken. See the variable definitions above. */}
         <div className="flex items-center gap-2 mt-4">
-          {hasAnyActiveCall ? (
+          {isAgentOnCall ? (
             <>
               {/* Live duration pill */}
               <div className={`flex items-center gap-2.5 px-3 py-1.5 rounded border ${
@@ -881,10 +945,36 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
                 isOnHold={isOnHold}
                 isRecording={isRecording}
                 userRole={currentUser?.role}
+                // Pass the Call so CallControlPanel can read the transport-
+                // specific capability set and hide buttons that don't apply
+                // (e.g. Backup/Escalate on bridge calls).
+                call={activeCallForContact}
                 onHoldChange={setIsOnHold}
                 onRecordingChange={setIsRecording}
               />
-              {isInConference && conferenceParticipants.length > 0 && (
+              {/* Observer actions for users NOT on the call (Listen). Three
+                  layered gates:
+                    1. Call exists at all.
+                    2. The viewer isn't the call's assigned agent — listening
+                       to your own call would loop audio.
+                    3. The transport supports monitor (bridge mode loses this
+                       until promote-to-conference ships in M4).
+                  ObserverControls itself adds a fourth: permission flag
+                  (can_listen_ai_calls / can_listen_human_calls) — renders
+                  null if the viewer lacks it. */}
+              {(activeCallForContact?.id || currentCallSid)
+                && activeCallForContact?.assigned_agent_id !== currentUser?.id
+                && callCaps.canMonitor && (
+                <ObserverControls
+                  callId={(activeCallForContact?.id ?? currentCallSid) as string | number}
+                  callType={isAICall || isInboundAICall ? 'ai' : 'human'}
+                />
+              )}
+              {/* Conference participant list — only meaningful for conference
+                  transport. Bridge calls have no conference, so the array is
+                  empty anyway; the capability gate is the cleaner signal. */}
+              {isInConference && callCaps.isMultiPartyCapable
+                && conferenceParticipants.length > 0 && (
                 <ConferenceParticipants
                   participants={conferenceParticipants}
                   className="mt-3"

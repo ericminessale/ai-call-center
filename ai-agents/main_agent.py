@@ -46,6 +46,10 @@ DATABASE_URL = os.getenv('DATABASE_URL', '')
 EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
 EMBEDDING_DIM = 384
 
+# Defends against SQL injection where collection_name is interpolated into
+# the chunks_<name> table identifier (psycopg2 can't parameterize idents).
+_COLLECTION_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
+
 # Global embedding model (loaded lazily)
 _embedding_model = None
 
@@ -190,6 +194,50 @@ def do_reindex(collection_name, documents, connection_string):
 
     print(f"Reindexed {total_chunks} chunks for collection '{collection_name}'", flush=True)
     return total_chunks
+
+
+def do_search(collection_name, query, top_k, connection_string):
+    """Vector similarity search against chunks_<collection>. Returns [] if
+    the chunks table doesn't exist — that's a normal state for an unindexed
+    collection, not an error."""
+    import psycopg2
+
+    if not _COLLECTION_NAME_RE.match(collection_name):
+        raise ValueError(f"Invalid collection_name: {collection_name!r}")
+
+    model = get_embedding_model()
+    if model is None:
+        raise RuntimeError("Embedding model not available")
+
+    query_embedding = model.encode([query])[0].tolist()
+    table_name = f"chunks_{collection_name}"
+
+    conn = psycopg2.connect(connection_string)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass(%s)", (table_name,))
+        if cur.fetchone()[0] is None:
+            return []
+        cur.execute(
+            f"SELECT content, filename, section, metadata, "
+            f"1 - (embedding <=> %s::vector) AS score "
+            f"FROM {table_name} "
+            f"ORDER BY embedding <=> %s::vector LIMIT %s",
+            (query_embedding, query_embedding, top_k),
+        )
+        return [
+            {
+                'content': row[0],
+                'filename': row[1],
+                'section': row[2],
+                'metadata': row[3],
+                'score': float(row[4]),
+            }
+            for row in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+        conn.close()
 
 
 def get_assigned_collection(agent_id):
@@ -347,9 +395,48 @@ def start_admin_api():
             traceback.print_exc()
             return JSONResponse({'error': str(e)}, status_code=500)
 
+    @admin_app.post("/search")
+    async def search(request: Request):
+        try:
+            data = await request.json()
+            collection_name = data.get('collection_name')
+            query = (data.get('query') or '').strip()
+            top_k = data.get('top_k', 5)
+
+            if not collection_name:
+                return JSONResponse({'error': 'collection_name is required'}, status_code=400)
+            if not query:
+                return JSONResponse({'error': 'query is required'}, status_code=400)
+            if not isinstance(top_k, int) or top_k < 1 or top_k > 50:
+                top_k = 5
+            if not DATABASE_URL:
+                return JSONResponse({'error': 'DATABASE_URL not configured'}, status_code=500)
+
+            results = do_search(collection_name, query, top_k, DATABASE_URL)
+            return JSONResponse({
+                'success': True,
+                'collection_name': collection_name,
+                'query': query,
+                'results': results,
+            })
+        except ValueError as e:
+            return JSONResponse({'error': str(e)}, status_code=400)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({'error': str(e)}, status_code=500)
+
     @admin_app.get("/admin/health")
     async def admin_health():
         return {"status": "healthy", "service": "ai-agents-admin"}
+
+    # Pre-warm the embedding model so the first /reindex or /search call doesn't
+    # eat the 10–30s cold-load. Without this, first request hits the Flask
+    # proxy's 10s timeout and returns 503 even though /search succeeds.
+    try:
+        get_embedding_model()
+    except Exception as e:
+        print(f"[admin_api] Pre-warm of embedding model failed (non-fatal): {e}", flush=True)
 
     uvicorn.run(admin_app, host="0.0.0.0", port=8081, log_level="info")
 
@@ -1488,6 +1575,7 @@ if __name__ == '__main__':
     print('  /outbound-support : Outbound support (proactive + RAG)')
     print('\nAdmin API:')
     print('  POST /reindex : Reindex documents into pgvector (port 8081)')
+    print('  POST /search  : Vector similarity search (port 8081)')
     print(f'\nDatabase: {DATABASE_URL[:50]}...' if DATABASE_URL else '\nDatabase: NOT CONFIGURED')
     print('\nStarting agent server on port 8080...\n')
 

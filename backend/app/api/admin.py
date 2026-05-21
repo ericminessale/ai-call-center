@@ -238,11 +238,21 @@ def create_queue():
         if Queue.find_by_slug(slug):
             return jsonify({'error': f'Queue "{slug}" already exists'}), 409
 
+        # Validate routing_transport — only two values, conference (default)
+        # or bridge. Anything else falls back to conference so a typo can't
+        # break call routing.
+        routing_transport = data.get('routing_transport', 'conference')
+        if routing_transport not in ('conference', 'bridge'):
+            return jsonify({
+                'error': "routing_transport must be 'conference' or 'bridge'",
+            }), 400
+
         queue = Queue(
             slug=slug,
             display_name=data['display_name'],
             description=data.get('description'),
             routing_strategy=data.get('routing_strategy', 'round_robin'),
+            routing_transport=routing_transport,
             ai_agent_route=data.get('ai_agent_route'),
             default_priority=data.get('default_priority', 5),
             sla_threshold_seconds=data.get('sla_threshold_seconds', 60),
@@ -271,9 +281,18 @@ def update_queue(queue_id):
             return jsonify({'error': 'Queue not found'}), 404
 
         data = request.get_json()
+
+        # Validate routing_transport if present — only two valid values.
+        if 'routing_transport' in data and data['routing_transport'] not in (
+            'conference', 'bridge',
+        ):
+            return jsonify({
+                'error': "routing_transport must be 'conference' or 'bridge'",
+            }), 400
+
         for field in ['display_name', 'description', 'is_active', 'routing_strategy',
-                      'ai_agent_route', 'default_priority', 'sla_threshold_seconds',
-                      'max_wait_before_ai_fallback']:
+                      'routing_transport', 'ai_agent_route', 'default_priority',
+                      'sla_threshold_seconds', 'max_wait_before_ai_fallback']:
             if field in data:
                 setattr(queue, field, data[field])
 
@@ -822,6 +841,232 @@ def update_user_languages(user_id):
         return jsonify({'error': str(e)}), 500
 
 
+KB_FACTBOOK_MODES = {'off', 'manual', 'auto'}
+COACH_MODES = {'off', 'on_request', 'auto'}
+COACH_INTENSITIES = {'terse', 'standard', 'verbose'}
+
+
+@admin_bp.route('/users/<int:user_id>/kb-factbook-mode', methods=['PUT'])
+@require_auth
+def update_user_kb_factbook_mode(user_id):
+    """Set this user's Knowledge Factbook mode for Agent Assist. Admin-only."""
+    data = request.get_json() or {}
+    mode = data.get('kb_factbook_mode')
+
+    if mode not in KB_FACTBOOK_MODES:
+        return jsonify({
+            'error': f'kb_factbook_mode must be one of: {", ".join(sorted(KB_FACTBOOK_MODES))}'
+        }), 400
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    refused = _refuse_if_demo_persona(user)
+    if refused:
+        return jsonify(refused[0]), refused[1]
+
+    try:
+        user.kb_factbook_mode = mode
+        db.session.commit()
+        logger.info(
+            f"User {user_id} ({user.email}) kb_factbook_mode set to '{mode}' "
+            f"by admin {request.current_user.id}"
+        )
+        return jsonify({'user': user.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to update kb_factbook_mode: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/users/<int:user_id>/coach-settings', methods=['PUT'])
+@require_auth
+def update_user_coach_settings(user_id):
+    """Set this user's AI Coach style preset. Admin-only.
+
+    Body: ``{coach_intensity: terse|standard|verbose}``.
+
+    Note: ``coach_mode`` is no longer admin-controlled — agents pick mode
+    per-call in the live Coach panel (gated by the ``can_use_coach``
+    permission flag). This endpoint now only writes the agent's style
+    preset, which the sidecar prompt uses at attach time.
+    """
+    data = request.get_json() or {}
+    intensity = data.get('coach_intensity')
+
+    # coach_mode is intentionally not accepted here. If a stale client sends
+    # it, ignore rather than error so the call doesn't fail outright.
+    if 'coach_mode' in data:
+        logger.info(
+            f"coach-settings: ignoring deprecated coach_mode field for user "
+            f"{user_id} — mode is now an in-call agent toggle."
+        )
+
+    if intensity is None:
+        return jsonify({'error': 'coach_intensity is required'}), 400
+    if intensity not in COACH_INTENSITIES:
+        return jsonify({
+            'error': f'coach_intensity must be one of: {", ".join(sorted(COACH_INTENSITIES))}'
+        }), 400
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    refused = _refuse_if_demo_persona(user)
+    if refused:
+        return jsonify(refused[0]), refused[1]
+
+    try:
+        user.coach_intensity = intensity
+        db.session.commit()
+        logger.info(
+            f"User {user_id} ({user.email}) coach_intensity set to "
+            f"'{intensity}' by admin {request.current_user.id}"
+        )
+        return jsonify({'user': user.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to update coach settings: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@admin_bp.route('/users/<int:user_id>/reset-subscriber', methods=['POST'])
+@require_auth
+def reset_user_subscriber(user_id):
+    """Force-recreate this user's SignalWire Call Fabric subscriber.
+
+    Recovery hammer for the "WebRTC endpoint registration failed" (-32603)
+    class of bugs originating in Hagrid's `mWebRTCEndpoints` legacy
+    registration cache (see CALL_TRANSPORT.md changelog 2026-05-14). When a
+    subscriber's device binding gets stuck server-side, the SDK can't
+    register a new device for that subscriber. Deleting the subscriber and
+    minting a fresh one drops all stale bindings.
+
+    Flow:
+      1. Best-effort DELETE the SignalWire subscriber via Fabric REST API.
+         404 is treated as success (already gone).
+      2. NULL out the user's signalwire_* fields locally. Next call to
+         /api/fabric/token will trigger _create_permanent_subscriber, which
+         mints a brand-new subscriber with a fresh subscriber_id, username,
+         and password — no inherited Hagrid binding state.
+      3. The user must reload their browser to pick up the new subscriber.
+         If they're resetting their own (admin), the frontend chains a
+         localStorage clear + reload after the response.
+
+    Admin-only. Refuses on demo personas (they auto-recreate via demo_seed).
+    """
+    # Reusing the role gate pattern from other admin endpoints — only
+    # admins can wipe subscribers, including their own.
+    if getattr(request.current_user, 'role', None) != 'admin':
+        return jsonify({'error': 'Admin role required'}), 403
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    refused = _refuse_if_demo_persona(user)
+    if refused:
+        return jsonify(refused[0]), refused[1]
+
+    sw_delete_error = None
+    deleted_subscriber_id = user.signalwire_subscriber_id
+
+    # Step 1: try to delete the SignalWire subscriber. Best-effort — even
+    # if SignalWire is unreachable, we still clear the local fields so the
+    # user can mint a fresh subscriber on next token request.
+    if deleted_subscriber_id and sw_client.is_configured():
+        try:
+            sw_client.get_client().fabric.subscribers.delete(deleted_subscriber_id)
+            logger.info(
+                f"reset-subscriber: SignalWire subscriber "
+                f"{deleted_subscriber_id} deleted for user {user_id}"
+            )
+        except sw_client.SignalWireRestError as e:
+            if getattr(e, 'status_code', None) == 404:
+                logger.info(
+                    f"reset-subscriber: SW subscriber {deleted_subscriber_id} "
+                    f"already gone (404) — treating as success"
+                )
+            else:
+                sw_delete_error = f"SignalWire delete failed: {e}"
+                logger.warning(f"reset-subscriber: {sw_delete_error}")
+        except Exception as e:
+            sw_delete_error = f"SignalWire unreachable: {e}"
+            logger.warning(f"reset-subscriber: {sw_delete_error}")
+
+    # Step 2: null the local fields. About to recreate, so this is just
+    # the gate that lets _create_permanent_subscriber take the
+    # "no existing subscriber" branch in step 3.
+    try:
+        user.signalwire_subscriber_id = None
+        user.signalwire_username = None
+        user.signalwire_password_encrypted = None
+        user.signalwire_address = None
+        user.fabric_subscriber_created_at = None
+        db.session.commit()
+        logger.info(
+            f"reset-subscriber: cleared local subscriber fields for "
+            f"user {user_id} ({user.email}) by admin {request.current_user.id}"
+        )
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"reset-subscriber: local field clear failed: {e}")
+        return jsonify({
+            'error': 'Failed to clear local subscriber state',
+            'detail': str(e),
+            'sw_warning': sw_delete_error,
+        }), 500
+
+    # Step 3: mint a fresh subscriber immediately. Atomic from the caller's
+    # POV — they go in with a stale subscriber, come out with a working one.
+    # If this step fails, the user is left in the "no subscriber yet"
+    # transient state — they can still sign in to retry (the token endpoint
+    # will _create_permanent_subscriber on first call). We surface the
+    # failure as `recreate_error` so the UI can warn.
+    sw_recreate_error = None
+    new_subscriber_id = None
+    try:
+        from app.api.fabric import _create_permanent_subscriber
+        _create_permanent_subscriber(user)
+        new_subscriber_id = user.signalwire_subscriber_id
+        logger.info(
+            f"reset-subscriber: fresh SW subscriber minted for user {user_id}: "
+            f"{new_subscriber_id} ({user.signalwire_address})"
+        )
+    except Exception as e:
+        sw_recreate_error = f"Subscriber recreate failed: {e}"
+        logger.error(f"reset-subscriber: {sw_recreate_error}", exc_info=True)
+        # Don't fail the whole request — the delete + clear succeeded, so
+        # the user is unblocked from the stuck-binding state even if the
+        # immediate recreate didn't go through. They can retry by signing
+        # back in (which calls /api/fabric/token → _create_permanent_subscriber).
+
+    result = {
+        'success': True,
+        'message': (
+            f'Subscriber reset for {user.email}.'
+            + (
+                ' Fresh subscriber created — reload to pick it up.'
+                if new_subscriber_id
+                else ' Recreate failed; sign in again to retry.'
+            )
+        ),
+        'deleted_subscriber_id': deleted_subscriber_id,
+        'new_subscriber_id': new_subscriber_id,
+        'user': user.to_dict(),
+    }
+    if sw_delete_error:
+        # Soft warning — local state IS cleared, SignalWire-side may have
+        # the orphaned record. It'll TTL out or be cleared on Hagrid restart.
+        result['sw_warning'] = sw_delete_error
+    if sw_recreate_error:
+        result['recreate_error'] = sw_recreate_error
+
+    return jsonify(result), 200
+
+
 @admin_bp.route('/users/<int:user_id>/permissions', methods=['PUT'])
 @require_auth
 def update_user_permissions(user_id):
@@ -963,6 +1208,49 @@ def delete_user(user_id):
 # and materializes as a `cxml_webhook` resource in Fabric, which is the
 # wrong resource type for a call center returning SWML.
 
+VALID_PHONE_TARGET_MODES = ('ai_triage', 'ai_specialist', 'human_direct')
+
+
+def _compute_phone_routing_url(base_url: str, target_mode: str, target_queue_slug):
+    """Pick the SWML webhook URL for a phone number based on its routing mode.
+    Raises ValueError for invalid combinations (queue-mode missing a queue)."""
+    if target_mode == 'ai_specialist':
+        if not target_queue_slug:
+            raise ValueError("target_queue_slug required for ai_specialist mode")
+        return f"{base_url}/api/swml/ai-specialist/{target_queue_slug}"
+    if target_mode == 'human_direct':
+        if not target_queue_slug:
+            raise ValueError("target_queue_slug required for human_direct mode")
+        return f"{base_url}/api/queues/{target_queue_slug}/direct-inbound"
+    return f"{base_url}/api/swml/initial-call"
+
+
+def _parse_phone_routing_from_url(url, base_url):
+    """Reverse of _compute_phone_routing_url. Returns
+    ``{'target_mode', 'target_queue_slug'}`` or None when the URL isn't one
+    we manage (numbers pointing at an external SWML / cXML script)."""
+    if not url or not base_url:
+        return None
+    base_trim = base_url.rstrip('/')
+    if not url.startswith(base_trim):
+        return None
+    path = url[len(base_trim):]
+    if '?' in path:
+        path = path.split('?', 1)[0]
+    path = path.rstrip('/')
+
+    if path == '/api/swml/initial-call':
+        return {'target_mode': 'ai_triage', 'target_queue_slug': None}
+    if path.startswith('/api/swml/ai-specialist/'):
+        slug = path[len('/api/swml/ai-specialist/'):]
+        if slug:
+            return {'target_mode': 'ai_specialist', 'target_queue_slug': slug}
+    if path.startswith('/api/queues/') and path.endswith('/direct-inbound'):
+        slug = path[len('/api/queues/'):-len('/direct-inbound')]
+        if slug:
+            return {'target_mode': 'human_direct', 'target_queue_slug': slug}
+    return None
+
 
 @admin_bp.route('/phone-numbers', methods=['GET'])
 @require_auth
@@ -985,11 +1273,7 @@ def list_phone_numbers():
             # Also honor call_request_url so legacy (laml_webhooks) assignments
             # from earlier migrations still show as assigned.
             current_url = n.get('call_relay_script_url') or n.get('call_request_url') or ''
-            is_assigned = bool(
-                webhook_url
-                and current_url
-                and current_url.rstrip('/') == webhook_url.rstrip('/')
-            )
+            routing = _parse_phone_routing_from_url(current_url, base_url) if base_url else None
             phone_numbers.append({
                 'sid': n.get('id'),
                 'phone_number': n.get('number') or n.get('phone_number', ''),
@@ -997,7 +1281,9 @@ def list_phone_numbers():
                 'voice_url': current_url,
                 'call_handler': n.get('call_handler') or '',
                 'status_callback': n.get('call_status_callback_url') or '',
-                'is_assigned': is_assigned,
+                'is_assigned': routing is not None,
+                'target_mode': routing['target_mode'] if routing else None,
+                'target_queue_slug': routing['target_queue_slug'] if routing else None,
             })
 
         return jsonify({
@@ -1017,7 +1303,14 @@ def list_phone_numbers():
 @admin_bp.route('/phone-numbers/<string:number_sid>', methods=['POST'])
 @require_auth
 def update_phone_number(number_sid):
-    """Route/unroute a phone number to the call center's SWML webhook."""
+    """Route/unroute a phone number to a specific SWML entry point.
+
+    Body for ``assign``:
+      ``{action: 'assign', target_mode?: str, target_queue_slug?: str}``
+      Defaults: ``target_mode='ai_triage'``, no queue.
+
+    Body for ``unassign``: ``{action: 'unassign'}``.
+    """
     data = request.get_json() or {}
     action = data.get('action')
 
@@ -1025,38 +1318,126 @@ def update_phone_number(number_sid):
         return jsonify({'error': 'action must be "assign" or "unassign"'}), 400
 
     base_url = get_base_url()
-    if action == 'assign' and not base_url:
-        return jsonify({'error': 'EXTERNAL_URL not configured. Cannot assign webhook.'}), 400
+    # Both assign and unassign now require a base_url. Assign points at a
+    # routing SWML; unassign points at /api/swml/out-of-service (SignalWire
+    # rejects empty call_relay_script_url with 422).
+    if not base_url:
+        return jsonify({'error': 'EXTERNAL_URL not configured. Cannot update phone number routing.'}), 400
 
-    webhook_url = f"{base_url}/api/swml/initial-call"
     client = sw_client.get_client()
 
     try:
         if action == 'assign':
-            client.phone_numbers.update(
+            target_mode = data.get('target_mode') or 'ai_triage'
+            target_queue_slug = data.get('target_queue_slug')
+
+            if target_mode not in VALID_PHONE_TARGET_MODES:
+                return jsonify({
+                    'error': f"target_mode must be one of: {', '.join(VALID_PHONE_TARGET_MODES)}"
+                }), 400
+
+            if target_mode in ('ai_specialist', 'human_direct'):
+                if not target_queue_slug:
+                    return jsonify({
+                        'error': f"target_queue_slug is required for target_mode='{target_mode}'"
+                    }), 400
+                queue = Queue.query.filter_by(slug=target_queue_slug, is_active=True).first()
+                if not queue:
+                    return jsonify({
+                        'error': f"Queue '{target_queue_slug}' not found or inactive"
+                    }), 400
+                if target_mode == 'ai_specialist' and not queue.ai_agent_route:
+                    return jsonify({
+                        'error': (
+                            f"Queue '{target_queue_slug}' has no AI agent route configured. "
+                            f"Pick another queue or use human_direct mode."
+                        )
+                    }), 400
+
+            try:
+                webhook_url = _compute_phone_routing_url(base_url, target_mode, target_queue_slug)
+            except ValueError as ve:
+                return jsonify({'error': str(ve)}), 400
+
+            from app.utils.url_utils import signed_webhook_url
+            from app.services.fabric_sync import update_swml_webhook_for_phone
+            status_callback_url = signed_webhook_url(
+                f"{base_url}/api/webhooks/call-status"
+            )
+            updated = client.phone_numbers.update(
                 number_sid,
                 call_handler='relay_script',
                 call_relay_script_url=webhook_url,
+                call_status_callback_url=status_callback_url,
             )
-            logger.info(f"Routed phone {number_sid} to SWML webhook {webhook_url}")
+
+            # phone_numbers.update keeps the legacy fields aligned but the
+            # field SignalWire's runtime actually reads for status callbacks
+            # lives on the swml_webhook Fabric resource (the Dashboard's
+            # "Calling Handler"). The legacy call_status_callback_url is
+            # display-only for relay_script handlers; without explicitly
+            # updating the swml_webhook here, the status_callback_url stays
+            # at whatever it was when the resource was first created (often
+            # a stale ngrok subdomain from a prior session).
+            handler_id = (updated or {}).get('calling_handler_resource_id')
+            swml_wh_result = update_swml_webhook_for_phone(
+                calling_handler_resource_id=handler_id,
+                primary_request_url=webhook_url,
+                status_callback_url=status_callback_url,
+            )
+            logger.info(
+                f"Routed phone {number_sid} → mode={target_mode} "
+                f"queue={target_queue_slug or '—'} url={webhook_url} "
+                f"status_callback={status_callback_url} "
+                f"swml_webhook={handler_id} → {swml_wh_result.get('ok')}"
+            )
             return jsonify({
                 'success': True,
-                'phone_number': {'sid': number_sid, 'is_assigned': True},
-                'message': 'Phone number routed to call center (SWML)',
+                'phone_number': {
+                    'sid': number_sid,
+                    'is_assigned': True,
+                    'target_mode': target_mode,
+                    'target_queue_slug': target_queue_slug,
+                    'voice_url': webhook_url,
+                },
+                'message': 'Phone number routed',
             }), 200
 
-        # Unassign — keep the handler as relay_script but clear the URL so
-        # no Fabric resource gets associated. Matches the "detached"
-        # presentation in the dashboard.
-        client.phone_numbers.update(
+        # Unassign — SignalWire rejects empty call_relay_script_url with
+        # 422 ("Call relay script url must be set"). Point instead at a
+        # dedicated "out of service" SWML endpoint that plays a rejection
+        # message and hangs up. _parse_phone_routing_from_url doesn't match
+        # this path, so the number correctly reads as is_assigned=False in
+        # the admin UI.
+        oos_url = f"{base_url}/api/swml/out-of-service"
+        from app.utils.url_utils import signed_webhook_url
+        from app.services.fabric_sync import update_swml_webhook_for_phone
+        status_callback_url = signed_webhook_url(
+            f"{base_url}/api/webhooks/call-status"
+        )
+        updated = client.phone_numbers.update(
             number_sid,
             call_handler='relay_script',
-            call_relay_script_url='',
+            call_relay_script_url=oos_url,
+            call_status_callback_url=status_callback_url,
         )
-        logger.info(f"Unrouted phone {number_sid} (cleared call_relay_script_url)")
+        # Also sync the swml_webhook (the real source of truth — see assign
+        # branch above for the long comment).
+        handler_id = (updated or {}).get('calling_handler_resource_id')
+        update_swml_webhook_for_phone(
+            calling_handler_resource_id=handler_id,
+            primary_request_url=oos_url,
+            status_callback_url=status_callback_url,
+        )
+        logger.info(f"Unrouted phone {number_sid} → out-of-service SWML")
         return jsonify({
             'success': True,
-            'phone_number': {'sid': number_sid, 'is_assigned': False},
+            'phone_number': {
+                'sid': number_sid,
+                'is_assigned': False,
+                'target_mode': None,
+                'target_queue_slug': None,
+            },
             'message': 'Phone number unrouted from call center',
         }), 200
 

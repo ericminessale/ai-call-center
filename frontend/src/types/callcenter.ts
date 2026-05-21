@@ -220,9 +220,34 @@ export interface Call {
   // Queue tracking
   assigned_agent_id?: number;  // Agent assigned to handle this call
   assigned_at?: string;  // When agent was notified
-  conference_name?: string;  // Interaction conference name
+  conference_name?: string;  // Interaction conference name (null in bridge mode)
   wait_time_seconds?: number;  // How long caller has been waiting
+
+  // Call transport — 'conference' (caller in interaction conf) or 'bridge'
+  // (two-leg direct dial). See CALL_TRANSPORT.md.
+  transport?: 'conference' | 'bridge';
+  // Per-call capability set shipped from backend (call_transport.capabilities).
+  // UI button visibility gates on membership in this list — never on transport
+  // directly. Keep in sync with backend/app/services/call_transport/base.py.
+  capabilities?: string[];
 }
+
+// Mirrors backend/app/services/call_transport/base.py Capability enum. Keep
+// in sync; the source of truth is the backend.
+export type CallCapability =
+  | 'hold'
+  | 'unhold'
+  | 'send_dtmf_caller'
+  | 'send_dtmf_agent'
+  | 'record_start'
+  | 'record_stop'
+  | 'monitor_listen'
+  | 'whisper'
+  | 'barge'
+  | 'takeover'
+  | 'transfer'
+  | 'live_translate'
+  | 'sidecar_coach';
 
 export interface TranscriptionMessage {
   id?: string;

@@ -5,7 +5,8 @@ export type PermissionFlag =
   | 'can_listen_human_calls'
   | 'can_whisper'
   | 'can_barge'
-  | 'can_control_recording';
+  | 'can_control_recording'
+  | 'can_use_coach';
 
 export interface User {
   id: string;
@@ -21,6 +22,12 @@ export interface User {
   // Explicit per-user overrides; drives the "overridden" state in the admin
   // user-config drawer. Empty = pure role defaults.
   permission_overrides?: Partial<Record<PermissionFlag, boolean>>;
+  // Agent Assist — Knowledge Factbook mode. See AGENT_ASSIST.md.
+  kb_factbook_mode?: 'off' | 'manual' | 'auto';
+  // Agent Assist — AI Coach prompt-tone preset. Mode is picked per-call in
+  // the live Coach panel (gated by `can_use_coach` permission), so it's
+  // intentionally not in this profile shape.
+  coach_intensity?: 'terse' | 'standard' | 'verbose';
 }
 
 export interface AuthResponse {

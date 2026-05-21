@@ -8,7 +8,7 @@ from app import db, socketio
 from app.models.call import Call
 from app.models.call_leg import CallLeg
 from app.models import User
-from app.utils.decorators import require_auth, require_role
+from app.utils.decorators import require_auth, require_permission, require_role
 from app.services.signalwire_api import get_signalwire_api
 from app.services.redis_service import get_redis_client
 from datetime import datetime
@@ -239,6 +239,7 @@ def play_into_call(call_id):
 
 @call_control_bp.route('/<call_id>/record/start', methods=['POST'])
 @require_auth
+@require_permission('can_control_recording')
 def start_recording(call_id):
     """Start recording an active call."""
     call = find_call(call_id)
@@ -300,6 +301,7 @@ def recording_status(call_id):
 
 @call_control_bp.route('/<call_id>/record/stop', methods=['POST'])
 @require_auth
+@require_permission('can_control_recording')
 def stop_recording(call_id):
     """Stop recording an active call."""
     call = find_call(call_id)
@@ -767,6 +769,17 @@ def escalate_to_supervisor(call_id):
 
     data = request.get_json() or {}
     whisper_mode = data.get('whisper', False)
+
+    # Whisper mode = supervisor speaks one-way to the requesting agent.
+    # Gated by the requesting user's `can_whisper` flag (it's the user opting
+    # into the coach-audio shape). Non-whisper escalation = full participant
+    # supervisor join and remains available to any authenticated agent.
+    if whisper_mode and not request.current_user.has_permission('can_whisper'):
+        return jsonify({
+            'error': 'Missing required permissions',
+            'required_permissions': ['can_whisper'],
+            'missing_permissions': ['can_whisper'],
+        }), 403
 
     try:
         # Find available supervisors and admins

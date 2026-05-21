@@ -422,14 +422,36 @@ export const adminApi = {
     api.put(`/api/admin/users/${id}/languages`, { languages }),
   updateUserPermissions: (id: number, permissions: Record<string, boolean>) =>
     api.put(`/api/admin/users/${id}/permissions`, { permissions }),
+  updateUserKbFactbookMode: (id: number, kb_factbook_mode: 'off' | 'manual' | 'auto') =>
+    api.put(`/api/admin/users/${id}/kb-factbook-mode`, { kb_factbook_mode }),
+  // Admin-set: only the prompt-tone preset is set here. Per-call mode lives
+  // in the LiveCallTab Coach panel as an in-call agent toggle, gated by the
+  // `can_use_coach` permission flag.
+  updateUserCoachIntensity: (
+    id: number,
+    coach_intensity: 'terse' | 'standard' | 'verbose',
+  ) =>
+    api.put(`/api/admin/users/${id}/coach-settings`, { coach_intensity }),
   deleteUser: (id: number) =>
     api.delete(`/api/admin/users/${id}`),
+  // Recovery hammer for stuck Call Fabric registrations (Hagrid's
+  // mWebRTCEndpoints leaks). Deletes the SignalWire subscriber + clears
+  // local credentials so the next /api/fabric/token call mints a fresh
+  // one. See CALL_TRANSPORT.md.
+  resetUserSubscriber: (id: number) =>
+    api.post<{ success: boolean; message: string; sw_warning?: string }>(
+      `/api/admin/users/${id}/reset-subscriber`,
+    ),
 
   // Phone number management
   getPhoneNumbers: () =>
     api.get('/api/admin/phone-numbers'),
-  updatePhoneNumber: (sid: string, action: 'assign' | 'unassign') =>
-    api.post(`/api/admin/phone-numbers/${sid}`, { action }),
+  updatePhoneNumber: (
+    sid: string,
+    action: 'assign' | 'unassign',
+    config?: { target_mode?: 'ai_triage' | 'ai_specialist' | 'human_direct'; target_queue_slug?: string | null },
+  ) =>
+    api.post(`/api/admin/phone-numbers/${sid}`, { action, ...(config || {}) }),
   getWebhookUrl: () =>
     api.get('/api/admin/webhook-url'),
 

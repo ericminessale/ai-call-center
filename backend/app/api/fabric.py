@@ -125,16 +125,47 @@ def _create_permanent_subscriber(user):
         logger.error(f"Could not determine username from subscriber data: {subscriber_data}")
         raise Exception("Subscriber data missing username/email field")
 
-    # Build the fabric address
-    # IMPORTANT: Call Fabric addresses must be alphanumeric with hyphens.
-    # Email format like "/private/eric.minessale@gmail.com" is INVALID.
-    # Use a sanitized format: "agent-{user_id}"
-    fabric_address_name = f"agent-{user.id}"
+    # Fetch the subscriber's REAL Fabric address from SignalWire.
+    # Old code fabricated this as "/private/agent-{user.id}" — that string
+    # was NEVER registered with the platform, so any SWML using it as a
+    # connect target failed silently (Bug J). SignalWire actually
+    # auto-materializes one address per subscriber, slugged from the
+    # subscriber's display_name (e.g. "System Administrator" →
+    # "/private/system-administrator"). The format is opaque to us; the
+    # only safe thing is to ask the platform what it created.
+    subscriber_id = subscriber_data.get('id')
+    fabric_address = f"/private/agent-{user.id}"  # Fallback if list fails.
+    try:
+        addrs_resp = sw_client.get_client().fabric.subscribers.list_addresses(subscriber_id)
+        addr_list = addrs_resp.get('data', []) if isinstance(addrs_resp, dict) else addrs_resp
+        if addr_list:
+            first = addr_list[0]
+            # `name` is the slug; build the /private/<name> form. If the
+            # platform ever returns multi-channel addresses, the audio
+            # channel string under `channels.audio` is the most precise.
+            real_name = first.get('name')
+            if real_name:
+                fabric_address = f"/private/{real_name}"
+            logger.info(
+                f"Subscriber {subscriber_id}: real Fabric address resolved "
+                f"to {fabric_address}"
+            )
+        else:
+            logger.warning(
+                f"Subscriber {subscriber_id} has no addresses yet — falling "
+                f"back to fabricated agent-{user.id}. Re-run subscriber sync "
+                f"after the platform materializes one."
+            )
+    except Exception as e:
+        logger.error(
+            f"Failed to list addresses for subscriber {subscriber_id}; "
+            f"using fabricated /private/agent-{user.id}: {e}"
+        )
 
-    user.signalwire_subscriber_id = subscriber_data.get('id')
+    user.signalwire_subscriber_id = subscriber_id
     user.signalwire_username = username  # Keep original for token generation
     user.set_subscriber_password(password)  # Encrypted storage
-    user.signalwire_address = f"/private/{fabric_address_name}"
+    user.signalwire_address = fabric_address
     user.fabric_subscriber_created_at = datetime.utcnow()
 
     logger.info(f"Subscriber fabric address: {user.signalwire_address} (token ref: {username})")

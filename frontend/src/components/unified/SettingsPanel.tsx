@@ -23,6 +23,7 @@ import {
   Upload,
   Plug,
   Activity,
+  RotateCcw,
 } from 'lucide-react';
 import { adminApi } from '../../services/api';
 import { useAuthStore } from '../../stores/authStore';
@@ -74,7 +75,16 @@ interface AdminUser {
   effective_permissions?: Partial<Record<PermissionKey, boolean>>;
   // Explicit overrides only — empty means "use role defaults".
   permission_overrides?: Partial<Record<PermissionKey, boolean>>;
+  // Agent Assist — Knowledge Factbook mode. See AGENT_ASSIST.md.
+  kb_factbook_mode?: 'off' | 'manual' | 'auto';
+  // Agent Assist — AI Coach style preset. Per-call mode lives on the live
+  // call surface as an in-call toggle (gated by `can_use_coach` permission),
+  // not here.
+  coach_intensity?: 'terse' | 'standard' | 'verbose';
 }
+
+type FactbookMode = 'off' | 'manual' | 'auto';
+type CoachIntensity = 'terse' | 'standard' | 'verbose';
 
 // Keep in lockstep with PERMISSION_FLAGS in backend/app/models/user.py.
 // Order controls the order in the edit modal.
@@ -83,7 +93,8 @@ type PermissionKey =
   | 'can_listen_human_calls'
   | 'can_whisper'
   | 'can_barge'
-  | 'can_control_recording';
+  | 'can_control_recording'
+  | 'can_use_coach';
 
 const PERMISSION_LABELS: Record<PermissionKey, { label: string; hint: string }> = {
   can_listen_ai_calls: {
@@ -106,6 +117,10 @@ const PERMISSION_LABELS: Record<PermissionKey, { label: string; hint: string }> 
     label: 'Control recording',
     hint: 'Start or stop recording on calls they participate in.',
   },
+  can_use_coach: {
+    label: 'Use AI coach',
+    hint: 'Attach the AI Coach sidecar on their own calls (per-call toggle; bills per minute while attached).',
+  },
 };
 
 const PERMISSION_ORDER: PermissionKey[] = [
@@ -114,6 +129,7 @@ const PERMISSION_ORDER: PermissionKey[] = [
   'can_whisper',
   'can_barge',
   'can_control_recording',
+  'can_use_coach',
 ];
 
 // BCP-47 language menu shown to admins. Keep small — these are the
@@ -138,7 +154,11 @@ interface PhoneNumber {
   voice_url: string;
   status_callback: string;
   is_assigned: boolean;
+  target_mode: 'ai_triage' | 'ai_specialist' | 'human_direct' | null;
+  target_queue_slug: string | null;
 }
+
+type PhoneTargetMode = 'ai_triage' | 'ai_specialist' | 'human_direct';
 
 interface QueueConfig {
   id: number;
@@ -147,6 +167,11 @@ interface QueueConfig {
   description: string | null;
   is_active: boolean;
   routing_strategy: string;
+  // Call transport: 'conference' (default) or 'bridge'. See CALL_TRANSPORT.md.
+  // Bridge mode: SWML `connect` direct to assigned agent; per-leg REST verbs
+  // (hold, DTMF) operate natively. Conference mode: caller in interaction
+  // conference; multi-party (whisper/barge/listen) available.
+  routing_transport?: 'conference' | 'bridge';
   ai_agent_route: string | null;
   default_priority: number;
   sla_threshold_seconds: number;
@@ -303,18 +328,24 @@ function formatPhoneNumber(phone: string): string {
 
 function PhoneNumbersTab() {
   const [numbers, setNumbers] = useState<PhoneNumber[]>([]);
+  const [queues, setQueues] = useState<QueueConfig[]>([]);
   const [webhookUrl, setWebhookUrl] = useState('');
   const [isConfigured, setIsConfigured] = useState(true);
   const [loading, setLoading] = useState(true);
   const [updatingNumber, setUpdatingNumber] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [configuringNumber, setConfiguringNumber] = useState<PhoneNumber | null>(null);
 
   const loadNumbers = useCallback(async () => {
     try {
-      const resp = await adminApi.getPhoneNumbers();
-      setNumbers(resp.data.phone_numbers);
-      setWebhookUrl(resp.data.webhook_url);
-      setIsConfigured(resp.data.is_configured);
+      const [phonesResp, queuesResp] = await Promise.all([
+        adminApi.getPhoneNumbers(),
+        adminApi.getQueues(),
+      ]);
+      setNumbers(phonesResp.data.phone_numbers);
+      setWebhookUrl(phonesResp.data.webhook_url);
+      setIsConfigured(phonesResp.data.is_configured);
+      setQueues(queuesResp.data.queues || []);
     } catch (err: any) {
       toast.error(err.response?.data?.error || 'Failed to load phone numbers');
     } finally {
@@ -324,20 +355,73 @@ function PhoneNumbersTab() {
 
   useEffect(() => { loadNumbers(); }, [loadNumbers]);
 
-  const handleToggleAssign = async (number: PhoneNumber) => {
+  const handleUnassign = async (number: PhoneNumber) => {
     setUpdatingNumber(number.sid);
-    const action = number.is_assigned ? 'unassign' : 'assign';
     try {
-      await adminApi.updatePhoneNumber(number.sid, action);
-      toast.success(
-        `${formatPhoneNumber(number.phone_number)} ${action === 'assign' ? 'assigned to' : 'unassigned from'} call center`
-      );
+      await adminApi.updatePhoneNumber(number.sid, 'unassign');
+      toast.success(`${formatPhoneNumber(number.phone_number)} unassigned`);
       await loadNumbers();
     } catch (err: any) {
-      toast.error(err.response?.data?.error || `Failed to ${action} phone number`);
+      toast.error(err.response?.data?.error || 'Failed to unassign phone number');
     } finally {
       setUpdatingNumber(null);
     }
+  };
+
+  const handleConfigureSave = async (
+    number: PhoneNumber,
+    target_mode: PhoneTargetMode,
+    target_queue_slug: string | null,
+  ) => {
+    setUpdatingNumber(number.sid);
+    try {
+      await adminApi.updatePhoneNumber(number.sid, 'assign', { target_mode, target_queue_slug });
+      toast.success(`${formatPhoneNumber(number.phone_number)} routing updated`);
+      setConfiguringNumber(null);
+      await loadNumbers();
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Failed to update routing');
+    } finally {
+      setUpdatingNumber(null);
+    }
+  };
+
+  const renderStatusChip = (n: PhoneNumber, hasExternal: boolean) => {
+    if (n.is_assigned && n.target_mode === 'ai_triage') {
+      return (
+        <span className="chip chip-live">
+          <span className="dot dot-live !w-1.5 !h-1.5" />AI receptionist
+        </span>
+      );
+    }
+    if (n.is_assigned && n.target_mode === 'ai_specialist') {
+      return (
+        <span className="chip chip-live" title={`AI specialist for queue: ${n.target_queue_slug}`}>
+          <span className="dot dot-live !w-1.5 !h-1.5" />
+          AI · {n.target_queue_slug}
+        </span>
+      );
+    }
+    if (n.is_assigned && n.target_mode === 'human_direct') {
+      return (
+        <span className="chip chip-wait" title="Skips AI — caller goes straight into the human queue">
+          <span className="dot dot-wait !w-1.5 !h-1.5" />
+          Human · {n.target_queue_slug}
+        </span>
+      );
+    }
+    if (hasExternal) {
+      return (
+        <span className="chip chip-wait" title={`Current webhook: ${n.voice_url}`}>
+          <span className="dot dot-wait !w-1.5 !h-1.5" />External
+        </span>
+      );
+    }
+    return (
+      <span className="chip chip-muted">
+        <span className="w-1.5 h-1.5 rounded-full bg-ink-faint inline-block" />Not configured
+      </span>
+    );
   };
 
   const handleCopyWebhookUrl = async () => {
@@ -350,10 +434,19 @@ function PhoneNumbersTab() {
     }
   };
 
+  const handleCopyNumber = async (phone: string) => {
+    try {
+      await navigator.clipboard.writeText(phone);
+      toast.success(`${formatPhoneNumber(phone)} copied`);
+    } catch {
+      toast.error('Failed to copy');
+    }
+  };
+
   if (loading) return <LoadingSpinner />;
 
   return (
-    <div className="max-w-5xl">
+    <div className="max-w-6xl">
       <div className="mb-5">
         <div className="kicker mb-1">Inbound</div>
         <h2 className="font-display text-[24px] text-ink leading-none mb-2">Phone numbers</h2>
@@ -416,22 +509,23 @@ function PhoneNumbersTab() {
               const hasExternalWebhook = !number.is_assigned && number.voice_url && number.voice_url.length > 0;
               return (
                 <tr key={number.sid} className="border-b border-rule/60 last:border-b-0 hover:bg-canvas-hover/30">
-                  <td className="px-4 py-3">
-                    <div className="mono text-[13px] text-ink">{formatPhoneNumber(number.phone_number)}</div>
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    <div className="inline-flex items-center gap-2">
+                      <span className="mono text-[13px] text-ink">{formatPhoneNumber(number.phone_number)}</span>
+                      <button
+                        onClick={() => handleCopyNumber(number.phone_number)}
+                        className="text-ink-faint hover:text-ink transition-colors"
+                        title="Copy phone number"
+                      >
+                        <Copy className="w-3 h-3" />
+                      </button>
+                    </div>
                   </td>
-                  <td className="px-4 py-3">
+                  <td className="px-4 py-3 whitespace-nowrap">
                     <span className="text-[13px] text-ink-muted">{number.friendly_name || '\u2014'}</span>
                   </td>
                   <td className="px-4 py-3">
-                    {number.is_assigned ? (
-                      <span className="chip chip-live"><span className="dot dot-live !w-1.5 !h-1.5" />Assigned</span>
-                    ) : hasExternalWebhook ? (
-                      <span className="chip chip-wait" title={`Current webhook: ${number.voice_url}`}>
-                        <span className="dot dot-wait !w-1.5 !h-1.5" />External
-                      </span>
-                    ) : (
-                      <span className="chip chip-muted"><span className="w-1.5 h-1.5 rounded-full bg-ink-faint inline-block" />Not configured</span>
-                    )}
+                    {renderStatusChip(number, !!hasExternalWebhook)}
                   </td>
                   <td className="px-4 py-3">
                     <span className="mono text-[11px] text-ink-dim truncate block max-w-[280px]" title={number.voice_url || 'None'}>
@@ -439,14 +533,26 @@ function PhoneNumbersTab() {
                     </span>
                   </td>
                   <td className="px-4 py-3 text-right">
-                    <button
-                      onClick={() => handleToggleAssign(number)}
-                      disabled={isUpdating || !isConfigured}
-                      className={number.is_assigned ? 'btn-secondary !py-1 !px-2.5 !text-[12px]' : 'btn-primary !py-1 !px-2.5 !text-[12px]'}
-                    >
-                      {isUpdating ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
-                      {number.is_assigned ? 'Unassign' : 'Assign'}
-                    </button>
+                    <div className="flex justify-end gap-1.5">
+                      <button
+                        onClick={() => setConfiguringNumber(number)}
+                        disabled={isUpdating || !isConfigured}
+                        className="btn-secondary !py-1 !px-2.5 !text-[12px]"
+                      >
+                        {isUpdating ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                        Configure
+                      </button>
+                      {number.is_assigned && (
+                        <button
+                          onClick={() => handleUnassign(number)}
+                          disabled={isUpdating}
+                          className="btn-secondary !py-1 !px-2.5 !text-[12px]"
+                          title="Remove the SWML webhook from this phone number"
+                        >
+                          Unassign
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               );
@@ -467,6 +573,177 @@ function PhoneNumbersTab() {
           {numbers.filter(n => n.is_assigned).length} / {numbers.length} numbers assigned
         </p>
       )}
+
+      {configuringNumber && (
+        <PhoneNumberConfigureModal
+          phoneNumber={configuringNumber}
+          queues={queues}
+          saving={updatingNumber === configuringNumber.sid}
+          onSave={(mode, queueSlug) => handleConfigureSave(configuringNumber, mode, queueSlug)}
+          onCancel={() => setConfiguringNumber(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+
+function PhoneNumberConfigureModal({
+  phoneNumber,
+  queues,
+  saving,
+  onSave,
+  onCancel,
+}: {
+  phoneNumber: PhoneNumber;
+  queues: QueueConfig[];
+  saving: boolean;
+  onSave: (mode: PhoneTargetMode, queueSlug: string | null) => void;
+  onCancel: () => void;
+}) {
+  const [mode, setMode] = useState<PhoneTargetMode>(
+    (phoneNumber.target_mode as PhoneTargetMode) || 'ai_triage',
+  );
+  const [queueSlug, setQueueSlug] = useState<string | null>(phoneNumber.target_queue_slug);
+
+  // Escape closes
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCancel(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+
+  const activeQueues = queues.filter((q) => q.is_active);
+  // ai_specialist requires the queue to have an AI agent route, otherwise the
+  // SWML fallback kicks in and the agent triage runs anyway — surface the
+  // restriction so admins can't pick an unusable combo.
+  const availableQueues = mode === 'ai_specialist'
+    ? activeQueues.filter((q) => q.ai_agent_route)
+    : activeQueues;
+
+  const handleModeChange = (newMode: PhoneTargetMode) => {
+    setMode(newMode);
+    if (newMode === 'ai_triage') {
+      setQueueSlug(null);
+      return;
+    }
+    // If the current queueSlug isn't valid in the new mode, default to the first available.
+    const filtered = newMode === 'ai_specialist'
+      ? activeQueues.filter((q) => q.ai_agent_route)
+      : activeQueues;
+    if (!queueSlug || !filtered.find((q) => q.slug === queueSlug)) {
+      setQueueSlug(filtered[0]?.slug || null);
+    }
+  };
+
+  const canSave = !saving && (mode === 'ai_triage' || !!queueSlug);
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onCancel} />
+
+      <div className="relative panel-raised rounded-md shadow-panel w-full max-w-[480px] flex flex-col">
+        <div className="px-6 pt-5 pb-4 border-b border-rule">
+          <div className="kicker mb-1">Phone number routing</div>
+          <h3 className="font-display text-[22px] text-ink leading-none">
+            {formatPhoneNumber(phoneNumber.phone_number)}
+          </h3>
+          {phoneNumber.friendly_name && (
+            <p className="mt-1.5 text-[13px] text-ink-muted">{phoneNumber.friendly_name}</p>
+          )}
+        </div>
+
+        <div className="px-6 py-5 space-y-5">
+          <section>
+            <div className="kicker mb-2">Route incoming calls to</div>
+            <div className="space-y-2">
+              <label className="flex items-start gap-3 p-3 rounded border border-rule hover:bg-canvas-hover/40 cursor-pointer">
+                <input
+                  type="radio"
+                  checked={mode === 'ai_triage'}
+                  onChange={() => handleModeChange('ai_triage')}
+                  className="mt-0.5 accent-sw-turquoise"
+                />
+                <div>
+                  <div className="text-[13px] text-ink">AI receptionist (default)</div>
+                  <div className="text-[11.5px] text-ink-dim mt-0.5">
+                    AI answers, classifies intent, routes to the matching queue.
+                  </div>
+                </div>
+              </label>
+              <label className="flex items-start gap-3 p-3 rounded border border-rule hover:bg-canvas-hover/40 cursor-pointer">
+                <input
+                  type="radio"
+                  checked={mode === 'ai_specialist'}
+                  onChange={() => handleModeChange('ai_specialist')}
+                  className="mt-0.5 accent-sw-turquoise"
+                />
+                <div>
+                  <div className="text-[13px] text-ink">AI specialist for a queue</div>
+                  <div className="text-[11.5px] text-ink-dim mt-0.5">
+                    Skip triage, go straight to the queue's AI agent.
+                  </div>
+                </div>
+              </label>
+              <label className="flex items-start gap-3 p-3 rounded border border-rule hover:bg-canvas-hover/40 cursor-pointer">
+                <input
+                  type="radio"
+                  checked={mode === 'human_direct'}
+                  onChange={() => handleModeChange('human_direct')}
+                  className="mt-0.5 accent-sw-turquoise"
+                />
+                <div>
+                  <div className="text-[13px] text-ink">Human direct to a queue</div>
+                  <div className="text-[11.5px] text-ink-dim mt-0.5">
+                    Skip AI entirely. Agent's pre-join whisper notes "direct line, no AI screening".
+                  </div>
+                </div>
+              </label>
+            </div>
+          </section>
+
+          {mode !== 'ai_triage' && (
+            <section>
+              <div className="kicker mb-2">Queue</div>
+              {availableQueues.length === 0 ? (
+                <div className="text-[12px] text-ink-dim p-3 bg-canvas-sunken rounded border border-rule">
+                  No queues available for this mode.
+                  {mode === 'ai_specialist' && (
+                    <span> (Mode requires a queue with an AI agent route configured.)</span>
+                  )}
+                </div>
+              ) : (
+                <select
+                  value={queueSlug || ''}
+                  onChange={(e) => setQueueSlug(e.target.value || null)}
+                  className="input w-full"
+                >
+                  <option value="">— pick a queue —</option>
+                  {availableQueues.map((q) => (
+                    <option key={q.slug} value={q.slug}>
+                      {q.display_name} ({q.slug})
+                    </option>
+                  ))}
+                </select>
+              )}
+            </section>
+          )}
+        </div>
+
+        <div className="px-6 py-4 border-t border-rule flex justify-end gap-2">
+          <button onClick={onCancel} disabled={saving} className="btn-secondary">
+            Cancel
+          </button>
+          <button
+            onClick={() => onSave(mode, mode === 'ai_triage' ? null : queueSlug)}
+            disabled={!canSave}
+            className="btn-primary"
+          >
+            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+            Save
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -527,6 +804,7 @@ function QueuesTab() {
       display_name: q.display_name,
       description: q.description,
       routing_strategy: q.routing_strategy,
+      routing_transport: q.routing_transport || 'conference',
       ai_agent_route: q.ai_agent_route,
       default_priority: q.default_priority,
       sla_threshold_seconds: q.sla_threshold_seconds,
@@ -703,6 +981,31 @@ function QueuesTab() {
                 </select>
                 <p className="text-[11px] text-ink-dim mt-1">
                   {ROUTING_STRATEGIES.find(s => s.value === editForm.routing_strategy)?.desc}
+                </p>
+              </div>
+              {/* Call transport: see CALL_TRANSPORT.md. Conference (current default)
+                  supports multi-party — supervisor monitor, whisper, barge. Bridge
+                  is a direct two-leg dial with native per-leg REST verbs (hold,
+                  DTMF) but no multi-party until promote-to-conference ships (M4).
+                  Bridge falls back to conference automatically when no agent is
+                  available, so the queue safety net is preserved. */}
+              <div className="col-span-2">
+                <label className="block kicker mb-1">Call Transport</label>
+                <select
+                  value={editForm.routing_transport || 'conference'}
+                  onChange={e => setEditForm({
+                    ...editForm,
+                    routing_transport: e.target.value as 'conference' | 'bridge',
+                  })}
+                  className="input"
+                >
+                  <option value="conference">Conference — multi-party (supervisor monitor, whisper, barge)</option>
+                  <option value="bridge">Bridge — direct dial (native hold + DTMF, no multi-party)</option>
+                </select>
+                <p className="text-[11px] text-ink-dim mt-1">
+                  {editForm.routing_transport === 'bridge'
+                    ? 'New calls dial the assigned agent directly. Falls back to conference parking when no agent is available.'
+                    : 'New calls park in an interaction conference; agent joins via WebRTC. Default.'}
                 </p>
               </div>
               <div className="col-span-2">
@@ -1646,8 +1949,19 @@ function UserEditModal({
   const [draftOverrides, setDraftOverrides] = useState<Partial<Record<PermissionKey, boolean>>>(
     user.permission_overrides || {}
   );
+  const [draftFactbookMode, setDraftFactbookMode] = useState<FactbookMode>(
+    (user.kb_factbook_mode as FactbookMode) || 'manual'
+  );
+  const [draftCoachIntensity, setDraftCoachIntensity] = useState<CoachIntensity>(
+    (user.coach_intensity as CoachIntensity) || 'standard'
+  );
   const [saving, setSaving] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  // Reset-subscriber state: separate from delete-user. Resetting just nukes
+  // the SignalWire subscriber binding to break a stuck WebRTC registration;
+  // the User row, calls, contacts all stay. See `resetSubscriber()` below.
+  const [showResetSubscriberConfirm, setShowResetSubscriberConfirm] = useState(false);
+  const [resettingSubscriber, setResettingSubscriber] = useState(false);
 
   // Escape closes the modal. Don't rebind on every render.
   useEffect(() => {
@@ -1669,6 +1983,7 @@ function UserEditModal({
         can_whisper: true,
         can_barge: true,
         can_control_recording: true,
+        can_use_coach: true,
       };
     }
     if (draftRole === 'supervisor') {
@@ -1678,6 +1993,7 @@ function UserEditModal({
         can_whisper: true,
         can_barge: true,
         can_control_recording: true,
+        can_use_coach: true,
       };
     }
     // agent
@@ -1687,6 +2003,7 @@ function UserEditModal({
       can_whisper: false,
       can_barge: false,
       can_control_recording: true,
+      can_use_coach: true,
     };
   }, [draftRole]);
 
@@ -1731,8 +2048,16 @@ function UserEditModal({
       JSON.stringify((user.languages || []).slice().sort()),
     permissions:
       JSON.stringify(draftOverrides) !== JSON.stringify(user.permission_overrides || {}),
+    factbookMode: draftFactbookMode !== ((user.kb_factbook_mode as FactbookMode) || 'manual'),
+    coachIntensity:
+      draftCoachIntensity !== ((user.coach_intensity as CoachIntensity) || 'standard'),
   };
-  const hasChanges = dirty.role || dirty.languages || dirty.permissions;
+  const hasChanges =
+    dirty.role ||
+    dirty.languages ||
+    dirty.permissions ||
+    dirty.factbookMode ||
+    dirty.coachIntensity;
 
   const save = async () => {
     if (!hasChanges || saving) return;
@@ -1764,6 +2089,14 @@ function UserEditModal({
         const resp = await adminApi.updateUserPermissions(user.id, clean);
         next = resp.data.user;
       }
+      if (dirty.factbookMode) {
+        const resp = await adminApi.updateUserKbFactbookMode(user.id, draftFactbookMode);
+        next = resp.data.user;
+      }
+      if (dirty.coachIntensity) {
+        const resp = await adminApi.updateUserCoachIntensity(user.id, draftCoachIntensity);
+        next = resp.data.user;
+      }
       toast.success('User updated');
       onUpdated(next);
     } catch (err: unknown) {
@@ -1790,6 +2123,69 @@ function UserEditModal({
         (err as { response?: { data?: { error?: string } } })?.response?.data?.error ||
         'Failed to delete user';
       toast.error(message);
+    }
+  };
+
+  // Recovery action: force-recreate the SignalWire subscriber. Hammer for
+  // the Hagrid-side "WebRTC endpoint registration failed" (-32603) class
+  // of bugs \u2014 when the SDK can't go online because of a stale device
+  // binding server-side, deleting + recreating the subscriber drops it.
+  //
+  // When admin resets their OWN subscriber, we also clear the SDK's
+  // localStorage cache and hard-reload \u2014 they're getting a clean
+  // browser-side state to match the fresh server-side identity.
+  // When admin resets ANOTHER user's, that user has to reload manually;
+  // we just toast a reminder.
+  const doResetSubscriber = async () => {
+    setResettingSubscriber(true);
+    try {
+      const resp = await adminApi.resetUserSubscriber(user.id);
+      const data = resp.data || {} as any;
+      // Surface soft warnings (delete-failed / recreate-failed). The
+      // operation as a whole is still success if either surfaced \u2014 local
+      // state is clean, recreate just needs a sign-in to retry.
+      if (data.sw_warning) {
+        toast(data.sw_warning, { icon: '\u26a0\ufe0f' });
+      }
+      if (data.recreate_error) {
+        toast(
+          'Subscriber deleted but recreate failed. Sign back in to retry.',
+          { icon: '\u26a0\ufe0f' },
+        );
+      }
+      // Atomic refresh of the parent's view of this user. Backend returns
+      // the full to_dict() of the user AFTER the delete + recreate ran,
+      // so we don't have to synthesize anything \u2014 it has the new
+      // signalwire_address, has_subscriber, etc.
+      const freshUser = data.user as AdminUser | undefined;
+      if (freshUser) {
+        onUpdated(freshUser);
+      }
+      if (isSelf) {
+        toast.success('Subscriber reset. Reloading\u2026');
+        // Match the Reset CF button behavior: clear sw:* SDK state then
+        // hard-reload so initializeClient picks up the fresh credentials
+        // against the new subscriber on next mount.
+        try {
+          for (const k of Object.keys(localStorage)) {
+            if (k.startsWith('sw:')) localStorage.removeItem(k);
+          }
+        } catch {
+          // localStorage unavailable in some private-browsing modes
+        }
+        // Small delay so the success toast renders before reload.
+        setTimeout(() => window.location.reload(), 600);
+      } else {
+        toast.success(data.message || 'Subscriber reset');
+      }
+      setShowResetSubscriberConfirm(false);
+    } catch (err: unknown) {
+      const message =
+        (err as { response?: { data?: { error?: string } } })?.response?.data?.error ||
+        'Failed to reset subscriber';
+      toast.error(message);
+    } finally {
+      setResettingSubscriber(false);
     }
   };
 
@@ -1853,6 +2249,46 @@ function UserEditModal({
               </div>
             </section>
 
+            {/* Knowledge Factbook (Agent Assist) */}
+            <section>
+              <div className="kicker mb-2">Knowledge factbook</div>
+              <select
+                value={draftFactbookMode}
+                onChange={(e) => setDraftFactbookMode(e.target.value as FactbookMode)}
+                className="input"
+              >
+                <option value="off">Off — hide the panel</option>
+                <option value="manual">Manual — typed query + transcript button</option>
+                <option value="auto">Auto — stream facts as the caller talks</option>
+              </select>
+              <p className="mt-1.5 text-[11.5px] text-ink-dim">
+                Controls how this user gets KB facts surfaced during a live call.
+              </p>
+            </section>
+
+            {/* AI Coach style preset.
+                Whether the agent CAN use the coach at all is the
+                `can_use_coach` permission flag below. Whether they're
+                actively using it on a given call is an in-call toggle in the
+                Live Call panel — not an admin setting. This dropdown just
+                sets the prompt-tone preset the sidecar uses when attached. */}
+            <section>
+              <div className="kicker mb-2">AI coach style</div>
+              <select
+                value={draftCoachIntensity}
+                onChange={(e) => setDraftCoachIntensity(e.target.value as CoachIntensity)}
+                className="input"
+              >
+                <option value="terse">Terse — one short tip</option>
+                <option value="standard">Standard — balanced suggestion</option>
+                <option value="verbose">Verbose — full reasoning + script</option>
+              </select>
+              <p className="mt-1.5 text-[11.5px] text-ink-dim">
+                Prompt-tone preset fed to the sidecar when this agent
+                enables the coach on a live call.
+              </p>
+            </section>
+
             {/* Permissions */}
             <section>
               <div className="flex items-baseline justify-between mb-2">
@@ -1912,20 +2348,81 @@ function UserEditModal({
                   roleDefault={roleDefaults.can_control_recording}
                   draftRole={draftRole}
                 />
+                <PermissionRow
+                  flag="can_use_coach"
+                  resolved={resolvedFor('can_use_coach')}
+                  overridden={isOverridden('can_use_coach')}
+                  toggle={() => toggleFlag('can_use_coach')}
+                  reset={() => resetFlag('can_use_coach')}
+                  roleDefault={roleDefaults.can_use_coach}
+                  draftRole={draftRole}
+                />
               </div>
             </section>
 
-            {/* Subscriber */}
+            {/* Subscriber.
+                Two distinct states share one backend endpoint but present
+                different intents:
+                  - has_subscriber: "Reset" (destructive recovery, drops
+                    active session, urgent palette)
+                  - no subscriber:  "Create" (constructive setup, info
+                    palette, no session to drop) */}
             <section>
               <div className="kicker mb-2">SignalWire subscriber</div>
               {user.has_subscriber ? (
-                <div className="text-[12px]">
-                  <span className="mono text-live-soft">{user.signalwire_address || 'Linked'}</span>
-                </div>
+                <>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="mono text-[12px] text-live-soft truncate">
+                      {user.signalwire_address || 'Linked'}
+                    </span>
+                    <button
+                      onClick={() => setShowResetSubscriberConfirm(true)}
+                      disabled={resettingSubscriber || saving}
+                      className="btn-secondary !border-urgent/40 !text-urgent-soft hover:!bg-urgent/10 disabled:opacity-50 !py-1 !px-2.5 !text-[12px] whitespace-nowrap"
+                      title={
+                        "Force-recreate this user's Call Fabric subscriber. " +
+                        "Recovery for stuck WebRTC registrations " +
+                        "(Hagrid mWebRTCEndpoints binding stuck server-side). " +
+                        (isSelf
+                          ? "Will clear your local Call Fabric state and reload after."
+                          : "The user must reload their browser after.")
+                      }
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      {resettingSubscriber ? 'Resetting…' : 'Reset subscriber'}
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-[11px] text-ink-dim">
+                    Drops the existing subscriber and mints a fresh one.
+                    Recovery for stuck "WebRTC endpoint registration failed"
+                    errors. {isSelf ? 'Your browser will reload after.' : 'The user must reload their browser to pick it up.'}
+                  </p>
+                </>
               ) : (
-                <div className="text-[12px] text-ink-dim">
-                  No subscriber linked yet. Created on first sign-in to the agent phone.
-                </div>
+                <>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-[12px] text-ink-dim">
+                      No subscriber linked yet.
+                    </span>
+                    <button
+                      onClick={() => setShowResetSubscriberConfirm(true)}
+                      disabled={resettingSubscriber || saving}
+                      className="btn-secondary !border-info/40 !text-info-soft hover:!bg-info/10 disabled:opacity-50 !py-1 !px-2.5 !text-[12px] whitespace-nowrap"
+                      title={
+                        "Mint a Call Fabric subscriber for this user now. " +
+                        "Normally one is created on first sign-in; use this " +
+                        "to provision ahead of time or to recover from an " +
+                        "incomplete prior reset."
+                      }
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      {resettingSubscriber ? 'Creating…' : 'Create subscriber'}
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-[11px] text-ink-dim">
+                    Auto-created on first sign-in, or click to provision now.
+                  </p>
+                </>
               )}
             </section>
           </div>
@@ -1965,6 +2462,22 @@ function UserEditModal({
             setShowDeleteConfirm(false);
           }}
           onCancel={() => setShowDeleteConfirm(false)}
+        />
+      )}
+      {showResetSubscriberConfirm && (
+        <ConfirmModal
+          title={user.has_subscriber ? 'Reset SignalWire subscriber' : 'Create SignalWire subscriber'}
+          message={
+            user.has_subscriber
+              ? (isSelf
+                  ? `Reset YOUR OWN SignalWire subscriber? This will drop your active Call Fabric session immediately, clear cached SDK state, and reload your browser. Use this when "Go Online" fails with a WebRTC registration error.`
+                  : `Reset ${user.email}'s SignalWire subscriber? Their current Call Fabric session will drop immediately and they must reload their browser to get a fresh subscriber. The user account, calls, and contacts stay intact.`)
+              : (isSelf
+                  ? `Mint a Call Fabric subscriber for yourself now? Your browser will reload to pick up the new identity.`
+                  : `Mint a Call Fabric subscriber for ${user.email}? They'll need to reload their browser (or sign in) to pick it up.`)
+          }
+          onConfirm={doResetSubscriber}
+          onCancel={() => setShowResetSubscriberConfirm(false)}
         />
       )}
     </>

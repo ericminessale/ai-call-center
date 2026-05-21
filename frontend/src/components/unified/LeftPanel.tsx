@@ -30,6 +30,11 @@ interface LeftPanelProps {
   selectedCallbackId?: number | null;
   onSelectCallback?: (callback: Callback) => void;
   onPendingCallbackCountChange?: (count: number) => void;
+  /** Optional one-shot override of the CallbacksList filter — used by the
+   *  Contact banner so a deep link lands on a tab containing the row. */
+  callbacksForceFilter?: 'pending' | 'mine' | 'completed' | null;
+  /** Fired once the override has been applied so the parent can clear it. */
+  onCallbacksFilterAck?: () => void;
 }
 
 export function LeftPanel({
@@ -51,6 +56,8 @@ export function LeftPanel({
   selectedCallbackId,
   onSelectCallback,
   onPendingCallbackCountChange,
+  callbacksForceFilter,
+  onCallbacksFilterAck,
 }: LeftPanelProps) {
   switch (viewMode) {
     case 'contacts':
@@ -93,6 +100,8 @@ export function LeftPanel({
           selectedId={selectedCallbackId ?? null}
           onSelect={(cb) => onSelectCallback?.(cb)}
           onPendingCountChange={onPendingCallbackCountChange}
+          forceFilter={callbacksForceFilter ?? null}
+          onForceFilterAck={onCallbacksFilterAck}
         />
       );
 

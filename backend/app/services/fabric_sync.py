@@ -11,11 +11,25 @@ via POST /api/admin/fabric/sync-webhooks.
 
 import logging
 import os
+import re
 from typing import Optional
+from urllib.parse import urlparse
 
 from app.services import signalwire_client as sw_client
 
 logger = logging.getLogger(__name__)
+
+
+# Phone-number webhook URL paths we manage. After an ngrok rotation we re-point
+# any phone number whose path matches one of these to the new EXTERNAL_URL,
+# preserving the queue slug suffix so routing mode (ai_triage / ai_specialist /
+# human_direct) stays intact. URLs with paths NOT in this list are owned by
+# someone else (other apps, manual experiments) and are left untouched.
+_MANAGED_PHONE_PATH_PATTERNS = (
+    re.compile(r'^/api/swml/initial-call/?$'),
+    re.compile(r'^/api/swml/ai-specialist/[^/?]+/?$'),
+    re.compile(r'^/api/queues/[^/?]+/direct-inbound/?$'),
+)
 
 
 def _extract_address_name(fabric_address: str) -> Optional[str]:
@@ -112,8 +126,197 @@ def sync_agent_conference_webhook(external_url: str) -> dict:
         return {'error': str(e)}
 
 
+def update_swml_webhook_for_phone(
+    *,
+    calling_handler_resource_id: str,
+    primary_request_url: str,
+    status_callback_url: str,
+) -> dict:
+    """Update the swml_webhook Fabric resource bound to a phone number.
+
+    The phone_numbers REST API stores ``call_status_callback_url`` for
+    display, but the runtime field SignalWire actually fires when a call
+    completes lives on the per-phone ``swml_webhook`` Fabric resource
+    (the Dashboard's "Calling Handler"). Setting it via phone_numbers.update
+    does NOT reliably propagate — empirical: the user can manually edit
+    the Calling Handler in the dashboard and start getting webhooks, while
+    a REST update to phone_numbers (even with the same URL) doesn't.
+
+    The correct API path is ``PATCH /api/fabric/resources/swml_webhooks/{id}``
+    — note the ``/resources/`` segment that's easy to miss. The SDK
+    namespace ``client.fabric.swml_webhooks`` uses this path.
+
+    Idempotent — safe to call after every phone_numbers.update.
+    """
+    if not calling_handler_resource_id:
+        return {'skipped': True, 'reason': 'no calling_handler_resource_id'}
+
+    try:
+        client = sw_client.get_client()
+        result = client.fabric.swml_webhooks.update(
+            calling_handler_resource_id,
+            primary_request_url=primary_request_url,
+            status_callback_url=status_callback_url,
+        )
+        inner = (result.get('swml_webhook') or {}) if isinstance(result, dict) else {}
+        return {
+            'ok': True,
+            'webhook_id': calling_handler_resource_id,
+            'primary_request_url': inner.get('primary_request_url'),
+            'status_callback_url': inner.get('status_callback_url'),
+        }
+    except Exception as e:
+        logger.error(
+            f"[fabric_sync] failed to update swml_webhook "
+            f"{calling_handler_resource_id}: {e}"
+        )
+        return {'ok': False, 'error': str(e)}
+
+
+def sync_phone_number_webhooks(external_url: str) -> dict:
+    """Re-point managed phone-number SWML webhooks at the current EXTERNAL_URL.
+
+    For each phone number whose ``call_relay_script_url`` path matches one of
+    our routes (initial-call / ai-specialist/<slug> / queues/<slug>/direct-inbound),
+    swap the host portion to ``external_url``. The path + query are preserved so
+    the per-number routing mode survives ngrok rotations without manual reassign.
+
+    Phone numbers pointing at unmanaged URLs (other apps, external SWML scripts,
+    Twilio-compat cXML) are left alone — we don't touch what we don't own.
+    """
+    if not external_url:
+        return {'skipped': True, 'reason': 'EXTERNAL_URL not set'}
+    if not sw_client.is_configured():
+        return {'skipped': True, 'reason': 'SignalWire credentials not configured'}
+
+    target_host = external_url.rstrip('/')
+
+    # Phone-number-level call-state callback. Without this, SignalWire never
+    # tells us when a caller hangs up while parked in our SWML (in-line goto/
+    # label hold loop, AI script, etc.) — the Call row stays at status='waiting'
+    # forever and the queue UI shows ghost callers indefinitely. The SWML
+    # `set` verb's `call_state_url` is supposed to do the same thing per-call
+    # but in practice we've seen it not fire reliably; configuring it at the
+    # phone-number level guarantees every inbound leg gets its lifecycle
+    # events delivered to /api/webhooks/call-status. The handler there
+    # cleans up Redis + Conference rows + emits `queue_update action='ended'`.
+    from app.utils.url_utils import signed_webhook_url
+    desired_status_callback = signed_webhook_url(
+        f"{target_host}/api/webhooks/call-status"
+    )
+
+    try:
+        client = sw_client.get_client()
+        resp = client.phone_numbers.list(page_size=100)
+        numbers = resp.get('data', []) if isinstance(resp, dict) else resp
+    except Exception as e:
+        logger.error(f"[fabric_sync] phone-numbers list failed: {e}")
+        return {'error': f'Failed to list phone numbers: {e}'}
+
+    synced = []
+    errors = []
+    unchanged = 0
+    skipped_unmanaged = 0
+
+    for n in numbers:
+        sid = n.get('id')
+        current_url = n.get('call_relay_script_url') or ''
+        if not current_url:
+            continue
+
+        parsed = urlparse(current_url)
+        if not parsed.path or not any(p.match(parsed.path) for p in _MANAGED_PHONE_PATH_PATTERNS):
+            skipped_unmanaged += 1
+            continue
+
+        new_url = target_host + parsed.path
+        if parsed.query:
+            new_url += '?' + parsed.query
+
+        # Did any of the fields drift? Check both the legacy phone_numbers
+        # fields AND the swml_webhook fields (the latter is what SignalWire
+        # actually reads at runtime — the legacy view often lies). Without
+        # the swml_webhook check, fabric_sync skips updates when only the
+        # status_callback_url has drifted on the swml_webhook (a common
+        # failure mode after ngrok rotation, since the swml_webhook's
+        # status_callback_url isn't auto-synced from the phone_numbers view).
+        current_status_cb = n.get('call_status_callback_url') or ''
+        script_url_drifted = current_url.rstrip('/') != new_url.rstrip('/')
+        status_cb_drifted = current_status_cb.rstrip('/') != desired_status_callback.rstrip('/')
+
+        handler_id = n.get('calling_handler_resource_id')
+        swml_wh_drifted = False
+        if handler_id:
+            try:
+                wh = client.fabric.swml_webhooks.get(handler_id)
+                wh_inner = (wh.get('swml_webhook') or {}) if isinstance(wh, dict) else {}
+                wh_primary = (wh_inner.get('primary_request_url') or '').rstrip('/')
+                wh_status_cb = (wh_inner.get('status_callback_url') or '').rstrip('/')
+                if wh_primary != new_url.rstrip('/'):
+                    swml_wh_drifted = True
+                if wh_status_cb != desired_status_callback.rstrip('/'):
+                    swml_wh_drifted = True
+            except Exception as e:
+                logger.warning(
+                    f"[fabric_sync] swml_webhook drift check failed for {handler_id}: {e}"
+                )
+
+        if not (script_url_drifted or status_cb_drifted or swml_wh_drifted):
+            unchanged += 1
+            continue
+
+        try:
+            client.phone_numbers.update(
+                sid,
+                call_handler='relay_script',
+                call_relay_script_url=new_url,
+                call_status_callback_url=desired_status_callback,
+            )
+
+            # The phone_numbers update above keeps the legacy view in sync,
+            # but the field SignalWire's runtime actually reads for status
+            # callbacks lives on the swml_webhook Fabric resource (the
+            # Dashboard's "Calling Handler"). Update it explicitly — this
+            # is THE fix for "I hang up and the call stays in the queue".
+            handler_id = n.get('calling_handler_resource_id')
+            swml_wh_result = update_swml_webhook_for_phone(
+                calling_handler_resource_id=handler_id,
+                primary_request_url=new_url,
+                status_callback_url=desired_status_callback,
+            )
+
+            synced.append({
+                'number': n.get('number') or n.get('phone_number'),
+                'sid': sid,
+                'previous': current_url,
+                'url': new_url,
+                'status_callback': desired_status_callback,
+                'status_callback_previous': current_status_cb,
+                'swml_webhook_update': swml_wh_result,
+            })
+            logger.info(
+                f"[fabric_sync] phone {n.get('number')} ({sid}): "
+                f"script_url={current_url} → {new_url}; "
+                f"status_callback={current_status_cb or '(none)'} → {desired_status_callback}; "
+                f"swml_webhook={handler_id} → {swml_wh_result.get('ok')}"
+            )
+        except Exception as e:
+            errors.append({'sid': sid, 'error': str(e)})
+            logger.error(f"[fabric_sync] failed to sync phone {sid}: {e}")
+
+    return {
+        'ok': len(errors) == 0,
+        'synced_count': len(synced),
+        'unchanged': unchanged,
+        'skipped_unmanaged': skipped_unmanaged,
+        'synced': synced,
+        'errors': errors,
+    }
+
+
 def sync_all(external_url: str) -> dict:
     """Run every configured webhook sync. Extend this as more resources are added."""
     return {
         'agent_conference': sync_agent_conference_webhook(external_url),
+        'phone_numbers': sync_phone_number_webhooks(external_url),
     }

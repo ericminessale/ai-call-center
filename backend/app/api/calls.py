@@ -3,7 +3,7 @@ from app import db, socketio, redis_client
 from app.api import calls_bp
 from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
-from app.utils.decorators import require_auth, validate_json
+from app.utils.decorators import require_auth, require_permission, validate_json
 from app.utils.demo_config import block_in_demo_mode, is_demo_mode
 from app.utils.moderation import is_text_acceptable
 from app.utils.url_utils import get_base_url, signed_webhook_url
@@ -197,6 +197,338 @@ def get_call(call_id):
         return jsonify({'error': f'Failed to get call details: {str(e)}'}), 500
 
 
+@calls_bp.route('/<call_id>/kb-search', methods=['POST'])
+@require_auth
+def kb_search(call_id):
+    """KB Factbook: pgvector retrieval over a single collection.
+
+    Body: {query: str, collection_name: str, top_k?: int (1-20, default 5)}
+    Auto-derivation of collection_name from queue/agent assignment lands later.
+    """
+    import requests as http_requests
+
+    call = None
+    if call_id.isdigit():
+        call = db.session.query(Call).filter_by(id=int(call_id)).first()
+    if not call:
+        call = Call.find_by_sid(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+
+    data = request.get_json(silent=True) or {}
+    query = (data.get('query') or '').strip()
+    top_k = data.get('top_k', 5)
+    collection_name = (data.get('collection_name') or '').strip()
+
+    if not query:
+        return jsonify({'error': 'query is required'}), 400
+    if not collection_name:
+        return jsonify({'error': 'collection_name is required'}), 400
+    if not isinstance(top_k, int) or top_k < 1 or top_k > 20:
+        top_k = 5
+
+    ai_agents_url = os.getenv('AI_AGENTS_ADMIN_URL', 'http://ai-agents:8081')
+    try:
+        resp = http_requests.post(
+            f"{ai_agents_url}/search",
+            json={
+                'collection_name': collection_name,
+                'query': query,
+                'top_k': top_k,
+            },
+            timeout=30,
+        )
+    except http_requests.RequestException as exc:
+        logger.error(f"KB search proxy failed: {exc}")
+        return jsonify({'error': 'Search service unavailable'}), 503
+
+    if not resp.ok:
+        return jsonify({'error': f'Search service returned {resp.status_code}'}), 502
+
+    return jsonify(resp.json()), 200
+
+
+@calls_bp.route('/<call_id>/kb-search-from-transcript', methods=['POST'])
+@require_auth
+def kb_search_from_transcript(call_id):
+    """KB Factbook: search KB using the last N final caller utterances as the query.
+
+    Body: {collection_name: str, n_utterances?: int (1-20, default 5), top_k?: int (1-20, default 5)}
+    Returns {success, collection_name, query, results, [note]}. ``note`` is set
+    when there were no caller utterances to derive a query from — in that case
+    results is empty but it's not a hard error.
+    """
+    import requests as http_requests
+
+    call = None
+    if call_id.isdigit():
+        call = db.session.query(Call).filter_by(id=int(call_id)).first()
+    if not call:
+        call = Call.find_by_sid(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+
+    data = request.get_json(silent=True) or {}
+    n_utterances = data.get('n_utterances', 5)
+    top_k = data.get('top_k', 5)
+    collection_name = (data.get('collection_name') or '').strip()
+
+    if not collection_name:
+        return jsonify({'error': 'collection_name is required'}), 400
+    if not isinstance(n_utterances, int) or n_utterances < 1 or n_utterances > 20:
+        n_utterances = 5
+    if not isinstance(top_k, int) or top_k < 1 or top_k > 20:
+        top_k = 5
+
+    rows = (
+        db.session.query(Transcription)
+        .filter(Transcription.call_id == call.id)
+        .filter(Transcription.speaker == 'caller')
+        .filter(Transcription.is_final == True)
+        .order_by(Transcription.created_at.desc())
+        .limit(n_utterances)
+        .all()
+    )
+    utterances = [r.transcript for r in reversed(rows) if r.transcript]
+    if not utterances:
+        return jsonify({
+            'success': True,
+            'collection_name': collection_name,
+            'query': '',
+            'results': [],
+            'note': 'No caller utterances yet to derive a query from.',
+        }), 200
+
+    query = ' '.join(utterances)
+
+    ai_agents_url = os.getenv('AI_AGENTS_ADMIN_URL', 'http://ai-agents:8081')
+    try:
+        resp = http_requests.post(
+            f"{ai_agents_url}/search",
+            json={
+                'collection_name': collection_name,
+                'query': query,
+                'top_k': top_k,
+            },
+            timeout=30,
+        )
+    except http_requests.RequestException as exc:
+        logger.error(f"KB transcript-search proxy failed: {exc}")
+        return jsonify({'error': 'Search service unavailable'}), 503
+
+    if not resp.ok:
+        return jsonify({'error': f'Search service returned {resp.status_code}'}), 502
+
+    return jsonify(resp.json()), 200
+
+
+def _coach_call_lookup(call_id):
+    """Shared helper for the coach/* endpoints — resolve a call by id-or-SID
+    and enforce the "this is your call" gate. Returns (call, user, error_response).
+    On the happy path ``error_response`` is None.
+    """
+    call = None
+    if call_id.isdigit():
+        call = db.session.query(Call).filter_by(id=int(call_id)).first()
+    if not call:
+        call = Call.find_by_sid(call_id)
+    if not call:
+        return None, None, (jsonify({'error': 'Call not found'}), 404)
+
+    user = request.current_user
+    is_admin = getattr(user, 'role', None) == 'admin'
+    if not is_admin and call.assigned_agent_id != user.id:
+        return None, None, (jsonify({
+            'error': 'Only the assigned agent on this call can control the coach.',
+        }), 403)
+    return call, user, None
+
+
+@calls_bp.route('/<call_id>/coach/attach', methods=['POST'])
+@require_auth
+@require_permission('can_use_coach')
+def coach_attach(call_id):
+    """AI Coach (sidecar) attach — start the sidecar with the given mode.
+
+    Body: ``{mode: 'on_request' | 'auto'}``. Idempotent — calling attach
+    again with a new mode detaches the existing sidecar and starts a fresh
+    one with the new prompt. Use this for mode switches mid-call (the
+    sidecar can't be reconfigured in place; we detach + re-attach).
+
+    Authorization:
+      - Capability gate: ``can_use_coach`` (admin-set, defaults vary by role)
+      - Ownership gate: only the call's assigned agent (or any admin)
+
+    Returns 202 — sidecar attach is async; the next ``coaching_suggestion``
+    event is the agent's confirmation it's live.
+    """
+    from app.services.coach import VALID_MODES, is_active_mode
+    from app.services import call_transport
+    from app.utils.url_utils import get_base_url
+
+    call, user, err = _coach_call_lookup(call_id)
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    mode = (data.get('mode') or '').strip()
+    if mode not in VALID_MODES:
+        return jsonify({
+            'error': f'mode must be one of {VALID_MODES}',
+        }), 400
+    if not is_active_mode(mode):
+        # 'off' isn't an attach — call /detach instead. Reject explicitly so
+        # client bugs don't quietly leave a stale sidecar attached.
+        return jsonify({
+            'error': "Use POST /coach/detach to turn the coach off.",
+        }), 400
+
+    try:
+        # Detach first in case a previous mode is still attached. Cheap
+        # no-op when nothing's there. Both calls dispatch through the
+        # transport seam — sidecar attach is per-leg, so this works
+        # identically in conference and bridge mode.
+        try:
+            call_transport.detach_sidecar(call)
+        except Exception:
+            pass  # SignalWire returns benign errors on no-op detach
+        call_transport.attach_sidecar(
+            call=call,
+            agent=user,
+            mode=mode,
+            queue_slug=call.queue_id or '',
+            base_url=get_base_url(),
+        )
+    except Exception as e:
+        logger.error(
+            f"coach_attach: failed for call {call.signalwire_call_sid}: {e}",
+            exc_info=True,
+        )
+        return jsonify({
+            'error': 'Coach attach failed. Try again in a moment.',
+            'detail': str(e),
+        }), 502
+
+    return jsonify({
+        'success': True,
+        'mode': mode,
+        'message': f'Coach attached in {mode} mode.',
+    }), 202
+
+
+@calls_bp.route('/<call_id>/coach/detach', methods=['POST'])
+@require_auth
+@require_permission('can_use_coach')
+def coach_detach(call_id):
+    """Detach the AI Coach sidecar from this call.
+
+    Idempotent: no error when nothing's attached. Always returns 200 even
+    on SignalWire-side detach failure, because from the agent's perspective
+    "stop coaching" is a fire-and-forget — they don't need to retry.
+    """
+    from app.services import call_transport
+
+    call, _user, err = _coach_call_lookup(call_id)
+    if err:
+        return err
+
+    try:
+        call_transport.detach_sidecar(call)
+    except Exception as e:
+        # Log but don't surface — detach failures are not actionable for
+        # the agent; the sidecar will auto-terminate on call end anyway.
+        logger.warning(
+            f"coach_detach: SignalWire detach failed for "
+            f"{call.signalwire_call_sid}: {e}"
+        )
+
+    return jsonify({'success': True, 'mode': 'off'}), 200
+
+
+@calls_bp.route('/<call_id>/coach/ask', methods=['POST'])
+@require_auth
+@require_permission('can_use_coach')
+def coach_ask(call_id):
+    """AI Coach (sidecar) ask endpoint — agent-initiated suggestion request.
+
+    Used by the LiveCallTab Coach panel when the panel is in ``on_request``
+    mode. Body: ``{question: str}``. Returns 202 with a locally-generated
+    ``ask_id``; the actual answer arrives async via the sidecar webhook
+    (``/api/webhooks/sidecar/events``) and gets pushed to the agent's
+    call room as a ``coaching_suggestion`` event with kind=``ask_answer``.
+
+    Authorization: only the call's currently-assigned agent (or admin)
+    may ask. Observers and unrelated users get 403.
+
+    Correlation: pushes the ask to a per-call Redis FIFO list so the
+    webhook can pop-and-attach when the matching answer arrives.
+    """
+    call, user, err = _coach_call_lookup(call_id)
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    question = (data.get('question') or '').strip()
+    if not question:
+        return jsonify({'error': 'question is required'}), 400
+    if len(question) > 2000:
+        return jsonify({'error': 'question is too long (max 2000 chars)'}), 400
+
+    # Locally-generated correlation token. SignalWire may not echo this
+    # yet (roadmap 2k Q3 — sidecar ask_id pending). The M10 FIFO shim
+    # in webhooks.sidecar_events handles correlation as a fallback.
+    ask_id = secrets.token_urlsafe(12)
+    pending_entry = {
+        'ask_id': ask_id,
+        'question': question,
+        'agent_user_id': user.id,
+        'ts': datetime.utcnow().isoformat(),
+    }
+
+    # Push to per-call FIFO so the answer can be matched. Best-effort: if
+    # Redis is down we still send the ask, just lose correlation metadata.
+    try:
+        from app.services.redis_service import get_redis_client
+        r = get_redis_client()
+        if r is not None:
+            key = f"coach_pending_asks:{call.signalwire_call_sid}"
+            r.rpush(key, json.dumps(pending_entry))
+            # Cap pending depth (a chatty agent shouldn't OOM Redis) and
+            # expire so finished calls don't leak keys.
+            r.ltrim(key, -20, -1)
+            r.expire(key, 3600)
+    except Exception as e:
+        logger.warning(
+            f"coach_ask: failed to push pending entry to Redis (non-fatal): {e}"
+        )
+
+    # Fire the ask. Async — answer arrives via webhook.
+    try:
+        sw_api = get_signalwire_api()
+        sw_api.ask_ai_sidecar(
+            call.signalwire_call_sid, question, ask_id=ask_id,
+        )
+    except Exception as e:
+        logger.error(
+            f"coach_ask: SignalWire ask failed for call "
+            f"{call.signalwire_call_sid}: {e}"
+        )
+        return jsonify({
+            'error': 'Coach is unavailable right now. Try again in a moment.',
+            'detail': str(e),
+        }), 502
+
+    logger.info(
+        f"Coach ask sent: call={call.signalwire_call_sid} "
+        f"agent={user.id} ask_id={ask_id} q='{question[:80]}'"
+    )
+    return jsonify({
+        'success': True,
+        'ask_id': ask_id,
+        'message': 'Coach is thinking — answer will arrive in the panel shortly.',
+    }), 202
+
+
 @calls_bp.route('', methods=['GET'])
 @calls_bp.route('/', methods=['GET'])
 @require_auth
@@ -368,6 +700,20 @@ def end_call(call_id):
             call.duration = int((call.ended_at - call.answered_at).total_seconds())
         db.session.commit()
         logger.info(f"Call status updated to 'completed' in database")
+
+        # Redis queue cleanup — /end sets status='completed' directly, which does
+        # NOT trigger the webhook cleanup path (that fires on SignalWire's 'ended'
+        # status callback, which doesn't always reliably fire after an API-driven
+        # end). Without this, the call lingers in queue:{slug} Redis sets,
+        # inflating queue position counts on subsequent calls.
+        try:
+            from app.services.queue_service import QueueService
+            from app.services.redis_service import get_redis_client
+            rdb = get_redis_client()
+            if rdb and call.signalwire_call_sid:
+                QueueService(rdb).remove_call_from_all_queues(call.signalwire_call_sid)
+        except Exception as cleanup_err:
+            logger.warning(f"Redis queue cleanup failed after /end: {cleanup_err}")
 
         # Emit call update so frontend removes from active list
         from app.services.callcenter_socketio import emit_call_update
@@ -1049,7 +1395,11 @@ def cleanup_stale_calls():
 def get_my_stats():
     """Get real-time stats for the current agent."""
     try:
-        user_id = request.user_id
+        # @require_auth sets request.current_user (a User object). The
+        # previous code used request.user_id which doesn't exist — every
+        # call to /api/calls/my-stats 500'd silently, polluting the log
+        # and breaking the dashboard agent-stats panel.
+        user_id = request.current_user.id
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
         # Calls handled today (where this agent was assigned or initiated)

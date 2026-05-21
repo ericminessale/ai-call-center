@@ -260,6 +260,101 @@ def handle_hold_call(data):
     logger.info(f"Call {call_id} {'on hold' if hold else 'resumed'}")
 
 
+@socketio.on('reject_call_assignment')
+def handle_reject_call_assignment(data):
+    """Agent declined the incoming call banner. Re-queue the call so another
+    agent can pick it up; reset declining agent's status from busy → available.
+
+    Without this handler the call would stay ``assigned`` indefinitely:
+    `assigned_agent_id` still pointing at the declining agent, no other
+    agent ever gets a shot, the caller holds forever, and the Redis queue
+    counter is permanently inflated. This is the bug that produces the
+    "you are number 2 in queue" when only one caller is actually waiting.
+    """
+    token = data.get('token') or request.headers.get('Authorization', '').replace('Bearer ', '')
+    call_id = data.get('call_id')
+    conference_name = data.get('conference_name')
+
+    user_id = verify_token(token)
+    if not user_id:
+        emit('error', {'message': 'Invalid token'})
+        return
+
+    logger.info(
+        f"Agent {user_id} declined call assignment "
+        f"(call_id={call_id}, conf={conference_name})"
+    )
+
+    if not call_id:
+        emit('error', {'message': 'call_id required'})
+        return
+
+    call = None
+    if str(call_id).isdigit():
+        call = Call.query.filter_by(id=int(call_id)).first()
+    if not call:
+        call = Call.find_by_sid(call_id)
+    if not call:
+        logger.warning(f"Reject: call {call_id} not found")
+        return
+
+    queue_id = call.queue_id
+    declining_agent = str(user_id)
+
+    try:
+        from app.services.queue_service import QueueService
+        from app.services.redis_service import get_redis_client
+        qs = QueueService(get_redis_client())
+
+        # Record the decline BEFORE we flip the agent to available below.
+        # Otherwise set_agent_status('available') re-triggers push-dispatch,
+        # which sees the same call at the queue head, picks the same agent
+        # (single-agent scenarios), and we ring them again — the infinite
+        # banner loop the user reported.
+        qs.mark_decline(declining_agent, call.signalwire_call_sid)
+
+        # Reset assignment so another agent can take it.
+        call.assigned_agent_id = None
+        call.status = 'waiting'
+        db.session.commit()
+
+        # Re-add to the queue zset (was removed when this agent was assigned).
+        if queue_id:
+            try:
+                context = json.loads(call.ai_context) if call.ai_context else {}
+            except (ValueError, TypeError):
+                context = {}
+            qs.enqueue_call(
+                call_id=call.signalwire_call_sid,
+                queue_id=queue_id,
+                priority=context.get('priority', 5),
+                context=context,
+                caller_info={'number': call.from_number, 'name': None},
+            )
+
+        # Free the declining agent so they can take the next call (or this one
+        # again, if no other agents — that's a separate "exclude declined-by"
+        # feature). Only clear if Redis still thinks they're busy on THIS call.
+        agent_state = qs.get_agent_status(declining_agent)
+        if agent_state and agent_state.get('current_call_id') == call.signalwire_call_sid:
+            qs.set_agent_status(declining_agent, 'available')
+
+        # Notify dashboard listeners — call is back in the queue.
+        socketio.emit('queue_update', {
+            'call': call.to_dict(include_contact=True),
+            'queue_id': queue_id,
+            'action': 'added',
+        })
+
+        logger.info(
+            f"Re-queued call {call.id} into '{queue_id}' after agent "
+            f"{declining_agent} declined"
+        )
+    except Exception as e:
+        logger.error(f"Error processing reject_call_assignment: {e}")
+        db.session.rollback()
+
+
 @socketio.on('end_call')
 def handle_end_call(data):
     """Handle call end."""

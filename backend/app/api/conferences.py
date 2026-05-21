@@ -75,6 +75,16 @@ def build_whisper_text(context: dict) -> str:
 
     parts = []
 
+    # Direct-inbound calls (phone number set to human_direct mode) skip the AI
+    # entirely — no name / issue / priority was collected. Tell the agent so
+    # they don't expect the usual pre-collected context on screen.
+    if context.get('source') == 'direct_inbound':
+        queue = context.get('queue')
+        if queue:
+            parts.append(f"Direct line for {queue}, no AI screening")
+        else:
+            parts.append("Direct line, no AI screening")
+
     # Caller identity
     name = context.get('customer_name') or context.get('caller_name')
     company = context.get('company')

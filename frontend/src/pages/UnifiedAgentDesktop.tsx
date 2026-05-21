@@ -10,7 +10,7 @@ import { LeftPanel } from '../components/unified/LeftPanel';
 import { IncomingCallBanner } from '../components/unified/IncomingCallBanner';
 import { SettingsPanel } from '../components/unified/SettingsPanel';
 import { ContactDetailView } from '../components/contacts/ContactDetailView';
-import { contactsApi, callsApi, queueApi, callControlApi, Callback } from '../services/api';
+import { contactsApi, callsApi, queueApi, callControlApi, callbacksApi, Callback } from '../services/api';
 import { Contact, ContactMinimal, Call, QueueConfig } from '../types/callcenter';
 import { CallbackDetail } from '../components/unified/CallbackDetail';
 import type { SentimentData } from '../components/contacts/LiveCallTab';
@@ -83,6 +83,41 @@ export function UnifiedAgentDesktop() {
   // Callback System (Tier 2r) — selected row + pending-count for header badge.
   const [selectedCallback, setSelectedCallback] = useState<Callback | null>(null);
   const [pendingCallbackCount, setPendingCallbackCount] = useState(0);
+  // When the Contact banner deep-links into /callbacks, it passes a
+  // suggested filter ('mine' / 'pending' / etc.) so the list lands on a
+  // tab that contains the row. Cleared after the first apply so subsequent
+  // filter clicks aren't overridden.
+  const [callbacksForceFilter, setCallbacksForceFilter] = useState<'pending' | 'mine' | 'completed' | null>(null);
+
+  // React-router state arrives via the location object — drain it on mount
+  // (and on subsequent in-app navigations) into our local callback selection.
+  // The Contact banner uses this to deep-link into the right callback row
+  // with the right filter pre-applied.
+  useEffect(() => {
+    const state = (location.state as { callbackId?: number; suggestedFilter?: string } | null) ?? null;
+    if (!state?.callbackId) return;
+    let cancelled = false;
+    callbacksApi
+      .get(state.callbackId)
+      .then((res) => {
+        if (cancelled) return;
+        setSelectedCallback(res.data.callback);
+        if (
+          state.suggestedFilter === 'mine' ||
+          state.suggestedFilter === 'pending' ||
+          state.suggestedFilter === 'completed'
+        ) {
+          setCallbacksForceFilter(state.suggestedFilter);
+        }
+        // Clear the location state so a later refresh doesn't re-apply.
+        window.history.replaceState({}, '');
+      })
+      .catch((err) => logger.error('Failed to load deep-linked callback', err));
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.state]);
 
   // Live sentiment from AI agents, keyed by call ID
   const [liveSentimentMap, setLiveSentimentMap] = useState<Record<number, SentimentData>>({});
@@ -741,6 +776,8 @@ export function UnifiedAgentDesktop() {
                 selectedCallbackId={selectedCallback?.id}
                 onSelectCallback={(cb) => setSelectedCallback(cb)}
                 onPendingCallbackCountChange={setPendingCallbackCount}
+                callbacksForceFilter={callbacksForceFilter}
+                onCallbacksFilterAck={() => setCallbacksForceFilter(null)}
               />
             </div>
 

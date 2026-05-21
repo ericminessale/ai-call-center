@@ -27,6 +27,8 @@ import {
   Languages,
 } from 'lucide-react';
 import { callControlApi } from '../../services/api';
+import { useCallCapabilities } from '../../hooks/useCallCapabilities';
+import type { Call } from '../../types/callcenter';
 
 // Same BCP-47 menu as the admin user editor so caller/agent vocabularies match.
 const TRANSLATE_LANGUAGES: { code: string; label: string }[] = [
@@ -51,6 +53,10 @@ interface CallControlPanelProps {
   isOnHold: boolean;
   isRecording: boolean;
   userRole?: string;
+  // Optional Call object — when provided, we gate buttons on its
+  // transport-specific capability set. Without it the hook returns the
+  // legacy conference set so existing UIs don't change.
+  call?: Call | null;
   onHoldChange?: (held: boolean) => void;
   onRecordingChange?: (recording: boolean) => void;
   onBackupRequested?: () => void;
@@ -66,11 +72,16 @@ export default function CallControlPanel({
   isOnHold,
   isRecording,
   userRole = 'agent',
+  call,
   onHoldChange,
   onRecordingChange,
   onBackupRequested,
   onEscalateRequested,
 }: CallControlPanelProps) {
+  // Per-call capability set. Bridge mode loses multi-party (whisper/barge/
+  // monitor) but gains caller-leg DTMF; conference inverts that. UI buttons
+  // gate on these flags instead of branching on transport directly.
+  const caps = useCallCapabilities(call);
   const [showDtmfPad, setShowDtmfPad] = useState(false);
   const [showTtsInput, setShowTtsInput] = useState(false);
   const [ttsText, setTtsText] = useState('');
@@ -240,6 +251,28 @@ export default function CallControlPanel({
 
   const dtmfButtons = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'];
 
+  // Every primary control inside this panel (Hold, Record, TTS, DTMF,
+  // Translate, Backup, Escalate) is gated on `isHumanCall` AND a capability
+  // check. Rendering the panel header when nothing will render produces a
+  // Call-Controls dropdown that's permanently empty — confusing UX.
+  // Compute per-button visibility once so we can decide whether to render
+  // the panel header at all.
+  const showHold = isHumanCall && (caps.canHold || caps.canUnhold);
+  const showRecord = isHumanCall;  // recording perm gated server-side
+  const showTts = isHumanCall;     // calling.play works on any human leg
+  const showDtmf = isHumanCall && caps.canSendDtmfCaller;
+  const showTranslate = isHumanCall && caps.canLiveTranslate;
+  // Backup/Escalate add a second agent to the conference — multi-party only.
+  // We keep `isInConference` as a runtime gate (the agent has to actually
+  // be in the conference for the operation to make sense).
+  const showBackup = isHumanCall && caps.isMultiPartyCapable && isInConference;
+  const showEscalate = isHumanCall && caps.isMultiPartyCapable && isInConference && !isSupervisor;
+
+  const hasAnyVisibleControl =
+    showHold || showRecord || showTts || showDtmf || showTranslate
+    || showBackup || showEscalate;
+  if (!hasAnyVisibleControl) return null;
+
   return (
     <div className="mt-3">
       {/* Toggle header */}
@@ -255,8 +288,10 @@ export default function CallControlPanel({
         <div className="space-y-2">
           {/* Primary control buttons */}
           <div className="flex flex-wrap items-center gap-2">
-            {/* Hold/Resume - only for human agent calls */}
-            {isHumanCall && (
+            {/* Hold/Resume — gated on transport capability (both conference
+                and bridge support hold, but conference uses participant-mute
+                workaround while bridge uses REST calling.hold). */}
+            {showHold && (
               <button
                 onClick={handleHold}
                 disabled={isLoading === 'hold'}
@@ -274,7 +309,7 @@ export default function CallControlPanel({
             {/* Record — only for human agent calls (AI calls auto-record via SWML).
                 Button state is hydrated from GET /record/status on mount so it
                 accurately reflects whether a manual recording session is live. */}
-            {isHumanCall && (
+            {showRecord && (
               <button
                 onClick={handleRecord}
                 disabled={isLoading === 'record'}
@@ -307,7 +342,7 @@ export default function CallControlPanel({
             )}
 
             {/* TTS toggle - only for human agent calls (AI verb owns audio pipeline) */}
-            {isHumanCall && (
+            {showTts && (
               <button
                 onClick={() => { setShowTtsInput(!showTtsInput); setShowDtmfPad(false); }}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
@@ -322,8 +357,10 @@ export default function CallControlPanel({
               </button>
             )}
 
-            {/* DTMF toggle - only for human agent calls */}
-            {isHumanCall && (
+            {/* DTMF toggle — bridge mode unlocks this (calling.send_digits on
+                caller leg). Conference mode hides until SWML ships per-
+                participant DTMF; see CALL_TRANSPORT.md capability matrix. */}
+            {showDtmf && (
               <button
                 onClick={() => { setShowDtmfPad(!showDtmfPad); setShowTtsInput(false); }}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
@@ -339,7 +376,7 @@ export default function CallControlPanel({
             )}
 
             {/* Live Translate toggle - only for human agent calls */}
-            {isHumanCall && (
+            {showTranslate && (
               <button
                 onClick={handleToggleTranslate}
                 disabled={isLoading === 'translate'}
@@ -367,8 +404,9 @@ export default function CallControlPanel({
             {/* Listen/Whisper/Barge intentionally omitted — those are observer
                 actions for calls you are NOT on. See ObserverControls. */}
 
-            {/* Request Backup (when in conference) */}
-            {isInConference && isHumanCall && (
+            {/* Request Backup — multi-party only (conference). Bridge calls
+                lack this capability until promote-to-conference ships in M4. */}
+            {showBackup && (
               <button
                 onClick={handleRequestBackup}
                 disabled={isLoading === 'backup'}
@@ -379,8 +417,8 @@ export default function CallControlPanel({
               </button>
             )}
 
-            {/* Escalate to Supervisor */}
-            {isInConference && isHumanCall && !isSupervisor && (
+            {/* Escalate to Supervisor — same multi-party gate as Backup. */}
+            {showEscalate && (
               <button
                 onClick={handleEscalate}
                 disabled={isLoading === 'escalate'}

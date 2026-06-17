@@ -243,8 +243,11 @@ def create_callback():
 def claim_callback(callback_id):
     """An agent takes ownership of a pending callback.
 
-    Refuses if someone else already claimed it (returns 409). Self-claim
-    is a no-op so the UI can call this idempotently.
+    LIFE-03 fix (2026-06-02 audit): replaces the previous check-then-act
+    pattern with an atomic UPDATE...WHERE so two agents clicking Claim
+    simultaneously can't both succeed. Same shape as the LIFE-01
+    Take/Push-dispatch race fix in calls.py:take_queued_call. Self-claim
+    stays idempotent (the WHERE allows already-claimed-by-me).
     """
     try:
         cb, err = _find_callback_or_404(callback_id)
@@ -254,18 +257,47 @@ def claim_callback(callback_id):
             return jsonify({'error': 'Callback already completed'}), 409
         if cb.is_expired:
             return jsonify({'error': 'Callback has expired'}), 409
-        if cb.claimed_by_agent_id and cb.claimed_by_agent_id != request.current_user.id:
+
+        # Atomic claim. The WHERE filter accepts NULL (unclaimed) OR the
+        # current user (idempotent re-claim) — anything else loses.
+        from sqlalchemy import text
+        from datetime import datetime
+        user_id = request.current_user.id
+        result = db.session.execute(
+            text(
+                "UPDATE callbacks SET "
+                "  claimed_by_agent_id = :uid, "
+                "  claimed_at = COALESCE(claimed_at, :ts) "
+                "WHERE id = :id AND ("
+                "  claimed_by_agent_id IS NULL OR claimed_by_agent_id = :uid"
+                ") AND completed_at IS NULL "
+                "RETURNING id"
+            ),
+            {'uid': user_id, 'ts': datetime.utcnow(), 'id': callback_id},
+        )
+        if not result.fetchone():
+            db.session.rollback()
+            # Re-fetch to log who owns it now without trusting the
+            # potentially-stale in-memory cb.claimed_by_agent_id.
+            current = db.session.execute(
+                text("SELECT claimed_by_agent_id, completed_at FROM callbacks WHERE id = :id"),
+                {'id': callback_id},
+            ).fetchone()
+            if current and current[1] is not None:
+                return jsonify({'error': 'Callback already completed'}), 409
             return jsonify({
                 'error': 'Already claimed by another agent',
-                'claimed_by_agent_id': cb.claimed_by_agent_id,
+                'claimed_by_agent_id': current[0] if current else None,
             }), 409
 
-        cb.claim(request.current_user.id)
         db.session.commit()
+        # Refresh so the response payload reflects the claimed state.
+        db.session.refresh(cb)
         _emit_callback_event('claimed', cb)
         return jsonify({'callback': cb.to_dict(include_contact=True)}), 200
     except Exception as exc:
         logger.error('Failed to claim callback %s: %s', callback_id, exc)
+        db.session.rollback()
         return jsonify({'error': f'Failed to claim callback: {exc}'}), 500
 
 
@@ -374,21 +406,45 @@ def dial_callback(callback_id):
             return jsonify({'error': 'Callback has expired'}), 409
 
         # Auto-claim on dial — UX shortcut so the agent doesn't have to
-        # explicitly click claim before dial.
-        if cb.claimed_by_agent_id is None:
-            cb.claim(request.current_user.id)
-        elif cb.claimed_by_agent_id != request.current_user.id:
+        # explicitly click claim before dial. Atomic so a race with another
+        # agent's claim doesn't let both proceed to the outbound dial
+        # (LIFE-03 followup: the auto-claim used to be the same vulnerable
+        # check-then-act).
+        from sqlalchemy import text
+        from datetime import datetime
+        user_id = request.current_user.id
+        claim = db.session.execute(
+            text(
+                "UPDATE callbacks SET "
+                "  claimed_by_agent_id = :uid, "
+                "  claimed_at = COALESCE(claimed_at, :ts) "
+                "WHERE id = :id AND ("
+                "  claimed_by_agent_id IS NULL OR claimed_by_agent_id = :uid"
+                ") AND completed_at IS NULL "
+                "RETURNING id"
+            ),
+            {'uid': user_id, 'ts': datetime.utcnow(), 'id': callback_id},
+        )
+        if not claim.fetchone():
+            db.session.rollback()
+            current = db.session.execute(
+                text("SELECT claimed_by_agent_id FROM callbacks WHERE id = :id"),
+                {'id': callback_id},
+            ).fetchone()
             return jsonify({
                 'error': 'Already claimed by another agent',
-                'claimed_by_agent_id': cb.claimed_by_agent_id,
+                'claimed_by_agent_id': current[0] if current else None,
             }), 409
+        db.session.refresh(cb)
 
         # Initiate the outbound call. We dial through the standard
         # initial-call SWML so the agent's CRM context is preserved and
-        # transcription / recording kick in just like an inbound.
+        # transcription / recording kick in just like an inbound. amd=1
+        # adds answering-machine detection so the pipeline doesn't run
+        # against a voicemail greeting (machine → message + hangup).
         sw_api = get_signalwire_api()
         base_url = get_base_url()
-        swml_url = f"{base_url}/api/swml/initial-call"
+        swml_url = f"{base_url}/api/swml/initial-call?amd=1"
         status_callback = signed_webhook_url(f"{base_url}/api/webhooks/call-status")
 
         sw_call = sw_api.create_call(

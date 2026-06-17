@@ -69,144 +69,310 @@ def _find_agent_participant(call, user_id):
     )
 
 
+def _require_call_ownership(call, user):
+    """Return (jsonify, status) tuple to abort the request, or None to allow.
+
+    RE-AUDIT-04 (2026-06-03): endpoints that mutate call state or play
+    media into the customer leg used to gate only on @require_auth,
+    which let any logged-in user act on any agent's call by guessing
+    the call_id. Reject unless the requester IS the assigned agent on
+    the call OR holds supervisor/admin role. Apply to call control
+    endpoints that fire user-facing effects (play, DTMF, return-to-queue,
+    etc.).
+    """
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+    role = getattr(user, 'role', '') or ''
+    if role in ('admin', 'supervisor'):
+        return None
+    if call.assigned_agent_id == user.id:
+        return None
+    return jsonify({
+        'error': "You don't have ownership of this call",
+        'detail': (
+            'Only the assigned agent (or a supervisor/admin) can mutate this '
+            "call. If this is your call, your assignment may not have synced "
+            "yet — refresh and try again."
+        ),
+    }), 403
+
+
 @call_control_bp.route('/<call_id>/hold', methods=['POST'])
 @require_auth
 def hold_call(call_id):
-    """Hold the call — cut the agent's audio both ways.
+    """Hold the call — NOT YET IMPLEMENTED.
 
-    Conference-aware: if the call is bridged through a conference (the common
-    human-agent path), mute + deafen the AGENT's conference member. That
-    cleanly blocks audio in both directions, caller stays connected, and the
-    conference continues playing any configured hold media to remaining members.
-
-    Falls back to legacy `calling.hold` on the caller leg for non-conference
-    calls, with a log line so the operator knows what path was taken.
+    RE-AUDIT-01 (2026-06-03): the previous "leave-conference" workaround
+    was fundamentally broken in two ways the re-audit caught:
+      1. The interaction conference is created with ``end_on_exit: true``
+         (conferences.py:528), so the moment the agent left, SignalWire
+         ENDED the conference — disconnecting the caller, not holding
+         them.
+      2. The participant-leave webhook's ``is_hold_leave`` guard was
+         unreachable because ``ConferenceParticipant.get_active_by_call_sid``
+         filters ``status='active'`` and hold set the row to ``on_hold``
+         FIRST.
+      3. Frontend swallowed ``cf.hangup()`` failures and flipped the UI
+         to "on hold" while the agent was still bridged — a privacy
+         failure (customer keeps hearing the agent's mic after the
+         "Please hold" TTS).
+    Rather than fix three layered bugs against a feature SignalWire's
+    own platform doesn't fully support yet, deferred. Joins the same
+    "waiting on platform support" bucket as LIFE-02 transfer (the dev
+    said participant-level mute/hold is "still being fleshed out").
+    Frontend Hold button removed; this endpoint returns 501 so any
+    stale client that still tries it gets a clear answer.
     """
-    call = find_call(call_id)
-    if not call:
-        return jsonify({'error': 'Call not found'}), 404
-
-    try:
-        sw_api = get_signalwire_api()
-        user = request.current_user
-
-        agent_participant = _find_agent_participant(call, user.id)
-        if agent_participant and agent_participant.call_sid:
-            # Announce the hold to the caller BEFORE cutting audio both ways,
-            # so they don't hit a wall of silence. Failure is logged-not-raised
-            # — the hold itself takes priority over the announcement.
-            # TODO: localize the message based on call.caller_language when set.
-            try:
-                sw_api.play_tts(
-                    call.signalwire_call_sid,
-                    "Please hold. I'll be right back with you.",
-                )
-            except Exception as tts_err:
-                logger.warning(
-                    f"hold_call {call_id}: on-hold TTS announcement failed "
-                    f"(continuing with mute): {tts_err}"
-                )
-
-            # Conference path: mute + deaf the agent's own member so nothing
-            # crosses in either direction. Caller stays with the conference.
-            sw_api.mute_participant(
-                conference_name=call.conference_name,
-                call_id=agent_participant.call_sid,
-                muted=True,
-                deaf=True,
-            )
-            agent_participant.is_muted = True
-            agent_participant.is_deaf = True
-            agent_participant.status = 'muted'
-            path = 'conference-member'
-            result = {'participant_call_sid': agent_participant.call_sid}
-        else:
-            # Non-conference fallback — pauses media on the caller leg.
-            # Imperfect, but preserves the old behavior for call shapes we
-            # haven't modeled yet. Logged so operators can tell.
-            logger.warning(
-                f"hold_call {call_id}: no conference participant for user {user.id} — "
-                f"falling back to calling.hold on caller leg"
-            )
-            result = sw_api.hold_call(call.signalwire_call_sid)
-            path = 'legacy-caller-leg'
-
-        call.status = 'on_hold'
-        db.session.commit()
-
-        from app.services.callcenter_socketio import emit_call_update
-        emit_call_update(call)
-        emit_call_event(call.id, 'hold', {
-            'action': 'hold',
-            'path': path,
-            'agent': user.email,
-        }, call.signalwire_call_sid)
-
-        return jsonify({
-            'success': True, 'call_id': call.id, 'status': 'on_hold',
-            'path': path, 'result': result,
-        }), 200
-    except Exception as e:
-        logger.error(f"Failed to hold call {call_id}: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+    return jsonify({
+        'error': 'Hold not implemented',
+        'detail': (
+            'Conference-participant hold is not yet supported by the '
+            'SignalWire REST surface. The previous workaround (agent '
+            'leaves the conference) was broken — end_on_exit:true on '
+            'the interaction conference disconnected the caller. '
+            'Deferred until the platform exposes participant-level '
+            'hold. See RE-AUDIT-01 in REMEDIATION_2026-06-02.md.'
+        ),
+    }), 501
 
 
 @call_control_bp.route('/<call_id>/unhold', methods=['POST'])
 @require_auth
 def unhold_call(call_id):
-    """Resume a held call. Mirrors hold_call's two paths."""
+    """Resume a held call — NOT YET IMPLEMENTED. Counterpart to hold_call;
+    same RE-AUDIT-01 disablement rationale."""
+    return jsonify({
+        'error': 'Unhold not implemented',
+        'detail': 'Hold is currently disabled — see /hold for the rationale.',
+    }), 501
+
+
+# Codes accepted for the mandatory `reason` field on return-to-queue.
+# Per the 2p spec — keeps the action from being used as "get rid of this
+# caller" by forcing the agent to pick a category that supervisors can
+# audit. Kept tight; new categories require a code change + UI update.
+RETURN_REASON_CODES = (
+    'wrong-queue',       # caller belongs to a different queue
+    'taking-break',      # agent stepping away (lunch / EOD)
+    'cannot-resolve',    # agent can't solve this; needs different skill
+    'caller-request',    # caller asked for someone else
+    'other',             # falls back to other w/ free-text note in body
+)
+
+
+@call_control_bp.route('/<call_id>/return-to-queue', methods=['POST'])
+@require_auth
+@require_permission('can_return_to_queue')
+def return_call_to_queue(call_id):
+    """Bounce an accepted call back to queue routing (Tier 2p).
+
+    Fills the gap between Transfer (pick a specific target) and Hangup
+    (end the call). Use cases: agent realised wrong queue, stepping away,
+    can't resolve, caller asked for someone else.
+
+    Flow:
+      1. Announce TTS to caller ("Let me connect you with someone better
+         suited — hold for just a moment").
+      2. Mark Call.status='waiting', clear assigned_agent_id, increment
+         return_count, save last_return_reason.
+      3. Free the agent's Redis status from busy → available.
+      4. End the agent's CallLeg with reason='returned_to_queue' (this is
+         a real handoff — different from hold which preserves the leg).
+      5. Re-enqueue the call in the original queue's zset with original
+         priority + preserved ai_context (so the next agent doesn't have
+         to re-triage).
+      6. Tell the frontend to SDK-hangup, same pattern as Hold.
+      7. Soft-cap at 2 returns — if this would be the third return, refuse
+         and tell the agent to escalate to a supervisor instead.
+
+    SLA: the caller's wait clock continues from original call-received
+    time — no reset. Per the spec, their wait is their wait regardless
+    of how many agents touched them.
+
+    Request body: ``{reason: str, target_queue_slug?: str, note?: str}``.
+    reason must be in RETURN_REASON_CODES. target_queue_slug defaults to
+    the call's current queue_id (most common — return to same queue, just
+    a different agent). note is free-text, only stored when reason='other'.
+    """
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
+    if not call.conference_name:
+        return jsonify({'error': 'Call is not in a conference — return not supported'}), 400
+
+    # RE-AUDIT-04 (2026-06-03): ownership check. Previously @require_auth +
+    # @require_permission('can_return_to_queue') passed — but any agent with
+    # that permission could return any other agent's call by guessing the
+    # call_id. Now reject unless the requester IS the assigned agent (or a
+    # supervisor/admin). Pairs with the same gate on /play and /dtmf.
+    owner_check = _require_call_ownership(call, request.current_user)
+    if owner_check:
+        return owner_check
+
+    data = request.get_json() or {}
+    reason = (data.get('reason') or '').strip()
+    target_queue_slug = (data.get('target_queue_slug') or call.queue_id or '').strip()
+    note = (data.get('note') or '').strip() or None
+
+    if reason not in RETURN_REASON_CODES:
+        return jsonify({
+            'error': f'reason must be one of {list(RETURN_REASON_CODES)}'
+        }), 400
+    if not target_queue_slug:
+        return jsonify({'error': 'target_queue_slug required (no queue on the call to default to)'}), 400
+
+    # Soft cap — third return on the same call escalates instead of
+    # recycling. Prevents bouncing-loops where multiple agents punt the
+    # same caller back-and-forth.
+    if (call.return_count or 0) >= 2:
+        return jsonify({
+            'error': (
+                'Soft cap reached — this call has already been returned twice. '
+                'Escalate to supervisor instead of returning to the queue again.'
+            ),
+            'return_count': call.return_count,
+            'must_escalate': True,
+        }), 409
+
+    user = request.current_user
 
     try:
         sw_api = get_signalwire_api()
-        user = request.current_user
 
-        agent_participant = _find_agent_participant(call, user.id)
-        if agent_participant and agent_participant.call_sid:
-            sw_api.mute_participant(
-                conference_name=call.conference_name,
-                call_id=agent_participant.call_sid,
-                muted=False,
-                deaf=False,
+        # 1. Caller announcement. Best-effort — state transitions take
+        # priority over the announcement.
+        try:
+            sw_api.play_tts(
+                call.signalwire_call_sid,
+                "Let me connect you with someone better suited. "
+                "Please hold for just a moment.",
             )
-            agent_participant.is_muted = False
-            agent_participant.is_deaf = False
-            agent_participant.status = 'active'
-            path = 'conference-member'
-            result = {'participant_call_sid': agent_participant.call_sid}
-        else:
-            result = sw_api.unhold_call(call.signalwire_call_sid)
-            path = 'legacy-caller-leg'
+        except Exception as tts_err:
+            logger.warning(
+                f"return_to_queue {call_id}: announcement TTS failed (continuing): {tts_err}"
+            )
 
-        call.status = 'active'
+        # 2. Mark the agent's CallLeg as completed — this is a real
+        # handoff, not a hold pause. Reason captures the intent for
+        # supervisor-side reporting.
+        agent_leg = CallLeg.query.filter_by(
+            call_id=call.id,
+            user_id=user.id,
+            status='active',
+        ).first()
+        # Also catch an on_hold leg in case the agent returns FROM hold.
+        if not agent_leg:
+            agent_leg = CallLeg.query.filter_by(
+                call_id=call.id,
+                user_id=user.id,
+                status='on_hold',
+            ).first()
+        if agent_leg:
+            agent_leg.end_leg(reason=f'returned_to_queue:{reason}')
+
+        # 3. Mark agent's ConferenceParticipant as 'left'. (No on_hold
+        # bypass — this leave SHOULD be a teardown.)
+        agent_participant = _find_agent_participant(call, user.id)
+        if agent_participant:
+            agent_participant.leave()
+
+        # 4. Reset call back to 'waiting'. Increment counter, save reason.
+        # IMPORTANT: ai_context stays — the next agent sees the same
+        # collected context, no re-triage. answered_at also stays —
+        # SLA clock is original-to-now per the 2p spec.
+        call.status = 'waiting'
+        call.assigned_agent_id = None
+        call.assigned_at = None
+        call.handler_type = None
+        call.queue_id = target_queue_slug  # may differ from original
+        call.return_count = (call.return_count or 0) + 1
+        call.last_return_reason = (
+            f'{reason}: {note}' if (reason == 'other' and note) else reason
+        )
         db.session.commit()
 
+        # 5. Free the agent's Redis status.
+        try:
+            from app.services.queue_service import QueueService
+            qs = QueueService(get_redis_client())
+            agent_state = qs.get_agent_status(str(user.id))
+            if agent_state and agent_state.get('current_call_id') == call.signalwire_call_sid:
+                qs.set_agent_status(str(user.id), 'available')
+            # 6. Re-enqueue. Preserves AI-collected priority + context for
+            # the next agent.
+            try:
+                context = json.loads(call.ai_context) if call.ai_context else {}
+            except Exception:
+                context = {}
+            qs.enqueue_call(
+                call_id=call.signalwire_call_sid,
+                queue_id=target_queue_slug,
+                priority=context.get('priority', 5),
+                context=context,
+                caller_info={'number': call.from_number, 'name': None},
+            )
+        except Exception as e:
+            logger.error(f"return_to_queue {call_id}: queue re-enqueue failed: {e}")
+            # Don't bail — agent is already off the call. Manual recovery
+            # is fine; better than leaving the agent stuck busy.
+
+        # 7. Notify dashboards. queue_update fires the assignment banner
+        # for whoever's next, AND clears it from the supervisor's
+        # active-calls view since we're back to waiting.
         from app.services.callcenter_socketio import emit_call_update
         emit_call_update(call)
-        emit_call_event(call.id, 'hold', {
-            'action': 'unhold',
-            'path': path,
+        socketio.emit('queue_update', {
+            'call': call.to_dict(include_contact=True),
+            'queue_id': target_queue_slug,
+            'action': 'added',
+            'return_count': call.return_count,
+            'last_return_reason': call.last_return_reason,
+        })
+        emit_call_event(call.id, 'return_to_queue', {
             'agent': user.email,
+            'reason': reason,
+            'target_queue_slug': target_queue_slug,
+            'return_count': call.return_count,
+            'note': note,
         }, call.signalwire_call_sid)
 
+        logger.info(
+            f"Call {call.id} returned to queue '{target_queue_slug}' by "
+            f"agent {user.id} (reason={reason}, return_count={call.return_count})"
+        )
+
         return jsonify({
-            'success': True, 'call_id': call.id, 'status': 'active',
-            'path': path, 'result': result,
+            'success': True,
+            'call_id': call.id,
+            'status': 'waiting',
+            'queue_id': target_queue_slug,
+            'return_count': call.return_count,
+            'frontend_action': 'sdk_hangup',
         }), 200
     except Exception as e:
-        logger.error(f"Failed to unhold call {call_id}: {str(e)}")
+        logger.error(f"Failed to return call {call_id} to queue: {str(e)}")
+        db.session.rollback()
         return jsonify({'error': str(e)}), 500
 
 
 @call_control_bp.route('/<call_id>/play', methods=['POST'])
 @require_auth
 def play_into_call(call_id):
-    """Play audio or TTS into an active call."""
+    """Play audio or TTS into an active call.
+
+    RE-AUDIT-04 (2026-06-03): ownership gate. The customer hears
+    whatever this endpoint plays, so unauthenticated cross-agent use
+    is a privacy + abuse vector — any logged-in user could fire TTS
+    into another agent's live call by guessing the call_id. Now
+    restricted to the assigned agent + supervisor/admin.
+    """
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
+
+    owner_check = _require_call_ownership(call, request.current_user)
+    if owner_check:
+        return owner_check
 
     data = request.get_json() or {}
     play_type = data.get('type', 'tts')
@@ -469,10 +635,20 @@ def translate_status(call_id):
 @call_control_bp.route('/<call_id>/dtmf', methods=['POST'])
 @require_auth
 def send_dtmf(call_id):
-    """Send DTMF tones into an active call."""
+    """Send DTMF tones into an active call.
+
+    RE-AUDIT-04 (2026-06-03): ownership gate. DTMF tones are audible
+    on the customer's line and can interact with IVR menus the agent
+    might transfer to — cross-agent abuse is real. Restricted to the
+    assigned agent + supervisor/admin.
+    """
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
+
+    owner_check = _require_call_ownership(call, request.current_user)
+    if owner_check:
+        return owner_check
 
     data = request.get_json() or {}
     digits = data.get('digits', '')
@@ -567,12 +743,22 @@ def start_monitor(call_id):
             # AI call or non-conference: use tap
             base_url = os.environ.get('EXTERNAL_URL', 'http://localhost:5000')
             ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
-            tap_uri = f"{ws_url}/ws/tap-stream/{call.id}"
+            # RE-AUDIT-03 fix (2026-06-03): the tap URL used to embed
+            # ``call.id`` (DB int), so tap_relay's per-frame Socket.IO
+            # emits used ``room=f'tap:{db_id}'``. But the join_tap
+            # consumer handler keys the room off ``signalwire_call_sid``
+            # (the only identifier the frontend has at room-join time).
+            # Room-key mismatch → no supervisor ever received audio,
+            # because no socket was ever in ``tap:{db_id}``. Listen was
+            # silently dead for everyone. Use the sid in the URL so the
+            # producer's emit room matches what join_tap joins.
+            tap_uri = f"{ws_url}/ws/tap-stream/{call.signalwire_call_sid}"
 
             sw_api = get_signalwire_api()
             result = sw_api.tap_call(call.signalwire_call_sid, tap_uri, direction='both')
 
-            # Store tap control_id
+            # Store tap control_id (keyed by DB id for back-compat with
+            # the stop endpoint's lookup pattern).
             control_id = result.get('control_id')
             if control_id:
                 redis_client.set(f'tap:{call.id}:{user.id}', control_id, ex=7200)

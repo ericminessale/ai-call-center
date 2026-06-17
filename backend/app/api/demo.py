@@ -144,7 +144,18 @@ def start_demo_session():
         # Don't set the cookie yet — they have no lease, no need to track.
         return resp
 
-    tokens = generate_tokens(persona.id)
+    # SEC-03: bake the persona marker + current epoch into the JWT.
+    # verify_token cross-references both claims against demo_lease's Redis
+    # state on every auth-gated request, so the token only works while
+    # the lease is alive AND the epoch hasn't been bumped by a release.
+    from app.services.demo_lease import get_persona_epoch
+    tokens = generate_tokens(
+        persona.id,
+        extra_claims={
+            'persona': True,
+            'epoch': get_persona_epoch(persona.id),
+        },
+    )
     body = {
         'message': 'Demo session started',
         'user': persona.to_dict(),

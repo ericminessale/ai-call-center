@@ -9,6 +9,17 @@ Flow:
 2. SignalWire connects to /ws/tap-stream/<call_id> and streams raw audio (PCMU/PCMA)
 3. This service receives audio frames and emits them as Socket.IO 'tap_audio' events
 4. Frontend AudioMonitor component receives and plays via Web Audio API
+
+Audio routing (RT-01, 2026-06-02 audit follow-up):
+- All four emits below are SCOPED to ``room=f'tap:{call_id}'``. Without the
+  room, Socket.IO broadcasts to every connected client — including
+  unauthenticated ones — so live PCMU audio of every active call would leak
+  to anyone who happened to have the dashboard open.
+- The companion server-side ``join_tap`` Socket.IO handler in
+  ``callcenter_socketio.py`` checks the requester's permission (mirroring
+  ``call_control.py:start_monitor``) before adding them to the room.
+- Frontend AudioMonitor must emit ``join_tap`` (token + call_id) AFTER
+  authenticating its socket, BEFORE the audio starts flowing.
 """
 
 from flask_sock import Sock
@@ -27,23 +38,34 @@ def init_tap_relay(app):
     sock.init_app(app)
 
 
+def _tap_room(call_id: str) -> str:
+    """Canonical room name for the per-call tap audio stream.
+
+    Kept here (not in callcenter_socketio) so the producer (this file) and
+    the consumer-authorizer (join_tap handler) can't drift on naming.
+    """
+    return f'tap:{call_id}'
+
+
 @sock.route('/ws/tap-stream/<call_id>')
 def tap_stream(ws, call_id):
     """WebSocket endpoint that receives tap audio from SignalWire.
 
     SignalWire sends raw audio frames (PCMU 8kHz by default) over this connection.
-    We base64-encode each frame and relay it via Socket.IO to any monitoring clients.
-
-    The call_id is used to target the Socket.IO room so only the
-    monitoring client for this specific call receives the audio.
+    We base64-encode each frame and relay it via Socket.IO to authorized
+    monitoring clients (those who passed permission check via ``join_tap``).
     """
     logger.info(f"Tap stream connected for call {call_id}")
+    room = _tap_room(call_id)
 
-    # Emit an event so the frontend knows tap is active
+    # Emit an event so the frontend knows tap is active. Scoped to the tap
+    # room so only authorized monitor clients see the status flip; otherwise
+    # an unauthenticated dashboard could enumerate which calls have a tap
+    # attached, which is its own information leak.
     socketio.emit('tap_status', {
         'call_id': call_id,
         'status': 'connected',
-    })
+    }, room=room)
 
     frame_count = 0
     try:
@@ -67,7 +89,7 @@ def tap_stream(ws, call_id):
                     'codec': 'PCMU',
                     'sample_rate': 8000,
                     'frame': frame_count,
-                })
+                }, room=room)
             elif isinstance(data, str):
                 # SignalWire may send JSON metadata frames
                 try:
@@ -76,7 +98,7 @@ def tap_stream(ws, call_id):
                     socketio.emit('tap_metadata', {
                         'call_id': call_id,
                         'metadata': meta,
-                    })
+                    }, room=room)
                 except json.JSONDecodeError:
                     logger.warning(f"Unexpected text frame on tap {call_id}: {data[:100]}")
 
@@ -87,4 +109,4 @@ def tap_stream(ws, call_id):
         socketio.emit('tap_status', {
             'call_id': call_id,
             'status': 'disconnected',
-        })
+        }, room=room)

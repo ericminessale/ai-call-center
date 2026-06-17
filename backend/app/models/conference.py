@@ -71,58 +71,61 @@ class Conference(db.Model):
         ).first()
 
     @classmethod
-    def get_or_create_agent_conference(cls, user_id):
-        """Get or create an agent's personal conference."""
-        conference_name = f'agent-conf-{user_id}'
-        conference = cls.get_active_by_name(conference_name)
+    def _revive_or_create(cls, conference_name, **defaults):
+        """Get-by-name (any status) and revive if ended, otherwise insert.
 
-        if not conference:
-            conference = cls(
-                conference_name=conference_name,
-                conference_type='agent',
-                owner_user_id=user_id,
-                status='active'
-            )
-            db.session.add(conference)
-            db.session.flush()  # Get the ID
-
+        Previous helpers used ``get_active_by_name`` which returned None for
+        rows in 'ended' status — but ``conference_name`` has a unique index
+        without a status filter, so the follow-up INSERT hit a
+        UniqueViolation on the SECOND call per logical conference name
+        (per-agent, per-AI, per-queue). These names are designed to be
+        reused across calls; revive the existing row instead of duplicating.
+        """
+        existing = cls.get_by_name(conference_name)
+        if existing:
+            if existing.status != 'active':
+                existing.status = 'active'
+                existing.ended_at = None
+                db.session.flush()
+            return existing
+        conference = cls(conference_name=conference_name, status='active', **defaults)
+        db.session.add(conference)
+        db.session.flush()
         return conference
 
     @classmethod
+    def get_or_create_agent_conference(cls, user_id):
+        """Get or create an agent's personal conference (human-conference mode)."""
+        return cls._revive_or_create(
+            f'agent-conf-{user_id}',
+            conference_type='agent',
+            owner_user_id=user_id,
+        )
+
+    @classmethod
     def get_or_create_ai_conference(cls, ai_agent_name):
-        """Get or create an AI agent's conference."""
-        conference_name = f'ai-conf-{ai_agent_name}'
-        conference = cls.get_active_by_name(conference_name)
+        """Get or create an AI agent's conference.
 
-        if not conference:
-            conference = cls(
-                conference_name=conference_name,
-                conference_type='ai',
-                owner_ai_agent=ai_agent_name,
-                status='active'
-            )
-            db.session.add(conference)
-            db.session.flush()
-
-        return conference
+        NOTE: AI calls do NOT use conferences in the current architecture —
+        the /initial-call SWML transfers directly to the AI agent's SWML
+        with no join_conference verb. This helper is kept for the legacy
+        ai_join_conference endpoint (kept for backward compat) but should
+        not be used by new AI flows.
+        """
+        return cls._revive_or_create(
+            f'ai-conf-{ai_agent_name}',
+            conference_type='ai',
+            owner_ai_agent=ai_agent_name,
+        )
 
     @classmethod
     def get_or_create_hold_conference(cls, queue_id):
         """Get or create a hold conference for a queue."""
-        conference_name = f'hold-conf-{queue_id}'
-        conference = cls.get_active_by_name(conference_name)
-
-        if not conference:
-            conference = cls(
-                conference_name=conference_name,
-                conference_type='hold',
-                queue_id=queue_id,
-                status='active'
-            )
-            db.session.add(conference)
-            db.session.flush()
-
-        return conference
+        return cls._revive_or_create(
+            f'hold-conf-{queue_id}',
+            conference_type='hold',
+            queue_id=queue_id,
+        )
 
     def get_active_participant_count(self):
         """Get the count of active participants."""

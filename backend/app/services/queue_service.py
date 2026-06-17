@@ -60,6 +60,32 @@ class QueueService:
         # Remove any existing entry for this call (prevents duplicates from hold loop retries)
         self._remove_call_from_set(queue_key, call_id)
 
+        # LIFE-06 fix (2026-06-02 audit): SLA / wait-time clock must
+        # continue from the caller's ORIGINAL arrival, not reset on each
+        # enqueue. Previously ``enqueued_at`` was stamped with now() on
+        # every enqueue, which meant: (a) return-to-queue (Tier 2p)
+        # restarted the wait clock — invisible to the caller but it
+        # silently inflated reported service level; (b) the hold-loop
+        # re-enqueue path would also reset it on retries. We now prefer
+        # ``Call.created_at`` (the moment SignalWire's call-status webhook
+        # first saw the call), falling back to now() only when there's
+        # no DB row yet (rare, e.g. orphaned re-enqueues). Keep an
+        # ``originally_received_at`` distinct from ``enqueued_at`` so
+        # queue-position semantics (how long has this call been in THIS
+        # queue) can still read the latter if anyone wants — today
+        # nothing keys off it, all wait_time math here keys off the new
+        # field via _wait_seconds() below.
+        original_received_at = datetime.utcnow()
+        try:
+            from app.models import Call
+            existing = Call.find_by_sid(call_id) if call_id else None
+            if existing and existing.created_at:
+                original_received_at = existing.created_at
+        except Exception:
+            # Don't fail enqueue on a DB lookup blip — the now() fallback
+            # is graceful degradation, not a correctness break.
+            pass
+
         # Create call data
         call_data = {
             "call_id": call_id,
@@ -67,7 +93,12 @@ class QueueService:
             "priority": priority,
             "context": context or {},
             "caller_info": caller_info or {},
-            "enqueued_at": datetime.utcnow().isoformat()
+            # ``enqueued_at`` now means "first received in our system"
+            # (preserved across re-enqueues / returns-to-queue); the SLA
+            # clock keys off this. _calculate_service_level on the DB
+            # side already keys off Call.created_at, so the two clocks
+            # now agree.
+            "enqueued_at": original_received_at.isoformat(),
         }
 
         # Calculate score (higher priority = lower score for ZRANGE)
@@ -238,6 +269,26 @@ class QueueService:
             if other_status != status:
                 self.redis.srem(f"agents:{other_status}", agent_id)
 
+        # LIFE-04 fix (2026-06-02 audit): FIFO routing reads
+        # ``agent_last_assigned:<agent_id>`` to pick the longest-idle agent,
+        # but nothing in the codebase ever wrote that key — every FIFO pick
+        # saw None and short-circuited to the first available agent
+        # (alphabetical by id), collapsing FIFO to non-fair selection.
+        # Whenever an agent transitions INTO 'busy', stamp the timestamp.
+        # We bound the key TTL to the same 8h as the agent status itself
+        # so abandoned keys don't accumulate.
+        if status == 'busy':
+            try:
+                ts_key = f"agent_last_assigned:{agent_id}"
+                self.redis.setex(ts_key, 28800, str(datetime.utcnow().timestamp()))
+            except Exception as e:
+                # Don't fail the status write — FIFO degrading to non-fair
+                # selection is preferable to losing the busy mark.
+                logger.warning(
+                    f"set_agent_status: failed to stamp agent_last_assigned "
+                    f"for {agent_id}: {e}"
+                )
+
         logger.info(f"Agent {agent_id} status changed to {status}")
 
         # Push-dispatch on transition into 'available'. The caller is already
@@ -396,15 +447,48 @@ class QueueService:
             # Conference name is deterministic — set by /direct-inbound.
             conference_name = call.conference_name or f"interaction-{call_sid}"
 
-            # Atomic-ish: mark assigned in DB, mark agent busy, remove from queue,
-            # then emit the notification. If any step partly fails, the next
-            # available-transition will retry on the same waiting call (if it's
-            # still in queue) — defensive but not perfect.
+            # Atomic claim — race-safe assignment. Two parallel push-dispatch
+            # instances (e.g. two agents going Available simultaneously) used
+            # to both read the same waiting call, both write
+            # `assigned_agent_id`, and both fire `call_assignment` banners.
+            # Last writer won on the DB row but the loser's agent still saw
+            # the banner — clicking Take then failed with "assigned to
+            # another agent" because the row pointed elsewhere by then.
+            #
+            # ``UPDATE calls SET assigned_agent_id=... WHERE id=... AND
+            # assigned_agent_id IS NULL`` is atomic at the Postgres level:
+            # only one parallel claim succeeds, the other gets 0 rows and
+            # bails before the banner fires. No more phantom assignments.
             try:
-                call.assigned_agent_id = agent_user.id
-                call.assigned_at = datetime.utcnow()
-                call.status = 'assigned'
+                from sqlalchemy import text
+                claim = db.session.execute(
+                    text(
+                        "UPDATE calls "
+                        "SET assigned_agent_id = :uid, assigned_at = :ts, status = 'assigned' "
+                        "WHERE id = :id AND assigned_agent_id IS NULL "
+                        "RETURNING id"
+                    ),
+                    {
+                        'uid': agent_user.id,
+                        'ts': datetime.utcnow(),
+                        'id': call.id,
+                    },
+                )
+                if not claim.fetchone():
+                    # Lost the race — another worker already claimed this
+                    # call. Don't emit, don't mark agent busy. The agent
+                    # stays available for the next call.
+                    db.session.rollback()
+                    logger.info(
+                        f"Push-dispatch: lost race on call {call_sid} — "
+                        f"another worker claimed it before us. Agent "
+                        f"{agent_id} stays available."
+                    )
+                    return
                 db.session.commit()
+                # Refresh the in-memory call object so downstream emit reads
+                # the latest assigned_agent_id / status fields.
+                db.session.refresh(call)
             except Exception as e:
                 logger.error(f"Push-dispatch: DB update failed for call {call_sid}: {e}")
                 db.session.rollback()
@@ -897,6 +981,17 @@ class QueueService:
         """Get performance metrics for a queue"""
         status = self.get_queue_status(queue_id)
 
+        # Honor the queue's configured SLA threshold (Settings → Queues).
+        # Ad-hoc slugs without a Queue row fall back to the 60s default.
+        sla_threshold = 60
+        try:
+            from app.models.queue import Queue
+            queue_row = Queue.find_by_slug(queue_id)
+            if queue_row and queue_row.sla_threshold_seconds:
+                sla_threshold = queue_row.sla_threshold_seconds
+        except Exception:
+            pass
+
         return {
             **status,
             "available_agents": len(self.get_available_agents(queue_id)),
@@ -904,7 +999,10 @@ class QueueService:
                 a for a in self.get_agents_by_status("busy")
                 # Note: not yet filtered by per-agent queue assignment.
             ]),
-            "service_level": self._calculate_service_level(queue_id),
+            "service_level": self._calculate_service_level(
+                queue_id, threshold_seconds=sla_threshold,
+            ),
+            "sla_threshold_seconds": sla_threshold,
         }
 
     def _calculate_service_level(

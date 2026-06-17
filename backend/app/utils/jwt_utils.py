@@ -3,8 +3,14 @@ from datetime import datetime, timedelta
 from flask import current_app
 
 
-def generate_tokens(user_id):
-    """Generate access and refresh tokens for a user."""
+def generate_tokens(user_id, extra_claims=None):
+    """Generate access and refresh tokens for a user.
+
+    Optional ``extra_claims`` (dict) get merged into BOTH the access and
+    refresh payloads. SEC-03 uses this for demo personas, baking in
+    ``persona=true`` + the current ``epoch`` so ``verify_token`` can reject
+    tokens issued under a prior lease (see :mod:`app.services.demo_lease`).
+    """
     access_payload = {
         'user_id': user_id,
         'sub': user_id,  # Flask-JWT-Extended requires 'sub' claim
@@ -18,6 +24,14 @@ def generate_tokens(user_id):
         'exp': datetime.utcnow() + current_app.config['JWT_REFRESH_TOKEN_EXPIRES'],
         'type': 'refresh'
     }
+
+    if extra_claims:
+        # Don't let extra claims clobber the structural fields (sub/exp/type)
+        # — only fill in additional metadata.
+        reserved = {'user_id', 'sub', 'exp', 'type'}
+        safe = {k: v for k, v in extra_claims.items() if k not in reserved}
+        access_payload.update(safe)
+        refresh_payload.update(safe)
 
     access_token = jwt.encode(
         access_payload,
@@ -54,7 +68,21 @@ def decode_token(token):
 
 
 def verify_token(token, token_type='access'):
-    """Verify a token and return the user_id if valid."""
+    """Verify a token and return the user_id if valid.
+
+    SEC-03 extension: tokens minted for a demo persona (carrying
+    ``persona=true``) are additionally checked against the live persona
+    state in Redis:
+      1. The token's ``epoch`` claim must match the current persona epoch
+         (bumped by ``demo_lease.release_lease``) — invalidates JWTs
+         after an explicit release.
+      2. There must be an active (non-TTL-expired) lease for the persona
+         — invalidates JWTs after the lease lapses naturally.
+    Either check failing returns None (verification failure).
+
+    Non-persona tokens (real users) are unaffected and follow the
+    original codepath.
+    """
     payload = decode_token(token)
 
     if 'error' in payload:
@@ -62,5 +90,26 @@ def verify_token(token, token_type='access'):
 
     if payload.get('type') != token_type:
         return None
+
+    if payload.get('persona'):
+        # Lazy import — demo_lease pulls in Redis + models, which can
+        # cause circular imports if loaded at module top.
+        try:
+            from app.services.demo_lease import get_persona_epoch, has_active_lease
+        except Exception:
+            # If demo_lease isn't importable for any reason, a persona
+            # claim is suspicious — be paranoid, reject.
+            return None
+        uid = payload.get('user_id')
+        if uid is None:
+            return None
+        # Epoch check — bumped on release_lease.
+        token_epoch = payload.get('epoch', -1)
+        current_epoch = get_persona_epoch(uid)
+        if token_epoch != current_epoch:
+            return None
+        # Active-lease check — covers TTL-expiry case.
+        if not has_active_lease(uid):
+            return None
 
     return payload.get('user_id')

@@ -134,19 +134,20 @@ def initial_call():
     # This makes it appear in the Agent Dashboard as "AI Active"
     call.update_status('ai_active')
 
-    # Create initial AI leg for tracking
+    # Create initial AI leg for tracking. NOT tied to a Conference row —
+    # AI legs are a transfer to the AI agent's own SWML, not a conference
+    # join. The SWML returned below has no `join_conference` verb. Earlier
+    # code created a phantom "ai-conf-<name>" Conference row solely to
+    # satisfy the (nullable!) conference_id foreign key on CallLeg, which
+    # hit a unique-constraint violation on the second AI call per agent
+    # name. conference_id is nullable in the schema — let it be null for
+    # AI legs. Conferences will materialize only on AI→human handoff.
     existing_leg = CallLeg.get_active_leg(call.id)
     if not existing_leg:
-        # Get or create AI conference for this call
-        ai_conference = Conference.get_or_create_ai_conference('receptionist')
-        db.session.flush()
-
         CallLeg.create_initial_leg(
             call=call,
             leg_type='ai_agent',
             ai_agent_name='Receptionist',
-            conference_id=ai_conference.id,
-            conference_name=ai_conference.conference_name
         )
 
     db.session.commit()
@@ -208,11 +209,24 @@ def initial_call():
         "answer",
     ]
 
+    # Verbs that run once we know a person is on the line. Built separately
+    # from main_section so the AMD branch below can gate all of it.
+    post_answer: list = []
+
     # Recording is OFF by default in DEMO_MODE — visitors might say
     # sensitive things in the public sandbox; sidesteps the consent
     # question entirely. Production-shape deployments record as before.
     if not is_demo_mode():
-        main_section.append({
+        # Two-party-consent states require the announcement BEFORE recording
+        # starts. Toggle/message live in SystemConfig so admins can adjust
+        # without a deploy.
+        if SystemConfig.get('recording.consent_enabled', 'true').strip().lower() == 'true':
+            consent_message = SystemConfig.get(
+                'recording.consent_message',
+                'This call may be recorded for quality and training purposes.',
+            )
+            post_answer.append({"play": {"url": f"say:{consent_message}"}})
+        post_answer.append({
             "record_call": {
                 "format": "mp3",
                 "stereo": False,
@@ -221,8 +235,14 @@ def initial_call():
             }
         })
 
-    main_section.extend([
-        {
+    # Diagnostic kill-switch (2026-06-11): platform live_transcribe is the
+    # prime suspect in the intermittent media-fork seizure (TTS + recording +
+    # transcribe delivery all die together mid-call; details in the triage
+    # debug notes). Setting diagnostics.live_transcribe_enabled=false runs
+    # A/B calls without the component to confirm — costs the live transcript
+    # panel on those calls only. Default true = normal behavior.
+    if SystemConfig.get('diagnostics.live_transcribe_enabled', 'true').strip().lower() == 'true':
+        post_answer.append({
             "live_transcribe": {
                 "action": {
                     "start": {
@@ -231,17 +251,57 @@ def initial_call():
                         "live_events": True,
                         "ai_summary": True,
                         "direction": ["remote-caller", "local-caller"],
+                        # VAD endpointing: ms of silence before an utterance is
+                        # finalized. SignalWire default is 300ms, which splits
+                        # on normal mid-sentence pauses (breaths, "um", reading
+                        # a number) and newlines one sentence into several.
+                        # Raise it so a sentence stays one line. Tune via grep
+                        # vad_silence_ms (set in both swml.py starts + the REST
+                        # start_transcription); bump higher if still splitting.
+                        "vad_silence_ms": 800,
                     }
                 }
             }
-        },
+        })
+
+    post_answer.append(
         # Transfer to AI agent — caller's A-leg runs the AI agent's SWML directly
         {
             "transfer": {
                 "dest": f"{base_url}{initial_handler}?call_db_id={call.id}"
             }
-        },
-    ])
+        }
+    )
+
+    # Outbound dials (callback dial-outs, outbound AI) pass ?amd=1 so the AI
+    # never delivers its pitch to a voicemail greeting. detect_result is set
+    # by detect_machine (human | machine | fax | unknown); unknown proceeds
+    # like human rather than dropping a real person. Inbound calls skip AMD
+    # entirely — the caller dialed us, they're human.
+    if request.args.get('amd') == '1':
+        main_section.append({
+            "detect_machine": {
+                # Keep detecting until the greeting/beep ends so the machine
+                # branch leaves its message after the beep, not over it.
+                "detect_message_end": True,
+            }
+        })
+        main_section.append({
+            "switch": {
+                "variable": "detect_result",
+                "case": {
+                    "machine": [{
+                        "transfer": {
+                            "dest": f"{base_url}/api/swml/voicemail-detected?call_db_id={call.id}"
+                        }
+                    }],
+                    "fax": ["hangup"],
+                },
+                "default": post_answer,
+            }
+        })
+    else:
+        main_section.extend(post_answer)
 
     swml_response = {
         "version": "1.0.0",
@@ -280,6 +340,48 @@ def ai_specialist(queue_slug):
             f"queue/ai_agent_route missing — falling back to triage"
         )
     return initial_call()
+
+
+@swml_bp.route('/voicemail-detected', methods=['POST'])
+def voicemail_detected():
+    """SWML branch target when AMD classifies an outbound dial as a machine.
+
+    Stamps the call so wrap-up/reporting can distinguish voicemail from a
+    real conversation, then leaves a short message after the greeting (the
+    detect_machine verb in initial-call waits for message end) and hangs up.
+    """
+    call_db_id = request.args.get('call_db_id')
+    call = Call.query.get(call_db_id) if call_db_id else None
+    if call:
+        try:
+            ctx = call.ai_context_dict
+            ctx['amd_result'] = 'machine'
+            call.ai_context_dict = ctx
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logger.warning(f"voicemail-detected: failed to stamp call {call_db_id}: {e}")
+        WebhookEvent.log_event(
+            event_type='amd_result',
+            payload={'detect_result': 'machine', 'call_db_id': call.id},
+            call_id=call.id,
+        )
+    else:
+        logger.warning(f"voicemail-detected: unknown call_db_id={call_db_id!r}")
+
+    message = SystemConfig.get(
+        'outbound.voicemail_message',
+        "Hi, sorry we missed you. We'll try to reach you again soon. Goodbye.",
+    )
+    return jsonify({
+        "version": "1.0.0",
+        "sections": {
+            "main": [
+                {"play": {"url": f"say:{message}"}},
+                "hangup",
+            ]
+        },
+    })
 
 
 @swml_bp.route('/out-of-service', methods=['POST', 'GET'])
@@ -461,6 +563,10 @@ def start_transcription():
                                 "direction": ["remote-caller"],
                                 "beep": True,
                                 "timeout": 30,
+                                # Raise VAD silence from the 300ms default so
+                                # mid-sentence pauses don't split one utterance
+                                # into multiple transcript lines (see initial-call).
+                                "vad_silence_ms": 800,
                                 "hints": ["SignalWire", "transcription", "voice"]
                             }
                         }
@@ -495,10 +601,17 @@ def stop_transcription():
         "sections": {
             "main": [
                 {
+                    # PLAT-01 fix (2026-06-02 audit): TranscribeAction's stop
+                    # variant is a bare-string const per the SWML schema —
+                    # {action: "stop"}, not {action: {stop: {}}}. The object
+                    # form is non-conformant and silently parse-fails on
+                    # SignalWire's side, so live_transcribe never actually
+                    # stops and keeps streaming/billing. The REST helper
+                    # (signalwire_api.stop_transcription) already uses the
+                    # correct bare-string form — this is the SWML side
+                    # catching up.
                     "live_transcribe": {
-                        "action": {
-                            "stop": {}
-                        }
+                        "action": "stop"
                     }
                 },
                 {

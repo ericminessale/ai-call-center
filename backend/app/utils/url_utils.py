@@ -10,30 +10,32 @@ EXTERNAL_URL = os.getenv('EXTERNAL_URL')
 
 
 def get_base_url():
-    """Get the base URL for callbacks, handling proxy headers.
+    """Get the base URL for callbacks (the host SignalWire calls back into).
 
-    Priority:
-    1. EXTERNAL_URL environment variable (for local dev with ngrok)
-    2. X-Forwarded-Host header (when behind ngrok/proxy)
-    3. request.host_url (fallback)
+    SEC-05 fix (2026-06-02 audit): callbacks formerly fell back to the
+    request's ``X-Forwarded-Host`` header (and ultimately ``request.host_url``)
+    when ``EXTERNAL_URL`` was unset. Both headers are attacker-controllable
+    on an inbound request — an attacker who can reach a webhook endpoint
+    (now auth-gated, but the fail-fast here is defense in depth) can
+    poison the callback URLs we hand SignalWire, forking subsequent calls
+    into their domain (where they receive payload data, can drop the call,
+    etc.). ``EXTERNAL_URL`` is the only trustworthy source — operator-
+    controlled, not request-derived.
 
-    Usage:
-        Add EXTERNAL_URL=https://your-ngrok-url.ngrok.io to your .env file
-        when developing locally with ngrok.
+    Operators MUST set ``EXTERNAL_URL`` in .env to the public origin
+    SignalWire calls back into (e.g. the ngrok URL during local dev, the
+    real domain in production). Failing to set it now raises at the call
+    site rather than silently degrading.
     """
-    # If EXTERNAL_URL is set, always use it
     if EXTERNAL_URL:
         return EXTERNAL_URL.rstrip('/')
 
-    forwarded_host = request.headers.get('X-Forwarded-Host')
-    forwarded_proto = request.headers.get('X-Forwarded-Proto', 'https')
-
-    if forwarded_host:
-        if 'ngrok' in forwarded_host:
-            forwarded_proto = 'https'
-        return f"{forwarded_proto}://{forwarded_host}"
-    else:
-        return request.host_url.rstrip('/')
+    raise RuntimeError(
+        "EXTERNAL_URL is not set. Set it in .env to the public origin "
+        "SignalWire calls back into (ngrok URL in dev, real domain in "
+        "prod). The previous X-Forwarded-Host fallback was a callback-"
+        "hijacking vector — see SEC-05 in REMEDIATION_2026-06-02.md."
+    )
 
 
 def signed_webhook_url(url: str) -> str:

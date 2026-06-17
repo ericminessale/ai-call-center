@@ -537,6 +537,57 @@ def get_queue_status(queue_id):
         return jsonify({"error": "Failed to get queue status"}), 500
 
 
+@queues_bp.route('/wallboard', methods=['GET'])
+@require_auth
+def get_wallboard():
+    """Aggregate wallboard row per active queue (IMP-18).
+
+    One call instead of N per-queue /status fetches: live depth/waits from
+    Redis, 24h service level against each queue's own SLA threshold, and
+    24h offered/answered/abandoned counts from the Call table (end_reason
+    'abandoned_in_queue' is stamped deterministically at call end).
+    """
+    try:
+        from datetime import timedelta
+        from sqlalchemy import func, case
+
+        service = get_queue_service()
+        since = datetime.utcnow() - timedelta(hours=24)
+
+        rows = []
+        for queue in Queue.get_active_queues():
+            metrics = service.get_queue_metrics(queue.slug)
+            metrics.pop('calls', None)  # wallboard doesn't need per-call previews
+
+            counts = db.session.query(
+                func.count(Call.id),
+                func.sum(case((Call.answered_at.isnot(None), 1), else_=0)),
+                func.sum(case((Call.end_reason == 'abandoned_in_queue', 1), else_=0)),
+            ).filter(
+                Call.queue_id == queue.slug,
+                Call.created_at >= since,
+            ).one()
+            offered = int(counts[0] or 0)
+            answered = int(counts[1] or 0)
+            abandoned = int(counts[2] or 0)
+
+            rows.append({
+                **metrics,
+                'slug': queue.slug,
+                'display_name': queue.display_name,
+                'offered_24h': offered,
+                'answered_24h': answered,
+                'abandoned_24h': abandoned,
+                'abandon_rate': round(100.0 * abandoned / offered, 1) if offered else None,
+            })
+
+        return jsonify({'queues': rows, 'window_hours': 24})
+
+    except Exception as e:
+        logger.error(f"Error building wallboard: {str(e)}")
+        return jsonify({"error": "Failed to build wallboard"}), 500
+
+
 @queues_bp.route('/agent/status', methods=['PUT'])
 @require_auth
 def update_agent_status():
@@ -606,50 +657,35 @@ def get_agent_metrics():
 @queues_bp.route('/transfer', methods=['POST'])
 @require_auth
 def transfer_call():
+    """Transfer a call to another agent or queue — NOT YET IMPLEMENTED.
+
+    LIFE-02 (2026-06-02 audit). The previous implementation wrote a
+    transfer_history row + emitted ``call_transferred`` Socket.IO but
+    NEVER actually moved the participant on SignalWire's side. The
+    audio bridge stayed unchanged, the DB lied to the rest of the
+    stack, and any consumer reading transfer_history saw a transfer
+    that didn't happen.
+
+    No frontend currently calls this — the previous implementation was
+    a latent footgun. Returning 501 until the real path is wired
+    through ``conferences.move_participant`` (which actually relocates
+    a participant between conferences on the SignalWire side). Pair
+    with a design pass on warm-vs-blind semantics + target validation
+    + announcement TTS before re-enabling.
+
+    Sibling Socket.IO handler ``transfer_call`` in
+    ``callcenter_socketio.py`` was disabled identically.
     """
-    Transfer a call to another agent or queue
-    """
-    try:
-        data = request.json
-        call_id = data.get('call_id')
-        target = data.get('target')  # agent_id or queue_id
-        transfer_type = data.get('type', 'blind')  # blind or warm
-
-        if not call_id or not target:
-            return jsonify({"error": "Missing required fields"}), 400
-
-        agent_id = request.current_user.id
-        if not agent_id:
-            return jsonify({"error": "User not authenticated"}), 403
-
-        service = get_queue_service()
-        result = service.transfer_call(call_id, agent_id, target, transfer_type)
-
-        if not result['success']:
-            return jsonify(result), 400
-
-        # Update call record
-        call = Call.query.filter_by(signalwire_call_sid=call_id).first()
-        if call:
-            # Store transfer history as JSON string
-            import json
-            transfer_history = json.loads(call.transfer_history or '[]')
-            transfer_history.append({
-                'from': agent_id,
-                'to': target,
-                'type': transfer_type,
-                'timestamp': datetime.utcnow().isoformat()
-            })
-            call.transfer_history = json.dumps(transfer_history)
-            db.session.commit()
-
-        logger.info(f"Call {call_id} transferred from {agent_id} to {target}")
-
-        return jsonify(result)
-
-    except Exception as e:
-        logger.error(f"Error transferring call: {str(e)}")
-        return jsonify({"error": "Failed to transfer call"}), 500
+    return jsonify({
+        'error': 'Transfer not implemented',
+        'detail': (
+            'The previous implementation desynced state vs. the SignalWire '
+            'call object — see LIFE-02 in REMEDIATION_2026-06-02.md. Use '
+            '/api/call-control/<id>/return-to-queue or '
+            '/api/call-control/<id>/request-backup until a proper transfer '
+            'path lands.'
+        ),
+    }), 501
 
 
 @queues_bp.route('/all/status', methods=['GET'])

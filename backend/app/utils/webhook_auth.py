@@ -11,16 +11,23 @@ Configuration via env (in ``.env``):
 
     WEBHOOK_AUTH_USER=<username>
     WEBHOOK_AUTH_PASSWORD=<random-string>
-    WEBHOOK_AUTH_REQUIRED=true   # set to 'true' to enforce; missing/false = log-only
+    WEBHOOK_AUTH_REQUIRED=false  # OPTIONAL escape hatch. Default (unset)
+                                 # ENFORCES; only 'false' downgrades to
+                                 # soft-logging.
 
 Producers (the AI agents and any backend code that hands SignalWire a URL
 to call back) must inject these credentials into the URL — see
 ``app.utils.url_utils.signed_webhook_url`` for the helper.
 
-If ``WEBHOOK_AUTH_REQUIRED`` is not 'true', this decorator is a soft check:
-it logs a warning when credentials are missing or wrong but still calls
-the handler. That mode exists so adding the decorator broadly doesn't
-break a running deployment that hasn't yet rotated webhook URLs.
+Secure-by-default: :func:`require_webhook_auth` ENFORCES (rejects with 401)
+unless ``WEBHOOK_AUTH_REQUIRED=false`` is explicitly set. Soft mode logs a
+warning when credentials are missing or wrong but still calls the handler;
+it exists only as a temporary migration window for a deployment that hasn't
+yet rotated its webhook URLs to carry credentials. The private
+backend⇄ai-agents routes use :func:`require_internal_auth`, which ignores
+this flag and ALWAYS enforces (they expose decrypted credentials and a
+destructive reset). The app also fail-fasts at boot when the credentials are
+unset, unless soft mode was explicitly chosen — see ``app/__init__.py``.
 """
 
 from __future__ import annotations
@@ -42,7 +49,14 @@ def _expected_credentials() -> tuple[str | None, str | None]:
 
 
 def _enforce_mode() -> bool:
-    return os.getenv('WEBHOOK_AUTH_REQUIRED', '').lower() == 'true'
+    """Whether failed webhook auth REJECTS (vs soft-logs).
+
+    Secure-by-default: enforcement is ON unless ``WEBHOOK_AUTH_REQUIRED`` is
+    explicitly set to 'false'. The 'false' escape hatch exists only as a
+    short migration window (webhook URLs not yet rotated to carry creds) and
+    logs loudly while active.
+    """
+    return os.getenv('WEBHOOK_AUTH_REQUIRED', 'true').strip().lower() != 'false'
 
 
 def _parse_basic_auth(header_value: str) -> tuple[str, str] | None:
@@ -60,42 +74,51 @@ def _parse_basic_auth(header_value: str) -> tuple[str, str] | None:
     return user, password
 
 
-def require_webhook_auth(f: Callable) -> Callable:
-    """Validate HTTP Basic Auth on inbound webhook requests.
+def _validate_request_auth() -> tuple[bool, bool]:
+    """Validate the inbound HTTP Basic header against configured creds.
 
-    Behavior depends on env:
-      - ``WEBHOOK_AUTH_USER`` + ``WEBHOOK_AUTH_PASSWORD`` set + ``WEBHOOK_AUTH_REQUIRED=true``:
-            enforce; reject with 401 if header missing/wrong.
-      - credentials set but ``WEBHOOK_AUTH_REQUIRED`` not 'true':
-            soft-check; log a warning on mismatch but call the handler.
-      - credentials not set:
-            log once-per-startup warning, call the handler. Production should
-            never run in this state.
+    Returns ``(configured, authorized)``:
+      - ``configured`` is False when WEBHOOK_AUTH_USER/PASSWORD aren't set.
+      - ``authorized`` is True only when the header matches (constant-time).
+    """
+    expected_user, expected_pw = _expected_credentials()
+    if not expected_user or not expected_pw:
+        return False, False
+    provided = _parse_basic_auth(request.headers.get('Authorization', ''))
+    authorized = provided is not None and (
+        hmac.compare_digest(provided[0], expected_user)
+        and hmac.compare_digest(provided[1], expected_pw)
+    )
+    return True, authorized
+
+
+def require_webhook_auth(f: Callable) -> Callable:
+    """Validate HTTP Basic Auth on inbound SignalWire webhook requests.
+
+    Secure-by-default (see :func:`_enforce_mode`): rejects with 401 on a
+    missing/wrong header unless ``WEBHOOK_AUTH_REQUIRED=false`` downgrades it
+    to soft-logging. If credentials aren't configured at all, enforce mode
+    returns 500 (fail loud) — though the app also fail-fasts at boot in that
+    case unless soft mode was explicitly chosen.
     """
 
     @wraps(f)
     def wrapper(*args, **kwargs):
-        expected_user, expected_pw = _expected_credentials()
         enforce = _enforce_mode()
+        configured, authorized = _validate_request_auth()
 
-        if not expected_user or not expected_pw:
+        if not configured:
             if enforce:
                 logger.error(
-                    "%s: WEBHOOK_AUTH_REQUIRED=true but credentials are "
-                    "not configured — refusing request",
+                    "%s: webhook auth enforced but WEBHOOK_AUTH_USER/PASSWORD "
+                    "are not configured — refusing request",
                     request.path,
                 )
                 return jsonify({'error': 'Webhook auth not configured'}), 500
             # Soft mode: nothing to compare against.
             return f(*args, **kwargs)
 
-        provided = _parse_basic_auth(request.headers.get('Authorization', ''))
-        ok = provided is not None and (
-            hmac.compare_digest(provided[0], expected_user)
-            and hmac.compare_digest(provided[1], expected_pw)
-        )
-
-        if not ok:
+        if not authorized:
             if enforce:
                 logger.warning("%s: webhook auth failed (rejected)", request.path)
                 return (
@@ -104,11 +127,43 @@ def require_webhook_auth(f: Callable) -> Callable:
                     {'WWW-Authenticate': 'Basic realm="webhook"'},
                 )
             logger.warning(
-                "%s: webhook auth failed (allowed — set "
-                "WEBHOOK_AUTH_REQUIRED=true to enforce)",
+                "%s: webhook auth failed (allowed — soft mode; unset "
+                "WEBHOOK_AUTH_REQUIRED or remove the 'false' override to enforce)",
                 request.path,
             )
 
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+def require_internal_auth(f: Callable) -> Callable:
+    """Strict HTTP Basic auth for the private backend⇄ai-agents API.
+
+    Unlike :func:`require_webhook_auth`, this NEVER runs in soft mode. The
+    internal routes expose decrypted MCP-gateway credentials and a
+    destructive demo reset, so they reject unauthenticated callers
+    regardless of ``WEBHOOK_AUTH_REQUIRED``. Returns 500 if credentials are
+    unconfigured (fail loud rather than silently open).
+    """
+
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        configured, authorized = _validate_request_auth()
+        if not configured:
+            logger.error(
+                "%s: internal auth required but WEBHOOK_AUTH_USER/PASSWORD "
+                "are not configured — refusing request",
+                request.path,
+            )
+            return jsonify({'error': 'Internal auth not configured'}), 500
+        if not authorized:
+            logger.warning("%s: internal auth failed (rejected)", request.path)
+            return (
+                jsonify({'error': 'Unauthorized'}),
+                401,
+                {'WWW-Authenticate': 'Basic realm="internal"'},
+            )
         return f(*args, **kwargs)
 
     return wrapper

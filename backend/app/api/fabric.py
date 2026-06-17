@@ -288,10 +288,25 @@ def create_subscriber():
 @fabric_bp.route('/subscribers', methods=['GET'])
 @jwt_required()
 def list_subscribers():
+    """List all subscribers (agents) in the space, with their REAL Fabric addresses.
+
+    PLAT-02 fix (2026-06-02 audit): the old version emitted
+    ``/private/{username}`` for every subscriber, which was the same
+    fabrication the create path's docstring (fabric.py:128-135) calls
+    out as Bug J — SignalWire actually slugs addresses from
+    ``display_name`` (e.g. "System Administrator" →
+    ``/private/system-administrator``), and ``/private/{username}``
+    is NEVER what the platform materializes. SWML connect verbs
+    targeting the fabricated address fail silently.
+
+    Now reads the real address from the User table where the create
+    path persisted it as ``user.signalwire_address``. For subscribers
+    that exist on SignalWire's side but don't have a matching User row
+    (shouldn't normally happen — implies drift), falls back to a
+    per-subscriber ``list_addresses`` call to recover the right value
+    rather than emitting the bogus fabricated form.
     """
-    List all subscribers (agents) in the space.
-    Useful for showing available agents for transfers.
-    """
+    from app.models import User
     try:
         try:
             resp = sw_client.get_client().fabric.subscribers.list(page_size=100)
@@ -301,19 +316,57 @@ def list_subscribers():
 
         subscribers = resp.get('data', []) if isinstance(resp, dict) else resp
 
-        # Filter to only show agents (not system subscribers)
-        agents = [
-            {
-                'id': sub.get('id'),
+        # Build a lookup of subscriber_id -> signalwire_address from our DB
+        # so we don't pay N+1 list_addresses calls in the happy path.
+        sw_ids = [sub.get('id') for sub in subscribers if sub.get('id')]
+        addr_by_sw_id = {}
+        if sw_ids:
+            users = User.query.filter(User.signalwire_subscriber_id.in_(sw_ids)).all()
+            addr_by_sw_id = {
+                u.signalwire_subscriber_id: u.signalwire_address
+                for u in users
+                if u.signalwire_address
+            }
+
+        client = sw_client.get_client()
+        agents = []
+        for sub in subscribers:
+            if sub.get('metadata', {}).get('role') not in ['agent', 'supervisor']:
+                continue
+            sub_id = sub.get('id')
+            address = addr_by_sw_id.get(sub_id)
+            if not address and sub_id:
+                # No User row for this subscriber — recover the real
+                # address via list_addresses. Slower path, only fires
+                # when our DB and SignalWire have drifted.
+                try:
+                    addrs_resp = client.fabric.subscribers.list_addresses(sub_id)
+                    addr_list = addrs_resp.get('data', []) if isinstance(addrs_resp, dict) else addrs_resp
+                    if addr_list:
+                        real_name = addr_list[0].get('name')
+                        if real_name:
+                            address = f"/private/{real_name}"
+                except Exception as e:
+                    logger.warning(
+                        f"list_subscribers: list_addresses fallback failed "
+                        f"for {sub_id}: {e}"
+                    )
+            if not address:
+                # Last resort: omit the entry rather than emit a fabricated
+                # address that would silently fail at SWML execution time.
+                logger.warning(
+                    f"list_subscribers: skipping {sub_id} — no resolvable "
+                    f"Fabric address (DB lookup miss + list_addresses fallback failed)"
+                )
+                continue
+            agents.append({
+                'id': sub_id,
                 'name': sub.get('display_name'),
                 'email': sub.get('email'),
-                'address': f"/private/{sub.get('username')}",
-                'status': sub.get('status', 'offline'),  # Need to check actual status
-                'metadata': sub.get('metadata', {})
-            }
-            for sub in subscribers
-            if sub.get('metadata', {}).get('role') in ['agent', 'supervisor']
-        ]
+                'address': address,
+                'status': sub.get('status', 'offline'),
+                'metadata': sub.get('metadata', {}),
+            })
 
         return jsonify({'agents': agents})
 

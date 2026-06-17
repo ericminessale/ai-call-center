@@ -44,11 +44,93 @@ def handle_connect(auth=None):
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    """Handle client disconnection."""
+    """Handle client disconnection — clean up Redis sets + offline the agent
+    if this was their last live socket.
+
+    RT-04 fix (2026-06-02 audit): the previous handler only touched a
+    generic ``active_clients`` set, leaving three classes of stale state:
+      1. Per-user client tracking: ``user:<id>:clients`` accumulated
+         orphan SIDs forever — every reconnect added a new entry, none
+         were removed on disconnect.
+      2. Per-call listener tracking: ``call:<sid>:listeners`` and
+         ``conference:<name>:listeners`` were add-only.
+      3. Agent status: if an agent's tab crashed, they stayed in
+         ``agents:available`` indefinitely. Router would dispatch new
+         calls to a dead socket — they'd 401/timeout and the caller
+         would sit on hold.
+    We now (a) scan our per-user client set for any room this socket
+    joined, (b) discard the socket's SID from those sets, (c) if the
+    user has no other live sockets, flip their queue-service status to
+    ``offline`` so routing stops considering them. Best-effort — Redis
+    is the source of truth and any failure here is logged not raised.
+    """
     client_id = request.sid
     logger.info(f"Client disconnected: {client_id}")
-    # Clean up any room memberships
-    remove_from_set(f"active_clients", client_id)
+
+    # Clean up the legacy global active_clients set (kept for back-compat).
+    try:
+        remove_from_set("active_clients", client_id)
+    except Exception:
+        pass
+
+    # Identify which user (if any) this socket belonged to. We scan the
+    # user:*:clients sets — could store reverse mapping for O(1) instead
+    # if this becomes a hot path, but disconnects aren't frequent.
+    try:
+        from app.services.redis_service import get_redis_client
+        rdb = get_redis_client()
+        if not rdb:
+            return
+        owning_user_id = None
+        # SCAN keyspace for user:*:clients sets that contain this sid.
+        # Per-call/conference cleanup uses the same scan.
+        for raw_key in rdb.scan_iter('user:*:clients'):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            if rdb.srem(key, client_id):
+                # Got a hit — extract the user_id from the key shape
+                # 'user:<id>:clients'.
+                try:
+                    owning_user_id = key.split(':', 2)[1]
+                except (IndexError, ValueError):
+                    pass
+                # Don't break — a misconfigured client could have
+                # SIDs in multiple user buckets; clean all.
+
+        # Also drop this sid from any call/conference listener sets it
+        # had joined. join_call/join_conference add the sid to these;
+        # without explicit leave_* on a network blip the entries leak.
+        for prefix in ('call:', 'conference:'):
+            for raw_key in rdb.scan_iter(f'{prefix}*:listeners'):
+                key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+                rdb.srem(key, client_id)
+
+        # Offline the agent if this was their last live socket — i.e.
+        # the per-user client set is now empty.
+        if owning_user_id is not None:
+            remaining = rdb.scard(f'user:{owning_user_id}:clients') or 0
+            if remaining == 0:
+                try:
+                    from app.services.queue_service import QueueService
+                    qs = QueueService(rdb)
+                    # Only demote if they were tracking-live; preserves
+                    # explicitly-set 'break' or 'offline' states.
+                    state = qs.get_agent_status(str(owning_user_id))
+                    if state and state.get('status') in ('available', 'busy', 'after-call'):
+                        qs.set_agent_status(str(owning_user_id), 'offline')
+                        logger.info(
+                            f"Disconnect cleanup: agent {owning_user_id} "
+                            f"had no remaining sockets → offline"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Disconnect cleanup: queue_service offline for "
+                        f"user {owning_user_id} failed (non-fatal): {e}"
+                    )
+    except Exception as e:
+        # Cleanup failure must not propagate — disconnect handlers run
+        # in tight loops on connection churn and a Redis blip shouldn't
+        # crash the worker.
+        logger.warning(f"Disconnect cleanup failed for {client_id}: {e}")
 
 
 @socketio.on('authenticate')

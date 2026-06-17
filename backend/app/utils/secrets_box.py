@@ -17,6 +17,7 @@ Usage::
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from typing import Optional
@@ -26,22 +27,25 @@ from cryptography.fernet import Fernet, InvalidToken
 logger = logging.getLogger(__name__)
 
 
+@functools.lru_cache(maxsize=1)
 def _load_key() -> bytes:
-    """Return the active Fernet key, generating an ephemeral one in dev.
+    """Return the active Fernet key, cached for the process.
 
-    Production must set ``SUBSCRIBER_PASSWORD_KEY``. If it's missing we
-    log loudly and generate a one-shot key so nothing crashes during
-    development; a restart will produce a different key, which is the
-    point — production must opt out of that footgun by setting the env.
+    ``SUBSCRIBER_PASSWORD_KEY`` is REQUIRED. We fail fast when it's unset
+    rather than generating an ephemeral key: a per-process / per-restart key
+    silently makes previously-encrypted secrets undecryptable and can't be
+    shared across gunicorn workers, so "encryption at rest" would provide no
+    real durability or confidentiality. Caching also guarantees every
+    encrypt/decrypt in this process uses the same key.
     """
     key = os.getenv('SUBSCRIBER_PASSWORD_KEY')
     if not key:
-        key = Fernet.generate_key().decode()
-        logger.warning(
-            "SUBSCRIBER_PASSWORD_KEY not set — generated a one-shot key for "
-            "this process. Set the env var to persist encrypted secrets "
-            "across restarts. Generated key (do NOT use in prod): %s",
-            key,
+        raise RuntimeError(
+            "SUBSCRIBER_PASSWORD_KEY is not set. Generate one with: "
+            "python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())\" and set it in your .env. "
+            "A stable key is required so encrypted secrets survive restarts "
+            "and are shared across workers."
         )
     return key.encode() if isinstance(key, str) else key
 

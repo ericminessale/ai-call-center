@@ -205,6 +205,57 @@ def update_agent_config():
 
 
 # =============================================================================
+# Branding (IMP-02 white-label)
+# =============================================================================
+
+_HEX_COLOR = re.compile(r'^#[0-9a-fA-F]{6}$')
+
+
+@admin_bp.route('/branding', methods=['GET'])
+@require_auth
+def get_branding():
+    """Current white-label branding (None values mean stock SignalWire)."""
+    return jsonify({'branding': SystemConfig.get_branding_config()}), 200
+
+
+@admin_bp.route('/branding', methods=['PUT'])
+@require_auth
+def update_branding():
+    """Update white-label branding. Saving an empty string clears a field.
+
+    Applies live: the frontend re-fetches /api/config/runtime after save and
+    re-applies CSS variables — no rebuild, no restart.
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = request.current_user.id
+        updated = []
+
+        for field in SystemConfig.BRANDING_FIELDS:
+            if field not in data:
+                continue
+            value = (data[field] or '').strip()
+            if value and field.startswith('color_') and not _HEX_COLOR.match(value):
+                return jsonify({'error': f'{field} must be a #rrggbb hex value'}), 400
+            if value and field == 'logo_url' and not value.startswith(('https://', 'http://', '/')):
+                return jsonify({'error': 'logo_url must be an http(s) URL or absolute path'}), 400
+            if field == 'product_name' and len(value) > 60:
+                return jsonify({'error': 'product_name must be 60 characters or fewer'}), 400
+            SystemConfig.set(f'branding.{field}', value, user_id=user_id)
+            updated.append(field)
+
+        return jsonify({
+            'success': True,
+            'updated': updated,
+            'branding': SystemConfig.get_branding_config(),
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to update branding: {str(e)}")
+        return jsonify({'error': 'Failed to update branding'}), 500
+
+
+# =============================================================================
 # Queue Management
 # =============================================================================
 
@@ -721,12 +772,14 @@ def update_agent_assignments():
 
         db.session.commit()
 
-        # Return updated assignments
+        # Return updated assignments. Agents resolve their KB binding per
+        # request from a 30s-TTL cache (capture_base_url → attach_knowledge_search
+        # in ai-agents/main_agent.py) — no restart needed.
         assignments = AgentCollectionAssignment.query.all()
         return jsonify({
             'success': True,
             'assignments': [a.to_dict() for a in assignments],
-            'message': 'Agent restart required for changes to take effect',
+            'message': 'Saved — agents pick up knowledge base changes on new calls within 30 seconds',
         }), 200
     except Exception as e:
         db.session.rollback()
@@ -1228,13 +1281,45 @@ def _compute_phone_routing_url(base_url: str, target_mode: str, target_queue_slu
 def _parse_phone_routing_from_url(url, base_url):
     """Reverse of _compute_phone_routing_url. Returns
     ``{'target_mode', 'target_queue_slug'}`` or None when the URL isn't one
-    we manage (numbers pointing at an external SWML / cXML script)."""
+    we manage (numbers pointing at an external SWML / cXML script).
+
+    Strict mode — only matches when ``url`` starts with the CURRENT
+    ``base_url``. Use this for "is this number assigned to us right now"
+    decisions. URL drift (ngrok rotation, dev↔prod host change) makes the
+    same logical assignment fail this check. Pair with
+    :func:`_parse_phone_routing_loose` to recover the routing intent.
+    """
     if not url or not base_url:
         return None
     base_trim = base_url.rstrip('/')
     if not url.startswith(base_trim):
         return None
-    path = url[len(base_trim):]
+    return _parse_phone_routing_loose(url)
+
+
+def _parse_phone_routing_loose(url):
+    """Host-agnostic variant of :func:`_parse_phone_routing_from_url`.
+
+    Extracts our routing intent from the PATH alone, regardless of which
+    host the URL points at. Used for URL-drift detection — if a phone
+    number on SignalWire's side has a URL whose path matches one of our
+    known SWML routes but whose host doesn't match the current
+    ``base_url``, this returns the mode/queue we'd re-bind to, and the
+    caller flags the row as drifted.
+
+    Returns None when the path doesn't look like one of our routes (true
+    external assignment, e.g. a customer pointing at their own script).
+    """
+    if not url:
+        return None
+    # Drop scheme + host so we can match on path alone.
+    path = url
+    for prefix in ('https://', 'http://'):
+        if path.startswith(prefix):
+            rest = path[len(prefix):]
+            slash = rest.find('/')
+            path = rest[slash:] if slash >= 0 else '/'
+            break
     if '?' in path:
         path = path.split('?', 1)[0]
     path = path.rstrip('/')
@@ -1273,7 +1358,20 @@ def list_phone_numbers():
             # Also honor call_request_url so legacy (laml_webhooks) assignments
             # from earlier migrations still show as assigned.
             current_url = n.get('call_relay_script_url') or n.get('call_request_url') or ''
+
+            # Strict parse: is this number currently routed to us at the
+            # CURRENT base_url?
             routing = _parse_phone_routing_from_url(current_url, base_url) if base_url else None
+
+            # Loose parse: does the URL's PATH look like one of our SWML
+            # routes regardless of host? If yes but strict failed, the
+            # number was assigned to us under a previous base_url (ngrok
+            # rotation, dev↔prod move, etc.) and is now drifted. We can
+            # also recover the original routing intent so the UI offers a
+            # one-click re-sync.
+            loose = _parse_phone_routing_loose(current_url) if current_url else None
+            is_drifted = bool(loose) and routing is None
+
             phone_numbers.append({
                 'sid': n.get('id'),
                 'phone_number': n.get('number') or n.get('phone_number', ''),
@@ -1284,6 +1382,13 @@ def list_phone_numbers():
                 'is_assigned': routing is not None,
                 'target_mode': routing['target_mode'] if routing else None,
                 'target_queue_slug': routing['target_queue_slug'] if routing else None,
+                # Drift fields — populated only when the number is pointed
+                # at one of our routes under a non-current host. The UI
+                # shows a distinct "URL drifted" chip and a Re-sync button
+                # that re-binds to (drifted_target_mode, drifted_target_queue_slug).
+                'is_drifted': is_drifted,
+                'drifted_target_mode': loose['target_mode'] if is_drifted else None,
+                'drifted_target_queue_slug': loose['target_queue_slug'] if is_drifted else None,
             })
 
         return jsonify({

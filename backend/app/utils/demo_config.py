@@ -91,9 +91,20 @@ def runtime_config() -> dict:
     which phone numbers to show, etc. Never include secrets here —
     this endpoint is intentionally unauthenticated.
     """
+    branding = None
+    try:
+        from app.models.system_config import SystemConfig
+        branding = SystemConfig.get_branding_config()
+    except Exception:
+        branding = None
+
     return {
         'demo_mode': is_demo_mode(),
         'demo_phone_numbers': demo_phone_numbers() if is_demo_mode() else [],
+        # White-label branding (IMP-02) — public by design: the login page
+        # must render the brand before any auth exists. Name/logo/colors
+        # only, never secrets.
+        'branding': branding,
     }
 
 

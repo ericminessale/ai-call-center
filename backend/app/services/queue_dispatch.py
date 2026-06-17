@@ -248,37 +248,63 @@ def enqueue_and_build_swml(
                 except (ValueError, TypeError):
                     selected_user = User.query.filter_by(email=agent_id_str).first()
                 if selected_user and selected_user.signalwire_address:
-                    call.assigned_agent_id = selected_user.id
-                    call.assigned_at = datetime.utcnow()
-                    call.status = 'assigned'
-                    if conf:
-                        conf.owner_user_id = selected_user.id
-                    try:
-                        db.session.commit()
-                    except Exception:
-                        db.session.rollback()
-                    try:
-                        qs.set_agent_status(
-                            str(selected_user.id), 'busy', current_call_id=call_sid
+                    # Atomic claim — same race fix as push-dispatch. Two
+                    # immediate-dispatch paths can fire in parallel (two
+                    # concurrent inbound calls arriving while several agents
+                    # are available); without the WHERE clause both would
+                    # write to assigned_agent_id and one of the banner
+                    # recipients would later get rejected on Take.
+                    from sqlalchemy import text
+                    claim = db.session.execute(
+                        text(
+                            "UPDATE calls "
+                            "SET assigned_agent_id = :uid, assigned_at = :ts, status = 'assigned' "
+                            "WHERE id = :id AND assigned_agent_id IS NULL "
+                            "RETURNING id"
+                        ),
+                        {'uid': selected_user.id, 'ts': datetime.utcnow(), 'id': call.id},
+                    )
+                    if claim.fetchone():
+                        if conf:
+                            conf.owner_user_id = selected_user.id
+                        try:
+                            db.session.commit()
+                            db.session.refresh(call)
+                        except Exception:
+                            db.session.rollback()
+                        try:
+                            qs.set_agent_status(
+                                str(selected_user.id), 'busy', current_call_id=call_sid
+                            )
+                        except Exception as e:
+                            logger.warning(f"enqueue_and_build_swml: agent busy failed: {e}")
+                        try:
+                            qs.remove_call_from_all_queues(call_sid)
+                        except Exception as e:
+                            logger.warning(f"enqueue_and_build_swml: dequeue after assign failed: {e}")
+                        emit_call_assignment_to_agent(
+                            call=call,
+                            agent=selected_user,
+                            conference_name=conference_name,
+                            queue_slug=queue_slug,
+                            context=context,
                         )
-                    except Exception as e:
-                        logger.warning(f"enqueue_and_build_swml: agent busy failed: {e}")
-                    try:
-                        qs.remove_call_from_all_queues(call_sid)
-                    except Exception as e:
-                        logger.warning(f"enqueue_and_build_swml: dequeue after assign failed: {e}")
-                    emit_call_assignment_to_agent(
-                        call=call,
-                        agent=selected_user,
-                        conference_name=conference_name,
-                        queue_slug=queue_slug,
-                        context=context,
-                    )
-                    greeting = (
-                        "say:Connecting you to an agent now. "
-                        "They'll be joining you shortly, please hold."
-                    )
-                    agent_dispatched = True
+                        greeting = (
+                            "say:Connecting you to an agent now. "
+                            "They'll be joining you shortly, please hold."
+                        )
+                        agent_dispatched = True
+                    else:
+                        # Lost race — another path claimed the call. Fall
+                        # through to the announcement-loop branch so this
+                        # caller gets a normal queue experience while the
+                        # winning path runs its own dispatch sequence.
+                        db.session.rollback()
+                        logger.info(
+                            f"enqueue_and_build_swml: lost claim race on "
+                            f"call {call_sid} — another worker assigned. "
+                            f"Falling through to queue hold."
+                        )
     except Exception as e:
         logger.warning(f"enqueue_and_build_swml: immediate-dispatch check failed (non-fatal): {e}")
 

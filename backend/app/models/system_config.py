@@ -41,6 +41,23 @@ class SystemConfig(db.Model):
             'support_specialist': cls.get('route.support_specialist', '/support-ai'),
         }
 
+    # White-label branding (IMP-02). None means "stock SignalWire" for that
+    # field — the frontend only overrides what's actually set. Saving an
+    # empty string clears a field back to stock.
+    BRANDING_FIELDS = (
+        'product_name', 'logo_url',
+        'color_primary', 'color_accent', 'color_highlight',
+    )
+
+    @classmethod
+    def get_branding_config(cls):
+        out = {}
+        for field in cls.BRANDING_FIELDS:
+            value = cls.get(f'branding.{field}')
+            out[field] = value.strip() if value and value.strip() else None
+        out['enabled'] = any(out[field] for field in cls.BRANDING_FIELDS)
+        return out
+
     def to_dict(self):
         return {
             'key': self.key,

@@ -193,56 +193,27 @@ def handle_take_call(data):
 
 @socketio.on('transfer_call')
 def handle_transfer_call(data):
-    """Handle call transfer."""
-    token = data.get('token') or request.headers.get('Authorization', '').replace('Bearer ', '')
-    call_id = data.get('callId')
-    destination = data.get('destination')
-    transfer_type = data.get('type', 'cold')
-    notes = data.get('notes', '')
-    context = data.get('context', {})
+    """Handle call transfer — NOT YET IMPLEMENTED (LIFE-02, 2026-06-02 audit).
 
+    The previous implementation wrote to ``transfer_history`` and
+    emitted ``call_transferred`` but never moved the participant on
+    SignalWire's side. Stack-wide lie. Disabled until the real path is
+    wired through ``conferences.move_participant``. Mirror of the
+    /api/queues/transfer REST endpoint disablement.
+    """
+    token = data.get('token') or request.headers.get('Authorization', '').replace('Bearer ', '')
     user_id = verify_token(token)
     if not user_id:
         emit('error', {'message': 'Invalid token'})
         return
-
-    # Log transfer
-    logger.info(f"Transfer initiated: Call {call_id} to {destination} ({transfer_type})")
-
-    # Update call record (only for real calls, not demo)
-    if not call_id.startswith('demo_'):
-        try:
-            # Try by database ID if numeric, otherwise by SignalWire SID
-            call = None
-            if str(call_id).isdigit():
-                call = Call.query.filter_by(id=int(call_id)).first()
-            if not call:
-                call = Call.find_by_sid(call_id)
-            if call:
-                # Add transfer to history
-                transfer_history = json.loads(call.transfer_history or '[]')
-                transfer_history.append({
-                    'from': user_id,
-                    'to': destination,
-                    'type': transfer_type,
-                    'notes': notes,
-                    'timestamp': datetime.utcnow().isoformat()
-                })
-                call.transfer_history = json.dumps(transfer_history)
-                db.session.commit()
-        except Exception as e:
-            logger.error(f"Error updating transfer history: {e}")
-
-    # Emit transfer event
-    socketio.emit('call_transferred', {
-        'call_id': call_id,
-        'from_agent': user_id,
-        'to': destination,
-        'type': transfer_type,
-        'context': context
-    }, room=destination)
-
-    emit('transfer_complete', {'call_id': call_id})
+    logger.warning(
+        f"transfer_call: disabled stub fired by user {user_id} "
+        f"(see LIFE-02 in REMEDIATION_2026-06-02.md)"
+    )
+    emit('error', {
+        'message': 'Transfer not implemented',
+        'detail': 'Use return-to-queue or request-backup until the real transfer path lands.',
+    })
 
 
 @socketio.on('hold_call')
@@ -353,6 +324,104 @@ def handle_reject_call_assignment(data):
     except Exception as e:
         logger.error(f"Error processing reject_call_assignment: {e}")
         db.session.rollback()
+
+
+@socketio.on('join_tap')
+def handle_join_tap(data):
+    """Authorize the requester for tap audio on a specific call.
+
+    RT-01 (2026-06-02 audit follow-up). The tap audio stream
+    (``tap_audio``/``tap_status``/``tap_metadata`` emits in
+    :mod:`app.services.tap_relay`) is room-scoped to ``tap:{call_id}``.
+    Sockets only see the stream after this handler validates them against
+    the same permission check ``call_control.start_monitor`` uses for the
+    REST monitor surface — so the "Listen" button maps to one auth model
+    regardless of whether it's tap audio or conference silent-join.
+
+    Request body: ``{token: str, call_id: str|int}``.
+
+    Permission decision mirrors ``call_control.py:start_monitor``:
+      - human-handled conference call → requires ``can_listen_human_calls``
+      - everything else (AI sessions, tap-only monitoring) → requires
+        ``can_listen_ai_calls``
+
+    Failure modes — emit a ``tap_error`` event with a reason, do NOT
+    join the room. (Errors are scoped to the SOCKET, not broadcast, so
+    we don't leak that the call exists.)
+    """
+    token = data.get('token') or request.headers.get('Authorization', '').replace('Bearer ', '')
+    raw_call_id = data.get('call_id')
+
+    user_id = verify_token(token)
+    if not user_id:
+        emit('tap_error', {'message': 'Invalid token'})
+        return
+    if not raw_call_id:
+        emit('tap_error', {'message': 'call_id required'})
+        return
+
+    # Resolve to a Call row so we can pick the right permission flag.
+    from app.models.call import Call
+    from app.models.user import User
+    call = None
+    if str(raw_call_id).isdigit():
+        call = Call.query.filter_by(id=int(raw_call_id)).first()
+    if not call:
+        call = Call.find_by_sid(str(raw_call_id))
+    if not call:
+        # Don't tell the caller whether the call exists or just failed
+        # auth — both look the same to them.
+        emit('tap_error', {'message': 'Tap not available'})
+        return
+
+    user = User.query.filter_by(id=user_id).first()
+    if not user:
+        emit('tap_error', {'message': 'Invalid token'})
+        return
+
+    is_human_call = bool(call.conference_name and call.handler_type == 'human')
+    required_flag = 'can_listen_human_calls' if is_human_call else 'can_listen_ai_calls'
+    if not user.has_permission(required_flag):
+        logger.warning(
+            f"join_tap: user {user_id} lacks {required_flag} for call "
+            f"{call.id} (human={is_human_call})"
+        )
+        emit('tap_error', {
+            'message': 'Missing required permissions',
+            'required_permissions': [required_flag],
+        })
+        return
+
+    # The tap stream emits use the SignalWire call_id (string), not the
+    # DB id. Join the room under that key so the producer's emits land
+    # on this socket.
+    room = f'tap:{call.signalwire_call_sid}'
+    join_room(room)
+    logger.info(f"join_tap: user {user_id} joined {room} (call DB id {call.id})")
+    emit('tap_joined', {
+        'call_id': call.signalwire_call_sid,
+        'db_call_id': call.id,
+    })
+
+
+@socketio.on('leave_tap')
+def handle_leave_tap(data):
+    """Stop receiving tap audio for a call. Idempotent — leaving a room
+    you're not in is a no-op. No auth needed; the worst a caller can do
+    is leave a room they weren't authorized to be in anyway."""
+    raw_call_id = data.get('call_id')
+    if not raw_call_id:
+        return
+    # Accept either the DB id or the SignalWire sid; the producer keys
+    # by sid, so resolve.
+    from app.models.call import Call
+    call = None
+    if str(raw_call_id).isdigit():
+        call = Call.query.filter_by(id=int(raw_call_id)).first()
+    if not call:
+        call = Call.find_by_sid(str(raw_call_id))
+    sid = call.signalwire_call_sid if call else str(raw_call_id)
+    leave_room(f'tap:{sid}')
 
 
 @socketio.on('end_call')
@@ -484,7 +553,6 @@ def broadcast_queue_updates():
             'longest': int(longest_wait),
             'severity': severity,
             'trend': 'stable',  # Calculate based on history
-            'slaCompliance': 85 if severity == 'normal' else 70 if severity == 'warning' else 50,
             'waitingCalls': []  # Add actual call previews if needed
         })
 

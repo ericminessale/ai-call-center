@@ -14,6 +14,7 @@ from datetime import datetime
 from base64 import b64encode
 
 from app.utils.demo_config import block_in_demo_mode
+from app.utils.decorators import require_auth, require_permission
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,8 @@ def get_signalwire_auth_headers():
 
 
 @ai_control_bp.route('/active-sessions', methods=['GET'])
-@jwt_required()
+@require_auth
+@require_permission('can_listen_ai_calls')
 def get_active_ai_sessions():
     """
     Get all currently active AI agent calls.
@@ -139,7 +141,8 @@ def get_active_ai_sessions():
 
 
 @ai_control_bp.route('/inject-message', methods=['POST'])
-@jwt_required()
+@require_auth
+@require_permission('can_listen_ai_calls')
 def inject_system_message():
     """
     Inject a system message into an active AI call to redirect its behavior.
@@ -153,7 +156,7 @@ def inject_system_message():
     """
     try:
         logger.info("🎯 AI INJECT-MESSAGE ENDPOINT HIT!")
-        supervisor_id = get_jwt_identity()
+        supervisor_id = request.current_user.id
         logger.info(f"🎯 Supervisor ID: {supervisor_id}")
         data = request.get_json()
         logger.info(f"🎯 Request data: {data}")
@@ -210,7 +213,7 @@ def inject_system_message():
             }
             redis_client.lpush(
                 f'ai_injection:{call_id}',
-                str(injection_record)
+                json.dumps(injection_record)
             )
 
         return jsonify({
@@ -226,9 +229,17 @@ def inject_system_message():
 
 
 @ai_control_bp.route('/injection-history/<call_id>', methods=['GET'])
-@jwt_required()
+@require_auth
+@require_permission('can_listen_ai_calls')
 def get_injection_history(call_id):
-    """Get history of all system message injections for a specific call."""
+    """Get history of all system message injections for a specific call.
+
+    AI-02 sibling fix (2026-06-02 audit follow-up): previously @jwt_required()
+    only, which meant any authenticated user with a guessable call_id could
+    pull the full supervisor coaching audit trail (system prompts injected
+    into an AI agent's running session). Same threat class as AI-02's
+    write side (/inject-message) — gated identically here.
+    """
     try:
         from app.services.redis_service import get_redis_client
         redis_client = get_redis_client()
@@ -239,8 +250,19 @@ def get_injection_history(call_id):
         # Get injection history from Redis
         history = redis_client.lrange(f'ai_injection:{call_id}', 0, -1)
 
-        # Parse and return
-        injections = [eval(h) for h in history]  # Safe here since we control the data
+        # Parse records. New writes are JSON; tolerate legacy str(dict)
+        # records via a SAFE literal eval (never the builtin eval(), which
+        # would execute arbitrary code on supervisor-supplied message text).
+        import ast
+        injections = []
+        for h in history:
+            try:
+                injections.append(json.loads(h))
+            except (ValueError, TypeError):
+                try:
+                    injections.append(ast.literal_eval(h))
+                except (ValueError, SyntaxError):
+                    injections.append({'raw': h})
 
         return jsonify({
             'call_id': call_id,
@@ -253,11 +275,18 @@ def get_injection_history(call_id):
         return jsonify({'error': str(e)}), 500
 
 
-@ai_control_bp.route('/transcription/<call_id>', methods=['GET'])
 def get_call_transcription(call_id):
     """
-    Get real-time transcription for an active call.
-    This streams transcription updates.
+    Get real-time transcription for an active call (internal helper only).
+
+    AI-02 sibling fix (2026-06-02 audit follow-up): this function used to be
+    exposed as ``GET /api/ai/transcription/<call_id>`` with NO auth decorator
+    at all — any unauthenticated caller who guessed a call_id could pull
+    live transcripts via SignalWire's per-call transcription API. The
+    frontend never called the HTTP route (only the Python function is used,
+    from get_active_ai_sessions:114), so the safest fix is to delete the
+    route entirely. The Python helper signature is unchanged; internal
+    callers still work.
     """
     try:
         # Query SignalWire for call transcription
@@ -453,6 +482,9 @@ def outbound_ai_swml(call_id):
 
     logger.info(f"Outbound AI SWML: transferring to {agent_url}")
 
+    # AMD before the AI transfer: outbound AI must not deliver its pitch to a
+    # voicemail greeting. detect_result: machine → short message + hangup via
+    # /api/swml/voicemail-detected; fax → hangup; human/unknown → AI agent.
     swml = {
         "version": "1.0.0",
         "sections": {
@@ -465,10 +497,28 @@ def outbound_ai_swml(call_id):
                 },
                 "answer",
                 {
-                    "transfer": {
-                        "dest": agent_url
+                    "detect_machine": {
+                        "detect_message_end": True
                     }
-                }
+                },
+                {
+                    "switch": {
+                        "variable": "detect_result",
+                        "case": {
+                            "machine": [{
+                                "transfer": {
+                                    "dest": f"{base_url}/api/swml/voicemail-detected?call_db_id={call.id}"
+                                }
+                            }],
+                            "fax": ["hangup"],
+                        },
+                        "default": [{
+                            "transfer": {
+                                "dest": agent_url
+                            }
+                        }],
+                    }
+                },
             ]
         }
     }
@@ -526,7 +576,7 @@ def initiate_outbound_ai_call():
 
         call = Call(
             user_id=user_id,
-            from_number=os.getenv('SIGNALWIRE_PHONE_NUMBER', os.getenv('SIGNALWIRE_FROM_NUMBER')),
+            from_number=os.getenv('SIGNALWIRE_FROM_NUMBER', os.getenv('SIGNALWIRE_PHONE_NUMBER')),
             destination=phone,
             destination_type='phone',
             status='initiated',
@@ -588,19 +638,25 @@ def initiate_outbound_ai_call():
 
 
 @ai_control_bp.route('/pause/<call_id>', methods=['POST'])
-@jwt_required()
+@require_auth
+@require_permission('can_listen_ai_calls')
 def pause_ai_agent(call_id):
     """
-    Temporarily pause AI agent to allow supervisor intervention.
+    Temporarily put the AI session on hold so a supervisor can take over.
+
+    AI-04 fix (2026-06-02 audit): the SignalWire AI Session Control REST
+    surface has FOUR verbs — ``ai_message``, ``ai_hold``, ``ai_unhold``,
+    ``ai_stop``. ``ai_pause``/``ai_resume`` aren't real verbs, so this
+    endpoint used to silently 500 on every call. Renamed to the documented
+    ``ai_hold``. Also dropped the ``params:{reason}`` block — ai_hold
+    doesn't document accepting a reason and an unsupported param risks a
+    400. (If the audit trail wants the reason it can stay on the
+    application side via existing call_event emits.)
     """
     try:
-        # This would put the AI on hold while supervisor talks to customer
         payload = {
             "id": call_id,
-            "command": "calling.ai_pause",
-            "params": {
-                "reason": "supervisor_intervention"
-            }
+            "command": "calling.ai_hold",
         }
 
         url = f"https://{SIGNALWIRE_SPACE}/api/calling/calls"
@@ -624,13 +680,20 @@ def pause_ai_agent(call_id):
 
 
 @ai_control_bp.route('/resume/<call_id>', methods=['POST'])
-@jwt_required()
+@require_auth
+@require_permission('can_listen_ai_calls')
 def resume_ai_agent(call_id):
-    """Resume AI agent after supervisor intervention."""
+    """Resume the AI session after a supervisor took over via /pause.
+
+    AI-04 fix (2026-06-02 audit): renamed ``calling.ai_resume`` →
+    ``calling.ai_unhold`` to match the documented AI Session Control
+    REST verb. See pause_ai_agent docstring for the verb-rename
+    context.
+    """
     try:
         payload = {
             "id": call_id,
-            "command": "calling.ai_resume"
+            "command": "calling.ai_unhold",
         }
 
         url = f"https://{SIGNALWIRE_SPACE}/api/calling/calls"

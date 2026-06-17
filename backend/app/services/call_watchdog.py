@@ -35,16 +35,39 @@ gunicorn output — easy to spot if the heartbeat plumbing itself ever breaks.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List
 
 logger = logging.getLogger(__name__)
 
 
 # Tunables. Kept module-level so tests / ops can override.
-WATCHDOG_INTERVAL_SECONDS = 15
-HEARTBEAT_GRACE_SECONDS = 60
-ACTIVE_STATUSES = ('waiting', 'assigned')
+WATCHDOG_INTERVAL_SECONDS = 30
+
+# Per-status max age (seconds since created_at) before a non-terminal call is
+# considered stale and reaped. This is a SAFETY NET — prompt cleanup happens
+# via the queue-status / call-status webhooks (enter_queue fires queue-status
+# on hangup/timeout/failed; the call-state webhook handles conference calls).
+# These caps only catch the rows those webhooks missed:
+#   - SWML scripts that died without a terminal event
+#   - frontend optimistic 'active' that never actually bridged (the 44hr-stuck
+#     bridge calls that motivated covering 'active' here)
+#   - carrier-retry phantoms
+# Generous values so we never reap a legitimately-live call.
+STALE_MAX_AGE = {
+    'pending': 180,    # 3 min  — should promote to 'waiting' quickly
+    'waiting': 2100,   # 35 min — just past enter_queue wait_time (1800s)
+    'queued': 2100,    # alias of waiting in some paths
+    'assigned': 900,   # 15 min — assigned but never went active = stuck dispatch
+    'active': 14400,   # 4 hr   — beyond any realistic call-center call duration
+}
+
+# Redis lock so only ONE gunicorn worker performs the sweep each interval
+# (we run 4 workers, each spawns a watchdog greenlet — without this they all
+# reap the same rows simultaneously, producing duplicate log lines + wasted
+# work). Best-effort: if Redis is down the lock no-ops and every worker
+# sweeps, which is still correct (reap is idempotent), just noisier.
+_SWEEP_LOCK_KEY = 'call_watchdog:sweep_lock'
 
 
 def _reap_call(call) -> None:
@@ -60,6 +83,10 @@ def _reap_call(call) -> None:
     from app.services.redis_service import get_redis_client
 
     call_sid = call.signalwire_call_sid
+    # Classify how it ended BEFORE flipping status to 'ended' (compute reads
+    # the pre-end status to decide abandoned_in_queue vs missed etc).
+    if not call.end_reason:
+        call.end_reason = call.compute_end_reason()
     call.status = 'ended'
     if not call.ended_at:
         call.ended_at = datetime.utcnow()
@@ -151,14 +178,25 @@ def _scan_once(app) -> int:
     from app.services.redis_service import get_redis_client
 
     reaped = 0
+    now = datetime.utcnow()
     with app.app_context():
         redis_client = get_redis_client()
-        cutoff = datetime.utcnow() - timedelta(seconds=HEARTBEAT_GRACE_SECONDS)
+
+        # Single-worker guard: try to grab the sweep lock for this interval.
+        # If another worker holds it, skip this pass entirely.
+        if redis_client is not None:
+            try:
+                got_lock = redis_client.set(
+                    _SWEEP_LOCK_KEY, '1', nx=True, ex=WATCHDOG_INTERVAL_SECONDS - 1
+                )
+                if not got_lock:
+                    return 0
+            except Exception:
+                pass  # Redis hiccup → fall through, every worker sweeps (safe)
 
         candidates: List[Call] = (
             db.session.query(Call)
-            .filter(Call.status.in_(ACTIVE_STATUSES))
-            .filter(Call.created_at < cutoff)
+            .filter(Call.status.in_(tuple(STALE_MAX_AGE.keys())))
             .all()
         )
 
@@ -167,18 +205,28 @@ def _scan_once(app) -> int:
             if not call_sid:
                 continue
 
-            # Check the heartbeat key. Present → keep. Missing → reap.
+            max_age = STALE_MAX_AGE.get(call.status)
+            if max_age is None:
+                continue
+
+            created = call.created_at or now
+            age = (now - created).total_seconds()
+            if age < max_age:
+                continue  # not old enough yet — give webhooks time to clean up
+
+            # Fast-skip: if a heartbeat key still exists the SWML script is
+            # provably alive (only the legacy goto/label hold loop sets these;
+            # harmless if absent). Don't reap a call that's proven live.
             try:
-                has_beat = bool(
-                    redis_client and redis_client.exists(f"call_heartbeat:{call_sid}")
-                )
-            except Exception as e:
-                logger.warning(f"watchdog scan {call_sid}: exists check failed: {e}")
-                continue
+                if redis_client and redis_client.exists(f"call_heartbeat:{call_sid}"):
+                    continue
+            except Exception:
+                pass
 
-            if has_beat:
-                continue
-
+            logger.warning(
+                f"[call_watchdog] reaping {call_sid}: status={call.status!r} "
+                f"age={age:.0f}s exceeds cap {max_age}s"
+            )
             _reap_call(call)
             reaped += 1
 
@@ -190,7 +238,7 @@ def _run_loop(app) -> None:
     from app import socketio
     logger.warning(
         f"[call_watchdog] started (interval={WATCHDOG_INTERVAL_SECONDS}s, "
-        f"grace={HEARTBEAT_GRACE_SECONDS}s)"
+        f"age caps={STALE_MAX_AGE})"
     )
     while True:
         try:

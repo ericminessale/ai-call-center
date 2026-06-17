@@ -338,8 +338,16 @@ def agent_conference_webhook():
                 token_params = json.loads(redis_data)
                 logger.info(f"Found params from Redis: {token_params}")
                 parsed_params.update(token_params)
-                # Delete the one-time token
-                redis_client.delete(redis_key)
+                # DO NOT delete the token here. SignalWire fetches this
+                # SWML URL multiple times per dial (e.g. PSTN-leg node and
+                # WebRTC-leg node both request it), and we need every
+                # fetch to resolve to the same join_conference SWML. The
+                # earlier single-use semantic caused the 2nd fetch to fall
+                # through with "Agent ID required" → hangup, dropping the
+                # call ~10s after the agent accepted. The 5-min TTL on
+                # the Redis entry handles cleanup. join_conference is
+                # idempotent — returning the same SWML twice from the
+                # same call_id is a no-op on SignalWire's side.
             except json.JSONDecodeError:
                 logger.error(f"Failed to parse Redis data for token {join_token}")
 
@@ -1084,12 +1092,28 @@ def conference_status_callback(conference_name):
                     connecting_leg.status = 'active'
                     logger.info(f"Updated call leg {connecting_leg.id} status to 'active'")
 
-                # Update call status to 'active' (human handling)
-                # Include 'ringing' for outbound calls initiated via dial-out
-                if call.status in ['connecting', 'queued', 'ringing']:
+                # Update call status to 'active' (human handling). An agent
+                # just joined the conference, so the call IS now human-handled
+                # regardless of how it got here. Previously this only fired
+                # for connecting/queued/ringing — which missed the AI→human
+                # handoff case where the call was 'ai_active' before the
+                # agent picked up, leaving the Call row stuck at handler_type
+                # 'ai' and the contact page rendering AI-mode UI even though
+                # a human had taken over. Flip on any non-terminal pre-active
+                # status: ai_active, answered, waiting, assigned, etc.
+                NON_TERMINAL_PRE_ACTIVE = {
+                    'connecting', 'queued', 'ringing',
+                    'ai_active', 'answered', 'waiting', 'assigned',
+                    'on_hold',  # rejoin after hold flips back to active
+                }
+                if call.status in NON_TERMINAL_PRE_ACTIVE:
+                    prev_status = call.status
                     call.status = 'active'
                     call.handler_type = 'human'
-                    logger.info(f"Updated call {call.id} status to 'active'")
+                    logger.info(
+                        f"Conference join: call {call.id} status "
+                        f"{prev_status!r} → 'active', handler_type → 'human'"
+                    )
 
                 db.session.commit()
 
@@ -1119,9 +1143,18 @@ def conference_status_callback(conference_name):
 
         participant = ConferenceParticipant.get_active_by_call_sid(participant_call_sid)
         if participant:
+            # RE-AUDIT-01 (2026-06-03): the previous version branched on
+            # an ``is_hold_leave`` flag to skip teardown when the agent
+            # left for the Hold workaround. That whole feature was
+            # disabled in this round (see call_control.hold_call docstring
+            # for the rationale), so this branch was both unreachable
+            # AND wrong — get_active_by_call_sid filtered status='active'
+            # and the hold endpoint had set status='on_hold' first, so
+            # the participant row was never returned here anyway. Now
+            # every leave is treated as a real leave.
             participant.leave()
 
-            # If customer left, end the call leg and update call status
+            # If customer left, end the call leg and update call status.
             if participant.participant_type == 'customer':
                 call = Call.find_by_sid(participant_call_sid)
                 if call:

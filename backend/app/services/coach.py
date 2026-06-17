@@ -215,28 +215,55 @@ def build_sidecar_start_params(
         },
     ]
 
+    # Shape per the AI Sidecar dev spec
+    # (tatooine.cantina.cloud/devuser/bugs/ai_sidecar.html). This verb is NOT
+    # live_transcribe-shaped, despite the 2026-05-26 "interchangeable" note:
+    #   * Params are FLAT — there is no ``action.start`` wrapper. The bare
+    #     ``calling.ai_sidecar`` command IS the attach; detach/ask are the
+    #     separate ``calling.ai_sidecar.stop`` / ``.ask`` commands (see
+    #     signalwire_api.py). Our old ``{"action":"stop"}`` therefore hit the
+    #     attach path → "already a sidecar attached".
+    #   * HTTP event delivery is the ``url`` field, NOT ``webhook``. With
+    #     ``webhook`` (ignored) the sidecar defaults to ``relay_only`` and
+    #     posts NOTHING over HTTP — exactly why /sidecar/events saw zero
+    #     traffic on every prior call (verified 2026-06-08: 0 ngrok hits).
+    #   * ``lang`` is required at top level. SWAIG tools live under
+    #     ``SWAIG.functions``. live_events / final_summary live under ``params``.
+    # The sidecar manages its OWN transcriber (starts one on attach, tears it
+    # down on stop) and a leg permits exactly one transcriber — so the caller
+    # must stop live_transcribe first (see attach_sidecar_to_call). The
+    # sidecar's ``turn`` events carry the customer transcript, which is how the
+    # live panel stays populated while coach is on.
     return {
-        "action": {
-            "start": {
-                "prompt": prompt,
-                "webhook": signed_webhook_url(
-                    f"{base_url}/api/webhooks/sidecar/events"
-                ),
-                # global_data rides on every sidecar event back to our webhook
-                # (per dev Q4). Keys here drive M8's routing without a DB hit.
-                "global_data": {
-                    "agent_user_id": agent.id,
-                    "agent_name": agent.name or agent.email,
-                    "agent_email": agent.email,
-                    "queue_slug": queue_slug,
-                    "coach_mode": mode,
-                    "coach_intensity": coach_intensity,
-                    "call_sid": call.signalwire_call_sid,
-                    "call_db_id": call.id,
-                },
-                "swaig_functions": swaig_functions,
-            }
-        }
+        "lang": "en-US",
+        "prompt": prompt,
+        # HTTP webhook for sidecar events. Field MUST be ``url`` — ``webhook``
+        # is silently ignored and the sidecar falls back to relay_only (no POST).
+        "url": signed_webhook_url(f"{base_url}/api/webhooks/sidecar/events"),
+        # Hear + transcribe both sides: full context for coaching, and parity
+        # with the pre-coach live_transcribe (which ran both directions).
+        # customer_role marks which leg is the caller.
+        "direction": ["remote-caller", "local-caller"],
+        "customer_role": "remote-caller",
+        # global_data rides on every sidecar event back to our webhook so M8
+        # routing needs no DB hit.
+        "global_data": {
+            "agent_user_id": agent.id,
+            "agent_name": agent.name or agent.email,
+            "agent_email": agent.email,
+            "queue_slug": queue_slug,
+            "coach_mode": mode,
+            "coach_intensity": coach_intensity,
+            "call_sid": call.signalwire_call_sid,
+            "call_db_id": call.id,
+        },
+        "SWAIG": {
+            "functions": swaig_functions,
+        },
+        "params": {
+            "live_events": True,
+            "final_summary": True,
+        },
     }
 
 
@@ -274,6 +301,47 @@ def attach_sidecar_to_call(
     )
 
     api = SignalWireAPI()
+
+    # SignalWire enforces exactly one transcriber per call leg, so whatever
+    # holds that slot must vacate before ``start_ai_sidecar`` can take it.
+    # On the handoff the incumbent is ``calling.live_transcribe`` (started
+    # by the AI agent's ingress SWML, still running when the human accepts).
+    # Stop it first; the dev's recent slot-release fix makes that stop
+    # reliably free the slot. The sidecar is a superset of live_transcribe
+    # and carries the same transcribe params (lang, live_events, ai_summary,
+    # direction, webhook), so once it owns the slot it ALSO drives the
+    # transcription pipeline — utterances hit our sidecar webhook and the
+    # fast-path forwards them through ``_process_utterance_event`` (same
+    # persist+emit path /transcription uses), so the live panel never goes
+    # dark.
+    #
+    # We deliberately DO NOT blind-stop a prior sidecar here. A
+    # ``lang``-bearing ``ai_sidecar {action:'stop'}`` is mis-routed by the
+    # platform as an *attach*: on a fresh call it silently attaches a
+    # phantom sidecar, and the real ``start`` below then dies with
+    # ``-ERR: there is already a sidecar attached to this call`` (verified
+    # call 04faec83, 2026-06-08 — identical payload produced no error when
+    # nothing was attached, then "already attached" once the phantom
+    # existed). On a first attach there's nothing to clear, so skipping it
+    # is correct. Mid-call mode switches (on_request <-> auto) can't tear
+    # down the old sidecar until the ``ai_sidecar`` stop contract is settled
+    # with the dev — tracked; not a regression since the swap was already
+    # broken.
+    try:
+        api.stop_transcription(call.signalwire_call_sid)
+        logger.info(
+            f"AI Coach pre-attach: stopped live_transcribe on "
+            f"{call.signalwire_call_sid} to free the transcriber slot"
+        )
+    except Exception as e:
+        # Not fatal — most likely live_transcribe wasn't running. The
+        # sidecar attach below will surface a real error if the slot is
+        # actually still occupied.
+        logger.debug(
+            f"AI Coach pre-attach: stop_transcription no-op on "
+            f"{call.signalwire_call_sid}: {e}"
+        )
+
     api.start_ai_sidecar(call.signalwire_call_sid, params)
     logger.info(
         f"AI Coach attached: call={call.signalwire_call_sid} "
@@ -283,13 +351,39 @@ def attach_sidecar_to_call(
 
 
 def detach_sidecar_from_call(call) -> None:
-    """Detach any attached sidecar from this call.
+    """Detach any attached sidecar from this call AND restore live_transcribe.
 
-    Idempotent — SignalWire returns a benign error if no sidecar is
-    attached; ``SignalWireAPI.stop_ai_sidecar`` logs and swallows it.
+    Counterpart to :func:`attach_sidecar_to_call`'s swap. When the agent
+    turns coach off mid-call, we want the live transcription panel to keep
+    populating from the call's remaining audio. The sidecar held the
+    transcriber slot while it was attached; on detach we free the slot
+    and re-attach ``calling.live_transcribe`` pointed at the same webhook
+    the rest of the system already listens to. Failures here are logged
+    but never raised — detach is fire-and-forget from the agent's POV
+    (their UI gates on the API call's 200, not on whether SignalWire's
+    response was clean).
     """
     from app.services.signalwire_api import SignalWireAPI
+    from app.utils.url_utils import signed_webhook_url, get_base_url
 
     api = SignalWireAPI()
     api.stop_ai_sidecar(call.signalwire_call_sid)
     logger.info(f"AI Coach detached: call={call.signalwire_call_sid}")
+
+    # Restore live_transcribe so the transcription panel keeps populating
+    # for the remainder of the call. Best-effort: any failure here
+    # degrades to "no transcription until next call" rather than breaking
+    # detach itself.
+    try:
+        base_url = get_base_url()
+        webhook_url = signed_webhook_url(f"{base_url}/api/webhooks/transcription")
+        api.start_transcription(call.signalwire_call_sid, webhook_url)
+        logger.info(
+            f"AI Coach post-detach: restored live_transcribe on "
+            f"{call.signalwire_call_sid}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"AI Coach post-detach: failed to restore live_transcribe on "
+            f"{call.signalwire_call_sid}: {e}"
+        )

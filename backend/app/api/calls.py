@@ -8,6 +8,7 @@ from app.utils.demo_config import block_in_demo_mode, is_demo_mode
 from app.utils.moderation import is_text_acceptable
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.services.queue_service import QueueService
+from app.services import cost_service
 from datetime import datetime, timedelta
 from sqlalchemy import func
 import logging
@@ -16,6 +17,81 @@ import json
 import os
 
 logger = logging.getLogger(__name__)
+
+
+@calls_bp.route('/cost-rates', methods=['GET'])
+@require_auth
+def get_cost_rates():
+    """Published list rates the cost estimator uses (SystemConfig pricing.*)."""
+    return jsonify({
+        'rates': cost_service.get_rates(),
+        'disclaimer': 'Estimated at published list rates',
+    })
+
+
+@calls_bp.route('/cost-summary', methods=['GET'])
+@require_auth
+def get_cost_summary():
+    """Today's estimated platform spend across all calls (IMP-01).
+
+    Re-runs the same per-call estimator the call rows embed, so the day
+    total always agrees with the line items. Demo-scale query (one day of
+    calls); switch to a SQL aggregate if volumes ever matter.
+    """
+    try:
+        since = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        calls = Call.query.filter(
+            Call.created_at >= since,
+            Call.duration.isnot(None),
+            Call.duration > 0,
+        ).all()
+
+        total = 0.0
+        ai_minutes = 0.0
+        human_minutes = 0.0
+        for call in calls:
+            estimate = cost_service.estimate_call_cost(call)
+            if not estimate:
+                continue
+            total += estimate['total']
+            if call.handler_type == 'ai':
+                ai_minutes += estimate['minutes']
+            else:
+                human_minutes += estimate['minutes']
+
+        rates = cost_service.get_rates()
+        return jsonify({
+            'since': since.isoformat(),
+            'call_count': len(calls),
+            'total_estimated': round(total, 2),
+            'ai_minutes': round(ai_minutes, 1),
+            'human_minutes': round(human_minutes, 1),
+            'did_monthly': rates['did_monthly'],
+            'rates': rates,
+            'disclaimer': 'Estimated at published list rates',
+        })
+    except Exception as e:
+        logger.error(f"Failed to build cost summary: {str(e)}")
+        return jsonify({'error': 'Failed to build cost summary'}), 500
+
+
+@calls_bp.route('/<call_sid>/cost', methods=['GET'])
+@require_auth
+def get_call_cost(call_sid):
+    """Line-item cost estimate for one call."""
+    call = Call.find_by_sid(call_sid)
+    if not call and call_sid.isdigit():
+        call = db.session.get(Call, int(call_sid))
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+
+    estimate = cost_service.estimate_call_cost(call)
+    if not estimate:
+        return jsonify({'error': 'No billable duration on this call yet'}), 404
+    return jsonify({
+        'call_sid': call.signalwire_call_sid,
+        'estimate': estimate,
+    })
 
 
 @calls_bp.route('/initiate', methods=['POST'])
@@ -384,14 +460,17 @@ def coach_attach(call_id):
         }), 400
 
     try:
-        # Detach first in case a previous mode is still attached. Cheap
-        # no-op when nothing's there. Both calls dispatch through the
-        # transport seam — sidecar attach is per-leg, so this works
-        # identically in conference and bridge mode.
-        try:
-            call_transport.detach_sidecar(call)
-        except Exception:
-            pass  # SignalWire returns benign errors on no-op detach
+        # NOTE: previously this site called ``detach_sidecar`` first as a
+        # "cheap no-op cleanup in case a previous mode is still attached".
+        # That stopped being safe once ``detach_sidecar`` learned to
+        # restore ``live_transcribe`` (so coach-off doesn't kill the
+        # transcription panel). Calling detach then attach back-to-back
+        # would now do: stop sidecar → start live_transcribe → stop
+        # live_transcribe → start sidecar — a wasteful flip with a brief
+        # window of double-attach errors. ``attach_sidecar`` already
+        # handles all the slot-clearing internally (stops any old
+        # sidecar AND any active live_transcribe before starting the new
+        # sidecar), so we go straight to attach.
         call_transport.attach_sidecar(
             call=call,
             agent=user,
@@ -692,6 +771,15 @@ def end_call(call_id):
             # Call may already be ended on SignalWire's side — that's OK, still update our state
             sw_api_error = str(sw_err)
             logger.warning(f"SignalWire end_call failed (call may already be ended): {sw_api_error}")
+
+        # The agent explicitly pressed the hangup button (this endpoint is
+        # only hit from the agent's UI), so claim the hangup_direction on
+        # their behalf — but ONLY if the call-state webhook hasn't already
+        # set it (caller hung up first and the webhook beat us here). This
+        # is what drives the agent_hangup vs caller_hangup chip in the
+        # call-history list.
+        if not call.hangup_direction:
+            call.hangup_direction = 'agent'
 
         # Always update call status and emit events regardless of SignalWire API result
         call.update_status('completed')
@@ -1079,25 +1167,96 @@ def take_queued_call(call_id):
             logger.warning(f"Call {call_id} cannot be taken (status={call.status})")
             return jsonify({'error': f'Call cannot be taken (status: {call.status})'}), 400
 
-        # Check if already assigned to another agent
-        if call.status == 'assigned' and call.assigned_agent_id and call.assigned_agent_id != request.current_user.id:
-            logger.warning(f"Call {call_id} is assigned to another agent ({call.assigned_agent_id})")
+        # Atomic claim — match the push-dispatch race fix. Two agents
+        # clicking Take simultaneously (or one clicking Take while
+        # push-dispatch is mid-claim for someone else) used to do
+        # check-then-act on `assigned_agent_id`, with each agent's UI
+        # convinced they had ownership but only one DB row state. The
+        # UPDATE...WHERE clause makes it impossible to grab a call that's
+        # already pinned to a different agent. The OR-equal clause keeps
+        # Take idempotent for the assigned agent — refreshing the page or
+        # double-clicking won't 409 them.
+        from sqlalchemy import text
+        user_id = request.current_user.id
+        claim = db.session.execute(
+            text(
+                "UPDATE calls SET "
+                "  assigned_agent_id = :uid, "
+                "  assigned_at = COALESCE(assigned_at, :ts), "
+                "  status = 'assigned', "
+                "  handler_type = 'human', "
+                "  user_id = :uid, "
+                "  conference_name = COALESCE(conference_name, :conf) "
+                "WHERE id = :id AND ("
+                "  assigned_agent_id IS NULL OR assigned_agent_id = :uid"
+                ") RETURNING id"
+            ),
+            {
+                'uid': user_id,
+                'ts': datetime.utcnow(),
+                'id': call.id,
+                'conf': f"interaction-{call.signalwire_call_sid}",
+            },
+        )
+        if not claim.fetchone():
+            db.session.rollback()
+            # Re-fetch to log who actually owns it (without trusting the
+            # potentially-stale in-memory call.assigned_agent_id).
+            current = db.session.query(Call.assigned_agent_id).filter_by(id=call.id).scalar()
+            logger.warning(
+                f"Take: call {call_id} is assigned to agent {current} "
+                f"(requesting user {user_id})"
+            )
             return jsonify({'error': 'Call is assigned to another agent'}), 409
 
-        # Assign to this agent if not already
-        if call.assigned_agent_id != request.current_user.id:
-            call.assigned_agent_id = request.current_user.id
-            call.assigned_at = datetime.utcnow()
-
-        call.status = 'assigned'
-        call.handler_type = 'human'
-        call.user_id = request.current_user.id
-
-        # Ensure conference name is set
-        if not call.conference_name:
-            call.conference_name = f"interaction-{call.signalwire_call_sid}"
-
         db.session.commit()
+        # Refresh so downstream code (emit, response payload) reads the
+        # claimed state, not the pre-claim snapshot.
+        db.session.refresh(call)
+
+        # Mirror what the auto-dispatch paths do after a successful claim:
+        # (1) mark the agent busy in Redis so router doesn't dispatch them
+        # to another call, AND (2) remove this call from the queue zsets so
+        # router doesn't try to re-pop the SAME call onto another agent
+        # who just went available.
+        #
+        # The manual Take path historically did neither, causing:
+        #   - agents staying in agents:available → double-dispatch onto an
+        #     agent already on a call
+        #   - taken calls lingering in queue zsets → inflated queue-depth
+        #     metrics + spurious "Assigned to you" banners for newly-available
+        #     agents (they 409 on claim per the SEC race fix, but the
+        #     banner-then-failed-take UX is bad)
+        #   - caller-hangup / watchdog release guards never matching (they
+        #     key off current_call_id == signalwire_call_sid)
+        #
+        # 2026-06-02 audit (LIFE-01) shipped the busy-mark but missed the
+        # queue removal. Fixing both here on the same Redis handle.
+        # Best-effort throughout: a Redis hiccup must not fail an otherwise-
+        # successful claim.
+        try:
+            from app.services.redis_service import get_redis_client
+            rdb = get_redis_client()
+            if rdb:
+                qs = QueueService(rdb)
+                qs.set_agent_status(
+                    str(request.current_user.id),
+                    'busy',
+                    current_call_id=call.signalwire_call_sid,
+                )
+                # Remove from queue zsets so push-dispatch can't re-pop this
+                # sid onto another agent going available.
+                try:
+                    qs.remove_call_from_all_queues(call.signalwire_call_sid)
+                except Exception as remove_err:
+                    logger.warning(
+                        f"Take: failed to dequeue call {call.signalwire_call_sid} "
+                        f"after claim: {remove_err}"
+                    )
+        except Exception as e:
+            logger.warning(
+                f"Take: failed to mark agent {request.current_user.id} busy: {e}"
+            )
 
         logger.info(f"Call {call_id} taken by agent {request.current_user.id}, conference: {call.conference_name}")
 

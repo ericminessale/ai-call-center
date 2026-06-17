@@ -65,6 +65,25 @@ def create_app():
     app.config['SECRET_KEY'] = _require_env('SECRET_KEY')
     app.config['JWT_SECRET_KEY'] = _require_env('JWT_SECRET_KEY')
 
+    # Webhook/internal auth credentials — secure-by-default. SignalWire-facing
+    # webhooks and the private backend⇄ai-agents routes authenticate via HTTP
+    # Basic (see app/utils/webhook_auth.py). Require the creds at boot unless
+    # the operator has explicitly opted into soft-mode for a migration window
+    # (WEBHOOK_AUTH_REQUIRED=false). The /api/internal/* routes always enforce
+    # regardless of that flag, so missing creds there fail loud at request time.
+    if os.getenv('WEBHOOK_AUTH_REQUIRED', 'true').strip().lower() != 'false':
+        _require_env('WEBHOOK_AUTH_USER')
+        _require_env('WEBHOOK_AUTH_PASSWORD')
+
+    # SEC-05 fix (2026-06-02 audit): EXTERNAL_URL is the only trustworthy
+    # source for callback URLs handed to SignalWire. The previous
+    # X-Forwarded-Host fallback in url_utils.get_base_url was attacker-
+    # controllable on an inbound request — an attacker who could hit a
+    # webhook endpoint could poison the callback host SignalWire receives
+    # for subsequent legs of the call, redirecting them. Fail fast at
+    # boot so an operator can never accidentally launch without it.
+    _require_env('EXTERNAL_URL')
+
     # Initialize extensions
     db.init_app(app)
     migrate.init_app(app, db)

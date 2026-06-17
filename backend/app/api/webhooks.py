@@ -10,8 +10,53 @@ from typing import Optional
 import logging
 import json
 import os
+import threading
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Telemetry capture (debugging aid)
+# ---------------------------------------------------------------------------
+# Persist raw SignalWire webhook payloads to host-visible files so a single
+# test call can be inspected offline. The backend container bind-mounts
+# ./backend -> /app (see docker-compose.yml), so anything under _CAPTURE_DIR
+# shows up on the host at signalwire-call-center/backend/captures/.
+#
+# Two streams are written per kind:
+#   <kind>-latest.json : the most recent payload, pretty-printed (overwritten)
+#   <kind>.jsonl       : append-only history, one JSON record per line
+#
+# Best-effort: capture failures are logged and swallowed so they never break
+# real webhook handling. The lock serialises writes within this worker
+# process; across gunicorn workers each record is written in a single write()
+# and carries a microsecond `captured_at`, so a high-volume (debug level 2)
+# burst can be re-sorted by timestamp if lines from two workers interleave.
+_CAPTURE_DIR = os.getenv('WEBHOOK_CAPTURE_DIR') or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), '..', '..', 'captures'))
+_capture_lock = threading.Lock()
+
+
+def capture_webhook_payload(kind: str, payload, *, latest: bool = True,
+                            stream: bool = True) -> None:
+    """Write a webhook payload to captures/ for offline debugging."""
+    try:
+        record = {
+            'captured_at': datetime.utcnow().isoformat() + 'Z',
+            'payload': payload,
+        }
+        with _capture_lock:
+            os.makedirs(_CAPTURE_DIR, exist_ok=True)
+            if latest:
+                latest_path = os.path.join(_CAPTURE_DIR, f'{kind}-latest.json')
+                with open(latest_path, 'w', encoding='utf-8') as fh:
+                    fh.write(json.dumps(record, default=str, indent=2))
+            if stream:
+                stream_path = os.path.join(_CAPTURE_DIR, f'{kind}.jsonl')
+                with open(stream_path, 'a', encoding='utf-8') as fh:
+                    fh.write(json.dumps(record, default=str) + '\n')
+    except Exception:
+        logger.exception("Failed to capture %s webhook payload", kind)
 
 
 def map_to_dashboard_status(internal_status):
@@ -166,6 +211,43 @@ def call_status():
                     f"Promoted pending call {call_id} -> waiting on '{mapped_status}'"
                 )
             else:
+                # On 'ended', try to capture who hung up first from the
+                # SignalWire payload before update_status runs (so
+                # compute_end_reason sees hangup_direction). The field name
+                # SignalWire uses for inbound SWML call-state isn't formally
+                # documented per-event, so we check several plausible keys
+                # defensively. The frontend may also have already set this
+                # via /api/calls/<id>/hangup-direction (agent-pressed-end
+                # button) — don't overwrite that more-authoritative signal.
+                if mapped_status == 'ended' and not call.hangup_direction:
+                    src = {}
+                    if isinstance(data, dict):
+                        src.update(data)
+                        if isinstance(data.get('params'), dict):
+                            src.update(data['params'])
+                        if isinstance(data.get('call'), dict):
+                            src.update(data['call'])
+                    raw_dir = (
+                        src.get('hangup_direction')
+                        or src.get('hangup_disposition')  # FreeSWITCH style
+                        or src.get('end_source')
+                        or src.get('ended_by')
+                    )
+                    if raw_dir:
+                        raw = str(raw_dir).lower()
+                        # FreeSWITCH 'send_bye' = our side ended → agent;
+                        # 'recv_bye' = peer ended → caller. Plus literal
+                        # 'caller'/'callee'/'agent' variants.
+                        if raw in ('caller', 'callee_hangup', 'recv_bye'):
+                            call.hangup_direction = 'caller'
+                        elif raw in ('callee', 'agent', 'caller_hangup', 'send_bye'):
+                            # 'callee' here = the called party = the agent leg
+                            # that received the dial.
+                            call.hangup_direction = 'agent'
+                        logger.info(
+                            f"call-status: captured hangup_direction={call.hangup_direction!r} "
+                            f"from raw {raw_dir!r}"
+                        )
                 call.update_status(mapped_status)
 
             # Update from_number if provided and not already set
@@ -378,10 +460,147 @@ def call_heartbeat():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
+def _process_utterance_event(data, *, source: str) -> tuple:
+    """Persist + emit a SignalWire transcription utterance event.
+
+    Extracted from the ``/transcription`` webhook so the ``/sidecar/events``
+    webhook can reuse the same handling — per the SignalWire dev's confirmation,
+    ``calling.ai_sidecar`` is a strict superset of ``calling.live_transcribe``
+    and emits the same utterance shape when ``live_events: true`` is in the
+    start params. We want utterance events to flow through the same
+    persist-then-socket-emit pipeline regardless of which webhook hears them
+    first, so call history stays complete across coach attach/detach.
+
+    Args:
+        data: raw webhook JSON.
+        source: 'transcription' or 'sidecar' — only used for logging so we
+            can tell which webhook a given utterance arrived through.
+
+    Returns:
+        Tuple of (handled: bool, status_string). ``handled=False`` means this
+        wasn't a recognizable utterance event and the caller should keep
+        processing other event kinds (relevant for the sidecar webhook,
+        which multiplexes utterances with coaching events).
+    """
+    # Extract call_id from the nested structure
+    call_info = data.get('call_info', {})
+    call_id = call_info.get('call_id')
+
+    # Check if this is an utterance (transcript) event
+    utterance = data.get('utterance', {})
+
+    if not call_id:
+        # Try channel_data as fallback
+        channel_data = data.get('channel_data', {})
+        call_id = channel_data.get('call_id')
+
+    logger.info(f"[{source}] Extracted - Call ID: {call_id}, Has utterance: {bool(utterance)}")
+
+    # Log the webhook event (use call.id if we can find it)
+    call = Call.find_by_sid(call_id) if call_id else None
+    WebhookEvent.log_event(
+        event_type=f"{source}_utterance" if source != 'transcription' else "transcription",
+        payload=data,
+        call_id=call.id if call else None
+    )
+
+    # Check for recording URL in channel_data
+    channel_data = data.get('channel_data', {})
+    swml_vars = channel_data.get('SWMLVars', {})
+    recording_url = swml_vars.get('record_call_url')
+
+    # Update call with recording URL if present
+    if call and recording_url and not call.recording_url:
+        call.recording_url = recording_url
+        db.session.commit()
+        logger.info(f"Updated call {call_id} with recording URL: {recording_url}")
+
+    if not (utterance and call_id):
+        return (False, 'no-utterance')
+
+    # Extract transcript data from utterance
+    text = utterance.get('content', '')
+    confidence = utterance.get('confidence', 0)
+    role = utterance.get('role', 'unknown')
+    language = utterance.get('lang', 'en-US')
+    timestamp = utterance.get('timestamp', 0)
+
+    # Check if transcription is final (not partial). With partial_events: False
+    # in SWML we should only get final transcriptions, but check
+    # ``final``/``is_final`` defensively just in case.
+    is_final = utterance.get('final', utterance.get('is_final', True))
+
+    # Skip partial transcriptions to avoid duplicates
+    if not is_final:
+        logger.debug(f"[{source}] Skipping partial transcription: '{text}'")
+        return (True, 'skipped-partial')
+
+    if not call:
+        logger.warning(f"[{source}] Call not found for ID: {call_id}")
+        return (True, 'no-call')
+
+    # Get the next sequence number
+    last_trans = db.session.query(Transcription).filter_by(
+        call_id=call.id
+    ).order_by(Transcription.sequence_number.desc()).first()
+    sequence = (last_trans.sequence_number + 1) if last_trans else 0
+
+    # Map role to speaker format expected by frontend
+    speaker = 'caller' if role == 'remote-caller' else 'agent'
+
+    # Save transcription
+    transcription = Transcription(
+        call_id=call.id,
+        transcript=text,
+        confidence=confidence,
+        is_final=is_final,
+        sequence_number=sequence,
+        speaker=speaker,
+        language=language
+    )
+    db.session.add(transcription)
+    db.session.commit()
+
+    logger.info(
+        f"[{source}] Saved transcript: '{text}' "
+        f"(confidence: {confidence}, role: {role}, speaker: {speaker})"
+    )
+
+    # Emit transcription to call room (all agents viewing this call have
+    # joined this room)
+    transcription_data = {
+        'call_sid': call_id,
+        'text': text,
+        'confidence': confidence,
+        'is_final': is_final,
+        'sequence': sequence,
+        'role': role,
+        'speaker': speaker,  # 'caller' or 'agent' (mapped from role)
+        'timestamp': timestamp
+    }
+    socketio.emit('transcription', transcription_data, room=call_id)
+    logger.info(f"[{source}] ✓ Emitted transcription to call room {call_id}")
+
+    # Agent Assist Factbook auto-mode (see AGENT_ASSIST.md). Best-effort;
+    # failures must never break transcription persistence.
+    if speaker == 'caller' and call.assigned_agent_id:
+        try:
+            _trigger_kb_auto_search_if_enabled(call, call_id)
+        except Exception as e:
+            logger.warning(f"[{source}] [Factbook auto] trigger failed: {e}")
+
+    return (True, 'ok')
+
+
 @webhooks_bp.route('/transcription', methods=['POST'])
 @require_webhook_auth
 def transcription():
-    """Handle live transcription webhook from SignalWire."""
+    """Handle live transcription webhook from SignalWire.
+
+    Persists and emits via ``_process_utterance_event``; same helper is reused
+    by the sidecar webhook so utterances flow consistently regardless of
+    which verb is currently transcribing the call.
+    """
     try:
         data = request.get_json() if request.is_json else request.form.to_dict()
 
@@ -391,110 +610,7 @@ def transcription():
         logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
         logger.info("="*50)
 
-        # Extract call_id from the nested structure
-        call_info = data.get('call_info', {})
-        call_id = call_info.get('call_id')
-
-        # Check if this is an utterance (transcript) event
-        utterance = data.get('utterance', {})
-
-        if not call_id:
-            # Try channel_data as fallback
-            channel_data = data.get('channel_data', {})
-            call_id = channel_data.get('call_id')
-
-        logger.info(f"Extracted - Call ID: {call_id}, Has utterance: {bool(utterance)}")
-
-        # Log the webhook event (use call.id if we can find it)
-        call = Call.find_by_sid(call_id) if call_id else None
-        WebhookEvent.log_event(
-            event_type="transcription",
-            payload=data,
-            call_id=call.id if call else None
-        )
-
-        # Check for recording URL in channel_data
-        channel_data = data.get('channel_data', {})
-        swml_vars = channel_data.get('SWMLVars', {})
-        recording_url = swml_vars.get('record_call_url')
-
-        # Update call with recording URL if present
-        if call and recording_url and not call.recording_url:
-            call.recording_url = recording_url
-            db.session.commit()
-            logger.info(f"Updated call {call_id} with recording URL: {recording_url}")
-
-        if utterance and call_id:
-            # Extract transcript data from utterance
-            text = utterance.get('content', '')
-            confidence = utterance.get('confidence', 0)
-            role = utterance.get('role', 'unknown')
-            language = utterance.get('lang', 'en-US')
-            timestamp = utterance.get('timestamp', 0)
-
-            # Check if transcription is final (not partial)
-            # With partial_events: False in SWML, we should only get final transcriptions
-            # But check utterance for 'final' or 'is_final' field just in case
-            is_final = utterance.get('final', utterance.get('is_final', True))
-
-            # Skip partial transcriptions to avoid duplicates
-            if not is_final:
-                logger.debug(f"Skipping partial transcription: '{text}'")
-                return jsonify({'status': 'skipped', 'reason': 'partial'}), 200
-
-            # Find the call
-            if call:
-                # Get the next sequence number
-                last_trans = db.session.query(Transcription).filter_by(
-                    call_id=call.id
-                ).order_by(Transcription.sequence_number.desc()).first()
-
-                sequence = (last_trans.sequence_number + 1) if last_trans else 0
-
-                # Map role to speaker format expected by frontend
-                speaker = 'caller' if role == 'remote-caller' else 'agent'
-
-                # Save transcription
-                transcription = Transcription(
-                    call_id=call.id,
-                    transcript=text,
-                    confidence=confidence,
-                    is_final=is_final,
-                    sequence_number=sequence,
-                    speaker=speaker,
-                    language=language
-                )
-                db.session.add(transcription)
-                db.session.commit()
-
-                logger.info(f"Saved transcript: '{text}' (confidence: {confidence}, role: {role}, speaker: {speaker})")
-
-                # Emit transcription to both call-specific room and user room
-                transcription_data = {
-                    'call_sid': call_id,
-                    'text': text,
-                    'confidence': confidence,
-                    'is_final': is_final,
-                    'sequence': sequence,
-                    'role': role,
-                    'speaker': speaker,  # 'caller' or 'agent' (mapped from role)
-                    'timestamp': timestamp
-                }
-
-                # Emit to call room (all agents viewing this call have joined this room)
-                socketio.emit('transcription', transcription_data, room=call_id)
-                logger.info(f"✓ Emitted transcription to call room {call_id}")
-
-                # Agent Assist Factbook auto-mode (see AGENT_ASSIST.md).
-                # Best-effort; failures must never break transcription persistence.
-                if speaker == 'caller' and call.assigned_agent_id:
-                    try:
-                        _trigger_kb_auto_search_if_enabled(call, call_id)
-                    except Exception as e:
-                        logger.warning(f"[Factbook auto] trigger failed: {e}")
-            else:
-                logger.warning(f"Call not found for ID: {call_id}")
-
+        _process_utterance_event(data, source='transcription')
         return jsonify({'status': 'ok'}), 200
 
     except Exception as e:
@@ -569,45 +685,35 @@ def summary():
                 }, room=str(call.user_id))
                 logger.info(f"✓ Emitted summary to user room: {call.user_id}")
             else:
-                logger.warning(f"✗ Call not found in database for ID: {call_id}")
-                logger.info("Checking all calls in DB for debugging...")
-                from app.models.call import Call
-                all_calls = db.session.query(Call).order_by(Call.created_at.desc()).limit(10).all()
-                for c in all_calls:
-                    logger.info(f"  - Call ID {c.id}: SID={c.signalwire_call_sid}, Status={c.status}, Created={c.created_at}")
-
-                # Try to create the call if it doesn't exist (for direct webhook calls)
-                logger.info(f"Attempting to create call record for orphaned summary...")
-                try:
-                    from app.models import User
-                    system_user = User.find_by_email('system@signalwire.local')
-                    if not system_user:
-                        system_user = db.session.query(User).first()
-
-                    if system_user:
-                        new_call = Call(
-                            signalwire_call_sid=call_id,  # Store the call_id
-                            user_id=system_user.id,
-                            destination='unknown',
-                            destination_type='phone',
-                            status='ended',
-                            summary=summary_text
-                        )
-                        db.session.add(new_call)
-                        db.session.commit()
-                        logger.info(f"✓ Created call record for {call_id} with summary")
-
-                        # Emit the summary now
-                        socketio.emit('summary', {
-                            'call_sid': call_id,  # Frontend expects call_sid
-                            'summary': summary_text
-                        }, room=call_id)
-                        socketio.emit('summary', {
-                            'call_sid': call_id,  # Frontend expects call_sid
-                            'summary': summary_text
-                        }, room=str(system_user.id))
-                except Exception as e:
-                    logger.error(f"Failed to create call record: {str(e)}")
+                # SEC-04 fix (2026-06-02 audit): the previous code path here
+                # FABRICATED a Call row attributed to the first/system user
+                # whenever a summary arrived for an unknown call_id. Since
+                # the payload (call_id + summary text) is attacker-
+                # controllable (the soft-mode webhook fallback used to make
+                # this unauth — fixed by SEC-01; but the attribution-
+                # mismatch was still wrong even with auth on), an attacker
+                # who knew the WEBHOOK_AUTH_REQUIRED creds could spray
+                # fabricated calls into the system, attributed to the
+                # first admin. We now refuse. A real call will have a Call
+                # row created by /initial-call SWML BEFORE the summary
+                # webhook fires; a missing row means either (a) the call
+                # never reached our SWML (so it isn't ours), or (b) row
+                # creation failed (which is a separate bug to investigate
+                # — not "manufacture a fake row on the fly").
+                logger.warning(
+                    f"✗ Summary webhook received for unknown call_id={call_id}; "
+                    f"refusing to fabricate a Call row. If this is a legitimate "
+                    f"call, ensure /initial-call SWML created the Call before "
+                    f"the AI session ended."
+                )
+                # Still log the event for audit trail — payload is preserved
+                # but with call_id=None so it doesn't pretend to belong to a
+                # call row we don't have.
+                WebhookEvent.log_event(
+                    event_type="summary_orphan",
+                    payload=data,
+                    call_id=None,
+                )
         else:
             logger.warning(f"Missing call_id ({call_id}) or summary in webhook data")
 
@@ -690,9 +796,12 @@ def queue_status():
                     # Caller never bridged to an agent — verb ended without
                     # success. Mark the row ended if no agent has taken it.
                     # Includes 'pending' so a hangup before call-state
-                    # 'created' fires still closes the row.
+                    # 'created' fires still closes the row. update_status
+                    # stamps end_reason: 'timeout' → abandoned_in_queue
+                    # explicitly; hangup/failed fall to compute_end_reason.
                     if call.status in ('pending', 'waiting', 'queued', 'assigned'):
-                        call.status = 'ended'
+                        hint = 'abandoned_in_queue' if result == 'timeout' else None
+                        call.update_status('ended', end_reason=hint)
                 db.session.commit()
             except Exception as e:
                 db.session.rollback()
@@ -768,18 +877,24 @@ def sidecar_events():
         logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
         logger.info("=" * 50)
 
-        # global_data is set by coach.build_sidecar_start_params and rides on
-        # every event (per dev Q4). All downstream routing keys live in here.
-        global_data = data.get('global_data') or {}
+        # Coach events are WRAPPED (verified call 5a1def2d, 2026-06-08):
+        #   {"call_info": {...}, "sidecar_event": {"type": "...", ...}}
+        # Transcription utterances use a different envelope ({"utterance":...,
+        # "confidence":...}) handled by the fast-path below. call_info.call_id
+        # is present on every shape, so route off that.
+        call_info = data.get('call_info') or {}
+        sidecar = data.get('sidecar_event')
+        if not isinstance(sidecar, dict):
+            sidecar = {}
+        # global_data only rides start/stop/final events; per-turn events carry
+        # just channel_data. Pull call_sid from wherever it's available.
+        global_data = sidecar.get('global_data') or data.get('global_data') or {}
         call_sid = (
             global_data.get('call_sid')
+            or call_info.get('call_id')
+            or (sidecar.get('channel_data') or {}).get('call_id')
             or data.get('call_id')
-            or (data.get('call_info') or {}).get('call_id')
         )
-        agent_user_id = global_data.get('agent_user_id')
-        queue_slug = global_data.get('queue_slug')
-        coach_mode = global_data.get('coach_mode')
-        coach_intensity = global_data.get('coach_intensity')
 
         # Persist for audit/replay regardless of whether we can route it —
         # missing global_data shouldn't lose the event.
@@ -790,31 +905,71 @@ def sidecar_events():
             call_id=call.id if call else None,
         )
 
-        # Classify the event. Sidecar API isn't standardized yet; check the
-        # likely field names in order. Fall back to ``kind`` for forward-compat.
-        kind = (
-            data.get('event')
-            or data.get('event_type')
-            or data.get('type')
-            or data.get('kind')
-            or 'unknown'
-        )
+        # Utterance fast-path. Per the SignalWire dev (2026-05-26),
+        # ``calling.ai_sidecar`` is built on top of ``calling.live_transcribe``
+        # and emits the same utterance event shape when ``live_events: true``
+        # is in the start params. When the sidecar is the active transcriber
+        # (we swap them on coach attach to satisfy the "one transcriber per
+        # leg" SignalWire constraint), utterance events arrive HERE instead
+        # of at /api/webhooks/transcription. Forward to the shared helper so
+        # the live transcription panel and call history stay populated while
+        # coach is on.
+        if data.get('utterance'):
+            handled, _status = _process_utterance_event(data, source='sidecar')
+            if handled:
+                return jsonify({'status': 'ok', 'kind': 'utterance'}), 200
 
-        # Suggestion-style payloads put the human-readable text in one of
-        # these common slots. We forward whichever is present so the UI can
-        # render without caring which milestone of the sidecar API this is.
+        # The coach-event discriminator is ``sidecar_event.type`` (NOT a
+        # top-level field). Verified types (call 5a1def2d): start, turn,
+        # request, tool_call, tool_result, skip, insight, ask_answer, stop,
+        # final.
+        kind = sidecar.get('type') or 'unknown'
+
+        # Only agent-facing kinds surface in the UI: ``insight`` (coaching
+        # advice the model produced) and ``ask_answer`` (reply to an explicit
+        # /coach/ask). Everything else — turn/skip/tool_call/tool_result/
+        # request/start/stop/final — is observability: already persisted
+        # above, never pushed to the agent. (Transcription is handled by the
+        # utterance fast-path, NOT ``turn``.)
+        if kind not in ('insight', 'ask_answer'):
+            return jsonify({'status': 'ok', 'kind': kind}), 200
+
+        # Routing context. agent_user_id/queue_slug only ride global_data
+        # (start/stop/final events); per-turn insight events don't carry it,
+        # so fall back to the call's assigned agent for the user-room emit.
+        agent_user_id = global_data.get('agent_user_id') or (
+            call.assigned_agent_id if call else None
+        )
+        queue_slug = global_data.get('queue_slug') or (
+            call.queue_id if call else None
+        )
+        coach_mode = global_data.get('coach_mode')
+        coach_intensity = global_data.get('coach_intensity')
+
+        # Advice text. Per the spec ``insight`` carries it under ``raw``; be
+        # defensive about str vs structured, and keep ask_answer slots. Exact
+        # insight field layout still to be confirmed from a live insight
+        # sample (this call produced only skips) — every event is persisted to
+        # webhook_events for verification.
+        raw_field = sidecar.get('raw')
         suggestion_text = (
-            data.get('suggestion')
-            or data.get('text')
-            or data.get('message')
-            or (data.get('content') if isinstance(data.get('content'), str) else None)
+            (raw_field if isinstance(raw_field, str) else None)
+            or (raw_field.get('response') if isinstance(raw_field, dict) else None)
+            or (raw_field.get('text') if isinstance(raw_field, dict) else None)
+            or (raw_field.get('content') if isinstance(raw_field, dict) else None)
+            or sidecar.get('insight')
+            or sidecar.get('suggestion')
+            or sidecar.get('answer')
+            or sidecar.get('text')
+            or sidecar.get('message')
+            or (sidecar.get('content') if isinstance(sidecar.get('content'), str) else None)
             or ''
         )
 
         # ask correlation token (M10) — may not exist until SignalWire ships
         # the ask_id field. Until then we fall back to a FIFO pop against
         # the per-call pending_asks list that coach_ask pushes to.
-        ask_id = data.get('ask_id') or data.get('correlation_id')
+        ask_id = sidecar.get('ask_id') or sidecar.get('correlation_id')
         matched_question: Optional[str] = None
         if kind == 'ask_answer' and not ask_id and call_sid:
             try:
@@ -848,7 +1003,7 @@ def sidecar_events():
             # Echo the matched agent question back when FIFO correlated, so the
             # UI can pair it with the agent's optimistic "You asked" bubble.
             'matched_question': matched_question,
-            'timestamp': data.get('timestamp') or data.get('ts'),
+            'timestamp': sidecar.get('ts') or data.get('timestamp'),
             # Raw kept on the payload for debugging — the frontend ignores it
             # unless the developer console is open.
             'raw': data,
@@ -1036,6 +1191,10 @@ def post_prompt():
         logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
         logger.info("="*50)
 
+        # Persist the raw payload for offline debugging (most-recent + history).
+        # captures/postprompt-latest.json + captures/postprompt.jsonl
+        capture_webhook_payload('postprompt', data)
+
         # Extract key fields from the post_prompt payload
         app_name = data.get('app_name')
         call_id = data.get('call_id')
@@ -1068,27 +1227,95 @@ def post_prompt():
             if parsed_summary and len(parsed_summary) > 0:
                 merged_context['parsed_summary'] = parsed_summary[0]
 
+                # Tier B v1: AI-emitted disposition + post_mortem auto-fill the
+                # wrap-up fields so the panel shows them pre-populated. Human
+                # agents can still edit. We only set when empty so a manual
+                # value (or an earlier AI pass) is never clobbered.
+                ai_assessment = parsed_summary[0] if isinstance(parsed_summary[0], dict) else {}
+                raw_disp = (ai_assessment.get('disposition') or '').strip()
+                if raw_disp and not call.disposition_code:
+                    # Validate against the canonical list — defensive; the LLM
+                    # was told to pick from that list but might hallucinate.
+                    from app.api.calls import DISPOSITION_CODE_SET
+                    if raw_disp in DISPOSITION_CODE_SET:
+                        call.disposition_code = raw_disp
+                        logger.info(
+                            f"post_prompt: AI disposition auto-set call {call.id} -> {raw_disp!r}"
+                        )
+                    else:
+                        logger.warning(
+                            f"post_prompt: AI emitted unknown disposition {raw_disp!r} "
+                            f"for call {call.id}; ignoring"
+                        )
+                post_mortem = (ai_assessment.get('post_mortem') or '').strip()
+                if post_mortem and not call.agent_notes:
+                    call.agent_notes = post_mortem
+                    logger.info(
+                        f"post_prompt: AI post_mortem auto-filled into agent_notes "
+                        f"for call {call.id} ({len(post_mortem)} chars)"
+                    )
+
             call.ai_context = json.dumps(merged_context)
 
             # If we have a raw summary and no existing summary, use it
             if raw_summary and not call.summary:
                 call.summary = raw_summary
 
-            # Clean up any queue entries for this call
-            from app.services.queue_service import QueueService
-            from app.services.redis_service import get_redis_client
-            redis_client = get_redis_client()
-            if redis_client:
-                queue_svc = QueueService(redis_client)
-                queue_svc.remove_call_from_all_queues(call_id)
+            # RE-AUDIT-05 fix (2026-06-03): the previous code REMOVED the
+            # call from the queue zset here, then immediately below set
+            # status='waiting'. Result: a call ready for human pickup
+            # was status='waiting' but invisible to push-dispatch (which
+            # reads the zset to find candidates when an agent goes
+            # Available). Only manual Take worked, because that path
+            # looks up by Call.id not the zset. AI-01 activating the
+            # post_prompt URL exposed this latent bug — before AI-01
+            # the URL wasn't set so post_prompt never fired, and the
+            # dead code never broke push-dispatch.
+            #
+            # The remove was nonsensical to begin with: the call SHOULD
+            # be in the queue at this point, because the caller is
+            # still on the line waiting for a human. Deleted entirely.
+            # The original-intent comment "Clean up any queue entries"
+            # doesn't match what /post-prompt actually fires for — it's
+            # an AI-session-ended hook, not a call-end hook.
 
-            # post_prompt fires when the AI conversation ends, NOT when the phone call ends.
-            # The caller may still be on the line (e.g., waiting in queue for a human agent).
-            # Do NOT mark as 'completed' here — let the call-status webhook handle final status.
-            # Instead, transition active calls back to 'waiting' so agents can take them.
-            if call.status in ('answered', 'ai_active'):
-                call.status = 'waiting'
-                logger.info(f"Call {call_id} AI session ended — set to 'waiting' for human pickup")
+            # post_prompt fires when the AI conversation ends, NOT necessarily
+            # when the phone call ends — but for inbound relay_script calls the
+            # call-status webhook NEVER fires (call_state_url is not honored
+            # for relay_script handlers; see call_watchdog docstring), so
+            # whatever we set here is the call's final state until the
+            # 35-minute watchdog cap. Route on the session outcome,
+            # corroborated by hard state:
+            #   - handed to another AI agent → leave status alone; that
+            #     session posts its own post_prompt when IT ends
+            #   - handed to a human queue → 'waiting' so push-dispatch and
+            #     manual Take can pick it up
+            #   - anything else (abandoned/resolved/hangup) with no assigned
+            #     agent and no live conference → the call is over; close it
+            #     NOW instead of letting it haunt the dashboard as a phantom
+            #     queue entry until the watchdog cap.
+            outcome = ''
+            if ai_assessment:
+                outcome = str(ai_assessment.get('outcome') or '').lower()
+
+            if call.status in ('answered', 'ai_active', 'waiting'):
+                if 'transferred_to_ai' in outcome:
+                    logger.info(
+                        f"Call {call_id} AI session ended via AI->AI handoff — "
+                        f"status untouched ({call.status})"
+                    )
+                elif 'human' in outcome:
+                    call.status = 'waiting'
+                    logger.info(
+                        f"Call {call_id} AI session ended — set to 'waiting' "
+                        f"for human pickup"
+                    )
+                elif not call.assigned_agent_id and not call.conference_name:
+                    call.update_status('ended')
+                    logger.info(
+                        f"Call {call_id} AI session ended (outcome={outcome!r}, "
+                        f"no agent/conference) — call closed"
+                    )
 
             db.session.commit()
             logger.info(f"✓ Updated call {call.id} with post_prompt data (status: {call.status})")
@@ -1142,6 +1369,36 @@ def post_prompt():
         return jsonify({'error': str(e)}), 500
 
 
+@webhooks_bp.route('/debug-events', methods=['POST'])
+@require_webhook_auth
+def debug_events():
+    """Capture SWAIG debug webhook events to file for offline diagnosis.
+
+    The agents only point SignalWire at this endpoint when
+    DEBUG_WEBHOOK_ENABLED=true (see ai-agents/main_agent.py:capture_base_url).
+    At debug_webhook_level=2 the platform POSTs many events per call (LLM
+    request/response, step/context changes, fillers, conversation_add), so we
+    deliberately keep this light: stream each event to
+    captures/debug-events.jsonl and skip all DB work. Inspect the file after a
+    test call to see exactly what the agent did, turn by turn — e.g. a burst of
+    step_change/filler events is the "skips to the final step + spams fillers"
+    symptom, and the llm_request/llm_response pair shows why the model jumped.
+    """
+    try:
+        data = request.get_json(silent=True)
+        if data is None:
+            data = request.form.to_dict() if request.form else {}
+        event_type = data.get('label') or data.get('action') or 'unknown'
+        call_id = data.get('call_id')
+        # Stream only — the "latest single event" isn't useful; the sequence is.
+        capture_webhook_payload('debug-events', data, latest=False)
+        logger.info(f"DEBUG EVENT [{event_type}] call={call_id}")
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        logger.error(f"Error processing debug webhook: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @webhooks_bp.route('/recording', methods=['POST'])
 @require_webhook_auth
 def recording():
@@ -1169,20 +1426,55 @@ def recording():
 
         logger.info(f"Extracted - Call ID: {call_id}, Recording URL: {recording_url}")
 
-        # Log the webhook event
+        # Look up the Call row so we can persist the URL AND log the event
+        # against the right DB id. Without this we lose two things:
+        #   1. recording_url never lands on the Call row — so when the agent
+        #      opens the call-detail tab moments after hangup, the
+        #      ``interactions`` API returns recordingUrl=null and the player
+        #      doesn't appear until the user refreshes (the bug the user
+        #      hit). The other recording extraction path (transcription
+        #      webhook, swml_vars.record_call_url) was the only thing
+        #      writing the column before — and it doesn't always fire on
+        #      conference / human-handled calls.
+        #   2. ``WebhookEvent.log_event(call_id=...)`` was being passed the
+        #      raw SignalWire call_sid, which is the wrong type for the
+        #      ``calls.id`` foreign key — the row was either rejected or
+        #      stored against a bogus parent. Look up the DB id properly.
+        call = Call.find_by_sid(call_id) if call_id else None
         WebhookEvent.log_event(
             event_type="recording_completed",
             payload=data,
-            call_id=call_id  # This should be the database ID ideally
+            call_id=call.id if call else None,
         )
 
-        # Emit recording URL via WebSocket
+        # Persist recording_url to the Call row (idempotent — only write
+        # when we actually got one back AND the column is empty).
+        if call and recording_url and not call.recording_url:
+            call.recording_url = recording_url
+            db.session.commit()
+            logger.info(
+                f"Updated call {call.id} (sid={call_id}) with recording URL: {recording_url}"
+            )
+
+        # Emit two events so any UI surface can update without a refresh:
+        #   1. ``recording`` — the call's transcription/recording room
+        #      (LiveCallTab subscribes here while the call is live).
+        #   2. ``call_update`` — broadcast on Call.to_dict() so the
+        #      contact-detail tab (which renders ``interaction.recordingUrl``
+        #      from the interactions list) picks up the new URL on the
+        #      next render of the call-detail panel.
         if recording_url:
             socketio.emit('recording', {
                 'call_sid': call_id,  # Frontend expects call_sid
                 'recording_url': recording_url,
                 'recording_sid': recording_sid
             }, room=call_id)
+            if call:
+                # Lazy import to mirror the other call sites in this file
+                # (avoids a top-level import cycle through the socketio
+                # service).
+                from app.services.callcenter_socketio import emit_call_update
+                emit_call_update(call)
 
         return '', 200
 

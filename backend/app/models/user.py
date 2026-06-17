@@ -1,6 +1,5 @@
 from datetime import datetime
 from app import db, bcrypt
-from cryptography.fernet import Fernet
 from sqlalchemy.dialects.postgresql import JSON
 import os
 import base64
@@ -16,6 +15,7 @@ PERMISSION_FLAGS = (
     'can_barge',               # insert self into an active call (full audio)
     'can_control_recording',   # start/stop recording on calls they are participating in
     'can_use_coach',           # attach the AI Coach sidecar to their own calls (per-call toggle)
+    'can_return_to_queue',     # bounce an accepted call back to queue routing (Tier 2p)
 )
 
 ROLE_PERMISSION_DEFAULTS = {
@@ -27,6 +27,7 @@ ROLE_PERMISSION_DEFAULTS = {
         'can_barge':              True,
         'can_control_recording':  True,
         'can_use_coach':          True,
+        'can_return_to_queue':    True,
     },
     'agent': {
         'can_listen_ai_calls':    False,
@@ -35,6 +36,7 @@ ROLE_PERMISSION_DEFAULTS = {
         'can_barge':              False,
         'can_control_recording':  True,   # agent can pause/resume on their own call
         'can_use_coach':          True,   # opt-in via in-call toggle; defaults to off per-call
+        'can_return_to_queue':    True,   # default-on, revokable for abuse cases per 2p spec
     },
 }
 
@@ -112,41 +114,20 @@ class User(db.Model):
         """Check if the provided password matches the hash."""
         return bcrypt.check_password_hash(self.password_hash, password)
 
-    @staticmethod
-    def _get_encryption_key():
-        """Get or generate encryption key for subscriber passwords."""
-        key = os.getenv('SUBSCRIBER_PASSWORD_KEY')
-        if not key:
-            # Generate a key if not set (for development)
-            # In production, this MUST be set in environment
-            key = Fernet.generate_key().decode()
-            print(f"WARNING: Generated temporary encryption key. Set SUBSCRIBER_PASSWORD_KEY={key}")
-
-        # Ensure key is properly formatted
-        if isinstance(key, str):
-            key = key.encode()
-        return key
-
     def set_subscriber_password(self, password):
-        """Encrypt and store subscriber password."""
-        if not password:
-            self.signalwire_password_encrypted = None
-            return
+        """Encrypt and store the subscriber password.
 
-        key = self._get_encryption_key()
-        fernet = Fernet(key)
-        encrypted = fernet.encrypt(password.encode())
-        self.signalwire_password_encrypted = encrypted.decode()
+        Delegates to :mod:`app.utils.secrets_box` so all at-rest secrets
+        share one required, cached Fernet key (``SUBSCRIBER_PASSWORD_KEY``) —
+        no more per-call ephemeral keys or keys printed to stdout.
+        """
+        from app.utils.secrets_box import encrypt_secret
+        self.signalwire_password_encrypted = encrypt_secret(password or None)
 
     def get_subscriber_password(self):
-        """Decrypt and return subscriber password."""
-        if not self.signalwire_password_encrypted:
-            return None
-
-        key = self._get_encryption_key()
-        fernet = Fernet(key)
-        decrypted = fernet.decrypt(self.signalwire_password_encrypted.encode())
-        return decrypted.decode()
+        """Decrypt and return the subscriber password (None if unset/invalid)."""
+        from app.utils.secrets_box import decrypt_secret
+        return decrypt_secret(self.signalwire_password_encrypted)
 
     def effective_permissions(self) -> dict:
         """Return the user's flat permission map after merging role defaults

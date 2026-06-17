@@ -126,6 +126,34 @@ def sync_agent_conference_webhook(external_url: str) -> dict:
         return {'error': str(e)}
 
 
+def _friendly_name_for_route(url: str) -> Optional[str]:
+    """Turn one of our managed webhook URLs into a human-readable Calling
+    Handler name for the SignalWire Dashboard. Without this, the resource's
+    display_name defaults to the full ngrok URL — ugly + unstable. Returns
+    None for URLs we don't recognize (leave them as-is)."""
+    if not url:
+        return None
+    try:
+        path = urlparse(url).path or ''
+    except Exception:
+        return None
+    if path.startswith('/api/swml/initial-call'):
+        return 'AI Receptionist (initial call)'
+    if path.startswith('/api/swml/ai-specialist/'):
+        slug = path.split('/api/swml/ai-specialist/', 1)[1].strip('/').split('/', 1)[0]
+        if slug:
+            return f'AI Specialist — {slug.capitalize()}'
+        return 'AI Specialist'
+    if path.startswith('/api/queues/') and path.endswith('/direct-inbound'):
+        slug = path[len('/api/queues/'):-len('/direct-inbound')].strip('/')
+        if slug:
+            return f'{slug.capitalize()} — Direct inbound'
+        return 'Direct inbound'
+    if path.startswith('/api/swml/out-of-service'):
+        return 'Out of service (unassigned)'
+    return None
+
+
 def update_swml_webhook_for_phone(
     *,
     calling_handler_resource_id: str,
@@ -151,12 +179,22 @@ def update_swml_webhook_for_phone(
     if not calling_handler_resource_id:
         return {'skipped': True, 'reason': 'no calling_handler_resource_id'}
 
+    # Derive a human-readable name from the route so the Dashboard shows
+    # "Support — Direct inbound" instead of the raw ngrok URL.
+    friendly_name = _friendly_name_for_route(primary_request_url)
+
     try:
         client = sw_client.get_client()
+        update_kwargs = {
+            'primary_request_url': primary_request_url,
+            'status_callback_url': status_callback_url,
+        }
+        if friendly_name:
+            update_kwargs['name'] = friendly_name
+            update_kwargs['display_name'] = friendly_name
         result = client.fabric.swml_webhooks.update(
             calling_handler_resource_id,
-            primary_request_url=primary_request_url,
-            status_callback_url=status_callback_url,
+            **update_kwargs,
         )
         inner = (result.get('swml_webhook') or {}) if isinstance(result, dict) else {}
         return {
@@ -252,9 +290,17 @@ def sync_phone_number_webhooks(external_url: str) -> dict:
                 wh_inner = (wh.get('swml_webhook') or {}) if isinstance(wh, dict) else {}
                 wh_primary = (wh_inner.get('primary_request_url') or '').rstrip('/')
                 wh_status_cb = (wh_inner.get('status_callback_url') or '').rstrip('/')
+                wh_name = wh_inner.get('name') or ''
+                desired_name = _friendly_name_for_route(new_url) or ''
                 if wh_primary != new_url.rstrip('/'):
                     swml_wh_drifted = True
                 if wh_status_cb != desired_status_callback.rstrip('/'):
+                    swml_wh_drifted = True
+                # If the resource's display name still looks like a raw URL
+                # (or otherwise differs from the friendly route name), patch
+                # it on the next sync. Without this the Dashboard shows the
+                # ngrok URL as the handler's name — ugly and unstable.
+                if desired_name and wh_name != desired_name:
                     swml_wh_drifted = True
             except Exception as e:
                 logger.warning(

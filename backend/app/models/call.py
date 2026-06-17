@@ -17,6 +17,17 @@ def _call_capabilities(call) -> list:
         return []
 
 
+def _estimated_cost(call):
+    """Estimated platform cost in USD (IMP-01) — None until the call has a
+    duration. Same import-local guard as capabilities: serialization never
+    fails on the estimator."""
+    try:
+        from app.services import cost_service
+        return cost_service.estimate_cost_total(call)
+    except Exception:
+        return None
+
+
 class Call(db.Model):
     """Call model to track SignalWire calls."""
 
@@ -66,6 +77,34 @@ class Call(db.Model):
     disposition_code = db.Column(db.String(50), nullable=True)  # e.g. "resolved", "callback-scheduled"
     agent_notes = db.Column(db.Text, nullable=True)  # free-text wrap-up notes
     wrapped_up_at = db.Column(db.DateTime, nullable=True)  # timestamp the wrap-up was finalized
+
+    # Technical ending classification — HOW the call ended, distinct from
+    # disposition_code (the agent's BUSINESS outcome). Computed deterministically
+    # on call end (see compute_end_reason). Drives the call-history status chip.
+    #   abandoned_in_queue   — caller hung up before reaching anyone
+    #   missed               — agent was assigned but the call never connected
+    #   premature_disconnect — connected but dropped almost immediately (<10s)
+    #   caller_hangup        — connected, caller ended the call (per hangup_direction)
+    #   agent_hangup         — connected, agent ended the call (per hangup_direction)
+    #   completed            — connected, normal length, hangup direction unknown
+    #   failed               — call failed (carrier / setup error)
+    end_reason = db.Column(db.String(40), nullable=True)
+
+    # Who ended the call first — 'caller', 'agent', or NULL (unknown). Sourced
+    # from (1) the frontend signalling explicitly when the agent presses the
+    # hangup button, or (2) SignalWire's call-state 'ended' payload field
+    # `hangup_disposition` (caller/callee). Used by compute_end_reason to
+    # emit caller_hangup vs agent_hangup chips.
+    hangup_direction = db.Column(db.String(20), nullable=True)
+
+    # Return-to-queue tracking (Tier 2p). Increments each time an agent
+    # bounces this call back to the queue router via the "Return to queue"
+    # action. SLA clock is NOT reset (per the 2p spec — caller's wait time
+    # is their wait time regardless of how many agents touched them); these
+    # fields are purely for analytics + the soft-cap-at-2 forced-escalation
+    # check.
+    return_count = db.Column(db.Integer, nullable=False, default=0, server_default='0')
+    last_return_reason = db.Column(db.String(50), nullable=True)
 
     # Relationships
     transcriptions = db.relationship('Transcription', backref='call', lazy='dynamic', cascade='all, delete-orphan')
@@ -142,6 +181,7 @@ class Call(db.Model):
             'recordingUrl': self.recording_url,
             'summary': self.summary,
             'duration': self.duration,
+            'estimatedCost': _estimated_cost(self),
             'sentimentScore': self.sentiment_score,
             'aiContext': self.ai_context_dict,
             'createdAt': self.created_at.isoformat() if self.created_at else None,
@@ -166,6 +206,14 @@ class Call(db.Model):
             'dispositionCode': self.disposition_code,
             'agentNotes': self.agent_notes,
             'wrappedUpAt': self.wrapped_up_at.isoformat() if self.wrapped_up_at else None,
+            # Technical ending classification (how it ended)
+            'endReason': self.end_reason,
+            'hangupDirection': self.hangup_direction,
+            # Return-to-queue counters (Tier 2p). UI uses returnCount > 1
+            # as a supervisor-review flag, and the soft-cap-at-2 logic in
+            # the return endpoint uses it to force escalation.
+            'returnCount': self.return_count or 0,
+            'lastReturnReason': self.last_return_reason,
         }
 
         if include_contact and self.contact:
@@ -183,13 +231,56 @@ class Call(db.Model):
         """Find all calls for a user."""
         return db.session.query(cls).filter_by(user_id=user_id).order_by(cls.created_at.desc()).all()
 
-    def update_status(self, status):
-        """Update call status and set timestamps."""
+    def compute_end_reason(self):
+        """Deterministic classification of HOW this call ended.
+
+        Pure read of the call's own fields — safe to call repeatedly. Returns
+        one of the end_reason codes documented on the column.
+        """
+        if self.status == 'failed':
+            return 'failed'
+
+        answered = self.answered_at is not None
+        had_agent = self.assigned_agent_id is not None
+        duration = self.duration or 0
+
+        if not answered and duration == 0:
+            # Never carried audio. Was an agent already on the hook (missed
+            # pickup) or did the caller bail before anyone was assigned?
+            return 'missed' if had_agent else 'abandoned_in_queue'
+
+        if duration and duration < 10:
+            return 'premature_disconnect'
+
+        # Connected and ran a normal length — refine by who hung up if we
+        # know. Falls back to 'completed' when direction is unknown.
+        if had_agent and self.hangup_direction == 'agent':
+            return 'agent_hangup'
+        if self.hangup_direction == 'caller':
+            return 'caller_hangup'
+        return 'completed'
+
+    # Terminal statuses — any of these means the call is over and gets
+    # end_reason stamped. Centralized so the webhook / watchdog / agent-end
+    # paths all behave the same way.
+    TERMINAL_STATUSES = ('ended', 'completed', 'failed')
+
+    def update_status(self, status, end_reason=None):
+        """Update call status and set timestamps.
+
+        On transition to a terminal status (ended/completed/failed), also
+        stamps end_reason (the technical ending classification) and seals
+        ended_at + duration. Callers that already know the reason — e.g.
+        the enter_queue status webhook seeing a 'timeout' — can pass it in;
+        otherwise it's computed from the call's fields.
+        """
         self.status = status
         if status == 'answered' and not self.answered_at:
             self.answered_at = datetime.utcnow()
-        elif status == 'ended' and not self.ended_at:
+        elif status in self.TERMINAL_STATUSES and not self.ended_at:
             self.ended_at = datetime.utcnow()
             if self.answered_at:
                 delta = self.ended_at - self.answered_at
                 self.duration = int(delta.total_seconds())
+        if status in self.TERMINAL_STATUSES and not self.end_reason:
+            self.end_reason = end_reason or self.compute_end_reason()

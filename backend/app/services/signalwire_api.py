@@ -18,7 +18,9 @@ class SignalWireAPI:
         self.space = current_app.config.get('SIGNALWIRE_SPACE') or os.environ.get('SIGNALWIRE_SPACE')
         self.project_id = current_app.config.get('SIGNALWIRE_PROJECT_ID') or os.environ.get('SIGNALWIRE_PROJECT_ID')
         self.api_token = current_app.config.get('SIGNALWIRE_API_TOKEN') or os.environ.get('SIGNALWIRE_API_TOKEN')
-        self.from_number = current_app.config.get('SIGNALWIRE_FROM_NUMBER') or os.environ.get('SIGNALWIRE_FROM_NUMBER', '+12068655443')
+        # No hardcoded fallback: a cloned deployment must never silently dial
+        # out from someone else's DID. Outbound methods fail via _outbound_from().
+        self.from_number = current_app.config.get('SIGNALWIRE_FROM_NUMBER') or os.environ.get('SIGNALWIRE_FROM_NUMBER')
 
         if not all([self.space, self.project_id, self.api_token]):
             raise ValueError("SignalWire credentials not properly configured")
@@ -29,6 +31,16 @@ class SignalWireAPI:
 
         # API endpoint
         self.api_url = f"https://{self.space}/api/calling/calls"
+
+    def _outbound_from(self):
+        """Caller ID for outbound dials — required, no default."""
+        if not self.from_number:
+            raise ValueError(
+                "SIGNALWIRE_FROM_NUMBER is not configured. Set it in .env to a "
+                "phone number owned by this SignalWire space before placing "
+                "outbound calls."
+            )
+        return self.from_number
 
     def create_call(self, to, swml_url, status_callback=None):
         """Create an outbound call using SignalWire API."""
@@ -41,7 +53,7 @@ class SignalWireAPI:
 
             # Build the call parameters
             params = {
-                "from": self.from_number,
+                "from": self._outbound_from(),
                 "to": to,
                 "url": swml_url
             }
@@ -168,7 +180,10 @@ class SignalWireAPI:
                             "lang": "en-US",
                             "live_events": True,
                             "ai_summary": True,
-                            "direction": ["remote-caller"]
+                            "direction": ["remote-caller"],
+                            # Raise VAD silence from the 300ms default to reduce
+                            # mid-sentence utterance splitting (matches swml.py).
+                            "vad_silence_ms": 800
                         }
                     }
                 }
@@ -371,11 +386,27 @@ class SignalWireAPI:
                 logger.info(f"AI sidecar attached for call: {call_id}")
                 return response.json() if response.text else {}
             else:
+                # Carry SignalWire's reason into the exception so the
+                # /coach/attach endpoint's 502 detail field actually tells
+                # the agent why — instead of just "502 Bad Gateway". The
+                # common case ("there is already a transcriber attached
+                # to this call") is unactionable noise unless surfaced.
+                err_text = response.text or ''
+                try:
+                    err_json = response.json()
+                    err_msg = (
+                        err_json.get('errors', [{}])[0].get('message')
+                        or err_json.get('message')
+                        or err_json.get('error')
+                        or err_text
+                    )
+                except Exception:
+                    err_msg = err_text
                 logger.error(
-                    f"Failed to start AI sidecar: {response.status_code} - {response.text}"
+                    f"Failed to start AI sidecar: {response.status_code} - {err_text}"
                 )
                 raise Exception(
-                    f"Failed to start AI sidecar: {response.status_code}"
+                    f"Failed to start AI sidecar ({response.status_code}): {err_msg.strip()}"
                 )
         except Exception as e:
             logger.error(f"Failed to start AI sidecar: {str(e)}")
@@ -403,14 +434,15 @@ class SignalWireAPI:
                 'Authorization': self.auth_header,
             }
 
-            ask_body = {"text": text}
-            if ask_id:
-                ask_body["ask_id"] = ask_id
-
+            # Ask is its own command per the dev spec (calling.ai_sidecar.ask),
+            # not an action on the attach verb. Params are just {text};
+            # SignalWire returns an ask_id that the eventual ask_answer event
+            # echoes back, so we don't send our local ask_id (kept only for the
+            # FIFO correlation shim in coach_ask).
             data = {
                 "id": call_id,
-                "command": "calling.ai_sidecar",
-                "params": {"action": {"ask": ask_body}},
+                "command": "calling.ai_sidecar.ask",
+                "params": {"text": text},
             }
 
             logger.info("=" * 50)
@@ -457,8 +489,13 @@ class SignalWireAPI:
 
             data = {
                 "id": call_id,
-                "command": "calling.ai_sidecar",
-                "params": {"action": "stop"},
+                # Detach is its OWN command per the dev spec — NOT an action on
+                # the attach verb. The bare ``calling.ai_sidecar`` IS the
+                # attach, so the old {"action":"stop"} was read as a re-attach
+                # → "already a sidecar attached". params is empty; the sidecar
+                # tears down the transcriber it started on attach.
+                "command": "calling.ai_sidecar.stop",
+                "params": {},
             }
 
             response = requests.post(self.api_url, json=data, headers=headers)
@@ -997,7 +1034,7 @@ class SignalWireAPI:
             }
 
             params = {
-                "from": self.from_number,
+                "from": self._outbound_from(),
                 "to": to_address,
                 "url": swml_url,
             }
@@ -1068,7 +1105,7 @@ class SignalWireAPI:
             }
 
             params = {
-                "from": self.from_number,
+                "from": self._outbound_from(),
                 "to": to_address,
                 "url": swml_url
             }

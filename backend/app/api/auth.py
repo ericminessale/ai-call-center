@@ -1,3 +1,4 @@
+import os
 from flask import request, jsonify
 from app import db
 from app.api import auth_bp
@@ -7,10 +8,44 @@ from app.utils.decorators import validate_json
 import re
 
 
+def _public_registration_enabled() -> bool:
+    """SEC-06 gate. Self-service /register is OFF by default — users get
+    created by admin via /api/admin/users or seeded by demo persona setup.
+    Operators who actively want open registration (e.g. a public-facing
+    signup flow with their own captcha/ratelimit layer) opt in by setting
+    ``ALLOW_PUBLIC_REGISTRATION=true`` in .env.
+
+    Default-off is the right shape because: (a) every existing real
+    deployment uses admin-managed users, (b) the hosted-demo path
+    bypasses /register entirely via /demo/start, (c) leaving it open
+    exposes a public account-creation surface with no rate limit,
+    captcha, or email verification — trivially abusable for resource
+    creation."""
+    return os.getenv('ALLOW_PUBLIC_REGISTRATION', 'false').strip().lower() == 'true'
+
+
 @auth_bp.route('/register', methods=['POST'])
 @validate_json('email', 'password')
 def register():
-    """Register a new user."""
+    """Register a new user.
+
+    SEC-06 fix (2026-06-02 audit): now gated behind
+    ALLOW_PUBLIC_REGISTRATION (default off). When disabled, returns 403
+    pointing the caller at /api/admin/users (the admin-managed creation
+    path). Stronger password policy applies regardless of the gate when
+    the endpoint IS enabled.
+    """
+    if not _public_registration_enabled():
+        return jsonify({
+            'error': 'Public registration is disabled',
+            'detail': (
+                'User accounts are created by an admin via /api/admin/users. '
+                'Set ALLOW_PUBLIC_REGISTRATION=true in .env to enable this '
+                'endpoint (recommended only behind your own captcha + rate-limit '
+                'layer).'
+            ),
+        }), 403
+
     data = request.get_json()
     email = data.get('email').lower().strip()
     password = data.get('password')
@@ -19,9 +54,17 @@ def register():
     if not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email):
         return jsonify({'error': 'Invalid email format'}), 400
 
-    # Validate password strength
-    if len(password) < 8:
-        return jsonify({'error': 'Password must be at least 8 characters long'}), 400
+    # SEC-06: strengthen password policy from 8-char-only to a length +
+    # composition check. Length alone (8 chars) is insufficient for a
+    # public registration endpoint. Demand 12+ chars AND a mix of two
+    # character classes — common-sense baseline without the false
+    # precision of cracker-resistance theatre.
+    if len(password) < 12:
+        return jsonify({'error': 'Password must be at least 12 characters long'}), 400
+    if not (re.search(r'[A-Za-z]', password) and re.search(r'\d|[^A-Za-z0-9]', password)):
+        return jsonify({
+            'error': 'Password must contain at least one letter and one digit or symbol',
+        }), 400
 
     # Check if user exists
     if User.find_by_email(email):

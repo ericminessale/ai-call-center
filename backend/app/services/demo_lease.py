@@ -55,6 +55,64 @@ def _user_key(user_id: int) -> str:
     return f'demo:lease:user:{user_id}'
 
 
+# ── SEC-03 persona-epoch invalidation ────────────────────────────────
+# JWT tokens minted for a demo persona carry the persona_epoch as a
+# claim. ``release_lease`` increments the epoch, which causes
+# ``jwt_utils.verify_token`` to reject any token issued under the prior
+# epoch — closing the "visitor B can authenticate as visitor A's persona
+# by replaying their JWT after release" gap the 2026-06-02 audit flagged.
+#
+# Epoch lives in a separate Redis key from the lease itself so it
+# persists across lease lifecycles. It's NOT bumped on TTL-expiry of the
+# lease (Redis doesn't fire keyspace events here by default) — that case
+# is covered by the companion :func:`has_active_lease` check in
+# verify_token, which rejects persona tokens whose lease has expired
+# regardless of epoch.
+
+def _persona_epoch_key(user_id: int) -> str:
+    return f'demo:persona_epoch:{int(user_id)}'
+
+
+def get_persona_epoch(user_id: int) -> int:
+    """Current epoch for this demo persona. 0 if Redis is unavailable or
+    the persona has no recorded epoch yet (first lease).
+    """
+    redis_client = get_redis_client()
+    if redis_client is None:
+        return 0
+    try:
+        raw = redis_client.get(_persona_epoch_key(int(user_id)))
+        return int(raw) if raw is not None else 0
+    except (TypeError, ValueError, Exception):
+        return 0
+
+
+def bump_persona_epoch(user_id: int) -> int:
+    """Increment + return the new epoch. Called by :func:`release_lease`
+    to invalidate JWTs issued under the prior lease (SEC-03)."""
+    redis_client = get_redis_client()
+    if redis_client is None:
+        return 0
+    try:
+        return int(redis_client.incr(_persona_epoch_key(int(user_id))))
+    except Exception:
+        return 0
+
+
+def has_active_lease(user_id: int) -> bool:
+    """True iff there's an active (non-TTL-expired) lease for this persona.
+    Used by :func:`jwt_utils.verify_token` to reject persona tokens after
+    the lease has lapsed (covers the TTL-expiry case where epoch isn't bumped).
+    """
+    redis_client = get_redis_client()
+    if redis_client is None:
+        return False
+    try:
+        return bool(redis_client.exists(_user_key(int(user_id))))
+    except Exception:
+        return False
+
+
 def _session_key(session_token: str) -> str:
     return f'demo:lease:session:{session_token}'
 
@@ -181,9 +239,14 @@ def release_lease(session_token: str) -> bool:
         return False
     redis_client.delete(_user_key(user_id))
     redis_client.delete(session_k)
+    # SEC-03: bump the persona epoch so any JWT still in the wild for
+    # this persona is invalidated on the next verify_token call. Without
+    # this, visitor B who happens to lease the same persona would be
+    # vulnerable to visitor A's previously-captured JWT being replayed.
+    new_epoch = bump_persona_epoch(user_id)
     logger.info(
-        "demo_lease: released persona id=%s (session %s)",
-        user_id, session_token[:8],
+        "demo_lease: released persona id=%s (session %s, new epoch=%d)",
+        user_id, session_token[:8], new_epoch,
     )
     return True
 

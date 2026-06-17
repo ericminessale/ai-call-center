@@ -240,54 +240,196 @@ def do_search(collection_name, query, top_k, connection_string):
         conn.close()
 
 
-def get_assigned_collection(agent_id):
-    """Query backend for this agent's assigned collection name."""
+# ---------------------------------------------------------------------------
+# Knowledge-base assignment cache
+#
+# KB bindings resolve per request inside the dynamic-config callback (see
+# attach_knowledge_search), so an admin reassignment in Settings → Agents
+# applies to new calls within _KB_TTL_SECONDS — no container restart. The
+# cache is stale-while-revalidate: requests never block on the backend; a
+# failed refresh keeps serving the last good map and retries next window.
+# ---------------------------------------------------------------------------
+_KB_TTL_SECONDS = 30.0
+_kb_cache = {'map': {}, 'fetched_at': 0.0}
+_kb_refresh_lock = threading.Lock()
+_kb_refreshing = False
+_kb_last_logged = {}
+
+
+def _fetch_kb_assignments():
+    """GET the full agent→collection map from the backend's internal API.
+
+    Uses the same WEBHOOK_AUTH service credentials as the MCP gateway fetch
+    (the old admin-surface endpoint required a user JWT, so the agents' boot
+    fetch always 401'd and fell back). Returns None on any failure so callers
+    keep the previous map instead of blanking a working one.
+    """
     import requests
+    auth_user = os.getenv('WEBHOOK_AUTH_USER')
+    auth_password = os.getenv('WEBHOOK_AUTH_PASSWORD')
+    auth = (auth_user, auth_password) if (auth_user and auth_password) else None
     try:
         resp = requests.get(
-            f"{BACKEND_URL}/api/admin/agent-assignments",
-            params={'agent_id': agent_id},
+            f"{BACKEND_URL}/api/internal/agent-assignments",
+            auth=auth,
             timeout=5,
         )
         if resp.ok:
             assignments = resp.json().get('assignments', [])
-            if assignments:
-                return assignments[0].get('collection_name')
+            return {
+                a['agent_id']: a['collection_name']
+                for a in assignments
+                if a.get('agent_id') and a.get('collection_name')
+            }
+        print(f"Warning: agent-assignments fetch returned HTTP {resp.status_code}", flush=True)
     except Exception as e:
-        print(f"Warning: Could not fetch collection assignment for {agent_id}: {e}", flush=True)
+        print(f"Warning: agent-assignments fetch failed: {e}", flush=True)
     return None
+
+
+def _refresh_kb_cache_async():
+    """Kick a single-flight background refresh of the assignment cache."""
+    global _kb_refreshing
+    with _kb_refresh_lock:
+        if _kb_refreshing:
+            return
+        _kb_refreshing = True
+
+    def worker():
+        global _kb_refreshing
+        import time
+        try:
+            fresh = _fetch_kb_assignments()
+            if fresh is not None:
+                _kb_cache['map'] = fresh
+            # Stamp even on failure so a down backend is retried once per
+            # TTL window instead of on every request.
+            _kb_cache['fetched_at'] = time.time()
+        finally:
+            with _kb_refresh_lock:
+                _kb_refreshing = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def get_kb_collection(agent_id):
+    """Resolve an agent's assigned collection from the cache (never blocks)."""
+    import time
+    if time.time() - _kb_cache['fetched_at'] > _KB_TTL_SECONDS:
+        _refresh_kb_cache_async()
+    return _kb_cache['map'].get(agent_id)
+
+
+def prime_kb_assignments():
+    """Synchronously load assignments at boot so first calls bind correctly."""
+    import time
+    for attempt in range(3):
+        fresh = _fetch_kb_assignments()
+        if fresh is not None:
+            _kb_cache['map'] = fresh
+            _kb_cache['fetched_at'] = time.time()
+            print(f"KB assignments primed: {fresh or '(none — fallbacks in effect)'}", flush=True)
+            return
+        time.sleep(2 * (attempt + 1))
+    print(
+        "Warning: KB assignments could not be primed; fallback collections "
+        "serve until a background refresh succeeds.",
+        flush=True,
+    )
 
 
 def get_active_queues():
     """Fetch active queue configs from the backend at startup.
-    Falls back to hardcoded sales/support if backend is unavailable."""
+
+    AI-06 fix (2026-06-02 audit): the previous single-shot 5s GET would
+    silently fall back to hardcoded sales/support whenever the backend
+    was momentarily slow or starting up — and since this only runs once
+    at ai-agents process boot, the triage agent's contexts would be
+    permanently mis-seeded until an operator manually restarted the
+    container. In a docker-compose cold-start the backend often takes
+    10-15s to be ready (postgres healthchecks, migrations), reliably
+    triggering the fallback path.
+
+    Now retries with exponential backoff up to ~30s total. Empty-queues
+    response is treated as a hit, not a miss (an admin may have
+    legitimately disabled every queue — falling back to a hardcoded
+    sales+support would be wrong in that case).
+
+    Future work: add a runtime refresh path that subscribes to the
+    backend's ``queue_config_changed`` Socket.IO event so adding a new
+    queue takes effect without an ai-agents restart. Tracked as
+    AI-06-future in REMEDIATION.
+    """
     import requests
+    import time
     fallback = [
         {'slug': 'sales', 'display_name': 'Sales', 'description': 'Sales inquiries and purchases', 'ai_agent_route': '/sales-ai'},
         {'slug': 'support', 'display_name': 'Support', 'description': 'Technical support and issue resolution', 'ai_agent_route': '/support-ai'},
     ]
-    try:
-        resp = requests.get(f"{BACKEND_URL}/api/queues/config/active", timeout=5)
-        if resp.ok:
-            queues = resp.json().get('queues', [])
-            if queues:
-                print(f"Loaded {len(queues)} active queues from backend: {[q['slug'] for q in queues]}", flush=True)
+    # Six attempts with 1s, 2s, 4s, 8s, 16s waits between them — caps
+    # at ~31s of patience, which covers a normal docker-compose cold
+    # start with margin to spare while still surfacing a true outage.
+    delays = [0, 1, 2, 4, 8, 16]
+    last_error = None
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            resp = requests.get(f"{BACKEND_URL}/api/queues/config/active", timeout=5)
+            if resp.ok:
+                queues = resp.json().get('queues', [])
+                # Empty list IS a valid response — an admin may have
+                # legitimately disabled every queue. Don't paper over
+                # that with the hardcoded fallback.
+                print(
+                    f"Loaded {len(queues)} active queues from backend "
+                    f"(attempt {attempt + 1}/{len(delays)}): "
+                    f"{[q['slug'] for q in queues]}",
+                    flush=True,
+                )
                 return queues
-        print("No queues returned from backend, using fallback", flush=True)
-    except Exception as e:
-        print(f"Warning: Could not fetch queues from backend: {e}. Using fallback.", flush=True)
+            last_error = f"HTTP {resp.status_code}"
+        except Exception as e:
+            last_error = str(e)
+        print(
+            f"queues/config/active fetch attempt {attempt + 1}/{len(delays)} "
+            f"failed: {last_error}; retrying in {delays[attempt + 1] if attempt + 1 < len(delays) else 'no more'}s",
+            flush=True,
+        )
+
+    print(
+        f"WARNING: All {len(delays)} attempts to fetch queues failed "
+        f"(last error: {last_error}). Falling back to hardcoded "
+        f"sales/support — operator should investigate the backend.",
+        flush=True,
+    )
     return fallback
 
 
-def add_knowledge_search(agent, agent_id, fallback_collection=None):
-    """Add native_vector_search skill to an agent if a collection is assigned."""
+def attach_knowledge_search(agent):
+    """Attach native_vector_search to the per-request ephemeral agent.
+
+    Called from the dynamic-config callback, which the SDK runs on a fresh
+    ephemeral copy for BOTH SWML renders and SWAIG executions — so the tool
+    is registered with the current collection at execution time too.
+
+    The skill must NOT also be attached at boot: _create_ephemeral_copy
+    re-loads boot skills into each copy first, and with a duplicate tool
+    name the stale boot binding wins (add_skill treats the re-registration
+    as an expected duplicate and keeps the first one).
+
+    Agents opt in by setting ``_kb_agent_id`` (assignment slug) and
+    optionally ``_kb_fallback_collection`` in __init__.
+    """
+    agent_id = getattr(agent, '_kb_agent_id', None)
+    if not agent_id:
+        return
     if not DATABASE_URL:
         print(f"Warning: DATABASE_URL not set, skipping knowledge search for {agent_id}", flush=True)
         return
 
-    collection = get_assigned_collection(agent_id) or fallback_collection
+    collection = get_kb_collection(agent_id) or getattr(agent, '_kb_fallback_collection', None)
     if not collection:
-        print(f"No collection assigned to {agent_id}, skipping knowledge search", flush=True)
         return
 
     try:
@@ -296,13 +438,26 @@ def add_knowledge_search(agent, agent_id, fallback_collection=None):
             "backend": "pgvector",
             "connection_string": DATABASE_URL,
             "collection_name": collection,
-            "description": f"Search the knowledge base for relevant information. Use this when the customer asks questions about products, services, troubleshooting, or anything you need to look up.",
+            "description": "Search the knowledge base for relevant information. Use this when the customer asks questions about products, services, troubleshooting, or anything you need to look up.",
             "count": 5,
             "build_index": False,
+            # Per-tool fillers (filler policy: opt-in only — no language-level
+            # function_fillers anywhere). A KB lookup is a real 1-2s wait where
+            # the persona plausibly speaks; SkillBase merges swaig_fields into
+            # the tool definition it registers.
+            "swaig_fields": {
+                "fillers": [
+                    "Let me check on that for you.",
+                    "One moment while I look that up.",
+                ],
+            },
         })
-        print(f"Added knowledge search for {agent_id} -> collection '{collection}'", flush=True)
+        # Runs on every request — only log when the binding actually changes.
+        if _kb_last_logged.get(agent_id) != collection:
+            _kb_last_logged[agent_id] = collection
+            print(f"Knowledge search for {agent_id} -> collection '{collection}'", flush=True)
     except Exception as e:
-        print(f"Warning: Failed to add knowledge search for {agent_id}: {e}", flush=True)
+        print(f"Warning: Failed to attach knowledge search for {agent_id}: {e}", flush=True)
 
 
 def add_mcp_gateways(agent, agent_id):
@@ -459,8 +614,13 @@ def capture_base_url(query_params, body_params, headers, agent):
     """Dynamic config callback - captures external URL and sets post_prompt_url.
 
     Also reads 'ctx' query param (base64-encoded JSON) to inject customer context
-    as global_data for outbound AI calls.
+    as global_data for outbound AI calls, and binds the agent's knowledge-base
+    skill to its currently assigned collection (live reassignment, no restart).
     """
+    # Bind KB search to the current admin-assigned collection. Runs on the
+    # ephemeral copy, so each request reflects assignments within the TTL.
+    attach_knowledge_search(agent)
+
     existing_global = body_params.get('global_data', {})
     new_global = {}
     base_url = None
@@ -485,12 +645,40 @@ def capture_base_url(query_params, body_params, headers, agent):
                 base_url = env_url.rstrip('/')
                 new_global['agent_base_url'] = base_url
 
-    # Post-prompt URL disabled during testing — ngrok only exposes agent port (8080),
-    # not backend port (5000), so this 404s and wastes tunnel quota.
-    # Re-enable when backend is reachable at the same external URL (e.g., via nginx).
-    # if base_url:
-    #     post_prompt_url = f"{base_url}/api/webhooks/post-prompt"
-    #     agent.set_post_prompt_url(post_prompt_url)
+    # Wire the post-prompt summary to the backend's consumer
+    # (/api/webhooks/post-prompt auto-fills disposition/agent_notes/summary
+    # and transitions call state). The agent and backend share one external
+    # origin behind nginx — the same base_url every other webhook uses — so
+    # the prior "ngrok only exposes 8080" concern no longer applies. Signed
+    # with WEBHOOK_AUTH creds the backend validates (soft no-op if unset).
+    if base_url:
+        agent.set_post_prompt_url(
+            _signed_webhook_url(f"{base_url}/api/webhooks/post-prompt")
+        )
+
+        # Debug telemetry (opt-in via DEBUG_WEBHOOK_ENABLED). We set the SWML
+        # params DIRECTLY instead of calling self.enable_debug_events() on
+        # purpose: the SDK's enable path (agent_base.py ~1064) re-points
+        # debug_webhook_url at the agent's OWN /debug_events endpoint at render
+        # time, which would clobber this and send events to the agent instead
+        # of the backend. The platform only needs these two params in the AI
+        # verb, so setting them here routes debug events through nginx to the
+        # backend's /api/webhooks/debug-events capture — exactly like the
+        # post-prompt above. Keep self.enable_debug_events(...) commented out
+        # while using this. Level 2 is high volume (~dozens of POSTs/call);
+        # enable only while debugging a specific call, then flip the flag off.
+        if os.getenv('DEBUG_WEBHOOK_ENABLED', 'false').strip().lower() == 'true':
+            try:
+                debug_level = int(os.getenv('DEBUG_WEBHOOK_LEVEL', '2'))
+            except ValueError:
+                debug_level = 2
+            agent.set_params({
+                "debug_webhook_url": _signed_webhook_url(
+                    f"{base_url}/api/webhooks/debug-events"),
+                "debug_webhook_level": debug_level,
+            })
+            print(f"Debug webhook enabled (level {debug_level}) -> "
+                  f"{base_url}/api/webhooks/debug-events", flush=True)
 
     # Read conference name and call DB ID from query params (conference-first architecture)
     conf_param = query_params.get('conf')
@@ -600,6 +788,21 @@ def add_sentiment_tool(agent):
     )
 
 
+# Shared post_prompt wrap-up fields appended to every agent's per-call
+# JSON summary. The post-prompt webhook persists these into
+# calls.disposition_code + calls.agent_notes so the wrap-up panel in the
+# contact detail view shows them pre-filled (the human can still edit).
+# Valid disposition codes are mirrored from backend DISPOSITION_CODES in
+# backend/app/api/calls.py — keep in sync if either list changes.
+WRAP_UP_POST_PROMPT_FIELDS = (
+    '"disposition": "one of: resolved|transferred|callback-scheduled|escalated'
+    '|sales-opportunity|technical-issue|no-answer|wrong-number|spam|abandoned'
+    '|other — pick the best fit for the call\'s BUSINESS outcome", '
+    '"post_mortem": "2-3 sentence assessment for the agent reviewing this '
+    'call: what the caller wanted, how it ended, any recommended follow-up"'
+)
+
+
 class CallCenterAgent(AgentBase):
     """Project-wide base for every agent class in this file.
 
@@ -696,12 +899,25 @@ class CallCenterTriageAgent(CallCenterAgent):
         # Voice and speech configuration
         # Multiple languages so the receptionist can greet/converse in the caller's
         # language while we capture the preference for routing + live_translate.
-        self.add_language("English", "en-US", "openai.alloy",
-            function_fillers=["Bear with me one moment.", "I'm getting you connected now."])
-        self.add_language("Spanish", "es-ES", "openai.alloy",
-            function_fillers=["Un momento, por favor.", "Le estoy conectando ahora."])
-        self.add_language("French", "fr-FR", "openai.alloy",
-            function_fillers=["Un instant, s'il vous plaît.", "Je vous mets en relation."])
+        # Filler policy (2026-06-10): NO language-level function_fillers on any
+        # agent. They fire on EVERY tool call — including silent-by-design tools
+        # (set_caller_language, report_sentiment) — and they announce internal
+        # moves the caller must never perceive: the triage→department context
+        # shift is the same persona, same voice, one continuous person. Fillers
+        # are opt-in per tool: overt handoffs (transfer_*, escalate_*) declare
+        # their own; everything else is silent.
+        # VOICE ENGINE WORKAROUND (2026-06-11): the platform's openai TTS
+        # engine intermittently dies mid-call (generated turns render with
+        # audio_latency=0; voice_config_error; see voice-repro/ bug report).
+        # Pinned via isolation ladder: bare agent on openai.alloy dies by
+        # turn ~9; identical agent on rime.spore ran 20 turns clean. All
+        # English paths move to rime until the platform fix; es/fr keep
+        # openai.alloy (rarely exercised; rime multilingual ids unvalidated
+        # — a bad voice id is a runtime voice_error, the symptom we're
+        # escaping). Revert when the platform closes the bug.
+        self.add_language("English", "en-US", "rime.spore")
+        self.add_language("Spanish", "es-ES", "openai.alloy")
+        self.add_language("French", "fr-FR", "openai.alloy")
         self.set_prompt_llm_params(
             temperature=0.4, top_p=0.9,
             barge_confidence=0.6, frequency_penalty=0.2)
@@ -710,15 +926,22 @@ class CallCenterTriageAgent(CallCenterAgent):
             "ai_volume": 0,
             "enable_text_normalization": "both",
         })
-        # Observability: uncomment ONLY when debugging failures
+        # Observability: debug telemetry is wired through the BACKEND instead —
+        # set DEBUG_WEBHOOK_ENABLED=true and see capture_base_url(), which points
+        # debug_webhook_url at /api/webhooks/debug-events. Do NOT uncomment the
+        # line below: enable_debug_events() re-points debug_webhook_url at this
+        # agent's own endpoint at render time and would override that capture.
         # self.enable_debug_events(level=2)
 
         # Internal fillers for step/context transitions (common-mistakes.md #31)
         self.add_internal_filler("next_step", "en-US", [
             "One moment...", "Bear with me...",
         ])
+        # change_context must NOT reveal routing — "right team" reads as a
+        # handoff, but the department shift is the same persona and voice.
+        # Neutral, one-person acknowledgments only.
         self.add_internal_filler("change_context", "en-US", [
-            "Let me get you to the right team...", "One moment...",
+            "One moment...", "Sure, one second...",
         ])
 
         # Fetch active queues from backend (dynamic at startup)
@@ -783,7 +1006,8 @@ class CallCenterTriageAgent(CallCenterAgent):
             f'"department": "{dept_options}", '
             '"reason": "brief reason for call", '
             '"outcome": "transferred_to_human/transferred_to_ai/abandoned", '
-            '"notes": "any important details"}'
+            '"notes": "any important details", '
+            f'{WRAP_UP_POST_PROMPT_FIELDS}}}'
         )
         self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
@@ -900,7 +1124,13 @@ class CallCenterTriageAgent(CallCenterAgent):
     def set_caller_language(self, args, raw_data):
         """Persist caller's language preference into global_data so it flows with the call."""
         language = (args.get("language") or "en-US").strip()
-        result = FunctionResult("")  # Silent
+        # Return a NON-EMPTY result. An empty FunctionResult("") tells the engine
+        # the turn has nothing to say, so it ends the turn and the AI's next line
+        # (e.g. "Which department?") is generated but never spoken — the call
+        # stalls into dead air. report_sentiment (the other silent tool) returns
+        # "ok" for exactly this reason; mirror it. "ok" is a function return to
+        # the model, not spoken to the caller.
+        result = FunctionResult("ok")
         result.update_global_data({"caller_language": language})
         return result
 
@@ -1010,9 +1240,16 @@ class SalesAISpecialist(CallCenterAgent):
         )
 
         # Voice and speech configuration
-        self.add_language("English", "en-US", "openai.alloy",
-            speech_fillers=["Good question, let me think about that.", "Hmm, let me consider that."],
-            function_fillers=["Let me look that up for you.", "One moment while I check on that."])
+        # Persona voices: Sam=alloy (triage), Alex=echo (sales), Jordan=shimmer
+        # (support) — distinct voices make the triage→specialist handoff audible.
+        # OpenAI voice ids pass through to the platform; validate new ids on a
+        # live call before a demo (a bad id surfaces as voice_error at runtime).
+        # rime.spore: openai engine workaround (see triage note). Distinct
+        # persona voices (IMP-13) restored once more rime ids are validated.
+        self.add_language("English", "en-US", "rime.spore",
+            speech_fillers=["Good question, let me think about that.", "Hmm, let me consider that."])
+        # function_fillers removed — fillers are opt-in per tool (see policy in
+        # BasicReceptionist); search_knowledge carries its own via swaig_fields.
         self.set_prompt_llm_params(
             temperature=0.5, top_p=0.9,
             barge_confidence=0.5, frequency_penalty=0.1)
@@ -1021,7 +1258,11 @@ class SalesAISpecialist(CallCenterAgent):
             "end_of_speech_timeout": 1000,
             "enable_text_normalization": "both",
         })
-        # Observability: uncomment ONLY when debugging failures
+        # Observability: debug telemetry is wired through the BACKEND instead —
+        # set DEBUG_WEBHOOK_ENABLED=true and see capture_base_url(), which points
+        # debug_webhook_url at /api/webhooks/debug-events. Do NOT uncomment the
+        # line below: enable_debug_events() re-points debug_webhook_url at this
+        # agent's own endpoint at render time and would override that capture.
         # self.enable_debug_events(level=2)
         self.add_hints(["SignalWire", "pricing", "enterprise", "demo", "trial", "API",
                         "platform", "integration", "SDK", "CPaaS", "UCaaS"])
@@ -1029,8 +1270,10 @@ class SalesAISpecialist(CallCenterAgent):
         self.set_dynamic_config_callback(capture_base_url)
         add_sentiment_tool(self)
 
-        # Add knowledge base search (pgvector RAG)
-        add_knowledge_search(self, 'sales-ai', fallback_collection='sales_knowledge')
+        # KB search binds per request in capture_base_url — admin reassignment
+        # applies to new calls without a restart.
+        self._kb_agent_id = 'sales-ai'
+        self._kb_fallback_collection = 'sales_knowledge'
         add_mcp_gateways(self, 'sales-ai')
 
         self.set_post_prompt(
@@ -1039,7 +1282,8 @@ class SalesAISpecialist(CallCenterAgent):
             '"products_discussed": ["list"], "recommendations_made": ["list"], '
             '"next_steps": "recommended next steps", '
             '"lead_score": "1-10 where 1 is hot", '
-            '"outcome": "sale/quote_requested/follow_up_needed/lost"}'
+            '"outcome": "sale/quote_requested/follow_up_needed/lost", '
+            f'{WRAP_UP_POST_PROMPT_FIELDS}}}'
         )
         self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
@@ -1141,9 +1385,12 @@ class SupportAISpecialist(CallCenterAgent):
         )
 
         # Voice and speech configuration
-        self.add_language("English", "en-US", "openai.alloy",
-            speech_fillers=["Let me think about that.", "Good question."],
-            function_fillers=["Let me search our knowledge base.", "Checking on that for you."])
+        # Jordan's persona voice — see SalesAISpecialist for the voice map.
+        # rime.spore: openai engine workaround (see triage note).
+        self.add_language("English", "en-US", "rime.spore",
+            speech_fillers=["Let me think about that.", "Good question."])
+        # function_fillers removed — fillers are opt-in per tool (see policy in
+        # BasicReceptionist); search_knowledge carries its own via swaig_fields.
         self.set_prompt_llm_params(
             temperature=0.3, top_p=0.9,
             barge_confidence=0.5, frequency_penalty=0.2)
@@ -1152,7 +1399,11 @@ class SupportAISpecialist(CallCenterAgent):
             "end_of_speech_timeout": 1000,
             "enable_text_normalization": "both",
         })
-        # Observability: uncomment ONLY when debugging failures
+        # Observability: debug telemetry is wired through the BACKEND instead —
+        # set DEBUG_WEBHOOK_ENABLED=true and see capture_base_url(), which points
+        # debug_webhook_url at /api/webhooks/debug-events. Do NOT uncomment the
+        # line below: enable_debug_events() re-points debug_webhook_url at this
+        # agent's own endpoint at render time and would override that capture.
         # self.enable_debug_events(level=2)
         self.add_hints(["SignalWire", "error", "restart", "configuration", "API", "log",
                         "debug", "timeout", "connection", "webhook", "SDK"])
@@ -1160,8 +1411,9 @@ class SupportAISpecialist(CallCenterAgent):
         self.set_dynamic_config_callback(capture_base_url)
         add_sentiment_tool(self)
 
-        # Add knowledge base search (pgvector RAG)
-        add_knowledge_search(self, 'support-ai', fallback_collection='support_knowledge')
+        # KB search binds per request in capture_base_url (see SalesAISpecialist).
+        self._kb_agent_id = 'support-ai'
+        self._kb_fallback_collection = 'support_knowledge'
         add_mcp_gateways(self, 'support-ai')
 
         self.set_post_prompt(
@@ -1172,7 +1424,8 @@ class SupportAISpecialist(CallCenterAgent):
             '"resolution": "how resolved or null", '
             '"resolved": true or false, '
             '"escalation_reason": "why escalated or null", '
-            '"customer_satisfaction": "1-5 based on tone"}'
+            '"customer_satisfaction": "1-5 based on tone", '
+            f'{WRAP_UP_POST_PROMPT_FIELDS}}}'
         )
         self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
@@ -1282,9 +1535,12 @@ class OutboundSalesAgent(CallCenterAgent):
         )
 
         # Voice and speech configuration
-        self.add_language("English", "en-US", "openai.alloy",
-            speech_fillers=["That's a great question.", "Let me think about that."],
-            function_fillers=["Let me look that up.", "One moment while I check."])
+        # Outbound sales is the same "Alex" persona as SalesAISpecialist —
+        # keep the voice identical so the persona is consistent either direction.
+        # rime.spore: openai engine workaround (see triage note).
+        self.add_language("English", "en-US", "rime.spore",
+            speech_fillers=["That's a great question.", "Let me think about that."])
+        # function_fillers removed — fillers are opt-in per tool (filler policy).
         self.set_prompt_llm_params(
             temperature=0.5, top_p=0.9,
             barge_confidence=0.5, frequency_penalty=0.1)
@@ -1293,7 +1549,11 @@ class OutboundSalesAgent(CallCenterAgent):
             "end_of_speech_timeout": 1000,
             "enable_text_normalization": "both",
         })
-        # Observability: uncomment ONLY when debugging failures
+        # Observability: debug telemetry is wired through the BACKEND instead —
+        # set DEBUG_WEBHOOK_ENABLED=true and see capture_base_url(), which points
+        # debug_webhook_url at /api/webhooks/debug-events. Do NOT uncomment the
+        # line below: enable_debug_events() re-points debug_webhook_url at this
+        # agent's own endpoint at render time and would override that capture.
         # self.enable_debug_events(level=2)
         self.add_hints(["SignalWire", "pricing", "enterprise", "demo", "trial", "API",
                         "platform", "integration"])
@@ -1301,8 +1561,9 @@ class OutboundSalesAgent(CallCenterAgent):
         self.set_dynamic_config_callback(capture_base_url)
         add_sentiment_tool(self)
 
-        # Add knowledge base search (pgvector RAG)
-        add_knowledge_search(self, 'outbound-sales', fallback_collection='sales_knowledge')
+        # KB search binds per request in capture_base_url (see SalesAISpecialist).
+        self._kb_agent_id = 'outbound-sales'
+        self._kb_fallback_collection = 'sales_knowledge'
         add_mcp_gateways(self, 'outbound-sales')
 
         self.set_post_prompt(
@@ -1311,7 +1572,8 @@ class OutboundSalesAgent(CallCenterAgent):
             '"products_discussed": ["list"], '
             '"customer_interest_level": "high/medium/low/none", '
             '"next_steps": "recommended follow-up", '
-            '"outcome": "interested/callback_requested/not_interested/no_answer/voicemail"}'
+            '"outcome": "interested/callback_requested/not_interested/no_answer/voicemail", '
+            f'{WRAP_UP_POST_PROMPT_FIELDS}}}'
         )
         self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
@@ -1412,9 +1674,11 @@ class OutboundSupportAgent(CallCenterAgent):
         )
 
         # Voice and speech configuration
-        self.add_language("English", "en-US", "openai.alloy",
-            speech_fillers=["Let me think about that.", "Good question."],
-            function_fillers=["Let me check our knowledge base.", "Looking into that for you."])
+        # Outbound support is the same "Jordan" persona as SupportAISpecialist.
+        # rime.spore: openai engine workaround (see triage note).
+        self.add_language("English", "en-US", "rime.spore",
+            speech_fillers=["Let me think about that.", "Good question."])
+        # function_fillers removed — fillers are opt-in per tool (filler policy).
         self.set_prompt_llm_params(
             temperature=0.3, top_p=0.9,
             barge_confidence=0.5, frequency_penalty=0.2)
@@ -1423,7 +1687,11 @@ class OutboundSupportAgent(CallCenterAgent):
             "end_of_speech_timeout": 1000,
             "enable_text_normalization": "both",
         })
-        # Observability: uncomment ONLY when debugging failures
+        # Observability: debug telemetry is wired through the BACKEND instead —
+        # set DEBUG_WEBHOOK_ENABLED=true and see capture_base_url(), which points
+        # debug_webhook_url at /api/webhooks/debug-events. Do NOT uncomment the
+        # line below: enable_debug_events() re-points debug_webhook_url at this
+        # agent's own endpoint at render time and would override that capture.
         # self.enable_debug_events(level=2)
         self.add_hints(["SignalWire", "error", "restart", "configuration", "API", "log",
                         "debug", "timeout", "connection", "webhook"])
@@ -1431,8 +1699,9 @@ class OutboundSupportAgent(CallCenterAgent):
         self.set_dynamic_config_callback(capture_base_url)
         add_sentiment_tool(self)
 
-        # Add knowledge base search (pgvector RAG)
-        add_knowledge_search(self, 'outbound-support', fallback_collection='support_knowledge')
+        # KB search binds per request in capture_base_url (see SalesAISpecialist).
+        self._kb_agent_id = 'outbound-support'
+        self._kb_fallback_collection = 'support_knowledge'
         add_mcp_gateways(self, 'outbound-support')
 
         self.set_post_prompt(
@@ -1442,7 +1711,8 @@ class OutboundSupportAgent(CallCenterAgent):
             '"resolution": "how resolved or null", '
             '"resolved": true or false, '
             '"follow_up_needed": true or false, '
-            '"outcome": "resolved/escalated/callback_requested/no_answer/voicemail"}'
+            '"outcome": "resolved/escalated/callback_requested/no_answer/voicemail", '
+            f'{WRAP_UP_POST_PROMPT_FIELDS}}}'
         )
         self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
@@ -1553,6 +1823,11 @@ if __name__ == '__main__':
     # Also get RAG knowledge search
     outbound_sales = OutboundSalesAgent()
     outbound_support = OutboundSupportAgent()
+
+    # Prime the KB assignment cache now that the backend is reachable (the
+    # triage agent's get_active_queues just blocked on it) so the very first
+    # calls bind to admin-assigned collections instead of fallbacks.
+    prime_kb_assignments()
 
     # Register agents
     server.register(triage, '/receptionist')

@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
-import { Search, Plus, Star, Building2 } from 'lucide-react';
+import { Search, Plus, Star } from 'lucide-react';
 import { ContactMinimal } from '../../types/callcenter';
 import { contactsApi } from '../../services/api';
 import { ContactListSkeletonGroup } from '../shared/Skeleton';
 import { logger } from '../../lib/logger';
+import { Button, Chip, StatusDot, RailContactRow } from '../restraint';
 
 interface ContactListProps {
   contacts: ContactMinimal[];
@@ -40,31 +41,32 @@ export function ContactList({
       {/* Header */}
       <div className="px-4 pt-4 pb-3 border-b border-rule">
         <div className="flex items-center justify-between mb-3">
-          <span className="kicker">Contacts</span>
+          <span className="text-[11px] font-medium text-ink-dim">Contacts</span>
           <span className="mono text-[11px] text-ink-dim">{contacts.length}</span>
         </div>
 
         <div className="relative">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-ink-dim" />
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-ink-dim z-10" />
           <input
             type="text"
             placeholder="Search contacts…"
             value={searchQuery}
             onChange={(e) => onSearch(e.target.value)}
-            className="input pl-8 pr-8 py-[7px]"
+            className="w-full pl-8 pr-8 py-2 rounded-lg border border-rule-strong bg-canvas text-ink text-sm font-medium placeholder:text-ink-dim focus:outline-none focus:border-sw-fuchsia"
           />
-          <kbd className="absolute right-2 top-1/2 -translate-y-1/2 mono text-[9px] text-ink-dim px-1 py-0.5 rounded bg-canvas-raised border border-rule pointer-events-none">
+          <kbd className="absolute right-2 top-1/2 -translate-y-1/2 mono text-[9px] text-ink-dim px-1 py-0.5 rounded-sm bg-canvas-raised border border-rule-strong pointer-events-none">
             /
           </kbd>
         </div>
 
-        <button
+        <Button
+          variant="secondary"
+          icon={<Plus className="w-3.5 h-3.5" />}
           onClick={() => setShowNewContactModal(true)}
-          className="mt-2.5 w-full flex items-center justify-center gap-2 px-3 py-2 rounded bg-canvas-raised hover:bg-canvas-hover border border-rule hover:border-sw-blue/40 text-[13px] text-ink-muted hover:text-ink transition-colors group"
+          className="mt-2.5 w-full justify-center"
         >
-          <Plus className="w-3.5 h-3.5 group-hover:text-sw-blue" />
-          <span>New contact</span>
-        </button>
+          New contact
+        </Button>
       </div>
 
       {/* List */}
@@ -130,15 +132,17 @@ function Section({ title, count, tone = 'default', children }: {
   children: React.ReactNode;
 }) {
   return (
-    <div>
-      <div className="sticky top-0 z-10 bg-canvas-sunken/95 backdrop-blur-sm flex items-center justify-between px-4 py-1.5 border-b border-rule">
+    <div className="pb-1">
+      {/* Lightweight railhead — label + count, no full-width boxed border. */}
+      <div className="sticky top-0 z-10 bg-canvas-raised/95 backdrop-blur-sm flex items-center justify-between px-3 pt-2.5 pb-1.5">
         <div className="flex items-center gap-2">
-          {tone === 'live' && <span className="dot dot-live" />}
-          <span className="kicker">{title}</span>
+          {tone === 'live' && <StatusDot status="success" />}
+          <span className="text-[11px] font-medium text-ink-dim">{title}</span>
         </div>
         <span className="mono text-[10px] text-ink-dim">{count}</span>
       </div>
-      <div>{children}</div>
+      {/* Rows float: inset, rounded, small gaps (rs-clist). */}
+      <div className="px-2 flex flex-col gap-0.5">{children}</div>
     </div>
   );
 }
@@ -155,71 +159,26 @@ function ContactCard({
   const hasActiveCall = !!contact.activeCall;
   const tierChip = contact.accountTier && contact.accountTier !== 'prospect' ? contact.accountTier : null;
 
+  // Floating rs-crow: avatar + name(+VIP) + phone, with a right-side marker.
+  // Live > call count > tier. Tier-when-active info still lives in the detail KPI.
+  const trailing = hasActiveCall ? (
+    <Chip dot="success">Live</Chip>
+  ) : contact.totalCalls > 0 ? (
+    <span className="mono text-[10.5px] text-ink-dim">{contact.totalCalls}</span>
+  ) : tierChip ? (
+    <Chip className="capitalize">{tierChip}</Chip>
+  ) : null;
+
   return (
-    <button
+    <RailContactRow
+      name={contact.displayName}
+      phone={contact.phone}
+      avatar={contact.displayName.charAt(0).toUpperCase()}
+      selected={isSelected}
       onClick={onClick}
-      className={`relative w-full px-4 py-3 flex items-center gap-3 text-left border-b border-rule/60 transition-colors ${
-        isSelected ? 'row-selected' : 'hover:bg-canvas-hover/40'
-      }`}
-    >
-      {/* Avatar — flat, initials. Ring appears on live. */}
-      <div className="relative shrink-0">
-        <div className={`w-9 h-9 rounded flex items-center justify-center font-semibold text-[14px] tracking-tight ${
-          hasActiveCall
-            ? 'bg-live/15 text-live-soft border border-live/30'
-            : 'bg-canvas-raised text-ink-muted border border-rule'
-        }`}>
-          {contact.displayName.charAt(0).toUpperCase()}
-        </div>
-        {hasActiveCall && (
-          <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-live shadow-[0_0_6px_rgba(63,183,126,0.8)]" />
-        )}
-      </div>
-
-      {/* Info */}
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-1.5">
-          <span className={`font-medium truncate text-[13.5px] ${
-            isSelected ? 'text-ink' : 'text-ink'
-          }`}>
-            {contact.displayName}
-          </span>
-          {contact.isVip && (
-            <Star className="w-3 h-3 text-wait fill-wait flex-shrink-0" />
-          )}
-        </div>
-        <div className="flex items-center gap-1.5 text-[11.5px] text-ink-dim mt-0.5 min-w-0">
-          {contact.company ? (
-            <>
-              <Building2 className="w-3 h-3 flex-shrink-0" />
-              <span className="truncate">{contact.company}</span>
-            </>
-          ) : contact.phone ? (
-            <span className="mono truncate">{contact.phone}</span>
-          ) : null}
-        </div>
-      </div>
-
-      {/* Right side: calls count + tier */}
-      <div className="flex flex-col items-end gap-1 shrink-0">
-        {hasActiveCall ? (
-          <span className="chip chip-live">Live</span>
-        ) : contact.totalCalls > 0 ? (
-          <span className="mono text-[10.5px] text-ink-dim">
-            {contact.totalCalls} {contact.totalCalls === 1 ? 'call' : 'calls'}
-          </span>
-        ) : null}
-        {tierChip && (
-          <span className={`chip ${
-            tierChip === 'enterprise' ? 'chip-ai' :
-            tierChip === 'pro' ? 'chip-info' :
-            'chip-muted'
-          }`}>
-            {tierChip}
-          </span>
-        )}
-      </div>
-    </button>
+      badge={contact.isVip ? <Star className="w-3 h-3 text-status-warning fill-status-warning" /> : undefined}
+      trailing={trailing}
+    />
   );
 }
 
@@ -287,9 +246,11 @@ function NewContactModal({
     }
   };
 
+  const fieldClass = 'w-full px-3 py-2 rounded-lg border border-rule-strong bg-canvas text-ink text-sm font-medium placeholder:text-ink-dim focus:outline-none focus:border-sw-fuchsia';
+
   return (
     <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 animate-fade-in">
-      <div className="panel-raised rounded-md shadow-panel p-6 w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto">
+      <div className="bg-canvas-raised border border-rule rounded-lg shadow-panel p-6 w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto">
         <div className="mb-5">
           <div className="kicker mb-1">New</div>
           <h2 className="font-display text-[26px] text-ink leading-none">Add contact</h2>
@@ -298,13 +259,13 @@ function NewContactModal({
         <form onSubmit={handleSubmit} className="space-y-3.5">
           <div className="grid grid-cols-2 gap-3">
             <Field label="First name">
-              <input className="input" type="text"
+              <input className={fieldClass} type="text"
                 value={formData.firstName}
                 onChange={(e) => setFormData({ ...formData, firstName: e.target.value })}
                 placeholder="Jane" />
             </Field>
             <Field label="Last name">
-              <input className="input" type="text"
+              <input className={fieldClass} type="text"
                 value={formData.lastName}
                 onChange={(e) => setFormData({ ...formData, lastName: e.target.value })}
                 placeholder="Doe" />
@@ -312,35 +273,35 @@ function NewContactModal({
           </div>
 
           <Field label="Display name" required>
-            <input className="input" type="text" required
+            <input className={fieldClass} type="text" required
               value={formData.displayName}
               onChange={(e) => setFormData({ ...formData, displayName: e.target.value })}
               placeholder="Jane Doe" />
           </Field>
 
           <Field label="Phone" required>
-            <input className="input mono" type="tel" required
+            <input className={`${fieldClass} mono`} type="tel" required
               value={formData.phone}
               onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
               placeholder="+1 (555) 123-4567" />
           </Field>
 
           <Field label="Email">
-            <input className="input" type="email"
+            <input className={fieldClass} type="email"
               value={formData.email}
               onChange={(e) => setFormData({ ...formData, email: e.target.value })}
               placeholder="jane@acme.com" />
           </Field>
 
           <Field label="Company">
-            <input className="input" type="text"
+            <input className={fieldClass} type="text"
               value={formData.company}
               onChange={(e) => setFormData({ ...formData, company: e.target.value })}
               placeholder="Acme, Inc." />
           </Field>
 
           <Field label="Account tier">
-            <select className="input"
+            <select className={fieldClass}
               value={formData.accountTier}
               onChange={(e) => setFormData({ ...formData, accountTier: e.target.value as any })}>
               <option value="prospect">Prospect</option>
@@ -351,16 +312,17 @@ function NewContactModal({
           </Field>
 
           {error && (
-            <div className="p-2.5 bg-urgent/10 border border-urgent/30 rounded text-urgent-soft text-[12.5px] mono">
+            <div className="relative overflow-hidden p-2.5 pl-3.5 bg-canvas-raised border border-rule rounded-lg text-status-error text-[12.5px] mono">
+              <span className="absolute left-0 top-0 bottom-0 w-0.5 bg-status-error" />
               {error}
             </div>
           )}
 
           <div className="flex justify-end gap-2 pt-3 border-t border-rule">
-            <button type="button" onClick={onClose} className="btn-ghost">Cancel</button>
-            <button type="submit" disabled={isSaving} className="btn-primary">
+            <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
+            <Button type="submit" variant="primary" disabled={isSaving}>
               {isSaving ? 'Creating…' : 'Create contact'}
-            </button>
+            </Button>
           </div>
         </form>
       </div>
@@ -372,7 +334,7 @@ function Field({ label, required, children }: { label: string; required?: boolea
   return (
     <label className="block">
       <span className="block kicker mb-1">
-        {label}{required && <span className="text-signal-soft ml-0.5">*</span>}
+        {label}{required && <span className="text-sw-fuchsia ml-0.5">*</span>}
       </span>
       {children}
     </label>

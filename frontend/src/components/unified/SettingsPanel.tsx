@@ -24,11 +24,13 @@ import {
   Plug,
   Activity,
   RotateCcw,
+  Palette,
 } from 'lucide-react';
 import { adminApi } from '../../services/api';
 import { useAuthStore } from '../../stores/authStore';
 import toast from 'react-hot-toast';
 import { ConfirmModal } from '../shared/ConfirmModal';
+import { Chip, Checkbox } from '../restraint';
 import { ExternalToolsTab } from './ExternalToolsTab';
 import { WebhookLogTab } from './WebhookLogTab';
 
@@ -156,6 +158,13 @@ interface PhoneNumber {
   is_assigned: boolean;
   target_mode: 'ai_triage' | 'ai_specialist' | 'human_direct' | null;
   target_queue_slug: string | null;
+  // URL-drift fields — set when the SignalWire webhook URL points at one of
+  // OUR routes but under a stale host (typical cause: ngrok URL rotated and
+  // SignalWire still has the old one). Backend recovers the original mode
+  // from the path so we can offer a one-click re-sync.
+  is_drifted?: boolean;
+  drifted_target_mode?: 'ai_triage' | 'ai_specialist' | 'human_direct' | null;
+  drifted_target_queue_slug?: string | null;
 }
 
 type PhoneTargetMode = 'ai_triage' | 'ai_specialist' | 'human_direct';
@@ -186,7 +195,7 @@ interface QueueAgentAssignment {
   skill_level: number;
 }
 
-type SettingsTabId = 'phone-numbers' | 'queues' | 'agents' | 'knowledge' | 'external-tools' | 'users' | 'webhooks';
+type SettingsTabId = 'phone-numbers' | 'queues' | 'agents' | 'knowledge' | 'external-tools' | 'branding' | 'users' | 'webhooks';
 
 
 // =============================================================================
@@ -210,17 +219,16 @@ export function SettingsPanel() {
 
   return (
     <div className="h-full flex flex-col text-ink">
-      {/* Page header */}
-      <div className="bg-canvas-sunken border-b border-rule px-8 pt-6 pb-4">
-        <div className="kicker mb-1">Admin</div>
-        <h1 className="font-display text-[28px] text-ink leading-none tracking-tightest">Settings</h1>
-        <p className="text-[13px] text-ink-muted mt-2">
-          Configure phone numbers, queues, AI agents, knowledge, and team members.
+      {/* Page header — rs-h1 + subtitle on page bg (no raised band) */}
+      <div className="px-7 pt-6 pb-4">
+        <h1 className="text-[20px] font-semibold text-ink leading-none tracking-tight">Settings</h1>
+        <p className="text-[11px] font-medium text-ink-dim mt-1.5">
+          Phone numbers, queues, AI agents, knowledge, branding, and team.
         </p>
       </div>
 
       {/* Tab navigation */}
-      <div className="bg-canvas-sunken border-b border-rule px-8">
+      <div className="px-7 border-b border-rule">
         <nav className="flex gap-1">
           <TabButton
             id="phone-numbers"
@@ -258,6 +266,13 @@ export function SettingsPanel() {
             onClick={() => handleTabChange('external-tools')}
           />
           <TabButton
+            id="branding"
+            icon={<Palette className="w-3.5 h-3.5" />}
+            label="Branding"
+            active={activeTab === 'branding'}
+            onClick={() => handleTabChange('branding')}
+          />
+          <TabButton
             id="users"
             icon={<Users className="w-3.5 h-3.5" />}
             label="User Management"
@@ -281,6 +296,7 @@ export function SettingsPanel() {
         {activeTab === 'agents' && <AgentsTab onNavigateToCollection={handleNavigateToCollection} />}
         {activeTab === 'knowledge' && <KnowledgeBaseTab focusCollectionId={focusCollectionId} />}
         {activeTab === 'external-tools' && <ExternalToolsTab />}
+        {activeTab === 'branding' && <BrandingTab />}
         {activeTab === 'users' && <UserManagementTab />}
         {activeTab === 'webhooks' && <WebhookLogTab />}
       </div>
@@ -306,9 +322,174 @@ function TabButton({ icon, label, active, onClick }: {
       {icon}
       {label}
       {active && (
-        <span className="absolute -bottom-[1px] left-2 right-2 h-[2px] rounded-sm" style={{ background: 'var(--sw-turquoise)' }} />
+        <span className="absolute -bottom-[1px] left-2 right-2 h-[2px] rounded-sm bg-sw-fuchsia" />
       )}
     </button>
+  );
+}
+
+
+// =============================================================================
+// Tab: Branding (IMP-02 white-label)
+// =============================================================================
+
+interface BrandingForm {
+  product_name: string;
+  logo_url: string;
+  color_primary: string;
+  color_accent: string;
+  color_highlight: string;
+}
+
+const EMPTY_BRANDING: BrandingForm = {
+  product_name: '',
+  logo_url: '',
+  color_primary: '',
+  color_accent: '',
+  color_highlight: '',
+};
+
+const BRANDING_COLORS: Array<{
+  key: keyof BrandingForm;
+  label: string;
+  hint: string;
+  stock: string;
+}> = [
+  { key: 'color_primary', label: 'Primary', hint: 'Buttons, structure, focus ring', stock: '#044EF4' },
+  { key: 'color_accent', label: 'Accent', hint: 'Stats, table headers, link hover', stock: '#F72A72' },
+  { key: 'color_highlight', label: 'Highlight', hint: 'Links, active tab', stock: '#40E0D0' },
+];
+
+function BrandingTab() {
+  const fetchRuntimeConfig = useAuthStore((s) => s.fetchRuntimeConfig);
+  const [form, setForm] = useState<BrandingForm>(EMPTY_BRANDING);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    adminApi.getBranding()
+      .then((res) => {
+        const b = res.data.branding || {};
+        setForm({
+          product_name: b.product_name || '',
+          logo_url: b.logo_url || '',
+          color_primary: b.color_primary || '',
+          color_accent: b.color_accent || '',
+          color_highlight: b.color_highlight || '',
+        });
+      })
+      .catch(() => toast.error('Failed to load branding'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const save = async (next: BrandingForm) => {
+    setSaving(true);
+    try {
+      await adminApi.updateBranding(next);
+      // Re-fetching runtime config re-applies the CSS variables app-wide
+      // (App.tsx effect) — the rebrand lands live, no rebuild.
+      await fetchRuntimeConfig();
+      toast.success('Branding applied live');
+    } catch (e: any) {
+      toast.error(e.response?.data?.error || 'Failed to save branding');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const resetToStock = async () => {
+    setForm(EMPTY_BRANDING);
+    await save(EMPTY_BRANDING);
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-ink-muted text-[13px]">
+        <Loader2 className="w-4 h-4 animate-spin" />
+        Loading branding…
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-2xl">
+      <div className="mb-6">
+        <h2 className="font-display text-[22px] text-ink leading-none mb-2">White-label branding</h2>
+        <p className="text-[13px] text-ink-muted leading-relaxed">
+          Rebrand the entire console at runtime — product name, logo, and brand colors apply
+          live, with no rebuild or restart. Leave a field empty to keep the stock SignalWire
+          value. The agent desktop, login page, and demo landing all follow.
+        </p>
+      </div>
+
+      <div className="panel rounded-md p-6 space-y-5">
+        <div>
+          <label className="block kicker mb-1.5">Product name</label>
+          <input
+            value={form.product_name}
+            onChange={(e) => setForm({ ...form, product_name: e.target.value })}
+            placeholder="SignalWire"
+            maxLength={60}
+            className="input w-full"
+          />
+        </div>
+
+        <div>
+          <label className="block kicker mb-1.5">Logo URL</label>
+          <input
+            value={form.logo_url}
+            onChange={(e) => setForm({ ...form, logo_url: e.target.value })}
+            placeholder="https://example.com/logo.svg (optional)"
+            className="input w-full"
+          />
+          <p className="text-[11.5px] text-ink-dim mt-1">
+            Replaces the SignalWire mark in headers and on the login page. The SignalWire
+            logo itself is never recolored — supply your own asset instead.
+          </p>
+        </div>
+
+        <div className="space-y-3">
+          {BRANDING_COLORS.map(({ key, label, hint, stock }) => (
+            <div key={key} className="flex items-center gap-3">
+              <input
+                type="color"
+                value={form[key] || stock}
+                onChange={(e) => setForm({ ...form, [key]: e.target.value })}
+                className="w-9 h-9 rounded border border-rule bg-canvas-raised cursor-pointer"
+                title={`${label} color`}
+              />
+              <div className="flex-1">
+                <div className="text-[13px] font-medium text-ink">{label}</div>
+                <div className="text-[11.5px] text-ink-dim">{hint}</div>
+              </div>
+              <input
+                value={form[key]}
+                onChange={(e) => setForm({ ...form, [key]: e.target.value })}
+                placeholder={stock}
+                className="input w-28 mono text-[12px]"
+              />
+            </div>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2 pt-2 border-t border-rule">
+          <button onClick={() => save(form)} disabled={saving} className="btn-primary">
+            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            Apply live
+          </button>
+          <button onClick={resetToStock} disabled={saving} className="btn-secondary">
+            <RotateCcw className="w-3.5 h-3.5" />
+            Reset to SignalWire
+          </button>
+        </div>
+      </div>
+
+      <p className="text-[11.5px] text-ink-dim mt-4">
+        White-labeled deployments show a small "powered by signalwire" attribution on auth
+        surfaces. Per-DID tenant branding (two numbers, two brands, same code) builds on this
+        same config — see IMP-05 in the improvement plan.
+      </p>
+    </div>
   );
 }
 
@@ -407,6 +588,26 @@ function PhoneNumbersTab() {
         <span className="chip chip-wait" title="Skips AI — caller goes straight into the human queue">
           <span className="dot dot-wait !w-1.5 !h-1.5" />
           Human · {n.target_queue_slug}
+        </span>
+      );
+    }
+    // URL drift — distinct from External. The number IS bound to one of our
+    // routes, just under a stale host (common after ngrok rotation). Shows
+    // urgent-coloured so the admin notices, and the Re-sync action repairs
+    // it in one click using the recovered (mode, queue) from the path.
+    if (n.is_drifted) {
+      const modeLabel =
+        n.drifted_target_mode === 'ai_triage'     ? 'AI receptionist' :
+        n.drifted_target_mode === 'ai_specialist' ? `AI · ${n.drifted_target_queue_slug}` :
+        n.drifted_target_mode === 'human_direct'  ? `Human · ${n.drifted_target_queue_slug}` :
+        'this route';
+      return (
+        <span
+          className="chip chip-urgent"
+          title={`URL drifted — points at a stale host. Was: ${modeLabel}. Current webhook: ${n.voice_url}`}
+        >
+          <span className="dot dot-urgent !w-1.5 !h-1.5" />
+          URL drifted
         </span>
       );
     }
@@ -534,6 +735,25 @@ function PhoneNumbersTab() {
                   </td>
                   <td className="px-4 py-3 text-right">
                     <div className="flex justify-end gap-1.5">
+                      {/* Re-sync — only when drifted. One-click recovery
+                          using the (mode, queue) recovered from the stale
+                          URL's path. Avoids the two-step Unassign → Configure
+                          → Assign dance after every ngrok rotation. */}
+                      {number.is_drifted && number.drifted_target_mode && (
+                        <button
+                          onClick={() => handleConfigureSave(
+                            number,
+                            number.drifted_target_mode as PhoneTargetMode,
+                            number.drifted_target_queue_slug || null,
+                          )}
+                          disabled={isUpdating || !isConfigured}
+                          className="btn-primary !py-1 !px-2.5 !text-[12px]"
+                          title="Re-bind to the same route under the current host"
+                        >
+                          {isUpdating ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                          Re-sync
+                        </button>
+                      )}
                       <button
                         onClick={() => setConfiguringNumber(number)}
                         disabled={isUpdating || !isConfigured}
@@ -542,7 +762,7 @@ function PhoneNumbersTab() {
                         {isUpdating ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
                         Configure
                       </button>
-                      {number.is_assigned && (
+                      {(number.is_assigned || number.is_drifted) && (
                         <button
                           onClick={() => handleUnassign(number)}
                           disabled={isUpdating}
@@ -808,6 +1028,7 @@ function QueuesTab() {
       ai_agent_route: q.ai_agent_route,
       default_priority: q.default_priority,
       sla_threshold_seconds: q.sla_threshold_seconds,
+      max_wait_before_ai_fallback: q.max_wait_before_ai_fallback,
       is_active: q.is_active,
     });
   };
@@ -863,7 +1084,7 @@ function QueuesTab() {
   if (loading) return <LoadingSpinner />;
 
   return (
-    <div className="flex gap-6 h-full">
+    <div className="flex gap-3 h-full">
       {/* Left: Queue list */}
       <div className="w-80 flex-shrink-0">
         <div className="flex items-center justify-between mb-4">
@@ -917,26 +1138,29 @@ function QueuesTab() {
               onClick={() => handleSelectQueue(q)}
               className={`relative p-3 rounded-md cursor-pointer border transition-colors ${
                 selectedQueue?.id === q.id
-                  ? 'bg-canvas-elevated ring-1 ring-sw-blue/30'
+                  ? 'bg-canvas-hover border-rule-strong'
                   : 'panel hover:border-rule-strong'
               }`}
             >
+              {selectedQueue?.id === q.id && (
+                <span className="absolute left-0 top-2.5 bottom-2.5 w-0.5 rounded-sm bg-sw-fuchsia" />
+              )}
               <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 min-w-0">
                   <span className={`dot ${q.is_active ? 'dot-live' : 'dot-offline'}`} />
-                  <span className="text-[13px] font-medium text-ink">{q.display_name}</span>
+                  <span className="text-[13px] font-medium text-ink truncate">{q.display_name}</span>
                 </div>
                 <button
                   onClick={e => { e.stopPropagation(); setPendingDelete(q); }}
-                  className="p-1 rounded hover:bg-urgent/10 text-ink-dim hover:text-urgent-soft transition-colors"
+                  className="p-1 rounded hover:bg-urgent/10 text-ink-dim hover:text-urgent-soft transition-colors flex-shrink-0"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
               </div>
               <div className="flex items-center gap-2 mt-1.5">
-                <span className="chip chip-muted">
+                <Chip>
                   {ROUTING_STRATEGIES.find(s => s.value === q.routing_strategy)?.label || q.routing_strategy}
-                </span>
+                </Chip>
                 {q.agent_count !== undefined && (
                   <span className="mono text-[10.5px] text-ink-dim">{q.agent_count} agents</span>
                 )}
@@ -960,6 +1184,7 @@ function QueuesTab() {
 
             {/* Settings form */}
             <div className="grid grid-cols-2 gap-4 panel rounded-md p-5">
+              {/* Row 1: Display Name + Routing Strategy */}
               <div>
                 <label className="block kicker mb-1">Display Name</label>
                 <input
@@ -983,6 +1208,65 @@ function QueuesTab() {
                   {ROUTING_STRATEGIES.find(s => s.value === editForm.routing_strategy)?.desc}
                 </p>
               </div>
+
+              {/* Description — full width */}
+              <div className="col-span-2">
+                <label className="block kicker mb-1">Description</label>
+                <textarea
+                  value={editForm.description || ''}
+                  onChange={e => setEditForm({ ...editForm, description: e.target.value })}
+                  rows={2}
+                  className="input resize-none"
+                />
+              </div>
+
+              {/* Row: AI Agent Route + Default Priority */}
+              <div>
+                <label className="block kicker mb-1">AI Agent Route</label>
+                <select
+                  value={editForm.ai_agent_route || ''}
+                  onChange={e => setEditForm({ ...editForm, ai_agent_route: e.target.value || null })}
+                  className="input"
+                >
+                  <option value="">None</option>
+                  {agents.map(a => (
+                    <option key={a.id} value={a.route}>{a.name} ({a.route})</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block kicker mb-1">Default Priority (1–10)</label>
+                <input
+                  type="number" min={1} max={10}
+                  value={editForm.default_priority || 5}
+                  onChange={e => setEditForm({ ...editForm, default_priority: parseInt(e.target.value) || 5 })}
+                  className="input mono"
+                />
+              </div>
+
+              {/* Row: SLA Threshold + Max Wait Before AI Fallback */}
+              <div>
+                <label className="block kicker mb-1">SLA Threshold (seconds)</label>
+                <input
+                  type="number" min={0}
+                  value={editForm.sla_threshold_seconds || 60}
+                  onChange={e => setEditForm({ ...editForm, sla_threshold_seconds: parseInt(e.target.value) || 60 })}
+                  className="input mono"
+                />
+              </div>
+              <div>
+                <label className="block kicker mb-1">Max Wait Before AI Fallback (seconds)</label>
+                <input
+                  type="number" min={0}
+                  value={editForm.max_wait_before_ai_fallback ?? 120}
+                  onChange={e => setEditForm({ ...editForm, max_wait_before_ai_fallback: parseInt(e.target.value) || 0 })}
+                  className="input mono"
+                />
+                <p className="text-[11px] text-ink-dim mt-1">
+                  Waiting callers are offered the <span className="text-ai">✦</span> AI specialist after this delay.
+                </p>
+              </div>
+
               {/* Call transport: see CALL_TRANSPORT.md. Conference (current default)
                   supports multi-party — supervisor monitor, whisper, barge. Bridge
                   is a direct two-leg dial with native per-leg REST verbs (hold,
@@ -1008,61 +1292,65 @@ function QueuesTab() {
                     : 'New calls park in an interaction conference; agent joins via WebRTC. Default.'}
                 </p>
               </div>
-              <div className="col-span-2">
-                <label className="block kicker mb-1">Description</label>
-                <textarea
-                  value={editForm.description || ''}
-                  onChange={e => setEditForm({ ...editForm, description: e.target.value })}
-                  rows={2}
-                  className="input resize-none"
-                />
-              </div>
-              <div>
-                <label className="block kicker mb-1">AI Agent Route</label>
-                <select
-                  value={editForm.ai_agent_route || ''}
-                  onChange={e => setEditForm({ ...editForm, ai_agent_route: e.target.value || null })}
-                  className="input"
-                >
-                  <option value="">None</option>
-                  {agents.map(a => (
-                    <option key={a.id} value={a.route}>{a.name} ({a.route})</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="block kicker mb-1">Default Priority (1–10)</label>
-                <input
-                  type="number" min={1} max={10}
-                  value={editForm.default_priority || 5}
-                  onChange={e => setEditForm({ ...editForm, default_priority: parseInt(e.target.value) || 5 })}
-                  className="input mono"
-                />
-              </div>
-              <div>
-                <label className="block kicker mb-1">SLA Threshold (seconds)</label>
-                <input
-                  type="number" min={0}
-                  value={editForm.sla_threshold_seconds || 60}
-                  onChange={e => setEditForm({ ...editForm, sla_threshold_seconds: parseInt(e.target.value) || 60 })}
-                  className="input mono"
-                />
-              </div>
-              <div className="flex items-center gap-2 col-span-2">
-                <input
-                  type="checkbox"
-                  checked={editForm.is_active ?? true}
-                  onChange={e => setEditForm({ ...editForm, is_active: e.target.checked })}
-                  className="w-3.5 h-3.5 rounded-sm accent-sw-blue"
-                />
-                <label className="text-[13px] text-ink">Queue is active</label>
-              </div>
             </div>
 
-            <button onClick={handleSaveQueue} disabled={saving} className="btn-primary">
-              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-              Save queue settings
-            </button>
+            {/* Assigned Agents */}
+            <div className="panel rounded-md p-5">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <Users className="w-4 h-4 text-ink-dim" />
+                  <span className="kicker">Assigned Agents</span>
+                </div>
+                <Chip>{selectedQueue.agent_count ?? 0} assigned</Chip>
+              </div>
+              {selectedQueue.agent_count && selectedQueue.agent_count > 0 ? (
+                <div className="space-y-2.5">
+                  {Array.from({ length: selectedQueue.agent_count }).map((_, i) => (
+                    <div
+                      key={i}
+                      className="flex items-center gap-3 rounded-md border border-rule bg-canvas-raised px-3 py-2.5"
+                    >
+                      <span className="w-6 h-6 rounded-md bg-canvas-elevated border border-rule flex items-center justify-center text-[10px] font-semibold text-ink-muted flex-shrink-0">
+                        {String.fromCharCode(65 + (i % 26))}
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[13px] font-medium text-ink truncate">Agent {i + 1}</div>
+                        <div className="mono text-[11px] text-ink-dim truncate">Skill level set in agent console</div>
+                      </div>
+                      {/* Skill-level meter: 5 horizontal bar segments (12×4px) */}
+                      <div className="flex items-center gap-1 flex-shrink-0" title="Skill level managed per agent">
+                        {Array.from({ length: 5 }).map((_, d) => (
+                          <span
+                            key={d}
+                            className={`w-3 h-1 rounded-sm ${d < 3 ? 'bg-ink-muted' : 'bg-rule'}`}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                  <p className="text-[11px] text-ink-dim pt-1">
+                    Agents opt in to queues from their console (skill levels are set there). This list reflects current assignments.
+                  </p>
+                </div>
+              ) : (
+                <p className="text-[12.5px] text-ink-dim py-2">
+                  No agents assigned yet. Agents join this queue from the queue-activation toggle in their console.
+                </p>
+              )}
+            </div>
+
+            {/* Queue active + save */}
+            <div className="flex items-center justify-between gap-4">
+              <Checkbox
+                checked={editForm.is_active ?? true}
+                onChange={checked => setEditForm({ ...editForm, is_active: checked })}
+                label="Queue is active"
+              />
+              <button onClick={handleSaveQueue} disabled={saving} className="btn-primary">
+                {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                Save queue settings
+              </button>
+            </div>
           </div>
         ) : (
           <div className="flex items-center justify-center h-full bg-dotgrid rounded-md">
@@ -1264,7 +1552,7 @@ function AgentsTab({ onNavigateToCollection }: { onNavigateToCollection: (collec
             <div className="bg-wait/10 border border-wait/25 rounded p-3 flex items-start gap-2">
               <Info className="w-3.5 h-3.5 text-wait-soft mt-0.5 flex-shrink-0" />
               <p className="text-[12px] text-wait-soft">
-                KB changes require an agent container restart. Call routing is configured per-queue.
+                KB changes apply live — new calls pick them up within about 30 seconds. Call routing is configured per-queue.
               </p>
             </div>
 
@@ -2502,7 +2790,7 @@ function PermissionToggle({
       type="button"
       onClick={onClick}
       className={`mt-0.5 w-8 h-5 rounded-full flex-shrink-0 relative transition-colors ${
-        on ? 'bg-sw-turquoise/70' : 'bg-canvas-sunken border border-rule'
+        on ? 'bg-sw-fuchsia' : 'bg-canvas-sunken border border-rule'
       }`}
       aria-label={`${label} ${on ? 'on' : 'off'}`}
     >

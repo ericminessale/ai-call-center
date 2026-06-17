@@ -124,6 +124,34 @@ export function AudioMonitor({ callId, onClose }: AudioMonitorProps) {
     };
   }, [socket, callId, isPlaying, initAudio]);
 
+  // RT-01 fix (2026-06-02 audit) + RE-AUDIT-03 stability fix (2026-06-03):
+  // tap audio emits are scoped to a server-side ``tap:{signalwire_call_sid}``
+  // room. We MUST emit join_tap before audio flows — without it, the
+  // server has no way to route tap_audio events to this socket. The
+  // server-side handler also validates the user has the right monitor
+  // permission (can_listen_ai_calls / can_listen_human_calls) before
+  // adding us to the room; failure surfaces as a tap_error event.
+  //
+  // Kept in its OWN effect with deps [socket, callId] only — the
+  // re-audit caught that bundling this into the audio-frame effect
+  // (which has initAudio in its deps) caused a join/leave churn on
+  // every mute toggle, potentially interrupting the audio stream.
+  useEffect(() => {
+    if (!socket) return;
+    const token = localStorage.getItem('access_token');
+    socket.emit('join_tap', { token, call_id: callId });
+
+    const handleTapError = (err: { message?: string }) => {
+      logger.error('[AudioMonitor] join_tap rejected:', err?.message || err);
+    };
+    socket.on('tap_error', handleTapError);
+
+    return () => {
+      socket.off('tap_error', handleTapError);
+      socket.emit('leave_tap', { call_id: callId });
+    };
+  }, [socket, callId]);
+
   // Handle mute toggle
   useEffect(() => {
     if (gainNodeRef.current) {

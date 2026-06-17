@@ -7,20 +7,14 @@ import {
   Edit2,
   Star,
   Clock,
-  MessageSquare,
   ChevronDown,
   ChevronUp,
   Tag,
-  Building2,
-  User,
   Ban,
   MoreHorizontal,
   Trash2,
-  PhoneOutgoing,
-  PhoneIncoming,
   Mic,
   MicOff,
-  FileText,
   Pause,
   Play,
   Send,
@@ -45,7 +39,9 @@ import { ConferenceParticipants } from './ConferenceParticipants';
 import { ObserverControls } from '../shared/ObserverControls';
 import { useAuthStore } from '../../stores/authStore';
 import { useCallCapabilities } from '../../hooks/useCallCapabilities';
+import { useContactPanelMode } from '../../hooks/useContactPanelMode';
 import { logger } from '../../lib/logger';
+import { Tabs, Chip, Button, PillBadge, CallHistoryRow, StatusDot, AI_GLYPH, type TabItem, type RestraintStatus } from '../restraint';
 
 interface ContactDetailViewProps {
   contact: Contact;
@@ -120,12 +116,17 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   // Call state
   const [transcription, setTranscription] = useState<TranscriptionMessage[]>([]);
   const [callDuration, setCallDuration] = useState(0);
+
+  // Published list rates for the live cost ticker (IMP-01) — one fetch per
+  // mount; failure just hides the ticker.
+  const [costRates, setCostRates] = useState<Record<string, number> | null>(null);
+  useEffect(() => {
+    callsApi.costRates().then((r) => setCostRates(r.data.rates)).catch(() => {});
+  }, []);
   const [isAICall, setIsAICall] = useState(false);
   const [currentCallSid, setCurrentCallSid] = useState<string | null>(null);
 
-  // Determine if there's any active call (browser call, outbound AI, OR inbound AI)
   const inboundCallSid = activeCallForContact?.signalwire_call_sid || (activeCallForContact as any)?.call_sid;
-  const isInboundAICall = activeCallForContact?.status === 'ai_active' || activeCallForContact?.handler_type === 'ai';
   const effectiveCallSid = currentCallSid || inboundCallSid;
 
   // Call Fabric hook
@@ -262,44 +263,31 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     return `${mins}m ${secs}s`;
   };
 
-  // Determine if the agent is connected to a call (via conference or direct)
-  // When agent is in conference, treat it as "connected" not "outbound calling"
+  // Panel mode is derived from the agent's SDK session, not from the inbound
+  // Call row's mutable status field. See useContactPanelMode.ts for the full
+  // precedence rules. The short version: if callState === 'active' or there's
+  // an `activeCall`, panel goes human-active regardless of what the customer-
+  // side Call row says — this is what stops the "AI controls stuck after
+  // handoff" bug class.
+  const panel = useContactPanelMode(activeCallForContact);
+
+  // Outbound AI dispatched from this very page: while the backend's
+  // call_update hasn't propagated yet, `isAICall` (local state, set in
+  // handleSubmitAIForm) acts as a UI bridge. Once the row arrives, the
+  // hook's Rule 4 (handler_type === 'ai') takes over and this term is
+  // redundant. The `!showHumanControls` guard ensures that if the agent
+  // somehow lands on a live human leg, we never show AI controls — the
+  // SDK is the authoritative tie-breaker.
+  const showAIControls = panel.showAIMonitor || (isAICall && !panel.showHumanControls);
+
   const isAgentConnected = isInConference && (callState === 'active' || callState === 'ringing');
-
-  // Determine if there's a TRUE outbound call in progress (agent calling out to customer)
-  // NOT including conference joins for inbound calls
-  const isTrueOutboundCall = activeCallForContact?.direction === 'outbound' &&
-    ['ringing', 'active', 'connecting'].includes(activeCallForContact?.status || '');
-
-  // Show "ringing/calling" only for true outbound calls, not conference joins
-  const isOutboundCallInProgress = isTrueOutboundCall ||
-    (callState !== 'idle' && !isInConference);  // Only show ringing if NOT already in conference
-
-  // Pre-take queue states: a call exists for this contact but the agent
-  // hasn't taken it yet. The Take-call banner renders in these states; call
-  // controls (End call, Hold, …) must NOT, since the agent isn't on the call.
-  const PRE_TAKE_STATUSES = ['waiting', 'assigned', 'queued', 'urgent'];
-  const contactCallIsPreTake = !!(
-    activeCallForContact &&
-    PRE_TAKE_STATUSES.includes(activeCallForContact.status || '')
-  );
-
-  // Agent is actually on (or actively dialing) a call. Used to gate the call
-  // control surface — End call / Hold / Record / mute / TTS / DTMF. Excludes
-  // pre-take queue states. Without this split, queued calls render call
-  // controls and the impossible "In queue + End call" both-at-once state.
-  const isAgentOnCall = !!(
-    activeCall ||
-    currentCallSid ||
-    isOutboundCallInProgress ||
-    isInConference ||
-    (activeCallForContact && !contactCallIsPreTake)
-  );
+  const isOutboundCallInProgress = panel.showRinging;
+  const isAgentOnCall = panel.isAgentOnCall || (isAICall && !!currentCallSid);
 
   // Broader "is there any call activity tied to this contact" — kept for the
   // existing places that want to hide the AI-form / call-history selector
   // when a queued call exists for the contact.
-  const hasAnyActiveCall = !!(isAgentOnCall || activeCallForContact);
+  const hasAnyActiveCall = isAgentOnCall || !!activeCallForContact;
 
   // Get display status for calls
   const getOutboundCallStatus = () => {
@@ -464,10 +452,33 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     socket.on('recording_status', handleRecordingStatus);
     socket.on('recording', handleRecordingFinished);
 
+    // RT-02 (2026-06-02 audit followup): Socket.IO room membership is
+    // server-side state. When the socket disconnects (network blip, tab
+    // sleep, server restart) and reconnects, the server's session for
+    // this socket is brand new — the old room subscriptions are gone.
+    // The Socket.IO client object itself is reused on reconnect, so the
+    // outer effect doesn't re-fire and we never re-emit join_call.
+    // Result: transcription panel goes dead, recording status button
+    // gets stuck, agent doesn't know why until they refresh.
+    //
+    // Fix: subscribe to the socket's own `connect` event (fires on every
+    // reconnect, NOT just the initial connect). Re-emit join_call so the
+    // server re-adds us to the call-id room. Idempotent on the server
+    // side — Flask-SocketIO join_room is a no-op when already a member.
+    const handleSocketReconnect = () => {
+      const token = localStorage.getItem('access_token');
+      if (token) {
+        socket.emit('join_call', { call_sid: effectiveCallSid, token });
+        logger.debug('🔄 [ContactDetail] Socket reconnected → re-joined call room:', effectiveCallSid);
+      }
+    };
+    socket.on('connect', handleSocketReconnect);
+
     return () => {
       socket.off('transcription', handleTranscription);
       socket.off('recording_status', handleRecordingStatus);
       socket.off('recording', handleRecordingFinished);
+      socket.off('connect', handleSocketReconnect);
       // Leave the call room when component unmounts or call changes
       socket.emit('leave_call', { call_sid: effectiveCallSid });
     };
@@ -514,6 +525,74 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
     prevActiveCallRef.current = activeCallForContact;
   }, [activeCallForContact, contact.id]);
+
+  // When a recording finishes AFTER the call has ended, SignalWire delivers
+  // the URL via the /api/webhooks/recording webhook. The earlier socket
+  // listener up at the transcription effect only fires while the call room
+  // is still joined (effectiveCallSid populated). Once the call ends, that
+  // listener tears down — but the recording URL often arrives a few seconds
+  // later, which is what caused the "playback empty until refresh" bug.
+  //
+  // Listen for `recording` and `call_update` events at this higher scope
+  // (lifetime = this ContactDetailView mount, not the call room). When
+  // either delivers a recording URL for an interaction we currently have
+  // in state — either selectedHistoryCall on the call-detail tab, or one
+  // of the rows in the history list — patch it in place. No full refetch,
+  // no flicker.
+  useEffect(() => {
+    if (!socket) return;
+
+    const patchInteraction = (sid: string | undefined, recordingUrl: string) => {
+      if (!sid || !recordingUrl) return;
+
+      setInteractions((prev) =>
+        prev.map((it) => {
+          const itSid = (it as any).signalwireCallSid
+            || (it as any).signalwire_call_sid
+            || (it as any).callSid;
+          return itSid === sid && !it.recordingUrl
+            ? { ...it, recordingUrl }
+            : it;
+        }),
+      );
+
+      setSelectedHistoryCall((prev) => {
+        if (!prev) return prev;
+        const prevSid = (prev as any).signalwireCallSid
+          || (prev as any).signalwire_call_sid
+          || (prev as any).callSid;
+        if (prevSid === sid && !prev.recordingUrl) {
+          return { ...prev, recordingUrl };
+        }
+        return prev;
+      });
+    };
+
+    const handleRecording = (data: { call_sid?: string; recording_url?: string }) => {
+      if (data.call_sid && data.recording_url) {
+        patchInteraction(data.call_sid, data.recording_url);
+      }
+    };
+
+    // call_update fires when ANY call field changes, including recording_url
+    // (we added an emit_call_update in /api/webhooks/recording). Same patch
+    // logic — pull the URL out of the payload if present.
+    const handleCallUpdate = (data: { call: any }) => {
+      const call = data?.call;
+      if (!call) return;
+      const sid = call.signalwireCallSid || call.signalwire_call_sid || call.call_sid;
+      const url = call.recordingUrl || call.recording_url;
+      if (sid && url) patchInteraction(sid, url);
+    };
+
+    socket.on('recording', handleRecording);
+    socket.on('call_update', handleCallUpdate);
+
+    return () => {
+      socket.off('recording', handleRecording);
+      socket.off('call_update', handleCallUpdate);
+    };
+  }, [socket]);
 
   // Close menu when clicking outside
   useEffect(() => {
@@ -772,57 +851,185 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
   return (
     <div className="h-full flex flex-col bg-canvas">
-      {/* Header — subtle raised band, distinct from page */}
-      <div className="bg-canvas-raised border-b border-rule p-5">
-        <div className="flex items-start gap-4">
-          {/* Avatar — flat, monogram */}
-          <div className="w-14 h-14 rounded bg-canvas-raised border border-rule-strong flex items-center justify-center text-ink text-[22px] font-semibold tracking-tight">
-            {contact.displayName.charAt(0).toUpperCase()}
+      {/* Header — contact identity on page bg (Restraint rs-main). No raised
+          band: the KPI strip below is the only bordered card. */}
+      <div className="px-6 pt-5 pb-4">
+        {/* chead — avatar · name/phone · inline actions (rs-chead) */}
+        <div className="flex items-center gap-3.5">
+          {/* Avatar — 46px rounded square monogram (rs-bigav) */}
+          <div className="w-[46px] h-[46px] rounded-xl bg-canvas-elevated border border-rule-strong flex items-center justify-center text-ink text-[17px] font-semibold flex-shrink-0">
+            {contact.displayName.split(' ').map((w) => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || '?'}
           </div>
 
-          {/* Basic Info */}
-          <div className="flex-1 min-w-0">
-            <div className="kicker mb-1">Contact</div>
+          {/* Name + phone */}
+          <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h2 className="font-display text-[32px] leading-none text-ink tracking-tightest truncate">
+              <h2 className="text-[23px] font-semibold text-ink tracking-tight leading-tight truncate">
                 {contact.displayName}
               </h2>
               {contact.isVip && (
-                <Star className="w-4 h-4 text-wait fill-wait flex-shrink-0" />
+                <Star className="w-4 h-4 text-status-warning fill-status-warning flex-shrink-0" />
               )}
               {contact.isBlocked && (
-                <span className="chip chip-urgent"><Ban className="w-2.5 h-2.5" />Blocked</span>
+                <Chip dot="error"><Ban className="w-2.5 h-2.5" />Blocked</Chip>
               )}
             </div>
-            <div className="flex items-center gap-4 mt-2 text-[13px]">
-              <span className="flex items-center gap-1.5 text-ink-muted">
-                <Phone className="w-3.5 h-3.5 text-ink-dim" />
-                <span className="mono">{contact.phone}</span>
-              </span>
-              {contact.email && (
-                <span className="flex items-center gap-1.5 text-ink-muted">
-                  <Mail className="w-3.5 h-3.5 text-ink-dim" />
-                  {contact.email}
-                </span>
-              )}
-              {contact.company && (
-                <span className="flex items-center gap-1.5 text-ink-muted">
-                  <Building2 className="w-3.5 h-3.5 text-ink-dim" />
-                  {contact.company}{contact.jobTitle && <span className="text-ink-dim"> · {contact.jobTitle}</span>}
-                </span>
+            <div className="mono text-[11.5px] text-ink-dim mt-[3px]">{contact.phone}</div>
+          </div>
+
+          {/* rs-actions — inline, right-aligned */}
+          <div className="ml-auto flex items-center gap-2">
+            {isAgentOnCall ? (
+              <>
+                {/* Live duration + cost pill (green=connected, amber=ringing, ✦=AI) */}
+                <PillBadge
+                  ai={showAIControls}
+                  dot={showAIControls ? undefined : callState === 'ringing' ? 'warning' : 'success'}
+                  time={
+                    isOutboundCallInProgress && callState !== 'active'
+                      ? getOutboundCallStatus()
+                      : formatCallDuration(activeCallForContact?.duration || callDuration)
+                  }
+                  cost={
+                    costRates && callState === 'active'
+                      ? `~$${(
+                          ((activeCallForContact?.duration || callDuration) / 60) *
+                          (showAIControls
+                            ? (costRates.ai_runtime_per_min || 0) + (costRates.voice_inbound_per_min || 0)
+                            : (costRates.voice_inbound_per_min || 0) +
+                              (costRates.webrtc_per_min || 0) +
+                              2 * (costRates.conference_per_participant_min || 0))
+                        ).toFixed(2)}`
+                      : undefined
+                  }
+                />
+                {showAIControls && <Chip ai>AI Agent</Chip>}
+                {!showAIControls && activeCall && (
+                  <Button
+                    variant="secondary"
+                    onClick={() => (isMuted ? unmute() : mute())}
+                    icon={isMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                  >
+                    {isMuted ? 'Unmute' : 'Mute'}
+                  </Button>
+                )}
+                {showAIControls && (
+                  <Button
+                    variant="primary"
+                    onClick={handleTakeOver}
+                    disabled={isInitializing}
+                    icon={<Phone className="w-3.5 h-3.5" />}
+                  >
+                    Take over
+                  </Button>
+                )}
+                <Button variant="danger" onClick={handleEndCall} icon={<PhoneOff className="w-3.5 h-3.5" />}>
+                  End call
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  variant="primary"
+                  onClick={handleCall}
+                  disabled={isInitializing}
+                  icon={<Phone className="w-3.5 h-3.5" />}
+                >
+                  {isInitializing ? 'Connecting…' : 'Call'}
+                </Button>
+                <Button variant="secondary" onClick={handleSendAI} icon={<Bot className="w-3.5 h-3.5" />}>
+                  Send AI agent
+                </Button>
+                {contact.email && (
+                  <Button
+                    variant="secondary"
+                    onClick={() => window.open(`mailto:${contact.email}`)}
+                    icon={<Mail className="w-3.5 h-3.5" />}
+                  >
+                    Email
+                  </Button>
+                )}
+              </>
+            )}
+
+            {/* ⋯ overflow — Edit + Delete */}
+            <div className="relative" ref={moreMenuRef}>
+              <Button
+                variant="secondary"
+                iconOnly
+                onClick={() => setShowMoreMenu(!showMoreMenu)}
+                aria-label="More actions"
+              >
+                <MoreHorizontal className="w-4 h-4" />
+              </Button>
+              {showMoreMenu && (
+                <div className="absolute right-0 mt-1 w-48 panel-raised rounded-md shadow-panel z-50 animate-fade-up overflow-hidden">
+                  <button
+                    onClick={() => { setShowMoreMenu(false); setIsEditing(true); }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-ink hover:bg-canvas-hover transition-colors text-[13px]"
+                  >
+                    <Edit2 className="w-4 h-4" />
+                    Edit contact
+                  </button>
+                  <button
+                    onClick={handleDeleteContact}
+                    disabled={isDeleting}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-status-error hover:bg-canvas-hover transition-colors disabled:opacity-50 text-[13px]"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    {isDeleting ? 'Deleting…' : 'Delete contact'}
+                  </button>
+                </div>
               )}
             </div>
           </div>
-
-          {/* Edit Button */}
-          <button
-            onClick={() => setIsEditing(true)}
-            className="btn-ghost !p-2"
-            title="Edit contact"
-          >
-            <Edit2 className="w-4 h-4" />
-          </button>
         </div>
+
+        {dialError && (
+          <div className="flex items-center gap-2 px-3 py-1 mt-2.5 w-fit bg-status-error-soft border border-status-error/30 rounded text-status-error text-[12px]">
+            <span>{dialError}</span>
+            <button onClick={() => setDialError(null)} className="ml-1 hover:text-ink">✕</button>
+          </div>
+        )}
+
+        {/* Active-call secondary controls — feature-rich panel + observer
+            (Listen) + conference participant list. Wiring kept verbatim; only
+            the surrounding container is restyled into a secondary row. */}
+        {isAgentOnCall && (
+          <>
+            <div className="flex items-center gap-2 mt-3 flex-wrap">
+              <CallControlPanel
+                callId={activeCallForContact?.id || currentCallSid || ''}
+                callSid={effectiveCallSid || ''}
+                isAICall={showAIControls}
+                isHumanCall={!showAIControls}
+                isInConference={isInConference}
+                isOnHold={isOnHold}
+                isRecording={isRecording}
+                userRole={currentUser?.role}
+                call={activeCallForContact}
+                onHoldChange={setIsOnHold}
+                onRecordingChange={setIsRecording}
+              />
+              {(activeCallForContact?.id || currentCallSid)
+                && !panel.showHumanControls
+                && activeCallForContact?.assigned_agent_id !== currentUser?.id
+                && callCaps.canMonitor && (
+                <ObserverControls
+                  callId={(activeCallForContact?.id ?? currentCallSid) as string | number}
+                  callType={showAIControls ? 'ai' : 'human'}
+                />
+              )}
+            </div>
+            {isInConference && callCaps.isMultiPartyCapable
+              && conferenceParticipants.length > 0 && (
+              <ConferenceParticipants
+                participants={conferenceParticipants}
+                className="mt-3"
+              />
+            )}
+          </>
+        )}
 
         {/* Queue Status Banner */}
         {isCallInQueue && (
@@ -881,157 +1088,6 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         {/* Pending callback banner (Tier 2r) */}
         <PendingCallbackBanner contactId={contact.id} />
 
-        {/* Action Buttons / Call Controls — gated on isAgentOnCall (not the
-            broader hasAnyActiveCall) so they don't render for queued calls the
-            agent hasn't taken. See the variable definitions above. */}
-        <div className="flex items-center gap-2 mt-4">
-          {isAgentOnCall ? (
-            <>
-              {/* Live duration pill */}
-              <div className={`flex items-center gap-2.5 px-3 py-1.5 rounded border ${
-                isAICall || isInboundAICall
-                  ? 'bg-ai/10 border-ai/30'
-                  : callState === 'ringing'
-                  ? 'bg-wait/10 border-wait/30'
-                  : 'bg-live/10 border-live/30'
-              }`}>
-                <span className={`dot ${
-                  isAICall || isInboundAICall ? 'dot-ai' : callState === 'ringing' ? 'dot-wait' : 'dot-live'
-                }`} />
-                <span className={`mono text-[13px] font-medium ${
-                  isAICall || isInboundAICall ? 'text-ai-soft' : callState === 'ringing' ? 'text-wait-soft' : 'text-live-soft'
-                }`}>
-                  {isOutboundCallInProgress && callState !== 'active'
-                    ? getOutboundCallStatus()
-                    : formatCallDuration(activeCallForContact?.duration || callDuration)
-                  }
-                </span>
-                {(isAICall || isInboundAICall) && (
-                  <span className="chip chip-ai"><Bot className="w-2.5 h-2.5" />AI Agent</span>
-                )}
-              </div>
-
-              {!isAICall && !isInboundAICall && activeCall && (
-                <button
-                  onClick={() => isMuted ? unmute() : mute()}
-                  className={`btn-secondary ${isMuted ? '!bg-wait/15 !border-wait/30 !text-wait-soft' : ''}`}
-                >
-                  {isMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-                  {isMuted ? 'Unmute' : 'Mute'}
-                </button>
-              )}
-
-              {(isAICall || isInboundAICall) && (
-                <button
-                  onClick={handleTakeOver}
-                  disabled={isInitializing}
-                  className="btn-secondary !border-info/30 !text-info-soft hover:!bg-info/10"
-                >
-                  <Phone className="w-3.5 h-3.5" />
-                  Take over
-                </button>
-              )}
-
-              <button onClick={handleEndCall} className="btn-danger">
-                <PhoneOff className="w-3.5 h-3.5" />
-                End call
-              </button>
-              <CallControlPanel
-                callId={activeCallForContact?.id || currentCallSid || ''}
-                callSid={effectiveCallSid || ''}
-                isAICall={isAICall || isInboundAICall}
-                isHumanCall={!isAICall && !isInboundAICall}
-                isInConference={isInConference}
-                isOnHold={isOnHold}
-                isRecording={isRecording}
-                userRole={currentUser?.role}
-                // Pass the Call so CallControlPanel can read the transport-
-                // specific capability set and hide buttons that don't apply
-                // (e.g. Backup/Escalate on bridge calls).
-                call={activeCallForContact}
-                onHoldChange={setIsOnHold}
-                onRecordingChange={setIsRecording}
-              />
-              {/* Observer actions for users NOT on the call (Listen). Three
-                  layered gates:
-                    1. Call exists at all.
-                    2. The viewer isn't the call's assigned agent — listening
-                       to your own call would loop audio.
-                    3. The transport supports monitor (bridge mode loses this
-                       until promote-to-conference ships in M4).
-                  ObserverControls itself adds a fourth: permission flag
-                  (can_listen_ai_calls / can_listen_human_calls) — renders
-                  null if the viewer lacks it. */}
-              {(activeCallForContact?.id || currentCallSid)
-                && activeCallForContact?.assigned_agent_id !== currentUser?.id
-                && callCaps.canMonitor && (
-                <ObserverControls
-                  callId={(activeCallForContact?.id ?? currentCallSid) as string | number}
-                  callType={isAICall || isInboundAICall ? 'ai' : 'human'}
-                />
-              )}
-              {/* Conference participant list — only meaningful for conference
-                  transport. Bridge calls have no conference, so the array is
-                  empty anyway; the capability gate is the cleaner signal. */}
-              {isInConference && callCaps.isMultiPartyCapable
-                && conferenceParticipants.length > 0 && (
-                <ConferenceParticipants
-                  participants={conferenceParticipants}
-                  className="mt-3"
-                />
-              )}
-            </>
-          ) : (
-            <>
-              <button onClick={handleCall} disabled={isInitializing} className="btn-primary">
-                <Phone className="w-3.5 h-3.5" />
-                {isInitializing ? 'Connecting…' : 'Call'}
-              </button>
-              <button onClick={handleSendAI} className="btn-secondary !border-ai/30 !text-ai-soft hover:!bg-ai/10">
-                <Bot className="w-3.5 h-3.5" />
-                Send AI agent
-              </button>
-              {contact.email && (
-                <button
-                  onClick={() => window.open(`mailto:${contact.email}`)}
-                  className="btn-ghost"
-                >
-                  <Mail className="w-3.5 h-3.5" />
-                  Email
-                </button>
-              )}
-            </>
-          )}
-
-          {dialError && (
-            <div className="flex items-center gap-2 px-3 py-1 bg-urgent/10 border border-urgent/30 rounded text-urgent-soft text-[12px]">
-              <span>{dialError}</span>
-              <button onClick={() => setDialError(null)} className="ml-1 hover:text-ink">✕</button>
-            </div>
-          )}
-
-          <div className="relative ml-auto" ref={moreMenuRef}>
-            <button
-              onClick={() => setShowMoreMenu(!showMoreMenu)}
-              className="btn-ghost !p-2"
-            >
-              <MoreHorizontal className="w-4 h-4" />
-            </button>
-            {showMoreMenu && (
-              <div className="absolute right-0 mt-1 w-48 panel-raised rounded-md shadow-panel z-50 animate-fade-up overflow-hidden">
-                <button
-                  onClick={handleDeleteContact}
-                  disabled={isDeleting}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-urgent-soft hover:bg-canvas-hover transition-colors disabled:opacity-50 text-[13px]"
-                >
-                  <Trash2 className="w-4 h-4" />
-                  {isDeleting ? 'Deleting…' : 'Delete contact'}
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-
         {callError && (
           <div className="mt-2 p-2 bg-urgent/10 border border-urgent/30 rounded text-urgent-soft text-[12px] flex items-center gap-2">
             <AlertCircle className="w-3.5 h-3.5" />
@@ -1045,7 +1101,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
                 <Bot className="w-3.5 h-3.5 text-ai-soft" />
-                <span className="kicker" style={{ color: '#B0A4FF' }}>Dispatch AI agent</span>
+                <span className="kicker text-ai">Dispatch AI agent</span>
               </div>
               <button
                 onClick={() => setShowAIForm(false)}
@@ -1103,7 +1159,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
                 </div>
                 <div className="flex items-end pb-1">
                   <label className="flex items-center gap-2 cursor-pointer text-[13px]">
-                    <input type="checkbox" className="w-3.5 h-3.5 rounded-sm accent-sw-blue"
+                    <input type="checkbox" className="w-3.5 h-3.5 rounded-sm accent-sw-fuchsia"
                       checked={aiFormData.isVip}
                       onChange={(e) => setAiFormData({ ...aiFormData, isVip: e.target.checked })} />
                     <span className={aiFormData.isVip ? 'text-wait-soft' : 'text-ink-muted'}>
@@ -1150,83 +1206,110 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         {contact.tags && contact.tags.length > 0 && (
           <div className="flex items-center gap-2 mt-4">
             <Tag className="w-3.5 h-3.5 text-ink-dim" />
-            <div className="flex flex-wrap gap-1">
+            <div className="flex flex-wrap gap-1.5">
               {contact.tags.map((tag, index) => (
-                <span key={index} className="chip chip-muted">{tag}</span>
+                <Chip key={index}>{tag}</Chip>
               ))}
             </div>
           </div>
         )}
 
-        {/* Quick Stats — inline, no grid cells, no dividers. Pure typography rhythm. */}
-        <div className="mt-6 flex items-baseline gap-10 flex-wrap">
-          <HeroStat kicker="Total calls" value={String(contact.totalCalls)} />
-          <HeroStat
-            kicker="Avg sentiment"
-            value={contact.averageSentiment != null ? (contact.averageSentiment > 0 ? '+' : '') + contact.averageSentiment.toFixed(1) : '—'}
-            tone={
-              contact.averageSentiment != null
-                ? contact.averageSentiment > 0.3 ? 'live'
-                  : contact.averageSentiment < -0.3 ? 'urgent'
-                  : 'default'
-                : 'default'
-            }
-          />
-          <HeroStat kicker="Tier" value={contact.accountTier} isTier />
-          <HeroStat kicker="Last contact" value={formatDate(contact.lastInteractionAt)} isSmall />
-        </div>
+        {/* KPI strip — bordered card, 5 equal divider-separated cells (Restraint).
+            HeroStat internals (kicker + value + tone logic) are preserved inside
+            each cell; tone-aware sentiment coloring (live/urgent/default) is kept. */}
+        {hasAnyActiveCall ? (
+          /* During a live/AI call the KPIs collapse to a quiet one-line statline
+             (rc-statline) so the live transcript / coach surface dominates. */
+          <div className="mt-[18px] flex items-center gap-6 flex-wrap text-[12px] text-ink-dim">
+            <span>Total calls <b className="mono font-medium text-ink ml-0.5">{contact.totalCalls}</b></span>
+            <span>
+              Avg sentiment{' '}
+              <b className={`mono font-medium ml-0.5 ${
+                contact.averageSentiment != null
+                  ? contact.averageSentiment > 0.3 ? 'text-status-success'
+                    : contact.averageSentiment < -0.3 ? 'text-status-error' : 'text-ink'
+                  : 'text-ink'
+              }`}>
+                {contact.averageSentiment != null ? (contact.averageSentiment > 0 ? '+' : '') + contact.averageSentiment.toFixed(1) : '—'}
+              </b>
+            </span>
+            <span>Tier <b className="font-medium text-ink capitalize ml-0.5">{contact.accountTier}</b></span>
+            <span>Last contact <b className="mono font-medium text-ink ml-0.5">{formatDate(contact.lastInteractionAt)}</b></span>
+          </div>
+        ) : (
+          <div className="mt-[18px] grid grid-cols-5 border border-rule rounded-lg bg-canvas-raised overflow-hidden">
+            <div className="px-4 py-3 border-r border-rule">
+              <HeroStat kicker="Total calls" value={String(contact.totalCalls)} />
+            </div>
+            <div className="px-4 py-3 border-r border-rule">
+              <HeroStat
+                kicker="Avg sentiment"
+                value={contact.averageSentiment != null ? (contact.averageSentiment > 0 ? '+' : '') + contact.averageSentiment.toFixed(1) : '—'}
+                tone={
+                  contact.averageSentiment != null
+                    ? contact.averageSentiment > 0.3 ? 'live'
+                      : contact.averageSentiment < -0.3 ? 'urgent'
+                      : 'default'
+                    : 'default'
+                }
+              />
+            </div>
+            <div className="px-4 py-3 border-r border-rule">
+              <HeroStat kicker="Tier" value={contact.accountTier} isTier />
+            </div>
+            <div className="px-4 py-3 border-r border-rule">
+              <HeroStat
+                kicker="Open tickets"
+                value={String(
+                  (contact as any).openTickets
+                    ?? contact.customFields?.openTickets
+                    ?? contact.customFields?.open_tickets
+                    ?? '—',
+                )}
+              />
+            </div>
+            <div className="px-4 py-3">
+              <HeroStat kicker="Last contact" value={formatDate(contact.lastInteractionAt)} isSmall />
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* Tabs */}
-      <div className="flex items-center px-5 h-11 gap-1">
-        {hasAnyActiveCall && (
-          <DetailTab
-            active={activeTab === 'live'}
-            onClick={() => setActiveTab('live' as any)}
-            tone={isInboundAICall || isAICall ? 'ai' : callState === 'ringing' ? 'wait' : 'live'}
-            label={
-              isInboundAICall || isAICall
-                ? 'AI Call'
-                : isOutboundCallInProgress && callState !== 'active'
-                  ? getOutboundCallStatus()
-                  : 'Live Call'
-            }
-            icon={
-              isInboundAICall || isAICall
-                ? <Bot className="w-3.5 h-3.5" />
-                : isOutboundCallInProgress && callState !== 'active'
-                  ? <PhoneOutgoing className="w-3.5 h-3.5" />
-                  : <span className={`dot ${callState === 'ringing' ? 'dot-wait' : 'dot-live'}`} />
-            }
-          />
-        )}
-        <DetailTab
-          active={activeTab === 'history'}
-          onClick={() => setActiveTab('history')}
-          label="Call History"
-          icon={<Clock className="w-3.5 h-3.5" />}
-        />
-        {selectedHistoryCall && (
-          <DetailTab
-            active={activeTab === 'callDetail'}
-            onClick={() => setActiveTab('callDetail')}
-            tone="signal"
-            label="Call Detail"
-            icon={<FileText className="w-3.5 h-3.5" />}
-            onClose={handleCloseCallDetail}
-          />
-        )}
-        <DetailTab
-          active={activeTab === 'notes'}
-          onClick={() => setActiveTab('notes')}
-          label="Notes"
-          icon={<MessageSquare className="w-3.5 h-3.5" />}
-        />
-        <DetailTab
-          active={activeTab === 'details'}
-          onClick={() => setActiveTab('details')}
-          label="Details"
-          icon={<User className="w-3.5 h-3.5" />}
+      {/* Tabs — Restraint underline subtabs (active = fuchsia underline). Live
+          and Call Detail render conditionally; AI-handled live call carries the
+          turquoise ✦ signal in its label rather than a colored underline. */}
+      <div className="px-5 pt-1">
+        <Tabs
+          value={activeTab}
+          onChange={(v) => setActiveTab(v)}
+          tabs={[
+            ...(hasAnyActiveCall
+              ? [{
+                  value: 'live' as const,
+                  label: (
+                    <span className={`inline-flex items-center gap-1.5 ${showAIControls ? 'text-ai' : ''}`}>
+                      {showAIControls ? (
+                        <><span aria-hidden>{AI_GLYPH}</span>AI Call</>
+                      ) : isOutboundCallInProgress && callState !== 'active' ? (
+                        getOutboundCallStatus()
+                      ) : (
+                        <><StatusDot status="success" size="chip" />Live Call</>
+                      )}
+                    </span>
+                  ),
+                } as TabItem<typeof activeTab>]
+              : []),
+            { value: 'history' as const, label: 'Call History' },
+            ...(selectedHistoryCall
+              ? [{
+                  value: 'callDetail' as const,
+                  label: 'Call Detail',
+                  onClose: handleCloseCallDetail,
+                } as TabItem<typeof activeTab>]
+              : []),
+            { value: 'notes' as const, label: 'Notes' },
+            { value: 'details' as const, label: 'Details' },
+          ]}
         />
       </div>
 
@@ -1235,7 +1318,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         {activeTab === 'live' && hasAnyActiveCall && (
           <LiveCallTab
             transcription={transcription}
-            isAICall={isAICall || isInboundAICall}
+            isAICall={showAIControls}
             callSid={effectiveCallSid || activeCall?.id}
             callDuration={activeCallForContact?.duration || callDuration}
             callState={callState}
@@ -1293,69 +1376,19 @@ function HeroStat({
   isTier?: boolean;
   isSmall?: boolean;
 }) {
-  const color = tone === 'live' ? 'text-live-soft' : tone === 'urgent' ? 'text-urgent-soft' : 'text-ink';
+  // Restraint rs-kpis: sentence-case 11px label over a calm mono 17px value;
+  // color only marks sentiment deviation (success/error), Tier reads as a word.
+  void isSmall;
+  const color = tone === 'live' ? 'text-status-success' : tone === 'urgent' ? 'text-status-error' : 'text-ink';
   return (
-    <div className="flex flex-col gap-1">
-      <span className="kicker">{kicker}</span>
+    <div className="flex flex-col gap-[3px]">
+      <span className="text-[11px] font-medium text-ink-dim">{kicker}</span>
       {isTier ? (
-        <span className={`font-heading font-semibold text-[20px] capitalize leading-none ${color}`}>{value}</span>
-      ) : isSmall ? (
-        <span className={`font-heading font-semibold text-[17px] leading-none mono ${color}`}>{value}</span>
+        <span className={`text-[17px] font-semibold capitalize leading-none ${color}`}>{value}</span>
       ) : (
-        <span className={`font-heading font-semibold text-[26px] leading-none tabular-nums ${color}`}>{value}</span>
+        <span className={`mono text-[17px] font-medium leading-none tabular-nums ${color}`}>{value}</span>
       )}
     </div>
-  );
-}
-
-function DetailTab({
-  active,
-  onClick,
-  label,
-  icon,
-  tone = 'default',
-  onClose,
-}: {
-  active: boolean;
-  onClick: () => void;
-  label: string;
-  icon?: React.ReactNode;
-  tone?: 'default' | 'live' | 'ai' | 'wait' | 'signal';
-  onClose?: () => void;
-}) {
-  const activeColor =
-    tone === 'live'   ? 'text-live-soft'   :
-    tone === 'ai'     ? 'text-ai-soft'     :
-    tone === 'wait'   ? 'text-wait-soft'   :
-    tone === 'signal' ? 'text-sw-turquoise' :
-    'text-ink';
-  const underline =
-    tone === 'live'   ? 'bg-live'   :
-    tone === 'ai'     ? 'bg-ai'     :
-    tone === 'wait'   ? 'bg-wait'   :
-    'bg-sw-turquoise';
-  return (
-    <button
-      onClick={onClick}
-      className={`relative h-10 px-3 flex items-center gap-1.5 text-[12.5px] font-medium transition-colors ${
-        active ? activeColor : 'text-ink-dim hover:text-ink-muted'
-      }`}
-    >
-      {icon}
-      <span>{label}</span>
-      {onClose && (
-        <span
-          onClick={(e) => { e.stopPropagation(); onClose(); }}
-          className="ml-1 p-0.5 hover:bg-canvas-hover rounded-sm cursor-pointer"
-          title="Close"
-        >
-          <X className="w-2.5 h-2.5" />
-        </span>
-      )}
-      {active && (
-        <span className={`absolute -bottom-[1px] left-2 right-2 h-[2px] ${underline} rounded-sm`} />
-      )}
-    </button>
   );
 }
 
@@ -1391,119 +1424,62 @@ function InteractionHistory({
     );
   }
 
-  const renderHandlerChain = (interaction: Interaction) => {
+  // Derive from/to handler chips (rs-hist's "✦ Receptionist → sofia@acme.com").
+  // Maps the call's legs (or single handlerType) onto the CallHistoryRow's
+  // from/to slots — AI legs carry the turquoise ✦ signal.
+  const handlerRefs = (interaction: Interaction): { from?: { label: string; ai?: boolean }; to?: { label: string; ai?: boolean } } => {
     const legs = interaction.legs;
-    if (!legs || legs.length === 0) {
-      if (interaction.handlerType === 'ai') {
-        return (
-          <span className="inline-flex items-center gap-1 text-[11px]">
-            <Bot className="w-3 h-3 text-ai-soft" />
-            <span className="text-ink-muted">{interaction.aiAgentName || 'AI'}</span>
-          </span>
-        );
-      }
-      return null;
-    }
-    if (legs.length === 1) {
-      const leg = legs[0];
+    const mk = (leg: CallLeg) => {
       const isAI = leg.legType === 'ai_agent';
-      return (
-        <span className="inline-flex items-center gap-1 text-[11px]">
-          {isAI ? <Bot className="w-3 h-3 text-ai-soft" /> : <User className="w-3 h-3 text-live-soft" />}
-          <span className="text-ink-muted">{isAI ? (leg.aiAgentName || 'AI') : (leg.userName || 'Agent')}</span>
-        </span>
-      );
+      return { label: isAI ? (leg.aiAgentName || 'AI') : (leg.userName || 'Agent'), ai: isAI };
+    };
+    if (legs && legs.length > 0) {
+      if (legs.length === 1) return { from: mk(legs[0]) };
+      return { from: mk(legs[0]), to: mk(legs[legs.length - 1]) };
     }
-    return (
-      <span className="inline-flex items-center gap-1 text-[11px]">
-        {legs.map((leg, idx) => {
-          const isAI = leg.legType === 'ai_agent';
-          return (
-            <span key={leg.id} className="inline-flex items-center gap-1">
-              {isAI ? <Bot className="w-3 h-3 text-ai-soft" /> : <User className="w-3 h-3 text-live-soft" />}
-              <span className="text-ink-muted">{isAI ? (leg.aiAgentName || 'AI') : (leg.userName || 'Agent')}</span>
-              {idx < legs.length - 1 && <span className="text-ink-faint mx-1">→</span>}
-            </span>
-          );
-        })}
-      </span>
-    );
+    if (interaction.handlerType === 'ai') return { from: { label: interaction.aiAgentName || 'AI', ai: true } };
+    return {};
+  };
+
+  const outcomeFor = (status?: string): { label: string; status: RestraintStatus } | undefined => {
+    if (!status) return undefined;
+    const dot: RestraintStatus =
+      status === 'completed' ? 'success' :
+      status === 'failed' || status === 'abandoned' ? 'error' :
+      status === 'missed' || status === 'no_answer' ? 'warning' :
+      'neutral';
+    const label = status.charAt(0).toUpperCase() + status.slice(1).replace(/_/g, ' ');
+    return { label, status: dot };
   };
 
   return (
-    <div>
-      {interactions.map((interaction, idx) => {
-        const sentimentTone =
-          interaction.sentimentScore == null ? null :
-          interaction.sentimentScore > 0.3 ? 'text-live-soft' :
-          interaction.sentimentScore < -0.3 ? 'text-urgent-soft' :
-          'text-ink-muted';
+    <div className="px-6 pt-1">
+      {interactions.map((interaction) => {
+        const { from, to } = handlerRefs(interaction);
+        const sentimentChip =
+          interaction.sentimentScore == null ? undefined : {
+            label: `${interaction.sentimentScore > 0 ? '+' : ''}${interaction.sentimentScore.toFixed(1)}`,
+            dot: (interaction.sentimentScore > 0.3 ? 'success' :
+                  interaction.sentimentScore < -0.3 ? 'error' : 'neutral') as RestraintStatus,
+          };
+        const rawCost = (interaction as any).estimatedCost;
+        const cost = rawCost != null
+          ? `$${Number(rawCost) < 0.1 ? Number(rawCost).toFixed(3) : Number(rawCost).toFixed(2)}`
+          : undefined;
         return (
-          <div key={interaction.id}>
-            <div
-              className="px-5 py-5 hover:bg-canvas-raised/40 transition-colors cursor-pointer"
-              onClick={() => onSelectCall(interaction)}
-            >
-              <div className="flex items-start gap-3">
-                {/* Direction glyph — minimal, muted */}
-                <div className="mt-0.5 text-ink-dim flex-shrink-0">
-                  {interaction.direction === 'inbound' ? (
-                    <PhoneIncoming className="w-4 h-4" />
-                  ) : (
-                    <PhoneOutgoing className="w-4 h-4" />
-                  )}
-                </div>
-
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-medium text-ink text-[13.5px]">
-                      {interaction.direction === 'inbound' ? 'Inbound' : 'Outbound'}
-                    </span>
-                    <span className="text-ink-dim text-[12px]">·</span>
-                    <span className="mono text-[11.5px] text-ink-muted">{formatDate(interaction.createdAt)}</span>
-                    {interaction.duration && (
-                      <>
-                        <span className="text-ink-dim text-[12px]">·</span>
-                        <span className="mono text-[11.5px] text-ink-muted">{formatDuration(interaction.duration)}</span>
-                      </>
-                    )}
-                    {sentimentTone && (
-                      <>
-                        <span className="text-ink-dim text-[12px]">·</span>
-                        <span className={`mono text-[11.5px] font-medium tabular-nums ${sentimentTone}`}>
-                          {interaction.sentimentScore! > 0 ? '+' : ''}{interaction.sentimentScore!.toFixed(1)}
-                        </span>
-                      </>
-                    )}
-                    {interaction.status && interaction.status !== 'completed' && (
-                      <>
-                        <span className="text-ink-dim text-[12px]">·</span>
-                        <span className="text-[11.5px] text-ink-muted capitalize">{interaction.status.replace('_', ' ')}</span>
-                      </>
-                    )}
-                  </div>
-
-                  {/* Handler chain — only if multi-leg, thin line */}
-                  {interaction.legs && interaction.legs.length > 1 && (
-                    <div className="mt-1.5 flex items-center gap-1 text-[11px] text-ink-muted">
-                      {renderHandlerChain(interaction)}
-                    </div>
-                  )}
-
-                  {/* Description — flows as paragraph, no box */}
-                  {interaction.summary && (
-                    <div className="mt-2 text-[12.5px] text-ink-muted leading-relaxed pr-8">
-                      <AISummaryDisplay summary={interaction.summary} />
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-            {/* Short divider between entries — fixed left offset, consistent width */}
-            {idx < interactions.length - 1 && (
-              <div className="ml-[272px] h-px w-32 rule-fade" aria-hidden />
-            )}
-          </div>
+          <CallHistoryRow
+            key={interaction.id}
+            direction={interaction.direction === 'inbound' ? 'inbound' : 'outbound'}
+            from={from}
+            to={to}
+            outcome={outcomeFor(interaction.status)}
+            extraChips={sentimentChip ? [sentimentChip] : undefined}
+            date={formatDate(interaction.createdAt)}
+            duration={interaction.duration ? formatDuration(interaction.duration) : undefined}
+            metaExtra={cost}
+            summary={interaction.summary ? <AISummaryDisplay summary={interaction.summary} /> : undefined}
+            onClick={() => onSelectCall(interaction)}
+          />
         );
       })}
     </div>
@@ -1706,7 +1682,7 @@ function EditContactModal({
 
           <div className="flex items-center gap-6 pt-1">
             <label className="flex items-center gap-2 cursor-pointer text-[13px]">
-              <input type="checkbox" className="w-3.5 h-3.5 rounded-sm accent-sw-blue"
+              <input type="checkbox" className="w-3.5 h-3.5 rounded-sm accent-sw-fuchsia"
                 checked={formData.isVip}
                 onChange={(e) => setFormData({ ...formData, isVip: e.target.checked })} />
               <span className="text-ink">VIP customer</span>

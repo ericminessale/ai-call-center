@@ -121,6 +121,9 @@ export interface Interaction {
   dispositionCode?: string | null;
   agentNotes?: string | null;
   wrappedUpAt?: string | null;
+  // Technical ending classification (how the call ended) — deterministic,
+  // distinct from dispositionCode (business outcome). See Call.compute_end_reason.
+  endReason?: string | null;
 }
 
 export interface ContactsListResponse {

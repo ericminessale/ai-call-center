@@ -22,6 +22,11 @@ interface LeftPanelProps {
   queuedCalls: Call[];
   onSelectCall: (call: Call) => void;
   onTakeCall: (call: Call) => void;
+  /** Queue view: select a WAITING call into the bespoke queue detail panel
+   *  (stays in the queue view rather than navigating to the contact). */
+  onSelectQueuedCall?: (call: Call) => void;
+  /** Id of the queued call currently open in the queue detail panel. */
+  selectedQueuedCallId?: number | null;
   isLoadingCalls?: boolean;
   isLoadingQueue?: boolean;
   // Queue configs for filter pills + badges
@@ -50,6 +55,8 @@ export function LeftPanel({
   queuedCalls,
   onSelectCall,
   onTakeCall,
+  onSelectQueuedCall,
+  selectedQueuedCallId,
   isLoadingCalls,
   isLoadingQueue,
   queueConfigs,
@@ -80,6 +87,7 @@ export function LeftPanel({
           onSelectCall={onSelectCall}
           isLoading={isLoadingCalls}
           queueConfigs={queueConfigs}
+          selectedContactId={selectedContactId}
         />
       );
 
@@ -87,10 +95,11 @@ export function LeftPanel({
       return (
         <QueueList
           calls={queuedCalls}
-          onSelectCall={onSelectCall}
+          onSelectCall={onSelectQueuedCall ?? onSelectCall}
           onTakeCall={onTakeCall}
           isLoading={isLoadingQueue}
           queueConfigs={queueConfigs}
+          selectedCallId={selectedQueuedCallId ?? undefined}
         />
       );
 
@@ -110,6 +119,7 @@ export function LeftPanel({
         <SupervisorPanel
           activeCalls={activeCalls}
           onSelectCall={onSelectCall}
+          selectedContactId={selectedContactId}
         />
       );
 

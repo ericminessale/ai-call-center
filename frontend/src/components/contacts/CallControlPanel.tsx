@@ -26,8 +26,11 @@ import {
   StopCircle,
   Languages,
 } from 'lucide-react';
-import { callControlApi } from '../../services/api';
+import { callControlApi, conferencesApi } from '../../services/api';
 import { useCallCapabilities } from '../../hooks/useCallCapabilities';
+import { useCallFabricContext } from '../../contexts/CallFabricContext';
+import { useAuthStore } from '../../stores/authStore';
+import { logger } from '../../lib/logger';
 import type { Call } from '../../types/callcenter';
 
 // Same BCP-47 menu as the admin user editor so caller/agent vocabularies match.
@@ -95,6 +98,13 @@ export default function CallControlPanel({
 
   const isSupervisor = userRole === 'supervisor' || userRole === 'admin';
 
+  // SDK handles for the leave-conference Hold pattern. Backend's hold endpoint
+  // marks state + announces to caller; this side issues the actual WebRTC
+  // hangup that evicts the agent from the conference. Unhold reverses via
+  // prepareJoin + client.dial, same path the original accept flow uses.
+  const cf = useCallFabricContext();
+  const { user } = useAuthStore();
+
   const clearError = () => setError(null);
 
   const handleHold = useCallback(async () => {
@@ -102,18 +112,55 @@ export default function CallControlPanel({
     clearError();
     try {
       if (isOnHold) {
-        await callControlApi.unhold(callId);
+        // ── UNHOLD ──────────────────────────────────────────────────
+        // 1. Tell backend: flip state to 'active', prep for rejoin.
+        const res = await callControlApi.unhold(callId);
+        const conferenceName = (res.data as any)?.conference_name;
+        if (!conferenceName) {
+          throw new Error('Unhold response missing conference_name');
+        }
+        // 2. Dial back into the conference via the same prepareJoin →
+        //    client.dial path the original Take flow uses. The
+        //    participant-join webhook on the backend will fire and any
+        //    on-hold CallLeg / participant state catches up.
+        if (!user?.id) {
+          throw new Error('Cannot unhold without authenticated user');
+        }
+        const prep = await conferencesApi.prepareJoin({
+          agent_id: Number(user.id),
+          conference_name: conferenceName,
+          call_id: typeof callId === 'number' ? callId : undefined,
+        });
+        await cf.joinInteractionConference(prep.data.dial_address, conferenceName);
         onHoldChange?.(false);
+        logger.debug(`[Hold] Unhold complete — rejoined ${conferenceName}`);
       } else {
-        await callControlApi.hold(callId);
+        // ── HOLD ────────────────────────────────────────────────────
+        // 1. Tell backend: play "please hold" TTS, mark state on_hold,
+        //    flag the agent's participant row so the imminent leave
+        //    webhook doesn't tear down the call. Backend response
+        //    includes frontend_action='sdk_hangup' as confirmation.
+        const res = await callControlApi.hold(callId);
+        const frontendAction = (res.data as any)?.frontend_action;
+        // 2. Now hang up the SDK call. Caller stays in the conference
+        //    alone — SignalWire's default conference behavior plays hold
+        //    audio to the lone remaining participant.
+        if (frontendAction === 'sdk_hangup') {
+          try {
+            await cf.hangup();
+          } catch (sdkErr) {
+            logger.warn('[Hold] SDK hangup failed (continuing — backend state already on_hold):', sdkErr);
+          }
+        }
         onHoldChange?.(true);
+        logger.debug('[Hold] Hold complete — agent SDK left conference');
       }
     } catch (e: any) {
-      setError(e.response?.data?.error || 'Failed to hold/unhold call');
+      setError(e.response?.data?.error || e?.message || 'Failed to hold/unhold call');
     } finally {
       setIsLoading(null);
     }
-  }, [callId, isOnHold, onHoldChange]);
+  }, [callId, isOnHold, onHoldChange, cf, user?.id]);
 
   const handleRecord = useCallback(async () => {
     setIsLoading('record');
@@ -249,6 +296,44 @@ export default function CallControlPanel({
     }
   }, [callId, onEscalateRequested]);
 
+  // Return-to-queue (Tier 2p) — confirmation sheet with mandatory reason
+  // code so the agent doesn't bounce callers reflexively. The reason gets
+  // saved to Call.last_return_reason for supervisor reporting.
+  const [showReturnSheet, setShowReturnSheet] = useState(false);
+  const [returnReason, setReturnReason] = useState<string>('cannot-resolve');
+  const [returnNote, setReturnNote] = useState('');
+  const submitReturn = useCallback(async () => {
+    setIsLoading('return');
+    clearError();
+    try {
+      const res = await callControlApi.returnToQueue(callId, {
+        reason: returnReason,
+        note: returnReason === 'other' ? returnNote.trim() || undefined : undefined,
+      });
+      // Match the Hold pattern — backend marked state, frontend now SDK-hangs-up
+      // to actually leave the conference.
+      if (res.data.frontend_action === 'sdk_hangup') {
+        try {
+          await cf.hangup();
+        } catch (sdkErr) {
+          logger.warn('[ReturnToQueue] SDK hangup failed (state already returned):', sdkErr);
+        }
+      }
+      setShowReturnSheet(false);
+      setReturnNote('');
+    } catch (e: any) {
+      const data = e?.response?.data;
+      // Soft-cap escalation hint from the backend.
+      if (data?.must_escalate) {
+        setError('Already returned twice — escalate to a supervisor instead.');
+      } else {
+        setError(data?.error || 'Failed to return call to queue');
+      }
+    } finally {
+      setIsLoading(null);
+    }
+  }, [callId, returnReason, returnNote, cf]);
+
   const dtmfButtons = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'];
 
   // Every primary control inside this panel (Hold, Record, TTS, DTMF,
@@ -288,23 +373,13 @@ export default function CallControlPanel({
         <div className="space-y-2">
           {/* Primary control buttons */}
           <div className="flex flex-wrap items-center gap-2">
-            {/* Hold/Resume — gated on transport capability (both conference
-                and bridge support hold, but conference uses participant-mute
-                workaround while bridge uses REST calling.hold). */}
-            {showHold && (
-              <button
-                onClick={handleHold}
-                disabled={isLoading === 'hold'}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-                  isOnHold
-                    ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
-                    : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
-                } disabled:opacity-50`}
-              >
-                {isOnHold ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
-                {isLoading === 'hold' ? '...' : isOnHold ? 'Resume' : 'Hold'}
-              </button>
-            )}
+            {/* Hold/Resume button removed (RE-AUDIT-01, 2026-06-03) —
+                deferred until SignalWire exposes participant-level
+                hold on the REST surface. See call_control.hold_call
+                docstring for the rationale. The handleHold callback +
+                isOnHold prop are kept around for the SDK orchestration
+                path that might come back later, but the button itself
+                doesn't ship until the platform supports it. */}
 
             {/* Record — only for human agent calls (AI calls auto-record via SWML).
                 Button state is hydrated from GET /record/status on mount so it
@@ -428,7 +503,85 @@ export default function CallControlPanel({
                 {isLoading === 'escalate' ? '...' : 'Escalate'}
               </button>
             )}
+
+            {/* Return to Queue (Tier 2p) — bounce the caller back into queue
+                routing with original AI context preserved. Opens a sheet
+                forcing the agent to pick a reason category (prevents the
+                action from being misused as a "get rid of annoying caller"
+                shortcut). Always visible while the agent is on a call
+                that came from a queue; the permission decorator on the
+                backend endpoint enforces revocable access. */}
+            {isInConference && (
+              <button
+                onClick={() => setShowReturnSheet(s => !s)}
+                disabled={isLoading === 'return'}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-800 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                title="Send this caller back to the queue for another agent"
+              >
+                <Users className="w-3.5 h-3.5" />
+                {isLoading === 'return' ? '...' : 'Return to queue'}
+              </button>
+            )}
           </div>
+
+          {/* Return-to-queue confirmation sheet — opens below the button row.
+              Reason is mandatory (default: cannot-resolve). For "other", a
+              free-text note becomes available so the agent can describe what
+              didn't fit the canned reasons. Submission triggers the API call
+              and the SDK hangup. */}
+          {showReturnSheet && (
+            <div className="mt-2 p-3 bg-gray-800/60 border border-blue-700/40 rounded-lg">
+              <div className="text-[12px] text-gray-300 mb-2">
+                Why are you returning this call to the queue?
+              </div>
+              <div className="grid grid-cols-1 gap-1 mb-2 text-[12.5px]">
+                {[
+                  ['wrong-queue',    'Wrong queue — caller belongs elsewhere'],
+                  ['taking-break',   "Taking a break — can't take this call"],
+                  ['cannot-resolve', "Can't resolve — needs different skill"],
+                  ['caller-request', 'Caller asked for someone else'],
+                  ['other',          'Other (add a note)'],
+                ].map(([val, label]) => (
+                  <label key={val} className="flex items-center gap-2 cursor-pointer text-gray-200 hover:text-white">
+                    <input
+                      type="radio"
+                      name="return-reason"
+                      value={val}
+                      checked={returnReason === val}
+                      onChange={() => setReturnReason(val)}
+                      className="accent-blue-500"
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              {returnReason === 'other' && (
+                <input
+                  type="text"
+                  value={returnNote}
+                  onChange={(e) => setReturnNote(e.target.value)}
+                  placeholder="Brief note (optional)"
+                  className="w-full mb-2 px-2 py-1.5 bg-gray-900 border border-gray-700 rounded text-[12.5px] text-gray-100 placeholder:text-gray-500 focus:outline-none focus:border-blue-500"
+                />
+              )}
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={() => { setShowReturnSheet(false); setReturnNote(''); }}
+                  disabled={isLoading === 'return'}
+                  className="px-3 py-1 text-[12px] text-gray-300 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={submitReturn}
+                  disabled={isLoading === 'return'}
+                  className="px-3 py-1 bg-blue-700 hover:bg-blue-600 text-white rounded text-[12px] disabled:opacity-50"
+                >
+                  {isLoading === 'return' ? 'Returning…' : 'Return to queue'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* TTS Input */}
           {showTtsInput && (

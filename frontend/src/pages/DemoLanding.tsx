@@ -2,7 +2,7 @@ import { useNavigate } from 'react-router-dom';
 import { Loader2, Phone, Sparkles } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useAuthStore } from '../stores/authStore';
-import Logo from '../components/shared/Logo';
+import { BrandMark, useBrand } from '../components/shared/Brand';
 
 /**
  * Hosted-demo landing card.
@@ -35,9 +35,10 @@ export default function DemoLanding() {
   };
 
   const phoneNumbers = runtimeConfig?.demo_phone_numbers ?? [];
+  const { productName, isWhiteLabeled } = useBrand();
 
   return (
-    <div className="relative min-h-screen bg-canvas flex items-center justify-center p-6 overflow-hidden">
+    <div className="relative h-full bg-canvas flex items-center justify-center p-6 overflow-hidden">
       {/* Atmospheric background — same blue/fuchsia glow as Login */}
       <div
         className="absolute -top-40 -right-40 w-[520px] h-[520px] rounded-full opacity-[0.18] blur-[140px] pointer-events-none"
@@ -49,7 +50,7 @@ export default function DemoLanding() {
       />
 
       <div className="absolute top-6 left-6 kicker text-ink-faint pointer-events-none">
-        signalwire / cf
+        {isWhiteLabeled ? 'powered by signalwire' : 'signalwire / cf'}
       </div>
       <div className="absolute top-6 right-6 mono text-[9.5px] text-ink-faint uppercase tracking-[0.3em] pointer-events-none">
         <span className="inline-flex items-center gap-1.5">
@@ -66,10 +67,10 @@ export default function DemoLanding() {
 
       <div className="relative z-10 w-full max-w-lg animate-fade-up">
         <div className="flex items-center gap-3 mb-8">
-          <Logo size="lg" />
+          <BrandMark size="lg" />
           <div className="leading-none">
             <div className="font-heading text-[26px] text-ink font-semibold tracking-heading">
-              SignalWire
+              {productName}
             </div>
             <div className="kicker mt-1">Call Center · Live Demo</div>
           </div>

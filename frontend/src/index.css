@@ -32,12 +32,25 @@
   --border-default: rgba(255, 255, 255, 0.12);
   --border-strong:  rgba(255, 255, 255, 0.15);
 
-  /* Brand colors (locked — never modify) */
+  /* Brand colors. These are the SignalWire defaults; the runtime branding
+     layer (IMP-02, src/lib/branding.ts) may override them at the document
+     root for white-label deployments. The SignalWire logo SVG itself stays
+     locked — never recolor the mark. */
   --sw-blue:      #044EF4;   /* structural fills, primary buttons, tab indicator, focus ring */
   --sw-fuchsia:   #F72A72;   /* 10% accent: stats, emphasis, links (hover), table header accent, logo */
   --sw-turquoise: #40E0D0;   /* links default, tab active, emphasis-small */
   --sw-gold:      #FFD700;   /* warnings only */
   --sw-purple:    #601BE6;   /* gradients, glows — not text */
+
+  /* Channel triplets of the same brand colors — Tailwind utilities resolve
+     through these as rgb(var(--sw-*-rgb) / <alpha-value>) so opacity
+     modifiers keep working AND runtime branding re-themes utility classes.
+     Keep in sync with the hexes above. */
+  --sw-blue-rgb:      4 78 244;
+  --sw-fuchsia-rgb:   247 42 114;
+  --sw-turquoise-rgb: 64 224 208;
+  --sw-gold-rgb:      255 215 0;
+  --sw-purple-rgb:    96 27 230;
 
   /* Semantic / status (brand spec) */
   --status-success:      #22c55e;
@@ -442,3 +455,115 @@ h1, h2, h3, h4, h5, h6 {
 .animate-slide-up   { animation: slide-up   0.3s ease-in forwards; }
 .animate-fade-up    { animation: fade-up    0.3s ease-out forwards; }
 .animate-fade-in    { animation: fade-in    0.3s ease-out forwards; }
+
+/* =============================================================================
+   RESTRAINT OVERRIDE LAYER (2026-06-12 · preview)
+   Applies the "Restraint" visual direction (claude.ai/design handoff) over the
+   existing token system: neutral near-black surfaces, one type family (Geist),
+   fuchsia as the only SOLID brand pop, turquoise reserved for AI, status as
+   green/amber/red only, no glows/grain. Appended (not merged) so the whole pass
+   is one reversible block during preview — fold into :root once approved.
+   Tailwind surface/status hexes are mirrored in tailwind.config.js.
+   ========================================================================== */
+:root {
+  /* Surfaces — dark elevation ramp (even ~8% steps; keep in sync with the
+     canvas-* hexes in tailwind.config.js). page < surface < raised; avatars
+     use raised (top) so they never melt into the rail/selected row. */
+  --bg-page:           #0f1013;
+  --bg-surface:        #17191e;
+  --bg-surface-raised: #282c34;
+  --bg-surface-hover:  rgba(255, 255, 255, 0.04);
+  --bg-overlay:        rgba(15, 16, 19, 0.94);
+  --bg-subtle:         rgba(255, 255, 255, 0.025);
+
+  /* Foreground — three tiers; weight carries hierarchy */
+  --fg-default:   #f2f3f5;
+  --fg-secondary: #d7d9dd;
+  --fg-muted:     #a2a5ab;
+  --fg-subtle:    #63666d;
+  --fg-headings:  #f2f3f5;
+
+  /* Borders — quiet, real hairlines (bumped slightly for definition) */
+  --border-default: #2b2e35;
+  --border-strong:  #393d46;
+
+  /* Status — calmer hues; healthy case stays silent */
+  --status-success:      #2fbf71;
+  --status-success-soft: rgba(47, 191, 113, 0.12);
+  --status-warning:      #d99a2b;
+  --status-warning-soft: rgba(217, 154, 43, 0.12);
+  --status-error:        #d65745;
+  --status-error-soft:   rgba(214, 87, 69, 0.12);
+  --status-info:         #5b6470;
+  --status-info-soft:    rgba(255, 255, 255, 0.05);
+
+  /* Depth from tonal lift + hairline, not glow */
+  --shadow-md:           0 4px 16px rgba(0, 0, 0, 0.40);
+  --shadow-panel:        0 1px 0 rgba(255, 255, 255, 0.02) inset;
+  --shadow-glow-fuchsia: none;
+  --shadow-glow-blue:    none;
+
+  /* Primary action = fuchsia pop (was blue) */
+  --btn-primary-bg:     var(--sw-fuchsia);
+  --btn-primary-hover:  #e01563;
+  --btn-primary-active: #c4124f;
+
+  /* Inputs + focus → fuchsia */
+  --input-bg:         #1a1c20;
+  --input-text:       #f2f3f5;
+  --input-focus:      var(--sw-fuchsia);
+  --input-focus-ring: 0 0 0 3px rgba(247, 42, 114, 0.25);
+
+  /* Links read as text; color only on hover */
+  --link-default: var(--fg-default);
+  --link-hover:   var(--sw-fuchsia);
+
+  /* Tabs — neutral text, fuchsia underline on active */
+  --tab-default:   var(--fg-muted);
+  --tab-active:    var(--fg-default);
+  --tab-hover:     var(--fg-default);
+  --tab-indicator: var(--sw-fuchsia);
+
+  /* Tables — quiet */
+  --table-header-text: var(--fg-muted);
+  --table-row-hover:   rgba(255, 255, 255, 0.025);
+  --table-border:      #26282d;
+
+  /* One type family — Geist does sans + mono */
+  --font-heading: 'Geist', ui-sans-serif, system-ui, sans-serif;
+  --font-body:    'Geist', ui-sans-serif, system-ui, sans-serif;
+  --font-code:    'Geist Mono', ui-monospace, SFMono-Regular, monospace;
+
+  --radius-sm: 6px;
+}
+
+/* Flatten: no grain, no dot-grid backdrop */
+body::before { display: none !important; }
+.bg-dotgrid { background-image: none; }
+
+/* Active tab underline = fuchsia (text stays neutral-bright) */
+.tab-active { border-bottom-color: var(--tab-indicator); }
+
+/* Selected-row rail = fuchsia (was blue) */
+.row-selected, .row-selected-blue { box-shadow: inset 2px 0 0 var(--sw-fuchsia); }
+
+/* Table header — neutral hairline, not a fuchsia bar */
+.table-header-underline { border-bottom: 1px solid var(--border-strong); }
+
+/* Selection — fuchsia tint (was blue) */
+::selection { background: rgba(247, 42, 114, 0.30); color: #fff; }
+
+/* Labels — Restraint rs-lbl: quiet sentence-case sans, NOT uppercase mono.
+   The old `.kicker` (Geist Mono, uppercase, 0.14em) read as the prior design;
+   redefining it here flips every eyebrow/label app-wide to the calm Restraint
+   label in one move (weight does hierarchy, not case). */
+.kicker {
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  /* No color set here on purpose: leave it to the @layer component default
+     (fg-muted) or any `text-*` utility paired with .kicker, so colored
+     eyebrows (e.g. `kicker text-ai`) keep their meaning. */
+}

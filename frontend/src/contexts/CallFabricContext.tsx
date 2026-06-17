@@ -180,6 +180,96 @@ export function useCallFabricContext() {
   return context;
 }
 
+/**
+ * Mute / unmute the local audio track for a SignalWire Call Fabric call.
+ *
+ * Why this exists: ``call.audioMute()`` throws
+ * ``CapabilityError: Missing audio mute capability`` on calls that landed
+ * via ``client.dial()`` into a conference SWML resource — the per-call
+ * capability set the SDK enforces internally doesn't include audio_mute for
+ * that path on @signalwire/client@dev. The conference verb's permissions
+ * don't grant it either, and we have no client-side knob to flip.
+ *
+ * Strategy: try every SDK shape we know about (audioMute/audioUnmute,
+ * setAudioMuted, mute/unmute), and if all of those refuse, walk the
+ * RTCPeerConnection ourselves and zero the outgoing audio track's
+ * ``enabled`` flag. That's a standard WebRTC mute — the browser stops
+ * sending audio frames upstream, so SignalWire's conference mixer hears
+ * silence regardless of what the SDK's capability matrix thinks.
+ *
+ * The peer object hangs off the SDK call under a handful of names
+ * depending on SDK version, so we probe a few candidates.
+ */
+async function setLocalAudioMuted(
+  activeCall: any,
+  muted: boolean,
+  setIsMuted: (v: boolean) => void,
+): Promise<void> {
+  if (!activeCall) {
+    logger.warn('[Mute] No active call');
+    return;
+  }
+
+  // Try every documented SDK method, in order from most-specific to most-
+  // generic. Wrap each in try/catch — a CapabilityError on one method
+  // doesn't mean another won't work.
+  const sdkAttempts: Array<[string, (() => Promise<void>) | undefined]> = muted
+    ? [
+        ['setAudioMuted(true)',  activeCall.setAudioMuted ? () => activeCall.setAudioMuted(true)  : undefined],
+        ['audioMute()',          activeCall.audioMute    ? () => activeCall.audioMute()           : undefined],
+        ['mute()',               activeCall.mute         ? () => activeCall.mute()                : undefined],
+      ]
+    : [
+        ['setAudioMuted(false)', activeCall.setAudioMuted ? () => activeCall.setAudioMuted(false) : undefined],
+        ['audioUnmute()',        activeCall.audioUnmute  ? () => activeCall.audioUnmute()         : undefined],
+        ['unmute()',             activeCall.unmute       ? () => activeCall.unmute()              : undefined],
+      ];
+
+  for (const [name, fn] of sdkAttempts) {
+    if (!fn) continue;
+    try {
+      await fn();
+      logger.debug(`[Mute] SDK ${name} succeeded`);
+      setIsMuted(muted);
+      return;
+    } catch (err: any) {
+      // CapabilityError or any other rejection — keep trying.
+      logger.warn(`[Mute] SDK ${name} threw, trying next: ${err?.message || err}`);
+    }
+  }
+
+  // Direct-track fallback. Pull the RTCPeerConnection off whichever
+  // property name the current SDK build is using. Property names observed
+  // across @signalwire/client@dev builds: ``peer``, ``peer.instance``,
+  // ``rtcPeerConnection``, plus a getter ``getRTCPeerConnection()``.
+  const peer: RTCPeerConnection | undefined =
+    activeCall.peer?.instance
+    || activeCall.peer
+    || activeCall.rtcPeerConnection
+    || (typeof activeCall.getRTCPeerConnection === 'function'
+        ? activeCall.getRTCPeerConnection()
+        : undefined);
+
+  if (!peer || typeof peer.getSenders !== 'function') {
+    logger.error('[Mute] No SDK method worked and no RTCPeerConnection found — cannot mute');
+    return;
+  }
+
+  let toggled = 0;
+  for (const sender of peer.getSenders()) {
+    if (sender.track?.kind === 'audio') {
+      sender.track.enabled = !muted; // enabled=false ⇒ muted
+      toggled++;
+    }
+  }
+  if (toggled === 0) {
+    logger.error('[Mute] RTCPeerConnection had no audio senders to toggle');
+    return;
+  }
+  logger.debug(`[Mute] Fallback: toggled track.enabled on ${toggled} audio sender(s) → muted=${muted}`);
+  setIsMuted(muted);
+}
+
 interface CallFabricProviderProps {
   children: ReactNode;
 }
@@ -635,9 +725,18 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
     } catch (error: any) {
       logger.error('❌ [CallFabric] Failed to change status:', error);
-      const errorMsg = error?.message || 'Failed to change status';
-      setError(errorMsg);
-      setConferenceJoinError(errorMsg);
+      // Don't leak raw SDK errors into the UI. The technical detail is in
+      // the log above; show the agent something friendly + actionable.
+      // "client.online is not a function" / "undefined" class errors mean
+      // the SDK script didn't load (or a stale/incompatible build is
+      // cached) — tell them to refresh. Everything else gets a generic
+      // retry message.
+      const raw = error?.message || '';
+      const friendlyMsg = /not a function|undefined|is not defined|cannot read/i.test(raw)
+        ? 'Phone system is still loading — please refresh the page and try again.'
+        : 'Could not change your status. Please try again.';
+      setError(friendlyMsg);
+      setConferenceJoinError(friendlyMsg);
 
       // If going available failed, revert to offline
       if (newStatus === 'available') {
@@ -2321,20 +2420,22 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     // Call-method dispatch. `activeCall` can be either (a) the raw CF SDK
     // Call from `client.dial(...)` or (b) a wrapped shim we construct for
     // outbound calls. The raw SDK exposes audioMute/audioUnmute; the shim
-    // exposes mute/unmute. Prefer the SDK names, fall back to the shim,
-    // so the button works regardless of which shape landed in state.
-    mute: async () => {
-      const c = activeCall as unknown as { audioMute?: () => Promise<void>; mute?: () => Promise<void> } | null;
-      if (c?.audioMute) await c.audioMute();
-      else if (c?.mute) await c.mute();
-      setIsMuted(true);
-    },
-    unmute: async () => {
-      const c = activeCall as unknown as { audioUnmute?: () => Promise<void>; unmute?: () => Promise<void> } | null;
-      if (c?.audioUnmute) await c.audioUnmute();
-      else if (c?.unmute) await c.unmute();
-      setIsMuted(false);
-    },
+    // exposes mute/unmute.
+    //
+    // Conference-joined calls (dial to a SWML resource that ends in
+    // join_conference) on @signalwire/client@dev throw
+    // ``CapabilityError: Missing audio mute capability`` from audioMute() —
+    // the SDK's per-call capability set doesn't include audio_mute when the
+    // call landed through SWML. We don't get to flip that flag from the
+    // client side, and the conference participant verb didn't grant it.
+    //
+    // Fallback chain: try every SDK method we can spot, then drop down to
+    // toggling the RTCRtpSender.track.enabled flag directly. WebRTC mutes
+    // by zeroing the outgoing audio frames, which is exactly what the SDK's
+    // happy-path audioMute does under the hood — we're just doing it
+    // ourselves when the SDK refuses.
+    mute: async () => setLocalAudioMuted(activeCall, true, setIsMuted),
+    unmute: async () => setLocalAudioMuted(activeCall, false, setIsMuted),
     hold: async () => { await activeCall?.hold?.(); },
     unhold: async () => { await activeCall?.unhold?.(); },
     sendDigits: async (digits: string) => { await activeCall?.sendDigits?.(digits); },

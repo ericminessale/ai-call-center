@@ -1,225 +1,317 @@
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, PieChart, Pie, Cell, ResponsiveContainer } from 'recharts';
-import { Activity, Bot, Users, Phone } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { Call } from '../../types/callcenter';
+import { callsApi, queueApi } from '../../services/api';
+import ObserverControls from '../shared/ObserverControls';
+import { FloorStatGrid, StatusDot, QueueDepthRow, AttentionBar, Button, AI_GLYPH } from '../restraint';
+import type { FloorStatTileProps, RestraintStatus } from '../restraint';
 
 interface DashboardChartsProps {
   activeCalls: Call[];
   queuedCalls: Call[];
+  /** Opens a call in the detail pane (used by the attention bar). */
+  onSelectCall?: (call: Call) => void;
 }
 
-const PALETTE = {
-  signal: '#F72A72',
-  live:   '#3FB77E',
-  ai:     '#8A7BFF',
-  wait:   '#E8A838',
-  urgent: '#F0516E',
-  info:   '#4DBCFF',
-};
+// Wallboard row from GET /api/queues/wallboard (IMP-18)
+interface WallboardRow {
+  slug: string;
+  display_name: string;
+  depth: number;
+  average_wait_seconds: number;
+  longest_wait_seconds: number;
+  available_agents: number;
+  service_level: number | null;
+  sla_threshold_seconds: number;
+  offered_24h: number;
+  answered_24h: number;
+  abandoned_24h: number;
+  abandon_rate: number | null;
+}
 
-const DIST_COLORS = [PALETTE.live, PALETTE.ai, PALETTE.wait, PALETTE.urgent, PALETTE.info, PALETTE.signal];
+// Day aggregate from GET /api/calls/cost-summary (IMP-01)
+interface CostSummaryData {
+  total_estimated: number;
+  call_count: number;
+  ai_minutes: number;
+  human_minutes: number;
+}
 
-export function DashboardCharts({ activeCalls, queuedCalls }: DashboardChartsProps) {
+function formatWaitShort(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds || 0));
+  const m = Math.floor(s / 60);
+  return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
+}
+
+export function DashboardCharts({ activeCalls, queuedCalls, onSelectCall }: DashboardChartsProps) {
+  // Self-fetched operational surfaces: SLA wallboard (IMP-18) and today's
+  // estimated spend (IMP-01). The socket queue_update events don't carry
+  // these, so light polling keeps the floor view honest.
+  const [wallboard, setWallboard] = useState<WallboardRow[]>([]);
+  const [costSummary, setCostSummary] = useState<CostSummaryData | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      queueApi.getWallboard()
+        .then((res) => { if (!cancelled) setWallboard(res.data.queues || []); })
+        .catch(() => {});
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      callsApi.costSummary()
+        .then((res) => { if (!cancelled) setCostSummary(res.data); })
+        .catch(() => {});
+    };
+    load();
+    const id = setInterval(load, 60000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
   const queueDepthMap: Record<string, number> = {};
   queuedCalls.forEach(c => {
     const q = c.queueId || (c as any).queue_id || 'unknown';
     queueDepthMap[q] = (queueDepthMap[q] || 0) + 1;
   });
-  const queueDepthData = Object.entries(queueDepthMap).map(([name, count]) => ({
-    name: name.charAt(0).toUpperCase() + name.slice(1),
-    waiting: count,
-  }));
+  // Bars scale against a fixed capacity (not the current peak) so a lone
+  // shallow queue doesn't read as "full". SLA threshold comes from config.
+  const QUEUE_CAPACITY = 5;
+  const slaThreshold = wallboard[0]?.sla_threshold_seconds ?? 60;
+  const queueRows = Object.entries(queueDepthMap).map(([slug, depth]) => {
+    const wb = wallboard.find(w => w.slug === slug || w.display_name?.toLowerCase() === slug.toLowerCase());
+    return {
+      name: wb?.display_name || (slug.charAt(0).toUpperCase() + slug.slice(1)),
+      depth,
+      max: QUEUE_CAPACITY,
+      sla: wb && depth > 0 ? formatWaitShort(wb.longest_wait_seconds) : undefined,
+    };
+  });
 
   const aiActiveCalls = activeCalls.filter(c => (c as any).handledBy === 'ai' || (c as any).isAiHandled || c.status === 'ai_active');
   const humanActiveCalls = activeCalls.filter(c => !((c as any).handledBy === 'ai' || (c as any).isAiHandled || c.status === 'ai_active'));
+  // In-flight handling only — AI vs Human (two-way). Queue depth is its own
+  // tile, so folding "waiting" into a "who's handling" bar would muddy the
+  // metric. Ink weight (not the AI hue) carries AI prominence; turquoise stays
+  // reserved for the ✦ signal.
   const distributionData = [
-    { name: 'Human', value: humanActiveCalls.length, color: PALETTE.live },
-    { name: 'AI',    value: aiActiveCalls.length,    color: PALETTE.ai },
-    { name: 'Queue', value: queuedCalls.length,      color: PALETTE.wait },
+    { name: 'AI',    value: aiActiveCalls.length,    cls: 'bg-ink' },
+    { name: 'Human', value: humanActiveCalls.length, cls: 'bg-ink-muted' },
   ].filter(d => d.value > 0);
+  const inFlight = aiActiveCalls.length + humanActiveCalls.length;
+  const distTotal = inFlight || 1;
 
-  const totalCalls = activeCalls.length + queuedCalls.length;
+  // Surface the single call most in need of supervision for the attention bar
+  // (most-negative sentiment, then longest-running). Color only marks deviation.
+  const attnCall = [...activeCalls]
+    .filter(c => (c.sentiment !== undefined && c.sentiment < -0.3) || (c.duration && c.duration > 600))
+    .sort((a, b) => (a.sentiment ?? 0) - (b.sentiment ?? 0))[0];
+  const attnIsAI = attnCall?.status === 'ai_active';
+
+  // Floor metric tiles — compact Restraint grid. AI is signalled with the ✦
+  // glyph; queue depth raises an amber attention dot when callers are waiting.
+  const longestWait = wallboard.length ? Math.max(0, ...wallboard.map(w => w.longest_wait_seconds || 0)) : 0;
+  const floorTiles: FloorStatTileProps[] = [
+    { label: 'Active now', value: activeCalls.length },
+    {
+      label: 'AI handling',
+      value: <span className="text-ai"><span aria-hidden>{AI_GLYPH}</span> {aiActiveCalls.length}</span>,
+      subtitle: activeCalls.length ? `${Math.round((aiActiveCalls.length / activeCalls.length) * 100)}% of active` : undefined,
+    },
+    {
+      label: 'Human agents',
+      value: humanActiveCalls.length,
+      subtitle: activeCalls.length ? `${Math.round((humanActiveCalls.length / activeCalls.length) * 100)}% of active` : undefined,
+    },
+    {
+      label: 'In queue',
+      value: queuedCalls.length,
+      attention: queuedCalls.length > 0 ? 'warning' : undefined,
+      subtitle: queuedCalls.length ? `longest ${formatWaitShort(longestWait)}` : undefined,
+    },
+  ];
+  if (costSummary) {
+    floorTiles.push({
+      label: "Today's spend",
+      value: `$${costSummary.total_estimated.toFixed(2)}`,
+      subtitle: 'est. list rates',
+    });
+  }
 
   return (
-    <div className="relative h-full overflow-y-auto bg-dotgrid">
-      {/* Hero header */}
-      <div className="px-10 pt-10 pb-8 border-b border-rule/60">
-        <div className="flex items-start justify-between max-w-5xl mx-auto">
+    <div className="relative h-full overflow-y-auto bg-canvas">
+      {/* Hero — full-bleed (rs-main 26px gutters); no seam, the floor reads as
+          one continuous calm column (spec). */}
+      <div className="px-7 pt-6 pb-3">
+        <div className="flex items-center justify-between">
           <div>
-            <div className="kicker mb-3">Control room</div>
-            <h1 className="font-display text-[48px] leading-[1] text-ink tracking-tightest mb-2">
+            <h1 className="text-[20px] font-semibold text-ink tracking-tight leading-none">
               Floor status
             </h1>
-            <p className="text-[13.5px] text-ink-muted max-w-md">
-              Real-time view of every AI and human conversation moving through the fabric.
-            </p>
+            <div className="text-[11px] font-medium text-ink-dim mt-1.5">
+              Every AI and human conversation, live.
+            </div>
           </div>
 
-          {/* Pulse indicator */}
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded border border-live/30 bg-live/5">
-            <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full rounded-full bg-live opacity-60 animate-ping" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-live" />
-            </span>
-            <span className="mono text-[11px] text-live-soft uppercase tracking-wider">Live</span>
+          {/* Live pill — quiet, no ping */}
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-rule-strong">
+            <StatusDot status="success" />
+            <span className="text-[11.5px] font-medium text-ink">Live</span>
           </div>
         </div>
       </div>
 
-      {/* Hero stats row — inline, typography rhythm, no grid cells */}
-      <div className="max-w-5xl mx-auto px-10 pt-8">
-        <div className="flex items-baseline gap-12 flex-wrap">
-          <BigStat kicker="Active now" value={activeCalls.length} icon={<Activity className="w-3.5 h-3.5" />} />
-          <BigStat kicker="AI handling" value={aiActiveCalls.length} tone="ai" icon={<Bot className="w-3.5 h-3.5" />} />
-          <BigStat kicker="Human agents" value={humanActiveCalls.length} tone="live" icon={<Users className="w-3.5 h-3.5" />} />
-          <BigStat kicker="In queue" value={queuedCalls.length} tone={queuedCalls.length > 0 ? 'wait' : 'default'} icon={<Phone className="w-3.5 h-3.5" />} />
-        </div>
+      {/* Floor metric tiles */}
+      <div className="px-7 pt-4">
+        <FloorStatGrid tiles={floorTiles} columns={floorTiles.length >= 5 ? 5 : 4} />
       </div>
 
-      {/* Charts row */}
-      <div className="max-w-5xl mx-auto px-10 py-8 grid grid-cols-2 gap-5">
-        {/* Queue depth */}
-        <div className="panel rounded-md p-5">
-          <div className="flex items-center justify-between mb-1">
-            <span className="kicker">Queue depth</span>
-            <span className="mono text-[11px] text-ink-dim">by queue</span>
+      {/* Service-level wallboard (IMP-18) — SL% against each queue's own
+          configured threshold, plus 24h abandon rate and live waits. */}
+      {wallboard.length > 0 && (
+        <div className="px-7 pt-7">
+          <div className="flex items-baseline justify-between mb-3">
+            <span className="text-[11px] font-medium text-ink-dim">Service level — last 24h</span>
+            <span className="mono text-[11px] text-ink-dim">answered within each queue's SLA target</span>
           </div>
-          <h3 className="font-display text-[22px] text-ink leading-none mb-4">Who is waiting.</h3>
-          {queueDepthData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={200}>
-              <BarChart data={queueDepthData} margin={{ top: 8, right: 8, left: -10, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="2 4" stroke="#24272E" vertical={false} />
-                <XAxis
-                  dataKey="name"
-                  tick={{ fill: '#A3A099', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
-                  tickLine={false}
-                  axisLine={{ stroke: '#24272E' }}
-                />
-                <YAxis
-                  allowDecimals={false}
-                  tick={{ fill: '#76736D', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
-                  tickLine={false}
-                  axisLine={false}
-                  width={28}
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: '#14171C',
-                    border: '1px solid #32363F',
-                    borderRadius: '4px',
-                    fontFamily: 'JetBrains Mono, monospace',
-                    fontSize: '11px',
-                    padding: '6px 10px',
-                  }}
-                  labelStyle={{ color: '#E8E5DE', fontWeight: 500 }}
-                  cursor={{ fill: 'rgba(247, 42, 114, 0.08)' }}
-                />
-                <Bar dataKey="waiting" fill={PALETTE.signal} radius={[2, 2, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+          <div className="grid grid-cols-2 lg:grid-cols-3 gap-2.5">
+            {wallboard.map((row) => (
+              <QueueSlaCard key={row.slug} row={row} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Cards row — Queue depth bars | Call distribution split (rs-cards 1.25fr 1fr) */}
+      <div className="px-7 pt-3 grid grid-cols-[1.25fr_1fr] gap-2.5">
+        {/* Queue depth — lightweight bars (rs-qrow), not a chart */}
+        <div className="border border-rule rounded-lg bg-canvas-raised px-4 py-3.5">
+          <div className="flex items-baseline justify-between">
+            <h3 className="text-[13.5px] font-semibold text-ink">Queue depth</h3>
+            <span className="text-[11px] font-medium text-ink-dim">SLA threshold {slaThreshold}s</span>
+          </div>
+          {queueRows.length > 0 ? (
+            <div className="mt-1.5">
+              {queueRows.map((q) => (
+                <QueueDepthRow key={q.name} name={q.name} depth={q.depth} max={q.max} sla={q.sla} />
+              ))}
+            </div>
           ) : (
-            <EmptyChart message="Queue is clear" />
+            <div className="py-7 text-center text-[13px] text-ink-dim">Queue is clear</div>
           )}
         </div>
 
-        {/* Distribution */}
-        <div className="panel rounded-md p-5">
-          <div className="flex items-center justify-between mb-1">
-            <span className="kicker">Call distribution</span>
-            <span className="mono text-[11px] text-ink-dim">{totalCalls} total</span>
+        {/* Call distribution — single split bar + legend (rs-distbar) */}
+        <div className="border border-rule rounded-lg bg-canvas-raised px-4 py-3.5">
+          <div className="flex items-baseline justify-between">
+            <h3 className="text-[13.5px] font-semibold text-ink">Call distribution</h3>
+            <span className="text-[11px] font-medium text-ink-dim">{inFlight} in flight</span>
           </div>
-          <h3 className="font-display text-[22px] text-ink leading-none mb-4">Human or AI?</h3>
-          {totalCalls > 0 ? (
+          {distributionData.length > 0 ? (
             <>
-              <ResponsiveContainer width="100%" height={180}>
-                <PieChart>
-                  <Pie
-                    data={distributionData}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={52}
-                    outerRadius={78}
-                    paddingAngle={3}
-                    dataKey="value"
-                    stroke="#14171C"
-                    strokeWidth={2}
-                  >
-                    {distributionData.map((d, i) => (
-                      <Cell key={i} fill={d.color} />
-                    ))}
-                  </Pie>
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: '#14171C',
-                      border: '1px solid #32363F',
-                      borderRadius: '4px',
-                      fontFamily: 'JetBrains Mono, monospace',
-                      fontSize: '11px',
-                      padding: '6px 10px',
-                    }}
-                    labelStyle={{ color: '#E8E5DE' }}
-                  />
-                </PieChart>
-              </ResponsiveContainer>
-              <div className="flex justify-center gap-4 mt-3">
+              <div className="flex h-1.5 rounded-full overflow-hidden gap-0.5 mt-4">
                 {distributionData.map((d) => (
-                  <div key={d.name} className="flex items-center gap-1.5">
-                    <span className="w-2 h-2 rounded-sm" style={{ background: d.color }} />
-                    <span className="mono text-[11px] text-ink-muted uppercase tracking-wider">
-                      {d.name} <span className="text-ink">{d.value}</span>
-                    </span>
-                  </div>
+                  <div key={d.name} className={`${d.cls} rounded-full`} style={{ width: `${(d.value / distTotal) * 100}%` }} />
                 ))}
               </div>
+              {distributionData.map((d) => (
+                <div key={d.name} className="flex items-center gap-2 text-[12.5px] text-ink-muted mt-2.5">
+                  <span className={`w-1.5 h-1.5 rounded-full ${d.cls}`} />
+                  {d.name}
+                  <span className="ml-auto mono text-[11px] text-ink">
+                    {d.value} · {Math.round((d.value / distTotal) * 100)}%
+                  </span>
+                </div>
+              ))}
             </>
           ) : (
-            <EmptyChart message="No calls in flight" />
+            <div className="py-7 text-center text-[13px] text-ink-dim">No calls in flight</div>
           )}
         </div>
       </div>
 
-      {/* Footer marker */}
-      <div className="max-w-5xl mx-auto px-10 pb-8">
-        <div className="rule-h mb-4" />
-        <div className="flex items-center justify-between text-[11px] text-ink-dim mono uppercase tracking-wider">
-          <span>signalwire / call fabric</span>
-          <span>v1.0</span>
+      {/* Attention bar — the single call most in need of supervision. Real
+          actions only: Listen (ObserverControls) + a fuchsia "Open call" that
+          drops the supervisor into the call detail (where whisper / take-over
+          live). Whisper/Barge buttons are intentionally NOT faked here. */}
+      {attnCall && (
+        <div className="px-7 pt-2.5 pb-7">
+          <AttentionBar
+            status="warning"
+            label="Needs attention"
+            meta={
+              attnCall.sentiment !== undefined
+                ? `sentiment ${attnCall.sentiment > 0 ? '+' : ''}${attnCall.sentiment.toFixed(1)}`
+                : 'long-running call'
+            }
+            phone={attnCall.from_number || attnCall.contact?.displayName || 'Unknown'}
+            chips={[
+              ...(attnCall.queueId || (attnCall as any).queue_id
+                ? [{ label: String(attnCall.queueId || (attnCall as any).queue_id) }]
+                : []),
+              ...(attnIsAI && attnCall.ai_agent_name ? [{ label: attnCall.ai_agent_name, ai: true }] : []),
+            ]}
+            timestamp={`${formatWaitShort(attnCall.duration || 0)}${attnIsAI && attnCall.ai_agent_name ? ` · ${attnCall.ai_agent_name}` : ''}`}
+            preview={attnCall.ai_summary || undefined}
+            actions={
+              <>
+                {onSelectCall && (
+                  <Button variant="primary" onClick={() => onSelectCall(attnCall)}>Open call</Button>
+                )}
+                {(!Array.isArray(attnCall.capabilities) || attnCall.capabilities.includes('monitor_listen')) && (
+                  <ObserverControls callId={attnCall.id} callType={attnIsAI ? 'ai' : 'human'} compact />
+                )}
+              </>
+            }
+          />
         </div>
-      </div>
+      )}
     </div>
   );
 }
 
-function BigStat({
-  kicker,
-  value,
-  tone = 'default',
-  icon,
-}: {
-  kicker: string;
-  value: number;
-  tone?: 'default' | 'live' | 'ai' | 'wait';
-  icon?: React.ReactNode;
-}) {
-  const color =
-    tone === 'live' ? 'text-live-soft' :
-    tone === 'ai'   ? 'text-ai-soft'   :
-    tone === 'wait' ? 'text-wait-soft' :
-    'text-ink';
+function QueueSlaCard({ row }: { row: WallboardRow }) {
+  const sl = row.service_level;
+  // SLA health drives a single status dot; the value stays neutral mono.
+  const slStatus: RestraintStatus =
+    sl == null ? 'neutral' :
+    sl >= 90   ? 'success' :
+    sl >= 70   ? 'warning' :
+    'error';
   return (
-    <div className="flex flex-col gap-1.5 items-start">
-      <div className="flex items-center gap-1.5 text-ink-dim">
-        {icon}
-        <span className="kicker">{kicker}</span>
+    <div className="border border-rule rounded-lg bg-canvas-raised p-4">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[13px] font-medium text-ink">{row.display_name}</span>
+        <span className="mono text-[10px] text-ink-dim uppercase">SL ≤ {row.sla_threshold_seconds}s</span>
       </div>
-      <span className={`font-heading font-semibold text-[40px] leading-none tabular-nums ${color}`}>{value}</span>
-    </div>
-  );
-}
-
-function EmptyChart({ message }: { message: string }) {
-  return (
-    <div className="h-[180px] flex items-center justify-center">
-      <p className="font-display text-[18px] text-ink-dim">{message}</p>
+      <div className="flex items-center gap-2 mb-3">
+        <StatusDot status={slStatus} />
+        <span className="mono text-2xl font-semibold leading-none tabular-nums text-ink">
+          {sl == null ? '—' : `${sl.toFixed(0)}%`}
+        </span>
+        <span className="mono text-[10px] text-ink-dim uppercase tracking-wider">
+          {sl == null ? 'no data' : 'service level'}
+        </span>
+      </div>
+      <div className="flex items-center gap-4 mono text-[11px] text-ink-muted">
+        <span title="Waiting right now">{row.depth} waiting</span>
+        <span title="Longest current wait">
+          {row.depth > 0 ? formatWaitShort(row.longest_wait_seconds) : '0s'} longest
+        </span>
+        <span
+          title="Abandon rate over the last 24h"
+          className={row.abandon_rate != null && row.abandon_rate > 10 ? 'text-status-error' : ''}
+        >
+          {row.abandon_rate == null ? '—' : `${row.abandon_rate.toFixed(0)}%`} abandon
+        </span>
+        <span title="Answered / offered over the last 24h">
+          {row.answered_24h}/{row.offered_24h}
+        </span>
+      </div>
     </div>
   );
 }

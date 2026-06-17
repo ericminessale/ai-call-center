@@ -117,9 +117,13 @@ export interface DemoPhoneNumber {
   number: string;
 }
 
+import type { Branding } from '../lib/branding';
+
 export interface RuntimeConfig {
   demo_mode: boolean;
   demo_phone_numbers: DemoPhoneNumber[];
+  // White-label branding (IMP-02); null/absent means stock SignalWire.
+  branding?: Branding | null;
 }
 
 export const runtimeApi = {
@@ -170,6 +174,14 @@ export const callsApi = {
 
   get: (call_sid: string) =>
     api.get<{ call: Call; transcriptions: Transcription[] }>(`/api/calls/${call_sid}`),
+
+  // Cost transparency (IMP-01) — estimates at published list rates
+  costRates: () =>
+    api.get<{ rates: Record<string, number>; disclaimer: string }>('/api/calls/cost-rates'),
+  costSummary: () =>
+    api.get('/api/calls/cost-summary'),
+  getCost: (call_sid: string) =>
+    api.get(`/api/calls/${call_sid}/cost`),
 
   end: (call_sid: string) =>
     api.post<{ success: boolean; call_sid: string; message: string }>(`/api/calls/${call_sid}/end`),
@@ -385,6 +397,12 @@ export const adminApi = {
   updateAgentConfig: (config: Record<string, string>) =>
     api.put('/api/admin/agent-config', config),
 
+  // White-label branding (IMP-02) — applies live via runtime-config refetch
+  getBranding: () =>
+    api.get('/api/admin/branding'),
+  updateBranding: (branding: Record<string, string>) =>
+    api.put('/api/admin/branding', branding),
+
   // Document collections
   getCollections: () =>
     api.get('/api/admin/collections'),
@@ -590,6 +608,23 @@ export const callControlApi = {
   stopMonitor: (callId: number | string) =>
     api.post<{ success: boolean; monitor_type: string }>(`/api/call-control/${callId}/monitor/stop`),
 
+  // Return-to-Queue (Tier 2p) — drop the agent off the call, send the caller
+  // back to queue routing with the original AI context preserved. Reason is
+  // mandatory + must be one of the codes the backend recognises. Soft cap at
+  // 2 returns on a single call — the third attempt returns 409 must_escalate.
+  returnToQueue: (
+    callId: number | string,
+    body: { reason: string; target_queue_slug?: string; note?: string },
+  ) =>
+    api.post<{
+      success: boolean;
+      call_id: number;
+      status: string;
+      queue_id: string;
+      return_count: number;
+      frontend_action: 'sdk_hangup';
+    }>(`/api/call-control/${callId}/return-to-queue`, body),
+
   // Multi-agent conferencing
   requestBackup: (callId: number | string, queueId?: string) =>
     api.post<{ success: boolean; selected_agent_id: number; selected_agent_name: string; leg_id: number }>(`/api/call-control/${callId}/request-backup`, { queue_id: queueId }),
@@ -622,6 +657,9 @@ export const queueApi = {
     api.post(`/api/queues/self-subscribe/${queueId}`),
   getActiveQueueConfigs: () =>
     api.get('/api/queues/config/active'),
+  // SLA wallboard aggregate (IMP-18)
+  getWallboard: () =>
+    api.get('/api/queues/wallboard'),
 };
 
 // WebSocket service - now uses a shared socket from SocketContext

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { PhoneOutgoing, Bot, Mic, Send, AlertCircle, TrendingUp, TrendingDown, Minus, BookOpen, ChevronDown, Search, MessageSquare, Sparkles, HelpCircle } from 'lucide-react';
+import { PhoneOutgoing, Bot, Mic, Send, AlertCircle, TrendingUp, TrendingDown, Minus, BookOpen, ChevronDown, Search, MessageSquare, HelpCircle } from 'lucide-react';
 import { TranscriptionMessage } from '../../types/callcenter';
 import api from '../../services/api';
 import websocket from '../../services/websocket';
@@ -8,6 +8,14 @@ import { useAuthStore } from '../../stores/authStore';
 import { usePermissions } from '../../hooks/usePermissions';
 import { AgentContextCard, hasContext } from '../shared/AgentContextCard';
 import CallEventStream from './CallEventStream';
+import {
+  Chip,
+  TranscriptUtterance,
+  TemplatePill,
+  SegmentedModeControl,
+  AI_GLYPH,
+  type RestraintStatus,
+} from '../restraint';
 
 export interface AIContext {
   customer_name?: string;
@@ -72,18 +80,15 @@ function SentimentIndicator({ sentiment }: { sentiment: SentimentData }) {
   const score = sentiment.score;
   const label = score > 0.3 ? 'Positive' : score < -0.3 ? 'Negative' : 'Neutral';
   const Icon = score > 0.3 ? TrendingUp : score < -0.3 ? TrendingDown : Minus;
-  const chipClass = score > 0.3
-    ? 'chip-live'
-    : score < -0.3
-    ? 'chip-urgent'
-    : 'chip-muted';
+  // Restraint: one neutral chip; meaning carried by the status dot, not a hue wash.
+  const dot: RestraintStatus = score > 0.3 ? 'success' : score < -0.3 ? 'error' : 'neutral';
 
   return (
-    <span className={`chip ${chipClass}`} title={sentiment.reason || label}>
+    <Chip dot={dot} title={sentiment.reason || label}>
       <Icon className="w-2.5 h-2.5" />
       <span>{label}</span>
-      <span className="opacity-70">({score > 0 ? '+' : ''}{score.toFixed(1)})</span>
-    </span>
+      <span className="text-ink-dim">({score > 0 ? '+' : ''}{score.toFixed(1)})</span>
+    </Chip>
   );
 }
 
@@ -237,9 +242,13 @@ export function LiveCallTab({
       }
     } catch (err: any) {
       logger.error('[Coach] mode change failed:', err.response?.data || err);
-      setCoachAttachError(
-        err.response?.data?.error || 'Failed to change coach mode'
-      );
+      // Combine the high-level error with the SignalWire detail when
+      // available — the detail is what tells the agent it's e.g. a
+      // transcriber conflict, not a generic "try again later".
+      const data = err.response?.data || {};
+      const base = data.error || 'Failed to change coach mode';
+      const detail = data.detail ? ` — ${data.detail}` : '';
+      setCoachAttachError(`${base}${detail}`);
     } finally {
       setCoachAttaching(false);
     }
@@ -359,13 +368,13 @@ export function LiveCallTab({
     }
   };
 
-  const getStatusDisplay = () => {
+  const getStatusDisplay = (): { text: string; dot: RestraintStatus } => {
     if (isOutboundCallInProgress) {
-      if (callState === 'ringing') return { text: 'Calling', dotClass: 'dot dot-wait', textClass: 'text-wait-soft' };
-      if (callState === 'ending') return { text: 'Ending', dotClass: 'dot dot-offline', textClass: 'text-ink-dim' };
+      if (callState === 'ringing') return { text: 'Calling', dot: 'warning' };
+      if (callState === 'ending') return { text: 'Ending', dot: 'neutral' };
     }
-    if (callState === 'active') return { text: 'Connected', dotClass: 'dot dot-live', textClass: 'text-live-soft' };
-    return { text: 'Recording', dotClass: 'dot dot-live', textClass: 'text-live-soft' };
+    if (callState === 'active') return { text: 'Connected', dot: 'success' };
+    return { text: 'Recording', dot: 'success' };
   };
 
   const status = getStatusDisplay();
@@ -388,21 +397,18 @@ export function LiveCallTab({
 
       {/* Live Transcription */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        <div className="flex items-center justify-between px-5 h-11 border-b border-rule bg-canvas-sunken/60 sticky top-0 z-10">
+        <div className="flex items-center justify-between px-5 h-11 border-b border-rule bg-canvas sticky top-0 z-10">
           <div>
-            <div className="kicker mb-0.5">
+            <div className="text-[11px] font-medium text-ink-dim mb-0.5">
               {isOutboundCallInProgress && callState === 'ringing' ? 'Outbound call' : 'Live feed'}
             </div>
-            <h3 className="font-display text-[18px] text-ink leading-none">
+            <h3 className="text-[13.5px] font-semibold text-ink leading-none">
               {isAICall ? 'Agent is speaking with the caller' : 'Transcription'}
             </h3>
           </div>
           <div className="flex items-center gap-2">
             {sentiment && <SentimentIndicator sentiment={sentiment} />}
-            <div className={`flex items-center gap-1.5 text-[11.5px] font-medium mono uppercase tracking-wider ${status.textClass}`}>
-              <span className={status.dotClass} />
-              {status.text}
-            </div>
+            <Chip dot={status.dot}>{status.text}</Chip>
           </div>
         </div>
         <div className="flex-1 px-5 pt-4 pb-5 overflow-y-auto">
@@ -419,29 +425,23 @@ export function LiveCallTab({
                 </div>
               </div>
             ) : transcription.length > 0 ? (
-              <div className="space-y-4">
+              <div className="divide-y divide-rule/40">
                 {transcription.map((entry, idx) => {
                   const isAgent = entry.speaker === 'agent' || entry.speaker === 'ai';
+                  const speaker = entry.speaker === 'agent'
+                    ? 'Agent'
+                    : entry.speaker === 'ai'
+                      ? `${AI_GLYPH} AI`
+                      : 'Caller';
                   return (
-                    <div key={entry.id || idx} className="flex gap-3 animate-fade-up">
-                      <div className="shrink-0 pt-0.5 w-16">
-                        <span className={`kicker ${
-                          entry.speaker === 'agent' ? 'text-live-soft' :
-                          entry.speaker === 'ai' ? 'text-ai-soft' :
-                          'text-info-soft'
-                        }`} style={{ color: 'inherit' }}>
-                          {entry.speaker === 'agent' ? 'Agent' : entry.speaker === 'ai' ? 'AI' : 'Caller'}
-                        </span>
-                        <div className="mono text-[9.5px] text-ink-faint mt-0.5">
-                          {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                        </div>
-                      </div>
-                      <div className={`flex-1 text-[13px] leading-relaxed pl-3 border-l ${
-                        isAgent ? 'border-ai/30' : 'border-info/30'
-                      } text-ink`}>
-                        {entry.text}
-                      </div>
-                    </div>
+                    <TranscriptUtterance
+                      key={entry.id || idx}
+                      className="animate-fade-up"
+                      speaker={speaker}
+                      role={isAgent ? 'agent' : 'caller'}
+                      text={entry.text}
+                      timestamp={new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                    />
                   );
                 })}
               </div>
@@ -465,19 +465,19 @@ export function LiveCallTab({
           ringing outbound, ended, or AI-active calls all hide it because the
           agent isn't talking to the caller yet (or won't be at all). */}
       {callSid && factbookEnabled && !isAICall && callState === 'active' && (
-        <div className="border-t border-rule bg-canvas-sunken">
+        <div className="mx-5 mt-2.5 border border-rule rounded-lg bg-canvas-raised overflow-hidden">
           <button
             onClick={() => setFactbookOpen(!factbookOpen)}
-            className="w-full flex items-center justify-between px-5 py-3 hover:bg-canvas-sunken/80 transition-colors"
+            className="w-full flex items-center justify-between px-3.5 py-2.5 hover:bg-canvas-hover transition-colors"
           >
             <div className="flex items-center gap-2">
-              <BookOpen className="w-3.5 h-3.5 text-info-soft" />
-              <span className="kicker text-info-soft">Knowledge factbook</span>
+              <BookOpen className="w-3.5 h-3.5 text-ink-muted" />
+              <span className="text-[12.5px] font-semibold text-ink">Knowledge factbook</span>
               <span className="text-[11.5px] text-ink-dim ml-1">
                 Look up facts from the knowledge base.
               </span>
             </div>
-            <ChevronDown className={`w-4 h-4 text-ink-faint transition-transform ${factbookOpen ? 'rotate-180' : ''}`} />
+            <ChevronDown className={`w-4 h-4 text-ink-dim transition-transform ${factbookOpen ? 'rotate-180' : ''}`} />
           </button>
 
           {factbookOpen && (
@@ -563,58 +563,38 @@ export function LiveCallTab({
             - 'on_request' → sidecar attached, Ask input visible
             - 'auto'       → sidecar attached, no input (suggestions stream) */}
       {callSid && coachAllowed && !isAICall && callState === 'active' && (
-        <div className="border-t border-rule bg-canvas-sunken">
-          <div className="w-full flex items-center justify-between px-5 py-3">
+        <div className="mx-5 mt-2.5 border border-rule rounded-lg bg-canvas-raised overflow-hidden">
+          <div className="w-full flex items-center justify-between px-3.5 py-2.5">
             <button
               onClick={() => setCoachOpen(!coachOpen)}
               className="flex items-center gap-2 hover:opacity-80 transition-opacity"
             >
-              <Sparkles className={`w-3.5 h-3.5 ${coachAttached ? 'text-ai-soft' : 'text-ink-faint'}`} />
-              <span className={`kicker ${coachAttached ? 'text-ai-soft' : 'text-ink-dim'}`}>
+              <span aria-hidden className={coachAttached ? 'text-ai' : 'text-ink-dim'}>{AI_GLYPH}</span>
+              <span className={`text-[12.5px] font-semibold ${coachAttached ? 'text-ai' : 'text-ink'}`}>
                 AI coach
               </span>
               {coachSuggestions.length > 0 && (
-                <span className="chip chip-muted ml-1">
-                  {coachSuggestions.length}
-                </span>
+                <Chip className="ml-1">{coachSuggestions.length}</Chip>
               )}
               <ChevronDown
-                className={`w-4 h-4 text-ink-faint transition-transform ${
+                className={`w-4 h-4 text-ink-dim transition-transform ${
                   coachOpen ? 'rotate-180' : ''
                 }`}
               />
             </button>
 
-            {/* In-call mode picker. Three buttons — clicking the current mode
-                is a no-op; clicking another fires attach/detach. Active mode
-                has the `ai` accent; inactive uses muted styling. */}
-            <div className="flex items-center gap-1 rounded-md border border-rule bg-canvas p-0.5">
-              {(['off', 'on_request', 'auto'] as const).map((m) => {
-                const isActive = coachMode === m;
-                const label = m === 'off' ? 'Off' : m === 'on_request' ? 'On request' : 'Auto';
-                return (
-                  <button
-                    key={m}
-                    onClick={() => changeCoachMode(m)}
-                    disabled={coachAttaching}
-                    className={`px-2.5 py-1 text-[11px] font-medium rounded transition-colors disabled:opacity-50 ${
-                      isActive
-                        ? 'bg-ai/15 text-ai-soft'
-                        : 'text-ink-dim hover:text-ink hover:bg-canvas-sunken'
-                    }`}
-                    title={
-                      m === 'off'
-                        ? 'No sidecar attached.'
-                        : m === 'on_request'
-                        ? 'Sidecar attached, stays silent — use "Ask coach" to pull suggestions.'
-                        : 'Sidecar suggests on every customer turn.'
-                    }
-                  >
-                    {coachAttaching && isActive ? '…' : label}
-                  </button>
-                );
-              })}
-            </div>
+            {/* In-call mode picker (Restraint SegmentedModeControl). Clicking the
+                current mode is a no-op; clicking another fires attach/detach.
+                changeCoachMode guards against re-entry while attaching. */}
+            <SegmentedModeControl
+              value={coachMode}
+              onChange={(m) => changeCoachMode(m as CoachMode)}
+              options={[
+                { value: 'off', label: coachAttaching && coachMode === 'off' ? '…' : 'Off' },
+                { value: 'on_request', label: coachAttaching && coachMode === 'on_request' ? '…' : 'On request' },
+                { value: 'auto', label: coachAttaching && coachMode === 'auto' ? '…' : 'Auto' },
+              ]}
+            />
           </div>
 
           {coachAttachError && (
@@ -730,10 +710,10 @@ export function LiveCallTab({
 
       {/* AI Message Controls */}
       {isAICall && (
-        <div className="border-t border-rule px-5 py-4 bg-canvas-sunken">
+        <div className="mx-5 mt-2.5 mb-2.5 border border-rule rounded-lg bg-canvas-raised px-3.5 py-3">
           <div className="flex items-center gap-2 mb-3">
-            <Bot className="w-3.5 h-3.5 text-ai-soft" />
-            <span className="kicker" style={{ color: '#B0A4FF' }}>Whisper to AI</span>
+            <span aria-hidden className="text-ai">{AI_GLYPH}</span>
+            <span className="text-[12.5px] font-semibold text-ink">Whisper to AI</span>
             <span className="text-[11.5px] text-ink-dim ml-1">
               Inject a system instruction mid-call.
             </span>
@@ -741,14 +721,14 @@ export function LiveCallTab({
 
           <div className="flex flex-wrap gap-1.5 mb-3">
             {quickTemplates.map((template, idx) => (
-              <button
+              <TemplatePill
                 key={idx}
                 onClick={() => setSystemMessage(template.message)}
-                className="text-[11.5px] px-2.5 py-1 rounded bg-ai/10 text-ai-soft border border-ai/25 hover:bg-ai/15 transition-colors"
                 disabled={isSending}
+                className="disabled:opacity-50"
               >
                 {template.label}
-              </button>
+              </TemplatePill>
             ))}
           </div>
 
@@ -765,10 +745,10 @@ export function LiveCallTab({
             <button
               onClick={sendSystemMessage}
               disabled={!systemMessage.trim() || isSending}
-              className="btn-secondary !border-ai/30 !text-ai-soft hover:!bg-ai/10 disabled:opacity-50"
+              className="btn-primary disabled:opacity-50"
             >
               {isSending ? (
-                <div className="animate-spin rounded-full h-3.5 w-3.5 border-2 border-ai-soft border-t-transparent" />
+                <div className="animate-spin rounded-full h-3.5 w-3.5 border-2 border-white border-t-transparent" />
               ) : (
                 <Send className="w-3.5 h-3.5" />
               )}

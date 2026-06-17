@@ -11,76 +11,88 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        heading: ['"Instrument Sans"', 'ui-sans-serif', 'system-ui', 'sans-serif'],
-        display: ['"Instrument Sans"', 'ui-sans-serif', 'system-ui', 'sans-serif'],
-        sans:    ['Lexend',            'ui-sans-serif', 'system-ui', 'sans-serif'],
-        mono:    ['"JetBrains Mono"',  'ui-monospace',  'SFMono-Regular', 'Menlo', 'monospace'],
+        heading: ['Geist', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        display: ['Geist', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        sans:    ['Geist', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        mono:    ['"Geist Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
       colors: {
         // ─── Brand-semantic namespace (new code uses these) ───────────────
         bg: {
-          page:    '#0e0e18',
-          surface: '#181a28',
-          raised:  '#222436',
+          page:    '#0f1013',
+          surface: '#17191e',
+          raised:  '#282c34',
         },
         fg: {
-          DEFAULT:   '#f0f0f4',
-          secondary: '#e8e8ec',
-          muted:     '#a0a0aa',
-          subtle:    '#73737e',
+          DEFAULT:   '#f2f3f5',
+          secondary: '#d7d9dd',
+          muted:     '#a2a5ab',
+          subtle:    '#63666d',
         },
+        // Brand colors resolve through CSS channel-triplet variables
+        // (src/index.css --sw-*-rgb) so the runtime branding layer (IMP-02)
+        // can re-theme built utility classes — including opacity modifiers
+        // like sw-blue/20 — without a rebuild.
         sw: {
-          blue:      '#044EF4',
-          fuchsia:   '#F72A72',
-          turquoise: '#40E0D0',
-          gold:      '#FFD700',
-          purple:    '#601BE6',
+          blue:      'rgb(var(--sw-blue-rgb) / <alpha-value>)',
+          fuchsia:   'rgb(var(--sw-fuchsia-rgb) / <alpha-value>)',
+          turquoise: 'rgb(var(--sw-turquoise-rgb) / <alpha-value>)',
+          gold:      'rgb(var(--sw-gold-rgb) / <alpha-value>)',
+          purple:    'rgb(var(--sw-purple-rgb) / <alpha-value>)',
         },
         status: {
-          success: '#22c55e',
-          warning: '#FFD700',
-          error:   '#ef4444',
-          info:    '#044EF4',
+          success: '#2fbf71',
+          warning: '#d99a2b',
+          error:   '#d65745',
+          // Restraint has no blue "info" accent — neutral gray (matches the
+          // --status-info override in index.css). Keeps the "Connecting" banner
+          // off the blue that's outside the color budget.
+          info:    '#5b6470',
         },
 
         // ─── Legacy aliases (existing components keep working) ────────────
-        // Canvas → brand page/surface/raised
+        // Canvas → dark elevation ramp. Even ~8% lightness steps so surfaces
+        // separate cleanly (incl. on cheap IPS panels). Order: page < raised
+        // < hover < elevated; AVATARS use `elevated` (top) so a monogram chip
+        // is always lighter than the rail / hovered / selected row beneath it.
         canvas: {
-          DEFAULT:  '#0e0e18',   // was #0B0D10 (too dark)
-          sunken:   '#09090f',
-          raised:   '#181a28',
-          elevated: '#222436',
-          hover:    '#2a2c3e',
+          DEFAULT:  '#0f1013',   // base page / main content
+          sunken:   '#0a0b0d',
+          raised:   '#17191e',   // header + rail + cards (primary elevated)
+          elevated: '#282c34',   // avatars + overlays (top of ramp)
+          hover:    '#1f222a',   // row hover + selected row (secondary elevated)
         },
         // Ink → brand foreground
         ink: {
-          DEFAULT: '#f0f0f4',    // was #E8E5DE (warm cream)
-          muted:   '#a0a0aa',
-          dim:     '#73737e',
-          faint:   '#4a4a55',
+          DEFAULT: '#f2f3f5',
+          muted:   '#a2a5ab',
+          dim:     '#63666d',
+          faint:   '#45474d',
         },
-        // Rule → brand border
+        // Rule → real hairline borders (Restraint). Bumped a touch for
+        // definition against the lighter surface ramp + on poor panels.
         rule: {
-          DEFAULT: 'rgba(255,255,255,0.12)',
-          strong:  'rgba(255,255,255,0.18)',
+          DEFAULT: '#2b2e35',
+          strong:  '#393d46',
         },
-        // Signal → brand fuchsia (reserved for 10% accent)
+        // Signal → brand fuchsia (reserved for 10% accent). DEFAULT/glow ride
+        // the runtime-brandable channel vars; soft/deep stay static tints.
         signal: {
-          DEFAULT: '#F72A72',
+          DEFAULT: 'rgb(var(--sw-fuchsia-rgb) / <alpha-value>)',
           soft:    '#FB5E92',
           deep:    '#C21E5C',
-          glow:    'rgba(247,42,114,0.15)',
+          glow:    'rgb(var(--sw-fuchsia-rgb) / 0.15)',
         },
-        // "live" operational green → brand success
-        live:   { DEFAULT: '#22c55e', soft: '#4ade80', glow: 'rgba(34,197,94,0.15)' },
-        // "ai" → brand turquoise (AI = "read this first" per brand dark emphasis role)
-        ai:     { DEFAULT: '#40E0D0', soft: '#7eeee3', glow: 'rgba(64,224,208,0.15)' },
-        // "wait" → brand gold (warning token)
-        wait:   { DEFAULT: '#FFD700', soft: '#ffe566', glow: 'rgba(255,215,0,0.15)' },
-        // "urgent" → brand error
-        urgent: { DEFAULT: '#ef4444', soft: '#f87171', glow: 'rgba(239,68,68,0.18)' },
-        // "info" → brand blue
-        info:   { DEFAULT: '#044EF4', soft: '#6e9eff', glow: 'rgba(4,78,244,0.15)' },
+        // "live" operational green → calmer success (Restraint)
+        live:   { DEFAULT: '#2fbf71', soft: '#5fd398', glow: 'rgba(47,191,113,0.15)' },
+        // "ai" → brand turquoise — RESERVED as the AI signal (✦, AI chips, AI-active)
+        ai:     { DEFAULT: 'rgb(var(--sw-turquoise-rgb) / <alpha-value>)', soft: '#7eeee3', glow: 'rgb(var(--sw-turquoise-rgb) / 0.15)' },
+        // "wait" → calmer amber (Restraint warning)
+        wait:   { DEFAULT: '#d99a2b', soft: '#e8b85a', glow: 'rgba(217,154,43,0.15)' },
+        // "urgent" → calmer red (Restraint error)
+        urgent: { DEFAULT: '#d65745', soft: '#e07d6f', glow: 'rgba(214,87,69,0.16)' },
+        // "info" → neutral gray under Restraint (no blue accent in the budget)
+        info:   { DEFAULT: '#5b6470', soft: '#8b9099', glow: 'rgba(91,100,112,0.15)' },
       },
       borderRadius: {
         xs: '2px',
@@ -91,12 +103,12 @@ export default {
         xl: '12px',
       },
       boxShadow: {
-        soft:  '0 1px 0 rgba(255,255,255,0.03) inset, 0 1px 2px rgba(0,0,0,0.3)',
-        panel: '0 8px 24px -8px rgba(0, 0, 0, 0.5), 0 1px 0 rgba(255,255,255,0.03) inset',
-        md:    '0 4px 16px rgba(0, 0, 0, 0.5)',
-        'glow-fuchsia': '0 0 20px rgba(247, 42, 114, 0.25)',
-        'glow-blue':    '0 0 20px rgba(4, 78, 244, 0.25)',
-        'signal-glow':  '0 0 20px rgba(247, 42, 114, 0.25)',  // alias
+        soft:  '0 1px 0 rgba(255,255,255,0.02) inset, 0 1px 2px rgba(0,0,0,0.3)',
+        panel: '0 1px 0 rgba(255,255,255,0.02) inset',
+        md:    '0 4px 16px rgba(0, 0, 0, 0.4)',
+        'glow-fuchsia': 'none',
+        'glow-blue':    'none',
+        'signal-glow':  'none',  // glows retired under Restraint
       },
       letterSpacing: {
         heading:  '-0.02em',

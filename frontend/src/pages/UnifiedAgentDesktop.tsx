@@ -17,6 +17,7 @@ import type { SentimentData } from '../components/contacts/LiveCallTab';
 import { Users, Phone, ListTodo } from 'lucide-react';
 import { ContactDetailSkeleton } from '../components/shared/Skeleton';
 import { DashboardCharts } from '../components/unified/DashboardCharts';
+import { QueueDetailPanel } from '../components/unified/QueueDetailPanel';
 import toast from 'react-hot-toast';
 import { logger } from '../lib/logger';
 import { mapCall, mapCalls } from '../lib/mapCall';
@@ -63,6 +64,10 @@ export function UnifiedAgentDesktop() {
   const [contacts, setContacts] = useState<ContactMinimal[]>([]);
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null);
   const [isLoadingContactDetail, setIsLoadingContactDetail] = useState(false);
+  // Queue view: the WAITING call open in the bespoke queue detail panel (a
+  // pre-answer triage surface that stays in the queue view, distinct from the
+  // contact-centric ContactDetailView the other views navigate to).
+  const [selectedQueuedCall, setSelectedQueuedCall] = useState<Call | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoadingContacts, setIsLoadingContacts] = useState(true);
 
@@ -185,13 +190,28 @@ export function UnifiedAgentDesktop() {
     socket.on('call_assigned', (data: { call: Call }) => {
       logger.debug('[Unified] call_assigned:', data);
       const call = data.call;
-      if (call) {
-        setActiveCalls(prev => [...prev, call]);
-        if (call.contact_id) {
-          loadContactDetail(call.contact_id);
-        }
-        updateCallCounts();
+      if (!call) return;
+      // FE-02 fix (2026-06-02 audit): call_assigned previously pushed the
+      // raw backend object and skipped dedup. Two consequences:
+      //   1. mapCall() never ran → the call lacked normalized
+      //      status/handler_type/from_number fields, so ActiveCallsList's
+      //      filter buckets (which key off status) dropped the agent's
+      //      newly-taken call into uncategorizedCalls until a follow-up
+      //      call_update arrived. Visible bucket-flicker on every Take.
+      //   2. Socket reconnect could redeliver call_assigned, producing
+      //      a duplicate row with the same id and a React key warning.
+      // Match call_update's upsert pattern: map first, then find-and-replace
+      // if the id already exists, otherwise append.
+      const mappedCall = mapCall(call);
+      setActiveCalls(prev => {
+        const exists = prev.find(c => c.id === mappedCall.id);
+        if (exists) return prev.map(c => c.id === mappedCall.id ? mappedCall : c);
+        return [...prev, mappedCall];
+      });
+      if (mappedCall.contact_id) {
+        loadContactDetail(mappedCall.contact_id);
       }
+      updateCallCounts();
     });
 
     // Call ended
@@ -600,6 +620,18 @@ export function UnifiedAgentDesktop() {
     setViewMode('contacts');
   };
 
+  // Queue-view selection: open the bespoke queue detail panel WITHOUT
+  // navigating away (the other views route a selected call to the contact).
+  const handleQueueCallSelect = (call: Call) => setSelectedQueuedCall(call);
+
+  // Drop the queue-panel selection once that call leaves the queue (taken,
+  // ended, or routed to AI) so the panel never shows a stale caller.
+  useEffect(() => {
+    if (selectedQueuedCall && !queuedCalls.some((c) => c.id === selectedQueuedCall.id)) {
+      setSelectedQueuedCall(null);
+    }
+  }, [queuedCalls, selectedQueuedCall]);
+
   // Handle take call from queue
   const handleTakeCall = async (call: Call) => {
     try {
@@ -702,7 +734,7 @@ export function UnifiedAgentDesktop() {
   };
 
   return (
-    <div className="h-screen flex flex-col bg-canvas">
+    <div className="h-full flex flex-col bg-canvas">
       {/* Hosted-demo strip — renders only when DEMO_MODE=true on the
           backend. No-op in production-shape deployments. */}
       <DemoBanner />
@@ -755,8 +787,10 @@ export function UnifiedAgentDesktop() {
           </div>
         ) : (
           <>
-            {/* Left Panel — sits on page surface; depth comes from detail pane being raised */}
-            <div className="w-[340px] border-r border-rule flex flex-col bg-canvas">
+            {/* Left Panel — raised panel surface (matches the header); the main
+                detail pane sits on the darker page bg for elevation contrast (spec
+                rs-rail = --panel, rs-main = --page). */}
+            <div className="w-[340px] border-r border-rule flex flex-col bg-canvas-raised">
               <LeftPanel
                 viewMode={viewMode}
                 contacts={contacts}
@@ -770,6 +804,8 @@ export function UnifiedAgentDesktop() {
                 queuedCalls={queuedCalls}
                 onSelectCall={handleCallSelect}
                 onTakeCall={handleTakeCall}
+                onSelectQueuedCall={handleQueueCallSelect}
+                selectedQueuedCallId={selectedQueuedCall?.id ?? null}
                 isLoadingCalls={isLoadingCalls}
                 isLoadingQueue={isLoadingQueue}
                 queueConfigs={queueConfigs}
@@ -790,11 +826,34 @@ export function UnifiedAgentDesktop() {
                   onUpdated={(updated) => setSelectedCallback(updated)}
                   onClose={() => setSelectedCallback(null)}
                 />
+              ) : viewMode === 'queue' ? (
+                /* Queue view owns its main pane: the bespoke triage panel for a
+                   selected waiting call, else the empty state. Never the
+                   contact-centric detail (that's for the other views). */
+                selectedQueuedCall ? (
+                  <QueueDetailPanel
+                    call={selectedQueuedCall}
+                    queueConfigs={queueConfigs}
+                    onAnswer={() => handleTakeCall(selectedQueuedCall)}
+                    onOpenContact={() => handleCallSelect(selectedQueuedCall)}
+                  />
+                ) : (
+                  <EmptyStage viewMode="queue" />
+                )
               ) : isLoadingContactDetail && !selectedContact ? (
                 <ContactDetailSkeleton />
               ) : selectedContact ? (
                 (() => {
-                  const activeCallForContact = [...activeCalls, ...queuedCalls].find(c => {
+                  // Filter all calls (active + queued) down to the ones tied
+                  // to this contact. We then RANK among them — a bare
+                  // ``.find()`` returns the first match in arbitrary order,
+                  // which lets a stale/abandoned call shadow the agent's
+                  // currently-connected one when both reference the same
+                  // caller phone (real bug hit 2026-05-28: first call failed
+                  // mid-flow, second call from same number → contact page
+                  // showed the first call's transcript and the TEST button
+                  // hit the dead SID instead of the live one).
+                  const isMatch = (c: typeof activeCalls[number]) => {
                     if (c.contact_id === selectedContact.id || (c as any).contactId === selectedContact.id) {
                       return true;
                     }
@@ -804,7 +863,45 @@ export function UnifiedAgentDesktop() {
                     return c.from_number === selectedContact.phone ||
                            (c as any).fromNumber === selectedContact.phone ||
                            c.phoneNumber === selectedContact.phone;
+                  };
+                  const matches = [...activeCalls, ...queuedCalls].filter(isMatch);
+
+                  // Rank rules, highest priority first:
+                  //   1. The agent's OWN currently-handled call (assigned to
+                  //      them AND status is active/connecting). This is the
+                  //      one they're actually on the phone with.
+                  //   2. Any other active/connecting/ringing call for this
+                  //      contact (e.g. supervisor view, another agent's
+                  //      live call against this contact).
+                  //   3. Queued pre-take calls (waiting/assigned/queued/urgent).
+                  //   4. Any remaining match — last resort. Terminal-status
+                  //      calls (ended/completed/failed) should have been
+                  //      filtered out by the cleanup path, but if they leak
+                  //      through they end up here, which is the right place.
+                  // Among same-tier candidates, prefer the most recently
+                  // created — new calls always win over older ones.
+                  const myId = user?.id ? Number(user.id) : -1;
+                  const LIVE = new Set(['active', 'connecting', 'ringing']);
+                  const PRE_TAKE = new Set(['waiting', 'assigned', 'queued', 'urgent']);
+                  const TERMINAL = new Set(['ended', 'completed', 'failed']);
+                  const tier = (c: typeof matches[number]) => {
+                    const status = c.status || '';
+                    if (TERMINAL.has(status)) return 4;
+                    if (c.assigned_agent_id === myId && LIVE.has(status)) return 0;
+                    if (LIVE.has(status)) return 1;
+                    if (PRE_TAKE.has(status)) return 2;
+                    return 3;
+                  };
+                  const createdAt = (c: typeof matches[number]) => {
+                    const raw = c.created_at || (c as any).createdAt;
+                    return raw ? new Date(raw).getTime() : 0;
+                  };
+                  matches.sort((a, b) => {
+                    const dt = tier(a) - tier(b);
+                    if (dt !== 0) return dt;
+                    return createdAt(b) - createdAt(a); // newest first
                   });
+                  const activeCallForContact = matches[0];
                   return (
                     <ContactDetailView
                       contact={selectedContact}
@@ -816,7 +913,7 @@ export function UnifiedAgentDesktop() {
                   );
                 })()
               ) : viewMode === 'supervisor' ? (
-                <DashboardCharts activeCalls={activeCalls} queuedCalls={queuedCalls} />
+                <DashboardCharts activeCalls={activeCalls} queuedCalls={queuedCalls} onSelectCall={handleCallSelect} />
               ) : (
                 <EmptyStage viewMode={viewMode} />
               )}

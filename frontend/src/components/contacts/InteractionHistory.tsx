@@ -1,6 +1,35 @@
 import { Bot, User, Clock, PhoneIncoming, PhoneOutgoing, Mic, FileText } from 'lucide-react';
 import { Interaction } from '../../types/callcenter';
 
+// Friendly label + color for the call-history status chip. Prefers the
+// technical ending classification (endReason) for finished calls — much more
+// useful than a bare "ended"/"completed" — and falls back to the live status
+// for in-progress calls (and for old rows predating end_reason).
+const END_REASON_CHIP: Record<string, { label: string; className: string }> = {
+  completed:            { label: 'Completed',     className: 'bg-green-500/20 text-green-400' },
+  caller_hangup:        { label: 'Caller hung up', className: 'bg-gray-500/20 text-gray-300' },
+  agent_hangup:         { label: 'Agent wrapped',  className: 'bg-gray-500/20 text-gray-300' },
+  premature_disconnect: { label: 'Dropped early',  className: 'bg-amber-500/20 text-amber-400' },
+  abandoned_in_queue:   { label: 'Abandoned',      className: 'bg-amber-500/20 text-amber-400' },
+  missed:               { label: 'Missed',         className: 'bg-red-500/20 text-red-400' },
+  failed:               { label: 'Failed',         className: 'bg-red-500/20 text-red-400' },
+};
+
+function statusChip(interaction: Interaction): { label: string; className: string } {
+  const isFinished = interaction.status === 'ended' || interaction.status === 'completed';
+  if (isFinished && interaction.endReason && END_REASON_CHIP[interaction.endReason]) {
+    return END_REASON_CHIP[interaction.endReason];
+  }
+  // Live / in-progress, or no end_reason recorded — show the raw status.
+  if (interaction.status === 'completed') {
+    return { label: 'Completed', className: 'bg-green-500/20 text-green-400' };
+  }
+  if (interaction.status === 'active' || interaction.status === 'ai_active') {
+    return { label: interaction.status === 'ai_active' ? 'AI active' : 'Active', className: 'bg-blue-500/20 text-blue-400' };
+  }
+  return { label: interaction.status, className: 'bg-gray-500/20 text-gray-400' };
+}
+
 interface InteractionHistoryProps {
   interactions: Interaction[];
   isLoading: boolean;
@@ -111,13 +140,14 @@ export function InteractionHistory({
                   {interaction.direction === 'inbound' ? 'Inbound' : 'Outbound'} Call
                 </span>
                 {renderHandlerChain(interaction)}
-                <span className={`px-2 py-0.5 text-xs rounded-full ${
-                  interaction.status === 'completed' ? 'bg-green-500/20 text-green-400' :
-                  interaction.status === 'active' || interaction.status === 'ai_active' ? 'bg-blue-500/20 text-blue-400' :
-                  'bg-gray-500/20 text-gray-400'
-                }`}>
-                  {interaction.status}
-                </span>
+                {(() => {
+                  const chip = statusChip(interaction);
+                  return (
+                    <span className={`px-2 py-0.5 text-xs rounded-full ${chip.className}`}>
+                      {chip.label}
+                    </span>
+                  );
+                })()}
               </div>
 
               <div className="flex items-center gap-4 mt-1 text-sm text-gray-400">

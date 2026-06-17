@@ -100,6 +100,14 @@ export function AISummaryDisplay({ summary }: { summary: string }) {
 export function ContactDetailView({ contact, onContactUpdate, onContactDelete, activeCallForContact, liveSentiment }: ContactDetailViewProps) {
   const [interactions, setInteractions] = useState<Interaction[]>([]);
   const [isLoadingInteractions, setIsLoadingInteractions] = useState(false);
+  // Call history is paginated (newest-first). We hold the loaded window and
+  // append older pages on demand via "Load older calls".
+  const [isLoadingMoreInteractions, setIsLoadingMoreInteractions] = useState(false);
+  const [interactionsTotal, setInteractionsTotal] = useState(0);
+  const [hasMoreInteractions, setHasMoreInteractions] = useState(false);
+  const interactionsPageRef = useRef(1);
+  const contactIdRef = useRef(contact.id);
+  const INTERACTIONS_PER_PAGE = 20;
   const [showAllNotes, setShowAllNotes] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [activeTab, setActiveTab] = useState<'history' | 'notes' | 'details' | 'live' | 'callDetail'>('history');
@@ -316,6 +324,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   // callDetail tab is active leaves the previous contact's call detail
   // rendered against the new contact's header (state bleed bug).
   useEffect(() => {
+    contactIdRef.current = contact.id;
     loadInteractions();
     setSelectedHistoryCall(null);
     if (activeTab === 'callDetail') {
@@ -504,9 +513,12 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
       // Reload interactions to get the just-completed call
       const loadAndSelectCall = async () => {
         try {
-          const response = await contactsApi.getInteractions(contact.id, 1, 20);
+          const response = await contactsApi.getInteractions(contact.id, 1, INTERACTIONS_PER_PAGE);
           const newInteractions = response.data.interactions;
           setInteractions(newInteractions);
+          setInteractionsTotal(response.data.total);
+          setHasMoreInteractions(response.data.page < response.data.pages);
+          interactionsPageRef.current = 1;
 
           // Select the most recent call (should be the one that just ended)
           if (newInteractions.length > 0) {
@@ -638,12 +650,44 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   const loadInteractions = async () => {
     setIsLoadingInteractions(true);
     try {
-      const response = await contactsApi.getInteractions(contact.id, 1, 20);
+      const response = await contactsApi.getInteractions(contact.id, 1, INTERACTIONS_PER_PAGE);
       setInteractions(response.data.interactions);
+      setInteractionsTotal(response.data.total);
+      setHasMoreInteractions(response.data.page < response.data.pages);
+      interactionsPageRef.current = 1;
     } catch (error) {
       logger.error('Failed to load interactions:', error);
     } finally {
       setIsLoadingInteractions(false);
+    }
+  };
+
+  // Append the next page of older calls. The backend returns newest-first, so
+  // each subsequent page walks further back in time. Threaded through the same
+  // endpoint so a future sort param drops in here unchanged.
+  const loadMoreInteractions = async () => {
+    if (isLoadingMoreInteractions) return;
+    const cid = contact.id;
+    const nextPage = interactionsPageRef.current + 1;
+    setIsLoadingMoreInteractions(true);
+    try {
+      const response = await contactsApi.getInteractions(cid, nextPage, INTERACTIONS_PER_PAGE);
+      // Guard against a contact switch mid-flight — never append one contact's
+      // page onto another contact's freshly-reset list.
+      if (contactIdRef.current !== cid) return;
+      setInteractions((prev) => {
+        // Dedupe by id in case a real-time insert shifted the offset window.
+        const seen = new Set(prev.map((it) => it.id));
+        const fresh = response.data.interactions.filter((it) => !seen.has(it.id));
+        return [...prev, ...fresh];
+      });
+      setInteractionsTotal(response.data.total);
+      setHasMoreInteractions(response.data.page < response.data.pages);
+      interactionsPageRef.current = nextPage;
+    } catch (error) {
+      logger.error('Failed to load more interactions:', error);
+    } finally {
+      setIsLoadingMoreInteractions(false);
     }
   };
 
@@ -1330,7 +1374,11 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         {activeTab === 'history' && (
           <InteractionHistory
             interactions={interactions}
+            total={interactionsTotal}
             isLoading={isLoadingInteractions}
+            hasMore={hasMoreInteractions}
+            isLoadingMore={isLoadingMoreInteractions}
+            onLoadMore={loadMoreInteractions}
             formatDate={formatDate}
             formatDuration={formatDuration}
             onSelectCall={handleSelectHistoryCall}
@@ -1394,13 +1442,21 @@ function HeroStat({
 
 function InteractionHistory({
   interactions,
+  total,
   isLoading,
+  hasMore,
+  isLoadingMore,
+  onLoadMore,
   formatDate,
   formatDuration,
   onSelectCall,
 }: {
   interactions: Interaction[];
+  total: number;
   isLoading: boolean;
+  hasMore: boolean;
+  isLoadingMore: boolean;
+  onLoadMore: () => void;
   formatDate: (date?: string) => string;
   formatDuration: (seconds?: number) => string;
   onSelectCall: (interaction: Interaction) => void;
@@ -1482,6 +1538,33 @@ function InteractionHistory({
           />
         );
       })}
+
+      {/* Load-more footer — paginated call history. Only shown when the loaded
+          window doesn't yet cover every call for this contact. */}
+      {hasMore && (
+        <div className="flex flex-col items-center gap-1.5 py-4">
+          <button
+            type="button"
+            onClick={onLoadMore}
+            disabled={isLoadingMore}
+            className="inline-flex items-center gap-2 rounded-lg border border-rule bg-canvas-raised px-4 py-2 text-[12px] font-medium text-ink-muted hover:bg-canvas-hover hover:text-ink transition-colors disabled:opacity-60 disabled:cursor-default"
+          >
+            {isLoadingMore ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                Loading…
+              </>
+            ) : (
+              'Load older calls'
+            )}
+          </button>
+          {total > 0 && (
+            <span className="text-[11px] text-ink-dim mono">
+              Showing {interactions.length} of {total}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

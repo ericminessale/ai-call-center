@@ -12,13 +12,20 @@ BACKEND_URL="${BACKEND_URL:-http://backend:5000}"
 USER="${WEBHOOK_AUTH_USER:-}"
 PASS="${WEBHOOK_AUTH_PASSWORD:-}"
 
-# When the backend's webhook_auth is in soft-mode (empty creds), the
-# request still works — the endpoint accepts it and logs a warning.
-# When in enforce mode, missing creds get a 401, which is fine — the
-# next run after operator wires the env vars will succeed.
+# /api/internal/demo-reset uses @require_internal_auth — ALWAYS enforces,
+# independent of the WEBHOOK_AUTH_REQUIRED soft-mode knob. (The
+# soft-mode escape hatch only applies to /api/webhooks/* +
+# /api/queues/<id>/route, not to internal routes — those hold the
+# credential-leak surface the 2026-06-02 SEC-01 audit closed.) If creds
+# aren't wired into the cron container's env, every nightly reset
+# silently 401s — we surface that as a non-zero exit so docker logs
+# show the cron failure instead of pretending success.
 AUTH_ARGS=""
 if [ -n "$USER" ] && [ -n "$PASS" ]; then
     AUTH_ARGS="-u ${USER}:${PASS}"
+else
+    echo "[demo-reset] ERROR: WEBHOOK_AUTH_USER / WEBHOOK_AUTH_PASSWORD not set — /api/internal/demo-reset will 401. Wire creds in docker-compose env." >&2
+    exit 2
 fi
 
 echo "[demo-reset] $(date -u +%Y-%m-%dT%H:%M:%SZ) firing reset against ${BACKEND_URL}"

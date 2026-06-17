@@ -397,7 +397,7 @@ docker-compose exec backend bash
 | `SWML_BASIC_AUTH_PASSWORD` | `agent123` | HTTP Basic Auth password |
 | `WEBHOOK_AUTH_USER` | (unset) | HTTP Basic creds the platform replays on inbound webhooks. Producers (this backend + AI agents) embed them in URLs they hand SignalWire. |
 | `WEBHOOK_AUTH_PASSWORD` | (unset) | Counterpart to `WEBHOOK_AUTH_USER`. |
-| `WEBHOOK_AUTH_REQUIRED` | `false` | When `true`, reject unauthenticated webhook hits with 401. Soft mode (default) logs warnings but accepts them — useful while rolling out. |
+| `WEBHOOK_AUTH_REQUIRED` | `true` | Enforce HTTP Basic on `/api/webhooks/*` + `/api/queues/<id>/route` callbacks. Default is enforce — set to `false` ONLY as a temporary rollout downgrade until every producer (AI agents, `/api/swml/initial-call`, phone-number assigns) signs its callback URLs. `/api/internal/*` always enforces independent of this flag. |
 | `CORS_ORIGINS` | `http://localhost,http://localhost:3000,http://localhost:5173` | Comma-separated origin allowlist. Browsers reject `*` when credentials are enabled, so list specific origins for production. |
 | `OPENAI_API_KEY` | (unset) | When set + `DEMO_MODE=true`, visitor-typed contact + AI-message text gets run through OpenAI's free moderation endpoint. Without a key the regex blocklist is the only check. |
 | `SKIP_AUTO_QUEUE_ASSIGN` | `false` | Local-sandbox knob: suppress auto-assignment of queued calls when an agent goes Available. Production + hosted demo both want auto-assign. |

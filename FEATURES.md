@@ -403,7 +403,7 @@ Two-tier check on every visitor-typed text field that gets persisted, gated on `
 
 ### Daily reset
 
-- **Cron container** runs nightly at `00:00 UTC` and hits the backend's `/api/internal/demo-reset` endpoint (gated by `@require_webhook_auth`).
+- **Cron container** runs nightly at `00:00 UTC` and hits the backend's `/api/internal/demo-reset` endpoint (gated by `@require_internal_auth` — always enforces, independent of the `WEBHOOK_AUTH_REQUIRED` soft-mode knob).
 - **Scope of wipe**: calls, call_legs, transcriptions, conferences, conference_participants, webhook_events, contacts. Plus `FLUSHDB` on Redis (leases, queue counters, ratelimit windows — all ephemeral demo state).
 - **Preserved across reset**: real users (admin/agent), 20 demo personas with their subscribers, queue config, knowledge base, MCP gateway config, system config.
 - **Active sessions notified gracefully** — backend broadcasts a `demo:reset` SocketIO event; frontend shows a "demo refreshing — reloading…" toast and reloads the page.
@@ -435,7 +435,7 @@ The items below are on the roadmap but not yet live. Listed here for completenes
 - **Post-call survey** via the SDK's survey prefab.
 - **Routing Profiles** — named entry-point flows per phone number (beyond the single default).
 - **Admin AI workflow editor** — in-UI prompt/tool/KB editor per agent.
-- **Outbound campaigns** — answering-machine detection, list upload, power dialer.
+- **Outbound campaigns** — list upload, power dialer. (Answering-machine detection itself shipped 2026-06-09: outbound AI calls and callback dials run `detect_machine` — voicemail gets a short message after the beep and a clean hangup instead of the AI pitch.)
 - **Whisper** and **Barge** observer actions.
 - **Visual SWML Builder** — drag-and-drop IVR flow editor. Deferred until the Tier 2 CCaaS gaps close.
 

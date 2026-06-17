@@ -46,11 +46,15 @@ clone-and-own path that the hosted demo runs on top of.
       `https://evil.example.com` against the deployed origin do NOT
       receive an `Access-Control-Allow-Origin` header. See
       `app/__init__.py::_cors_origins`.
-- [ ] **Webhook signature/auth in place.** SignalWire-facing endpoints
+- [ ] **Webhook auth on by default.** SignalWire-facing endpoints
       (`/api/webhooks/*`, `/api/queues/<id>/route`) are protected by
-      `@require_webhook_auth`. With `WEBHOOK_AUTH_REQUIRED=true`, an
-      unauthenticated POST returns 401. See
-      `app/utils/webhook_auth.py`.
+      `@require_webhook_auth`, which ENFORCES unless
+      `WEBHOOK_AUTH_REQUIRED=false` is explicitly set. With no override, an
+      unauthenticated POST returns 401. The private backend⇄ai-agents routes
+      (`/api/internal/*`) use `@require_internal_auth`, which always enforces
+      regardless of the flag. The backend fail-fasts at boot when the creds
+      are unset (unless soft-mode is explicitly chosen). See
+      `app/utils/webhook_auth.py` and `app/__init__.py`.
 - [ ] **No tracked secrets.** `git log -p` for the audited range shows
       no API tokens, passwords, JWTs, Fernet keys. `.env` is gitignored.
 - [ ] **No new debug logging.** No `console.log` in frontend production

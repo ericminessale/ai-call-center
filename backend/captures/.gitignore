@@ -1,0 +1,5 @@
+# Telemetry capture output (post-prompt + debug webhook events).
+# May contain call PII and signed credentials — never commit.
+# Keep the directory itself tracked so the capture path always exists.
+*
+!.gitignore

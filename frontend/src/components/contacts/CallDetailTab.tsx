@@ -233,12 +233,6 @@ export function CallDetailTab({
               { key: 'To', value: <span className="mono">{interaction.destination || '—'}</span> },
               { key: 'Status', value: <span className="capitalize">{interaction.status || '—'}</span> },
               { key: 'Handler', value: <span className="capitalize">{interaction.handlerType || '—'}</span> },
-              // Caller language is per-call metadata (detected by the AI), so it
-              // lives here in the call Details — not in the wrap-up.
-              ...(() => {
-                const lang = (interaction.aiContext as any)?.caller_language || (interaction.aiContext as any)?.caller_id_language;
-                return lang ? [{ key: 'Language', value: <span>{String(lang)}</span> }] : [];
-              })(),
             ]}
           />
 
@@ -246,7 +240,10 @@ export function CallDetailTab({
           {legs.length > 0 && (
             <div className="border border-rule rounded-lg bg-canvas-raised p-3">
               <div className="text-[12.5px] font-semibold text-ink mb-2">Call timeline</div>
-              <CallTimeline legs={legs} />
+              <CallTimeline
+                legs={legs}
+                callEnded={!!interaction.endedAt || ['completed', 'ended', 'failed', 'abandoned', 'no_answer', 'missed', 'canceled'].includes(interaction.status || '')}
+              />
             </div>
           )}
 

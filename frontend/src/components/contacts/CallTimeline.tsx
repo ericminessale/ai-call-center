@@ -6,9 +6,13 @@ export type { CallLeg };
 
 interface CallTimelineProps {
   legs: CallLeg[];
+  /** True when the parent call has ended — defensively renders any leg still
+   *  marked 'active'/'connecting' as Completed (legacy rows the backend didn't
+   *  fully close). The real fix is CallLeg.end_all_open() on the backend. */
+  callEnded?: boolean;
 }
 
-export function CallTimeline({ legs }: CallTimelineProps) {
+export function CallTimeline({ legs, callEnded }: CallTimelineProps) {
   if (!legs || legs.length === 0) {
     return null;
   }
@@ -83,18 +87,19 @@ export function CallTimeline({ legs }: CallTimelineProps) {
                   Leg {leg.legNumber}
                 </span>
 
-                {/* Status badge */}
-                <span
-                  className={`text-xs px-1.5 py-0.5 rounded ${
-                    leg.status === 'active'
-                      ? 'bg-green-500/20 text-green-400'
-                      : leg.status === 'connecting'
-                      ? 'bg-yellow-500/20 text-yellow-400'
-                      : 'bg-gray-600 text-gray-300'
-                  }`}
-                >
-                  {leg.status === 'active' ? 'Active' : leg.status === 'connecting' ? 'Connecting' : 'Completed'}
-                </span>
+                {/* Status badge — treat a leg as Completed when the call has
+                    ended or the leg has an end time, even if its stored status
+                    is still 'active'/'connecting' (legacy un-closed rows). */}
+                {(() => {
+                  const ended = callEnded || !!leg.endedAt || leg.status === 'completed';
+                  const cls = ended
+                    ? 'bg-gray-600 text-gray-300'
+                    : leg.status === 'connecting'
+                    ? 'bg-yellow-500/20 text-yellow-400'
+                    : 'bg-green-500/20 text-green-400';
+                  const label = ended ? 'Completed' : leg.status === 'connecting' ? 'Connecting' : 'Active';
+                  return <span className={`text-xs px-1.5 py-0.5 rounded ${cls}`}>{label}</span>;
+                })()}
               </div>
 
               {/* Time and duration */}

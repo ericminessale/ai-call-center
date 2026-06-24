@@ -1395,7 +1395,15 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
           <NotesTab contact={contact} onUpdate={onContactUpdate} />
         )}
         {activeTab === 'details' && (
-          <DetailsTab contact={contact} />
+          <DetailsTab
+            contact={contact}
+            callerLanguage={
+              (interactions[0]?.aiContext as any)?.caller_language ||
+              (interactions[0]?.aiContext as any)?.caller_id_language ||
+              (interactions[0] as any)?.caller_language ||
+              undefined
+            }
+          />
         )}
       </div>
 
@@ -1613,7 +1621,7 @@ function NotesTab({
   );
 }
 
-function DetailsTab({ contact }: { contact: Contact }) {
+function DetailsTab({ contact, callerLanguage }: { contact: Contact; callerLanguage?: string }) {
   return (
     <div className="p-5">
       <div className="kicker mb-3">Details</div>
@@ -1627,6 +1635,7 @@ function DetailsTab({ contact }: { contact: Contact }) {
         <DetailRow label="Job title"     value={contact.jobTitle} />
         <DetailRow label="Account tier"  value={contact.accountTier} />
         <DetailRow label="Status"        value={contact.accountStatus} />
+        <DetailRow label="Caller language" value={callerLanguage} />
         <DetailRow label="External ID"   value={contact.externalId} mono />
         <DetailRow label="VIP"           value={contact.isVip ? 'Yes' : 'No'} />
         <DetailRow label="Blocked"       value={contact.isBlocked ? 'Yes' : 'No'} />

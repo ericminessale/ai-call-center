@@ -94,6 +94,7 @@ export function WrapUpPanel({ interaction, onUpdate }: WrapUpPanelProps) {
           dispositionCode: res.data.call.disposition_code,
           agentNotes: res.data.call.agent_notes,
           wrappedUpAt: res.data.call.wrapped_up_at,
+          wrapUpSource: res.data.call.wrap_up_source,
         });
         window.setTimeout(() => {
           setSaveState((s) => (s === 'saved' ? 'idle' : s));
@@ -134,10 +135,12 @@ export function WrapUpPanel({ interaction, onUpdate }: WrapUpPanelProps) {
     }
   };
 
-  // AI-captured = there's a wrap-up default but no human has saved it yet
-  // (wrappedUpAt is only stamped on a human save) and nobody's edited it here.
-  const aiCaptured =
-    !humanTouched && !interaction.wrappedUpAt && (!!interaction.dispositionCode || !!interaction.agentNotes);
+  // AI-captured = the wrap-up still carries the AI's auto-filled values and no
+  // human has claimed it. wrapUpSource is stamped explicitly at the source —
+  // 'ai' by the post-prompt prefill, 'agent' the moment a human saves an edit —
+  // so this is a fact, not an inference. humanTouched flips it off instantly
+  // in-session, before the save round-trips.
+  const aiCaptured = !humanTouched && interaction.wrapUpSource === 'ai';
 
   if (!isEligible) return null;
 

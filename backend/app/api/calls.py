@@ -786,6 +786,11 @@ def end_call(call_id):
         call.ended_at = call.ended_at or datetime.utcnow()
         if call.answered_at and not call.duration:
             call.duration = int((call.ended_at - call.answered_at).total_seconds())
+        # Close any open legs here too — this API-driven end does NOT reliably
+        # trigger SignalWire's 'ended' webhook, so without this the legs (and the
+        # call timeline) stay 'active' on a completed call.
+        from app.models.call_leg import CallLeg
+        CallLeg.end_all_open(call.id, reason='hangup')
         db.session.commit()
         logger.info(f"Call status updated to 'completed' in database")
 
@@ -1466,6 +1471,9 @@ def update_wrap_up(call_id):
             call.wrapped_up_at = datetime.utcnow()
 
         if changed:
+            # A human edited the wrap-up — claim provenance so the
+            # "Captured by AI" badge turns off for good (not just this session).
+            call.wrap_up_source = 'agent'
             db.session.commit()
             logger.info(
                 "Wrap-up saved for call %s: disposition=%s notes_len=%s",
@@ -1485,6 +1493,7 @@ def update_wrap_up(call_id):
                 'disposition_code': call.disposition_code,
                 'agent_notes': call.agent_notes,
                 'wrapped_up_at': call.wrapped_up_at.isoformat() if call.wrapped_up_at else None,
+                'wrap_up_source': call.wrap_up_source,
             },
         }), 200
 

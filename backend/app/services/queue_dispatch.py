@@ -340,6 +340,19 @@ def enqueue_and_build_swml(
                         "lang": "en-US",
                         "live_events": True,
                         "ai_summary": True,
+                        # Steer the end-of-session summary toward a CRM wrap-up note.
+                        # Delivered on teardown as conversation_summary in the
+                        # calling.ai.transcribe.conversation_log event -> wrap-up notes
+                        # (handled in webhooks._apply_ai_wrapup_summary). This is the
+                        # conference/human leg, so it captures the human conversation.
+                        # Keep the prompt in sync with the AI-leg start in api/swml.py.
+                        "ai_summary_prompt": (
+                            "Write a concise call-center wrap-up note in plain prose "
+                            "(2-4 sentences, no headings or lists): why the caller reached "
+                            "out, what was discussed or done, the final outcome, and any "
+                            "follow-up needed. Write it for an agent reviewing this "
+                            "contact's account later."
+                        ),
                         "direction": ["remote-caller", "local-caller"],
                     }
                 }

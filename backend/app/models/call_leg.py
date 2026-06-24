@@ -80,6 +80,24 @@ class CallLeg(db.Model):
             self.transition_reason = reason
 
     @classmethod
+    def end_all_open(cls, call_id, reason='hangup'):
+        """End EVERY non-terminal leg (status active/connecting) for a call.
+
+        Call-end paths historically closed only ONE leg via get_active_leg()
+        (a .first()), so a call with more than one open leg — e.g. a conference
+        AI leg created alongside the customer leg — left the extras stuck
+        'active' forever, which the timeline then renders as 'Active' on a
+        completed call. Returns the number of legs closed.
+        """
+        open_legs = db.session.query(cls).filter(
+            cls.call_id == call_id,
+            cls.status.in_(['active', 'connecting'])
+        ).all()
+        for leg in open_legs:
+            leg.end_leg(reason=reason)
+        return len(open_legs)
+
+    @classmethod
     def get_active_leg(cls, call_id):
         """Get the currently active leg for a call."""
         return db.session.query(cls).filter_by(

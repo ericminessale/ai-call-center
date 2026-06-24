@@ -77,6 +77,10 @@ class Call(db.Model):
     disposition_code = db.Column(db.String(50), nullable=True)  # e.g. "resolved", "callback-scheduled"
     agent_notes = db.Column(db.Text, nullable=True)  # free-text wrap-up notes
     wrapped_up_at = db.Column(db.DateTime, nullable=True)  # timestamp the wrap-up was finalized
+    # Provenance of the current wrap-up values: 'ai' when auto-filled from the
+    # post-prompt report, 'agent' once a human edits/saves. Drives the
+    # "Captured by AI" badge explicitly, instead of inferring it from wrapped_up_at.
+    wrap_up_source = db.Column(db.String(10), nullable=True)
 
     # Technical ending classification — HOW the call ended, distinct from
     # disposition_code (the agent's BUSINESS outcome). Computed deterministically
@@ -206,6 +210,7 @@ class Call(db.Model):
             'dispositionCode': self.disposition_code,
             'agentNotes': self.agent_notes,
             'wrappedUpAt': self.wrapped_up_at.isoformat() if self.wrapped_up_at else None,
+            'wrapUpSource': self.wrap_up_source,
             # Technical ending classification (how it ended)
             'endReason': self.end_reason,
             'hangupDirection': self.hangup_direction,

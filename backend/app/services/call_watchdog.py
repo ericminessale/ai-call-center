@@ -116,13 +116,10 @@ def _reap_call(call) -> None:
             except Exception as e:
                 logger.warning(f"watchdog reap {call_sid}: agent release failed: {e}")
 
-    # Close active or connecting CallLeg rows.
+    # Close ALL active/connecting CallLeg rows (not just the first — multi-leg
+    # calls otherwise leave the extras stuck 'active').
     try:
-        active_leg = CallLeg.get_active_leg(call.id) or db.session.query(CallLeg).filter_by(
-            call_id=call.id, status='connecting'
-        ).first()
-        if active_leg:
-            active_leg.end_leg(reason='hangup')
+        CallLeg.end_all_open(call.id, reason='hangup')
     except Exception as e:
         logger.warning(f"watchdog reap {call_sid}: leg close failed: {e}")
 

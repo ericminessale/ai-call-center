@@ -343,19 +343,15 @@ def call_status():
                             queue_svc.set_agent_status(str(call.assigned_agent_id), 'available')
                             logger.info(f"Reverted agent {call.assigned_agent_id} to available (caller hung up before acceptance)")
 
-                # Close any active or connecting call legs
-                active_leg = CallLeg.get_active_leg(call.id)
-                if not active_leg:
-                    # Also check for legs stuck in 'connecting' (e.g., takeover legs
-                    # that were created but the agent hadn't fully connected yet)
-                    active_leg = db.session.query(CallLeg).filter_by(
-                        call_id=call.id,
-                        status='connecting'
-                    ).first()
-                if active_leg:
-                    active_leg.end_leg(reason='hangup')
+                # Close ALL active/connecting call legs — a call can have more
+                # than one open leg (e.g. a conference AI leg alongside the
+                # customer leg), and closing only the first left the rest stuck
+                # 'active' forever, which the timeline rendered as 'Active' on a
+                # finished call.
+                closed_count = CallLeg.end_all_open(call.id, reason='hangup')
+                if closed_count:
                     db.session.commit()
-                    logger.info(f"Closed leg {active_leg.id} (was {active_leg.status}) for call {call.id}")
+                    logger.info(f"Closed {closed_count} open leg(s) for call {call.id}")
 
                 # Mark the conference row as ended too. Same negligence pattern
                 # as Bug B: prior code left Conference rows in 'active' forever
@@ -458,6 +454,73 @@ def call_heartbeat():
     except Exception as e:
         logger.error(f"call_heartbeat error: {e}")
         return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+def _extract_conversation_summary(data):
+    """Pull the end-of-session AI summary text from a live_transcribe
+    conversation_log event (start param ai_summary:true). Returns None when this
+    isn't a summary event. Defensive across payload nesting since the exact
+    envelope for conversation_summary is platform-controlled."""
+    if not isinstance(data, dict):
+        return None
+
+    def _coerce(v):
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, dict):
+            t = v.get('text') or v.get('content') or v.get('summary')
+            return t.strip() if isinstance(t, str) and t.strip() else None
+        return None
+
+    containers = [data, data.get('params'), data.get('channel_data')]
+    if isinstance(data.get('conversation_log'), dict):
+        containers.append(data['conversation_log'])
+    for container in containers:
+        if isinstance(container, dict):
+            for key in ('conversation_summary', 'ai_summary'):
+                got = _coerce(container.get(key))
+                if got:
+                    return got
+    return None
+
+
+def _apply_ai_wrapup_summary(data, summary_text):
+    """Write the native end-of-session live_transcribe summary into the call's
+    wrap-up NOTES with AI provenance — unless a human has already taken over the
+    wrap-up. This is what finally captures the HUMAN-leg conversation; the AI
+    post-prompt only ever saw the pre-handoff AI portion."""
+    call_info = data.get('call_info') if isinstance(data.get('call_info'), dict) else {}
+    call_id = (call_info or {}).get('call_id') or data.get('call_id')
+    if not call_id and isinstance(data.get('channel_data'), dict):
+        call_id = data['channel_data'].get('call_id')
+
+    call = Call.find_by_sid(call_id) if call_id else None
+    WebhookEvent.log_event(
+        event_type="transcription_summary",
+        payload=data,
+        call_id=call.id if call else None,
+    )
+    if not call:
+        logger.warning(f"[transcription] conversation_summary for unknown call {call_id}")
+        return
+
+    # Never clobber a human who has already edited/saved the wrap-up.
+    if call.wrap_up_source == 'agent':
+        logger.info(f"conversation_summary: call {call.id} wrap-up is human-owned; skipping")
+        return
+
+    call.agent_notes = summary_text
+    call.wrap_up_source = 'ai'
+    db.session.commit()
+    logger.info(
+        f"conversation_summary -> wrap-up notes for call {call.id} ({len(summary_text)} chars)"
+    )
+
+    try:
+        from app.services.callcenter_socketio import emit_call_update
+        emit_call_update(call)
+    except Exception as e:
+        logger.warning(f"conversation_summary emit failed: {e}")
 
 
 def _process_utterance_event(data, *, source: str) -> tuple:
@@ -609,6 +672,14 @@ def transcription():
         logger.info("WEBHOOK: /api/webhooks/transcription")
         logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
         logger.info("="*50)
+
+        # End-of-session AI summary (live_transcribe ai_summary:true) arrives here
+        # as a calling.ai.transcribe.conversation_log event carrying
+        # conversation_summary — NOT an utterance. Route it to the wrap-up.
+        summary_text = _extract_conversation_summary(data)
+        if summary_text:
+            _apply_ai_wrapup_summary(data, summary_text)
+            return jsonify({'status': 'ok', 'handled': 'conversation_summary'}), 200
 
         _process_utterance_event(data, source='transcription')
         return jsonify({'status': 'ok'}), 200
@@ -1223,7 +1294,10 @@ def post_prompt():
             existing_context = json.loads(call.ai_context) if call.ai_context else {}
             merged_context = {**existing_context, **global_data}
 
-            # Add parsed summary if available
+            # Add parsed summary if available. ai_assessment is initialized
+            # OUTSIDE the block so the unconditional `if ai_assessment:` outcome
+            # check further down can never raise NameError on an empty parsed array.
+            ai_assessment = {}
             if parsed_summary and len(parsed_summary) > 0:
                 merged_context['parsed_summary'] = parsed_summary[0]
 
@@ -1232,6 +1306,7 @@ def post_prompt():
                 # agents can still edit. We only set when empty so a manual
                 # value (or an earlier AI pass) is never clobbered.
                 ai_assessment = parsed_summary[0] if isinstance(parsed_summary[0], dict) else {}
+                ai_filled_wrapup = False
                 raw_disp = (ai_assessment.get('disposition') or '').strip()
                 if raw_disp and not call.disposition_code:
                     # Validate against the canonical list — defensive; the LLM
@@ -1239,6 +1314,7 @@ def post_prompt():
                     from app.api.calls import DISPOSITION_CODE_SET
                     if raw_disp in DISPOSITION_CODE_SET:
                         call.disposition_code = raw_disp
+                        ai_filled_wrapup = True
                         logger.info(
                             f"post_prompt: AI disposition auto-set call {call.id} -> {raw_disp!r}"
                         )
@@ -1250,10 +1326,16 @@ def post_prompt():
                 post_mortem = (ai_assessment.get('post_mortem') or '').strip()
                 if post_mortem and not call.agent_notes:
                     call.agent_notes = post_mortem
+                    ai_filled_wrapup = True
                     logger.info(
                         f"post_prompt: AI post_mortem auto-filled into agent_notes "
                         f"for call {call.id} ({len(post_mortem)} chars)"
                     )
+                # Explicit provenance for the "Captured by AI" badge — stamped
+                # only when we actually auto-filled this pass and a human hasn't
+                # already claimed the wrap-up.
+                if ai_filled_wrapup and not call.wrap_up_source:
+                    call.wrap_up_source = 'ai'
 
             call.ai_context = json.dumps(merged_context)
 

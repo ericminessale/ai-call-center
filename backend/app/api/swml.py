@@ -250,6 +250,17 @@ def initial_call():
                         "lang": "en-US",
                         "live_events": True,
                         "ai_summary": True,
+                        # Steer the end-of-session summary toward a CRM wrap-up note
+                        # (keep in sync with the conference-leg start in
+                        # services/queue_dispatch.py). For AI-only calls this leg's
+                        # summary IS the whole call.
+                        "ai_summary_prompt": (
+                            "Write a concise call-center wrap-up note in plain prose "
+                            "(2-4 sentences, no headings or lists): why the caller reached "
+                            "out, what was discussed or done, the final outcome, and any "
+                            "follow-up needed. Write it for an agent reviewing this "
+                            "contact's account later."
+                        ),
                         "direction": ["remote-caller", "local-caller"],
                         # VAD endpointing: ms of silence before an utterance is
                         # finalized. SignalWire default is 300ms, which splits

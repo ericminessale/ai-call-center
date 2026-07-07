@@ -46,6 +46,12 @@ export function AudioMonitor({ callId, onClose }: AudioMonitorProps) {
   const audioContextRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
   const nextPlayTimeRef = useRef(0);
+  // The tap relay tags every frame with the SignalWire call_id (SID), but this
+  // component may be handed either the DB id or the SID as `callId`. Capture the
+  // authoritative SID from the tap_joined ack so the frame filter matches —
+  // the bug was a DB-id prop compared against SID-tagged frames, so every frame
+  // was silently dropped one line into the handler.
+  const tapIdRef = useRef<string | null>(callId);
 
   // Initialize Web Audio API
   const initAudio = useCallback(() => {
@@ -66,7 +72,7 @@ export function AudioMonitor({ callId, onClose }: AudioMonitorProps) {
     if (!socket || !isPlaying) return;
 
     const handleTapAudio = (data: { call_id: string; audio: string; codec: string; sample_rate: number }) => {
-      if (data.call_id !== callId) return;
+      if (data.call_id !== callId && data.call_id !== tapIdRef.current) return;
 
       // Lazy-init audio context (must be triggered by user interaction, which the "Listen" button provides)
       if (!audioContextRef.current) {
@@ -111,7 +117,7 @@ export function AudioMonitor({ callId, onClose }: AudioMonitorProps) {
     };
 
     const handleTapStatus = (data: { call_id: string; status: string }) => {
-      if (data.call_id !== callId) return;
+      if (data.call_id !== callId && data.call_id !== tapIdRef.current) return;
       setIsConnected(data.status === 'connected');
     };
 
@@ -138,8 +144,19 @@ export function AudioMonitor({ callId, onClose }: AudioMonitorProps) {
   // every mute toggle, potentially interrupting the audio stream.
   useEffect(() => {
     if (!socket) return;
+    // Reset the authoritative tap id to the prop, then let tap_joined upgrade it
+    // to the real SID the relay tags frames with.
+    tapIdRef.current = callId;
     const token = localStorage.getItem('access_token');
     socket.emit('join_tap', { token, call_id: callId });
+
+    // Server replies tap_joined { call_id: signalwire_call_sid, db_call_id }.
+    // Capture the SID so the frame/status guards accept the relay's frames
+    // regardless of whether this component was handed the DB id or the SID.
+    const handleTapJoined = (d: { call_id?: string }) => {
+      if (d?.call_id) tapIdRef.current = d.call_id;
+    };
+    socket.on('tap_joined', handleTapJoined);
 
     const handleTapError = (err: { message?: string }) => {
       logger.error('[AudioMonitor] join_tap rejected:', err?.message || err);
@@ -147,6 +164,7 @@ export function AudioMonitor({ callId, onClose }: AudioMonitorProps) {
     socket.on('tap_error', handleTapError);
 
     return () => {
+      socket.off('tap_joined', handleTapJoined);
       socket.off('tap_error', handleTapError);
       socket.emit('leave_tap', { call_id: callId });
     };

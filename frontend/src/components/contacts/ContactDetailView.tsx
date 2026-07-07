@@ -292,6 +292,17 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   const isOutboundCallInProgress = panel.showRinging;
   const isAgentOnCall = panel.isAgentOnCall || (isAICall && !!currentCallSid);
 
+  // The active-call CONTROL SURFACE (header action buttons + the secondary
+  // controls row: End / Mute / Take over, CallControlPanel, Listen, conference
+  // participants) must render for ANY live call on this contact — human-active
+  // (SDK leg), AI-monitored (the AI is handling the contact's call while the
+  // agent watches), or when the agent is in the conference. Gating these on
+  // isAgentOnCall alone (true only for SDK human_active/outbound) made the
+  // WHOLE surface vanish on AI-monitored calls — the agent saw only the idle
+  // "Call / Send AI" buttons. Individual buttons still self-gate on
+  // showAIControls / showHumanControls for the human-vs-AI distinction.
+  const hasLiveCallSurface = isAgentOnCall || showAIControls || isInConference;
+
   // Broader "is there any call activity tied to this contact" — kept for the
   // existing places that want to hide the AI-form / call-history selector
   // when a queued call exists for the contact.
@@ -923,7 +934,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
 
           {/* rs-actions — inline, right-aligned */}
           <div className="ml-auto flex items-center gap-2">
-            {isAgentOnCall ? (
+            {hasLiveCallSurface ? (
               <>
                 {/* Live duration + cost pill (green=connected, amber=ringing, ✦=AI) */}
                 <PillBadge
@@ -959,7 +970,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
                 )}
                 {showAIControls && (
                   <Button
-                    variant="primary"
+                    variant="secondary"
                     onClick={handleTakeOver}
                     disabled={isInitializing}
                     icon={<Phone className="w-3.5 h-3.5" />}
@@ -1039,7 +1050,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         {/* Active-call secondary controls — feature-rich panel + observer
             (Listen) + conference participant list. Wiring kept verbatim; only
             the surrounding container is restyled into a secondary row. */}
-        {isAgentOnCall && (
+        {hasLiveCallSurface && (
           <>
             <div className="flex items-center gap-2 mt-3 flex-wrap">
               <CallControlPanel
@@ -1358,7 +1369,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
       </div>
 
       {/* Tab Content */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 min-h-0 overflow-y-auto">
         {activeTab === 'live' && hasAnyActiveCall && (
           <LiveCallTab
             transcription={transcription}

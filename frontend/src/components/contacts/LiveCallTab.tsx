@@ -380,7 +380,7 @@ export function LiveCallTab({
   const status = getStatusDisplay();
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="flex flex-col min-h-full">
       {/* AI Context Panel */}
       {hasContext(aiContext) && (
         <div className="px-5 pt-4">
@@ -396,7 +396,7 @@ export function LiveCallTab({
       )}
 
       {/* Live Transcription */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex flex-col">
         <div className="flex items-center justify-between px-5 h-11 border-b border-rule bg-canvas sticky top-0 z-10">
           <div>
             <div className="text-[11px] font-medium text-ink-dim mb-0.5">
@@ -411,7 +411,7 @@ export function LiveCallTab({
             <Chip dot={status.dot}>{status.text}</Chip>
           </div>
         </div>
-        <div className="flex-1 px-5 pt-4 pb-5 overflow-y-auto">
+        <div className="px-5 pt-4 pb-5">
           <div
             ref={transcriptionContainerRef}
             className="relative bg-canvas-sunken border border-rule rounded-md min-h-[320px] max-h-[440px] overflow-y-auto p-5"

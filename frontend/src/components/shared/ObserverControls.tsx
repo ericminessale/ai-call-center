@@ -85,7 +85,7 @@ export function ObserverControls({
     'inline-flex items-center gap-1.5 rounded-md font-medium transition-colors disabled:opacity-50';
   const size = compact ? 'px-2 py-1 text-[11px]' : 'px-3 py-1.5 text-xs';
   const state = listening
-    ? 'bg-ai/20 text-ai-soft border border-ai/40 hover:bg-ai/25'
+    ? 'bg-canvas-hover text-ink border border-rule-strong'
     : 'bg-canvas-raised text-ink-muted border border-rule hover:text-ink hover:border-rule-strong';
 
   return (

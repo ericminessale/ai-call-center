@@ -3,7 +3,6 @@ import { Search, Phone } from 'lucide-react';
 import { Call, QueueConfig } from '../../types/callcenter';
 import { CallListSkeletonGroup } from '../shared/Skeleton';
 import { getQueueDisplayName } from '../../lib/queueColors';
-import ObserverControls from '../shared/ObserverControls';
 import { SegmentedControl, RailLiveCallRow } from '../restraint';
 import type { RestraintStatus } from '../restraint';
 
@@ -196,14 +195,28 @@ function ActiveCallRow({
   const queueSlug = call.queue_id || '';
   const isNegativeSentiment = call.sentiment !== undefined && call.sentiment < -0.3;
 
-  // Live-ticking duration between socket updates (preserved from the old card).
-  const [liveDuration, setLiveDuration] = useState(call.duration || 0);
+  // True elapsed time since the call started — derived from the call's start
+  // timestamp, NOT a mount-seeded counter. The old code reset to call.duration
+  // (null while a call is live) and counted up from 0 on every component mount,
+  // so the timer restarted at 0:00 every time the Active Calls tab was opened.
+  // Prefer answeredAt (when audio began) → createdAt → startTime; REST ships
+  // camelCase, the Call type declares snake_case, so read both.
+  const startMs = (() => {
+    const raw = (call as any).answeredAt || (call as any).answered_at
+      || call.created_at || (call as any).createdAt || (call as any).startTime;
+    const t = raw ? new Date(raw).getTime() : NaN;
+    return Number.isFinite(t) ? t : null;
+  })();
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (isConnecting) return;
-    setLiveDuration(call.duration || 0);
-    const interval = setInterval(() => setLiveDuration((prev) => prev + 1), 1000);
+    setNow(Date.now());
+    const interval = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(interval);
-  }, [call.id, call.duration, isConnecting]);
+  }, [isConnecting]);
+  const liveDuration = startMs != null
+    ? Math.max(0, Math.floor((now - startMs) / 1000))
+    : (call.duration || 0);
 
   const formatDuration = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
@@ -226,8 +239,6 @@ function ActiveCallRow({
   const handler = isAI
     ? { label: call.ai_agent_name || 'AI agent', ai: true }
     : { label: isConnecting ? 'Connecting' : 'Live' };
-  // Hide Listen for bridge-mode calls (no conference for the observer to join).
-  const canListen = !Array.isArray(call.capabilities) || call.capabilities.includes('monitor_listen');
 
   return (
     <RailLiveCallRow
@@ -240,13 +251,6 @@ function ActiveCallRow({
       attention={isNegativeSentiment}
       selected={selected}
       onClick={() => onSelectCall(call)}
-      trailing={
-        canListen ? (
-          <span onClick={(e) => e.stopPropagation()}>
-            <ObserverControls callId={call.id} callType={isAI ? 'ai' : 'human'} compact />
-          </span>
-        ) : undefined
-      }
     />
   );
 }

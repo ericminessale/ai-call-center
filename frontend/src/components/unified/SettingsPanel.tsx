@@ -858,12 +858,22 @@ function PhoneNumberConfigureModal({
 
   const canSave = !saving && (mode === 'ai_triage' || !!queueSlug);
 
+  // Routing options are selectable cards: a real surface (so the borders read
+  // as distinct rows, not flat lines on the modal) + a fuchsia-marked selected
+  // state. Fuchsia is the active-marker pop; turquoise stays AI-only.
+  const optionClass = (selected: boolean) =>
+    `flex items-start gap-3 p-3 rounded-md border cursor-pointer transition-colors ${
+      selected
+        ? 'border-sw-fuchsia bg-canvas'
+        : 'border-rule bg-canvas hover:border-rule-strong hover:bg-canvas-hover'
+    }`;
+
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onCancel} />
 
       <div className="relative panel-raised rounded-md shadow-panel w-full max-w-[480px] flex flex-col">
-        <div className="px-6 pt-5 pb-4 border-b border-rule">
+        <div className="px-6 pt-5 pb-4 border-b border-rule-strong">
           <div className="kicker mb-1">Phone number routing</div>
           <h3 className="font-display text-[22px] text-ink leading-none">
             {formatPhoneNumber(phoneNumber.phone_number)}
@@ -877,12 +887,12 @@ function PhoneNumberConfigureModal({
           <section>
             <div className="kicker mb-2">Route incoming calls to</div>
             <div className="space-y-2">
-              <label className="flex items-start gap-3 p-3 rounded border border-rule hover:bg-canvas-hover/40 cursor-pointer">
+              <label className={optionClass(mode === 'ai_triage')}>
                 <input
                   type="radio"
                   checked={mode === 'ai_triage'}
                   onChange={() => handleModeChange('ai_triage')}
-                  className="mt-0.5 accent-sw-turquoise"
+                  className="mt-0.5 accent-sw-fuchsia"
                 />
                 <div>
                   <div className="text-[13px] text-ink">AI receptionist (default)</div>
@@ -891,12 +901,12 @@ function PhoneNumberConfigureModal({
                   </div>
                 </div>
               </label>
-              <label className="flex items-start gap-3 p-3 rounded border border-rule hover:bg-canvas-hover/40 cursor-pointer">
+              <label className={optionClass(mode === 'ai_specialist')}>
                 <input
                   type="radio"
                   checked={mode === 'ai_specialist'}
                   onChange={() => handleModeChange('ai_specialist')}
-                  className="mt-0.5 accent-sw-turquoise"
+                  className="mt-0.5 accent-sw-fuchsia"
                 />
                 <div>
                   <div className="text-[13px] text-ink">AI specialist for a queue</div>
@@ -905,12 +915,12 @@ function PhoneNumberConfigureModal({
                   </div>
                 </div>
               </label>
-              <label className="flex items-start gap-3 p-3 rounded border border-rule hover:bg-canvas-hover/40 cursor-pointer">
+              <label className={optionClass(mode === 'human_direct')}>
                 <input
                   type="radio"
                   checked={mode === 'human_direct'}
                   onChange={() => handleModeChange('human_direct')}
-                  className="mt-0.5 accent-sw-turquoise"
+                  className="mt-0.5 accent-sw-fuchsia"
                 />
                 <div>
                   <div className="text-[13px] text-ink">Human direct to a queue</div>

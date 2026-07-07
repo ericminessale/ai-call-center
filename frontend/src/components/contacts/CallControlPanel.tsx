@@ -388,10 +388,10 @@ export default function CallControlPanel({
               <button
                 onClick={handleRecord}
                 disabled={isLoading === 'record'}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
                   isRecording
-                    ? 'bg-red-600 hover:bg-red-700 text-white'
-                    : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                    ? 'bg-canvas-hover text-ink border-rule-strong'
+                    : 'bg-canvas-raised hover:bg-canvas-hover text-ink-muted hover:text-ink border-rule-strong'
                 } disabled:opacity-50`}
                 title={
                   isRecording
@@ -420,10 +420,10 @@ export default function CallControlPanel({
             {showTts && (
               <button
                 onClick={() => { setShowTtsInput(!showTtsInput); setShowDtmfPad(false); }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
                   showTtsInput
-                    ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                    : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                    ? 'bg-canvas-hover text-ink border-rule-strong'
+                    : 'bg-canvas-raised hover:bg-canvas-hover text-ink-muted hover:text-ink border-rule-strong'
                 }`}
                 title="Speak a synthesized message into the call. Useful for canned greetings or reading back data hands-free."
               >
@@ -438,10 +438,10 @@ export default function CallControlPanel({
             {showDtmf && (
               <button
                 onClick={() => { setShowDtmfPad(!showDtmfPad); setShowTtsInput(false); }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
                   showDtmfPad
-                    ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                    : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                    ? 'bg-canvas-hover text-ink border-rule-strong'
+                    : 'bg-canvas-raised hover:bg-canvas-hover text-ink-muted hover:text-ink border-rule-strong'
                 }`}
                 title="Send touch-tone digits into the call. Use when the caller has been transferred to an external IVR (e.g. a bank) and needs navigation."
               >
@@ -455,15 +455,14 @@ export default function CallControlPanel({
               <button
                 onClick={handleToggleTranslate}
                 disabled={isLoading === 'translate'}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
-                  translateActive
-                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white ring-1 ring-emerald-400'
-                    : showTranslatePicker
-                      ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                      : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors disabled:opacity-50 ${
+                  translateActive || showTranslatePicker
+                    ? 'bg-canvas-hover text-ink border-rule-strong'
+                    : 'bg-canvas-raised hover:bg-canvas-hover text-ink-muted hover:text-ink border-rule-strong'
                 }`}
                 title={translateActive ? `Translating ${translateFromLang} ↔ ${translateToLang}` : 'Start live translation'}
               >
+                {translateActive && <span className="w-1.5 h-1.5 rounded-full bg-status-success flex-shrink-0" />}
                 <Languages className="w-3.5 h-3.5" />
                 {isLoading === 'translate'
                   ? '...'
@@ -474,7 +473,7 @@ export default function CallControlPanel({
             )}
 
             {/* Separator */}
-            <div className="w-px h-6 bg-gray-600 mx-1" />
+            <div className="w-px h-6 bg-rule-strong mx-1" />
 
             {/* Listen/Whisper/Barge intentionally omitted — those are observer
                 actions for calls you are NOT on. See ObserverControls. */}
@@ -485,7 +484,7 @@ export default function CallControlPanel({
               <button
                 onClick={handleRequestBackup}
                 disabled={isLoading === 'backup'}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-700 hover:bg-amber-600 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-canvas-raised hover:bg-canvas-hover text-ink-muted hover:text-ink border border-rule-strong rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
               >
                 <Users className="w-3.5 h-3.5" />
                 {isLoading === 'backup' ? '...' : 'Backup'}
@@ -497,7 +496,7 @@ export default function CallControlPanel({
               <button
                 onClick={handleEscalate}
                 disabled={isLoading === 'escalate'}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-orange-700 hover:bg-orange-600 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-canvas-raised hover:bg-canvas-hover text-ink-muted hover:text-ink border border-rule-strong rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
               >
                 <ShieldAlert className="w-3.5 h-3.5" />
                 {isLoading === 'escalate' ? '...' : 'Escalate'}
@@ -515,7 +514,7 @@ export default function CallControlPanel({
               <button
                 onClick={() => setShowReturnSheet(s => !s)}
                 disabled={isLoading === 'return'}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-800 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-canvas-raised hover:bg-canvas-hover text-ink-muted hover:text-ink border border-rule-strong rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
                 title="Send this caller back to the queue for another agent"
               >
                 <Users className="w-3.5 h-3.5" />
@@ -575,7 +574,7 @@ export default function CallControlPanel({
                 <button
                   onClick={submitReturn}
                   disabled={isLoading === 'return'}
-                  className="px-3 py-1 bg-blue-700 hover:bg-blue-600 text-white rounded text-[12px] disabled:opacity-50"
+                  className="px-3 py-1 bg-sw-fuchsia hover:bg-sw-fuchsia/90 text-white rounded text-[12px] disabled:opacity-50"
                 >
                   {isLoading === 'return' ? 'Returning…' : 'Return to queue'}
                 </button>
@@ -598,7 +597,7 @@ export default function CallControlPanel({
               <button
                 onClick={handlePlayTts}
                 disabled={!ttsText.trim() || isLoading === 'tts'}
-                className="flex items-center gap-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium transition-colors disabled:opacity-50"
+                className="flex items-center gap-1 px-3 py-1.5 bg-sw-fuchsia hover:bg-sw-fuchsia/90 text-white rounded text-sm font-medium transition-colors disabled:opacity-50"
               >
                 <Send className="w-3.5 h-3.5" />
                 {isLoading === 'tts' ? '...' : 'Speak'}
@@ -647,7 +646,7 @@ export default function CallControlPanel({
                 <button
                   onClick={handleStartTranslate}
                   disabled={isLoading === 'translate' || translateFromLang === translateToLang}
-                  className="flex-1 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  className="flex-1 px-3 py-1.5 bg-sw-fuchsia hover:bg-sw-fuchsia/90 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                 >
                   {isLoading === 'translate'
                     ? (translateActive ? 'Updating...' : 'Starting...')
@@ -665,14 +664,15 @@ export default function CallControlPanel({
 
           {/* Active translation status with change-language button */}
           {translateActive && (
-            <div className="flex items-center justify-between p-2 bg-emerald-900/30 border border-emerald-700/50 rounded text-xs">
-              <span className="flex items-center gap-2 text-emerald-300">
+            <div className="flex items-center justify-between p-2 bg-canvas-raised border border-rule rounded text-xs">
+              <span className="flex items-center gap-2 text-ink-muted">
+                <span className="w-1.5 h-1.5 rounded-full bg-status-success flex-shrink-0" />
                 <Languages className="w-3.5 h-3.5" />
                 Translating <span className="mono">{translateFromLang}</span> ↔ <span className="mono">{translateToLang}</span>
               </span>
               <button
                 onClick={() => setShowTranslatePicker(true)}
-                className="text-emerald-400 hover:text-emerald-200 underline"
+                className="text-ink-dim hover:text-ink underline"
               >
                 Change languages
               </button>

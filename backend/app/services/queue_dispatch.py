@@ -347,11 +347,14 @@ def enqueue_and_build_swml(
                         # conference/human leg, so it captures the human conversation.
                         # Keep the prompt in sync with the AI-leg start in api/swml.py.
                         "ai_summary_prompt": (
-                            "Write a concise call-center wrap-up note in plain prose "
-                            "(2-4 sentences, no headings or lists): why the caller reached "
-                            "out, what was discussed or done, the final outcome, and any "
-                            "follow-up needed. Write it for an agent reviewing this "
-                            "contact's account later."
+                            "Summarize this call for an agent's CRM wrap-up in 2-4 "
+                            "sentences of plain prose (no headings or lists). Cover ONLY "
+                            "what actually happened: why the caller reached out, what was "
+                            "discussed or done, and how the call ended. Do NOT invent or "
+                            "assume outcomes, next steps, follow-ups, or appointments that "
+                            "were not explicitly stated in the conversation. If the call "
+                            "was brief, unresolved, or the caller was unclear, say so "
+                            "plainly rather than inferring a resolution."
                         ),
                         "direction": ["remote-caller", "local-caller"],
                     }

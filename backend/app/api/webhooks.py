@@ -485,16 +485,20 @@ def _extract_conversation_summary(data):
 
 
 def _apply_ai_wrapup_summary(data, summary_text):
-    """Write the native end-of-session live_transcribe summary into the call's
-    wrap-up NOTES with AI provenance — unless a human has already taken over the
-    wrap-up. This is what finally captures the HUMAN-leg conversation; the AI
-    post-prompt only ever saw the pre-handoff AI portion."""
+    """Fold the native end-of-session live_transcribe summary into the call's
+    wrap-up NOTES with AI provenance — unless a human has already taken over.
+
+    This fires for the CONFERENCE/human leg (the AI leg has no ai_summary; its
+    triage is captured by the AI post-prompt, which seeds agent_notes first). We
+    APPEND the human-leg summary onto that AI-triage base so the wrap-up covers
+    the WHOLE call, and only act on the FINAL end-of-call summary (call_end_date
+    set) so mid-call interim fragments never overwrite the final note."""
+    channel_data = data.get('channel_data') if isinstance(data.get('channel_data'), dict) else {}
     call_info = data.get('call_info') if isinstance(data.get('call_info'), dict) else {}
-    call_id = (call_info or {}).get('call_id') or data.get('call_id')
-    if not call_id and isinstance(data.get('channel_data'), dict):
-        call_id = data['channel_data'].get('call_id')
+    call_id = (call_info or {}).get('call_id') or data.get('call_id') or (channel_data or {}).get('call_id')
 
     call = Call.find_by_sid(call_id) if call_id else None
+    # Log every conversation_log event (interim + final) for debuggability.
     WebhookEvent.log_event(
         event_type="transcription_summary",
         payload=data,
@@ -504,16 +508,36 @@ def _apply_ai_wrapup_summary(data, summary_text):
         logger.warning(f"[transcription] conversation_summary for unknown call {call_id}")
         return
 
+    # Only the END-of-call summary is the wrap-up. SignalWire also emits interim
+    # conversation_log events mid-call with call_end_date=0 — skip those so a
+    # partial summary never overwrites the final whole-call note.
+    call_end_date = (channel_data or {}).get('call_end_date')
+    if call_end_date is not None and not call_end_date:
+        logger.info(f"conversation_summary: interim event (call_end_date=0) for call {call.id}; not writing")
+        return
+
     # Never clobber a human who has already edited/saved the wrap-up.
     if call.wrap_up_source == 'agent':
         logger.info(f"conversation_summary: call {call.id} wrap-up is human-owned; skipping")
         return
 
-    call.agent_notes = summary_text
+    existing = (call.agent_notes or '').strip()
+    if summary_text in existing:
+        # Duplicate final event — already folded in. Idempotent no-op.
+        return
+    if existing:
+        # The AI post-prompt already wrote the AI-triage note; append the
+        # human-leg summary so the wrap-up reflects the whole call, not just
+        # the post-handoff portion.
+        call.agent_notes = f"{existing}\n\nAfter handoff to a human agent: {summary_text}"
+    else:
+        # AI-only call, or no post-prompt note — the human-leg summary stands alone.
+        call.agent_notes = summary_text
     call.wrap_up_source = 'ai'
     db.session.commit()
     logger.info(
-        f"conversation_summary -> wrap-up notes for call {call.id} ({len(summary_text)} chars)"
+        f"conversation_summary -> wrap-up notes for call {call.id} "
+        f"(combined={bool(existing)}, {len(summary_text)} chars)"
     )
 
     try:

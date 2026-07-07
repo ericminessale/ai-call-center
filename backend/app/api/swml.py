@@ -249,18 +249,15 @@ def initial_call():
                         "webhook": signed_webhook_url(f"{base_url}/api/webhooks/transcription"),
                         "lang": "en-US",
                         "live_events": True,
-                        "ai_summary": True,
-                        # Steer the end-of-session summary toward a CRM wrap-up note
-                        # (keep in sync with the conference-leg start in
-                        # services/queue_dispatch.py). For AI-only calls this leg's
-                        # summary IS the whole call.
-                        "ai_summary_prompt": (
-                            "Write a concise call-center wrap-up note in plain prose "
-                            "(2-4 sentences, no headings or lists): why the caller reached "
-                            "out, what was discussed or done, the final outcome, and any "
-                            "follow-up needed. Write it for an agent reviewing this "
-                            "contact's account later."
-                        ),
+                        # NO ai_summary on the AI leg. The AI post-prompt
+                        # (agent.summary -> /api/webhooks/post-prompt) already
+                        # summarizes the AI triage and seeds the wrap-up note; the
+                        # END-of-call summary comes from the conference/human leg's
+                        # live_transcribe (queue_dispatch.py) and is APPENDED to it.
+                        # Enabling ai_summary here too produced a duplicate AI-leg
+                        # fragment that overwrote the whole-call note (last-write-wins).
+                        # For AI-only calls (no human transfer) the post-prompt IS
+                        # the whole-call summary.
                         "direction": ["remote-caller", "local-caller"],
                         # VAD endpointing: ms of silence before an utterance is
                         # finalized. SignalWire default is 300ms, which splits

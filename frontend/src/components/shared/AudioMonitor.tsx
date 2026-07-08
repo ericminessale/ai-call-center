@@ -153,8 +153,17 @@ export function AudioMonitor({ callId, onClose }: AudioMonitorProps) {
     // Server replies tap_joined { call_id: signalwire_call_sid, db_call_id }.
     // Capture the SID so the frame/status guards accept the relay's frames
     // regardless of whether this component was handed the DB id or the SID.
-    const handleTapJoined = (d: { call_id?: string }) => {
-      if (d?.call_id) tapIdRef.current = d.call_id;
+    //
+    // CODE-3 (2026-07-07 pre-deploy): adopt the SID ONLY when the ack is for
+    // THIS monitor's call. The ack is broadcast to the joining socket, and
+    // with two Listen panels open on one socket both used to adopt whichever
+    // ack landed last — collapsing both onto one SID (one call's audio
+    // doubled, the other silently dropped). Match on either identifier since
+    // `callId` may be the DB id or the SID.
+    const handleTapJoined = (d: { call_id?: string; db_call_id?: string | number }) => {
+      const isForThisCall =
+        d?.call_id === callId || String(d?.db_call_id ?? '') === String(callId);
+      if (isForThisCall && d.call_id) tapIdRef.current = d.call_id;
     };
     socket.on('tap_joined', handleTapJoined);
 

@@ -1,7 +1,9 @@
 from flask_socketio import emit, join_room, leave_room
 from flask import request
 from app import socketio
+from app.models import Call, User
 from app.utils.jwt_utils import verify_token
+from app.utils.demo_config import is_demo_mode, call_is_persona_owned, demo_persona_self_scoped
 from app.services.redis_service import add_to_set, remove_from_set
 import logging
 
@@ -161,7 +163,18 @@ def handle_authenticate(data):
 
 @socketio.on('join_call')
 def handle_join_call(data):
-    """Join a call room to receive real-time updates."""
+    """Join a call room to receive real-time updates.
+
+    ISO-3 (2026-07-07 pre-deploy): the call room carries the live
+    transcript, AI context, KB facts and coaching for the call. This
+    handler used to verify the token then join the room with NO check
+    that the user was actually on the call — so on the shared demo any
+    leased persona could join another visitor's room (given an
+    ai_active call_sid, enumerable via list_calls) and passively receive
+    their conversation. Now we resolve the call and require the requester
+    to own it (initiated / assigned) OR hold a listen permission
+    (supervisor/admin), mirroring join_tap's authorization.
+    """
     call_sid = data.get('call_sid')
     token = data.get('token')
 
@@ -175,16 +188,64 @@ def handle_join_call(data):
         emit('error', {'message': 'Invalid or expired token'})
         return
 
-    # Join the call room
-    join_room(call_sid)
-    add_to_set(f"call:{call_sid}:listeners", request.sid)
+    user = User.find_by_id(user_id)
+    if not user:
+        emit('error', {'message': 'Invalid or expired token'})
+        return
+
+    # Resolve the call (accept DB id or SignalWire call_id) and authorize.
+    call = None
+    if str(call_sid).isdigit():
+        call = Call.query.filter_by(id=int(call_sid)).first()
+    if not call:
+        call = Call.find_by_sid(str(call_sid))
+    if not call:
+        # Don't disclose whether the room exists vs. auth failed.
+        emit('error', {'message': 'Call not available'})
+        return
+
+    role = user.role or ''
+    is_owner = (call.user_id == user.id) or (call.assigned_agent_id == user.id)
+    is_privileged = role in ('admin', 'supervisor')
+    is_human_call = bool(call.conference_name and call.handler_type == 'human')
+    listen_flag = 'can_listen_human_calls' if is_human_call else 'can_listen_ai_calls'
+    # Demo personas hold the listen flags (feature availability) but the
+    # flags are self-scoped — cross-visitor access flows only through the
+    # shared-floor allowance below, which excludes human and persona-owned
+    # calls.
+    flag_grants = user.has_permission(listen_flag) and not demo_persona_self_scoped(user)
+    authorized = is_owner or is_privileged or flag_grants
+
+    # Demo-mode allowance: the hosted demo's headline flow is "watch the AI
+    # triage a call live". Unattributed inbound calls are owned by the
+    # synthetic system user, so any leased persona may watch those AI calls.
+    # BUT a call from a visitor's VERIFIED number is attributed to that
+    # persona (call_is_persona_owned) — it's private, and only its owner (or a
+    # supervisor/admin) may join. So the shared-floor allowance applies only
+    # to non-human, non-persona-owned calls.
+    if not authorized and is_demo_mode() and not is_human_call and not call_is_persona_owned(call):
+        authorized = True
+
+    if not authorized:
+        logger.warning(
+            f"join_call: user {user_id} denied room for call {call.id} "
+            f"(owner={is_owner}, role={role})"
+        )
+        emit('error', {'message': 'Not authorized for this call'})
+        return
+
+    # Join the call room. Producers key emits by SignalWire call_id, so
+    # join under that (falling back to the supplied identifier).
+    room = call.signalwire_call_sid or str(call_sid)
+    join_room(room)
+    add_to_set(f"call:{room}:listeners", request.sid)
 
     emit('joined_call', {
-        'message': f'Joined call room: {call_sid}',
-        'call_sid': call_sid
+        'message': f'Joined call room: {room}',
+        'call_sid': room
     })
 
-    logger.info(f"Client {request.sid} joined call room: {call_sid}")
+    logger.info(f"Client {request.sid} joined call room: {room} (call DB id {call.id})")
 
 
 @socketio.on('leave_call')
@@ -364,6 +425,31 @@ def handle_agent_answered(data):
     user_id = verify_token(token)
     if not user_id:
         emit('error', {'message': 'Invalid or expired token'})
+        return
+
+    # ISO-7 (2026-07-07 pre-deploy): this bridges a client-supplied leg
+    # (call_id) into a client-supplied conference. Without a check, a caller
+    # could bridge an arbitrary leg into any conference (conference_name is
+    # derivable). Verify the conference belongs to a call this user is the
+    # assigned agent / owner of (or the user is supervisor/admin).
+    user = User.find_by_id(user_id)
+    if not user:
+        emit('error', {'message': 'Invalid or expired token'})
+        return
+    from app.models import Conference
+    conference = Conference.get_active_by_name(conference_name)
+    conf_call = Call.find_by_sid(conference.call_id) if conference else None
+    role = user.role or ''
+    authorized = role in ('admin', 'supervisor') or (
+        conf_call is not None
+        and (conf_call.assigned_agent_id == user.id or conf_call.user_id == user.id)
+    )
+    if not authorized:
+        logger.warning(
+            f"agent_answered: user {user_id} denied bridging leg {call_id} "
+            f"into conference {conference_name}"
+        )
+        emit('error', {'message': 'Not authorized for this conference'})
         return
 
     try:

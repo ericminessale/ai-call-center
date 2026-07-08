@@ -1639,3 +1639,27 @@ def list_webhook_event_types():
         .all()
     )
     return jsonify({'event_types': [r[0] for r in rows if r[0]]}), 200
+
+
+@admin_bp.route('/demo/stats', methods=['GET'])
+def demo_stats():
+    """Hosted-demo pool health for the real admin (M6 telemetry, minimal cut).
+
+    Reports how deep the persona pool is and how many leases are live
+    right now — the "are we ever at the cap?" question from the demo
+    plan. Works (harmlessly) on clone-and-own too: demo_mode false,
+    zero pool, zero leases.
+    """
+    from app.services.demo_lease import count_active_leases
+    from app.utils.demo_config import is_demo_mode
+
+    pool = User.query.filter_by(role=DEMO_AGENT_ROLE, is_active=True)
+    pool_size = pool.count()
+    provisioned = pool.filter(User.signalwire_subscriber_id.isnot(None)).count()
+
+    return jsonify({
+        'demo_mode': is_demo_mode(),
+        'pool_size': pool_size,
+        'provisioned': provisioned,
+        'active_leases': count_active_leases(),
+    }), 200

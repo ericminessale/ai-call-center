@@ -180,6 +180,24 @@ class SignalWireAPI:
                             "lang": "en-US",
                             "live_events": True,
                             "ai_summary": True,
+                            # CODE-5 (2026-07-07 pre-deploy): the SWML paths were
+                            # tuned (c9d9cbd) to steer the end-of-session summary
+                            # toward a factual CRM wrap-up, but this manual/agent-
+                            # initiated REST path was missed — with ai_summary on
+                            # and no prompt it reintroduces invented follow-ups
+                            # (and double "After handoff…" paragraphs alongside the
+                            # conference-leg summary). Keep this prompt in sync
+                            # with the canonical copy in services/queue_dispatch.py.
+                            "ai_summary_prompt": (
+                                "Summarize this call for an agent's CRM wrap-up in 2-4 "
+                                "sentences of plain prose (no headings or lists). Cover ONLY "
+                                "what actually happened: why the caller reached out, what was "
+                                "discussed or done, and how the call ended. Do NOT invent or "
+                                "assume outcomes, next steps, follow-ups, or appointments that "
+                                "were not explicitly stated in the conversation. If the call "
+                                "was brief, unresolved, or the caller was unclear, say so "
+                                "plainly rather than inferring a resolution."
+                            ),
                             "direction": ["remote-caller"],
                             # Raise VAD silence from the 300ms default to reduce
                             # mid-sentence utterance splitting (matches swml.py).

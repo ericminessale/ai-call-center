@@ -3,6 +3,12 @@ import { User } from '../types';
 import { authApi, demoApi, runtimeApi, RuntimeConfig } from '../services/api';
 import websocket from '../services/websocket';
 
+// localStorage key marking "this browser holds a hosted-demo session".
+// Set by startDemoSession, consumed by checkAuth (restore path) and
+// logout (eager lease release). Deliberately NOT in the zustand state —
+// it must survive reloads, which is the whole point.
+const DEMO_SESSION_FLAG = 'demo_session';
+
 interface AuthState {
   user: User | null;
   isAuthenticated: boolean;
@@ -72,6 +78,12 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   logout: () => {
+    // Demo sessions release their persona lease eagerly so it returns
+    // to the pool for the next visitor instead of waiting out the TTL.
+    if (localStorage.getItem(DEMO_SESSION_FLAG) === '1') {
+      demoApi.end().catch(() => {});
+      localStorage.removeItem(DEMO_SESSION_FLAG);
+    }
     localStorage.removeItem('access_token');
     localStorage.removeItem('refresh_token');
     websocket.disconnect();
@@ -80,6 +92,37 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   checkAuth: async () => {
     set({ isCheckingAuth: true });
+
+    // Demo sessions don't restore via /auth/me — persona JWTs are bound
+    // to the lease epoch and may be stale after a reload. Instead we
+    // re-call /demo/start: the HttpOnly session cookie survives the
+    // reload, so the backend refreshes the existing lease and returns
+    // the SAME persona with fresh tokens (or leases a new one if the
+    // old lease lapsed). Seamless F5 for demo visitors.
+    if (localStorage.getItem(DEMO_SESSION_FLAG) === '1') {
+      try {
+        const response = await demoApi.start();
+        const { access_token, refresh_token, user } = response.data;
+        localStorage.setItem('access_token', access_token);
+        localStorage.setItem('refresh_token', refresh_token);
+        websocket.connect(access_token);
+        set({ user, isAuthenticated: true, isCheckingAuth: false });
+        return;
+      } catch (error: any) {
+        // Only drop the flag on definitive signals: demo turned off
+        // (404) or pool full (503 — our lease is gone anyway). A 429
+        // (rate-limit) or network blip is transient — keep the flag so
+        // the next reload retries /demo/start, and keep logout's eager
+        // lease release working. Either way fall through to the token
+        // path, which lands unauthenticated if the persona token is
+        // stale.
+        const status = error?.response?.status;
+        if (status === 404 || status === 503) {
+          localStorage.removeItem(DEMO_SESSION_FLAG);
+        }
+      }
+    }
+
     const token = localStorage.getItem('access_token');
 
     if (!token) {
@@ -125,6 +168,9 @@ export const useAuthStore = create<AuthState>((set) => ({
       const { access_token, refresh_token, user } = response.data;
       localStorage.setItem('access_token', access_token);
       localStorage.setItem('refresh_token', refresh_token);
+      // Marks this browser as holding a demo session so checkAuth
+      // restores it via /demo/start (lease-aware) instead of /auth/me.
+      localStorage.setItem(DEMO_SESSION_FLAG, '1');
       websocket.connect(access_token);
       set({ user, isAuthenticated: true, isLoading: false });
     } catch (error: any) {

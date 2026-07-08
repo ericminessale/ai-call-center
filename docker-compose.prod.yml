@@ -1,0 +1,287 @@
+# Production compose for the hosted demo / clone-and-own deployment.
+#
+# USE STANDALONE, not as an overlay:
+#     docker compose -f docker-compose.prod.yml up -d --build
+#
+# It is a full definition (not a `-f base -f prod` overlay) on purpose: an
+# additive overlay cannot REMOVE the dev bind-mounts or the `npm run dev`
+# frontend command from docker-compose.yml (Compose merges volumes by target
+# and would keep them), which are exactly what make the dev file unsafe to
+# ship (DEPLOY-C4/M3). This file therefore hardens every axis the pre-deploy
+# review flagged:
+#   - No host port publishes for postgres/redis/backend/ai-agents (DEPLOY-C1) —
+#     only nginx is exposed. DB/cache are reachable only on the internal net.
+#   - Redis requires a password (DEPLOY-C1) and never evicts authoritative
+#     demo/queue state (DEPLOY-M2: maxmemory-policy noeviction).
+#   - No committed secret fallbacks (DEPLOY-C2) — the app fail-fasts if unset.
+#   - Production frontend build, not the Vite dev server (DEPLOY-C4).
+#   - restart: unless-stopped everywhere (DEPLOY-H3).
+#   - json-file logging with size caps (DEPLOY-M1) + resource limits (DEPLOY-M2).
+#   - No source bind-mounts (DEPLOY-M3) — containers run their built images.
+#   - Strong service-to-service creds required, no demo/demo (DEPLOY-M4).
+#
+# Required env (see .env.example): JWT_SECRET_KEY, SECRET_KEY,
+# SUBSCRIBER_PASSWORD_KEY, POSTGRES_PASSWORD, REDIS_PASSWORD, WEBHOOK_AUTH_*,
+# ADMIN_EMAIL, ADMIN_PASSWORD, DEMO_MCP_PASSWORD, and the SignalWire creds.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.0-pg15
+    container_name: callcenter-postgres
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-callcenter}
+      POSTGRES_USER: ${POSTGRES_USER:-ccuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    # No ports: — DB is internal-network only (DEPLOY-C1).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ccuser} -d ${POSTGRES_DB:-callcenter}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  redis:
+    image: redis:7-alpine
+    container_name: callcenter-redis
+    hostname: redis
+    restart: unless-stopped
+    logging: *default-logging
+    # Password-protected (DEPLOY-C1) and noeviction (DEPLOY-M2): queue state,
+    # demo leases/epochs and heartbeat keys are authoritative and must never be
+    # silently LRU-evicted.
+    command: >
+      redis-server --appendonly yes
+      --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    # No ports: — cache is internal-network only (DEPLOY-C1).
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    hostname: backend
+    container_name: callcenter-backend
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ccuser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-callcenter}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+
+      SIGNALWIRE_SPACE: ${SIGNALWIRE_SPACE}
+      SIGNALWIRE_SPACE_URL: https://${SIGNALWIRE_SPACE}
+      SIGNALWIRE_PROJECT_ID: ${SIGNALWIRE_PROJECT_ID}
+      SIGNALWIRE_API_TOKEN: ${SIGNALWIRE_API_TOKEN}
+      SIGNALWIRE_PHONE_NUMBER: ${SIGNALWIRE_PHONE_NUMBER}
+      SIGNALWIRE_FROM_NUMBER: ${SIGNALWIRE_FROM_NUMBER:-${SIGNALWIRE_PHONE_NUMBER}}
+
+      SWML_BASIC_AUTH_USER: ${SWML_BASIC_AUTH_USER}
+      SWML_BASIC_AUTH_PASSWORD: ${SWML_BASIC_AUTH_PASSWORD}
+
+      # No committed fallbacks (DEPLOY-C2) — boot fails if unset.
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      SECRET_KEY: ${SECRET_KEY}
+      SUBSCRIBER_PASSWORD_KEY: ${SUBSCRIBER_PASSWORD_KEY}
+
+      WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
+      WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
+      WEBHOOK_AUTH_REQUIRED: ${WEBHOOK_AUTH_REQUIRED:-true}
+
+      EXTERNAL_URL: ${EXTERNAL_URL}
+      FLASK_APP: app
+      FLASK_ENV: production
+
+      DEMO_MODE: ${DEMO_MODE:-false}
+      DEMO_PHONE_NUMBERS: ${DEMO_PHONE_NUMBERS:-}
+      DEMO_POOL_SIZE: ${DEMO_POOL_SIZE:-20}
+      DEMO_LEASE_TTL_SECONDS: ${DEMO_LEASE_TTL_SECONDS:-300}
+      DEMO_INBOUND_CAP_PER_HOUR: ${DEMO_INBOUND_CAP_PER_HOUR:-10}
+      # nginx (this stack) + optionally Cloudflare in front. Default 2 assumes
+      # Cloudflare→nginx; set 1 if nginx is directly internet-facing.
+      TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-2}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+
+      # First-admin seed (entrypoint.sh). No default password (DEPLOY-C3).
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+
+      PYTHONUNBUFFERED: 1
+    # No bind mount (DEPLOY-M3) — runs the built image.
+    # No host ports — nginx fronts the backend (DEPLOY-C1).
+    entrypoint: ["sh", "/app/entrypoint.sh"]
+    command: ["gunicorn", "--workers", "4", "--threads", "100", "--bind", "0.0.0.0:5000", "--timeout", "120", "wsgi:app"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 1500m
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_SIGNALWIRE_PHONE_NUMBER: ${VITE_SIGNALWIRE_PHONE_NUMBER:-${SIGNALWIRE_PHONE_NUMBER}}
+        VITE_SIGNALWIRE_HOST: ${VITE_SIGNALWIRE_HOST:-${SIGNALWIRE_SPACE}}
+        VITE_FABRIC_APPLICATION_ID: ${FABRIC_APPLICATION_ID:-}
+    container_name: callcenter-frontend
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - backend
+    # No command override (serves the built static bundle), no bind mounts
+    # (DEPLOY-C4/M3), no host ports — nginx fronts it.
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  ai-agents:
+    build:
+      context: ./ai-agents
+      dockerfile: Dockerfile
+    container_name: callcenter-agents
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    environment:
+      SIGNALWIRE_SPACE: ${SIGNALWIRE_SPACE}
+      SIGNALWIRE_PROJECT_ID: ${SIGNALWIRE_PROJECT_ID}
+      SIGNALWIRE_API_TOKEN: ${SIGNALWIRE_API_TOKEN}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ccuser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-callcenter}
+      BACKEND_URL: http://backend:5000
+      AGENT_PORT: 8080
+      AGENT_HOST: 0.0.0.0
+      AGENT_BASE_URL: ${AGENT_BASE_URL:-http://ai-agents:8080}
+      SWML_BASIC_AUTH_USER: ${SWML_BASIC_AUTH_USER}
+      SWML_BASIC_AUTH_PASSWORD: ${SWML_BASIC_AUTH_PASSWORD}
+      WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
+      WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
+      SWML_ALLOW_PRIVATE_URLS: ${SWML_ALLOW_PRIVATE_URLS:-true}
+      DEBUG_WEBHOOK_ENABLED: ${DEBUG_WEBHOOK_ENABLED:-false}
+      DEBUG_WEBHOOK_LEVEL: ${DEBUG_WEBHOOK_LEVEL:-2}
+      PYTHONUNBUFFERED: 1
+    # No bind mount (DEPLOY-M3). No host ports: 8080 is reached via nginx; the
+    # 8081 admin API (/reindex,/search) stays internal-only (DEPLOY-C5) — the
+    # backend calls it at http://ai-agents:8081 on this network.
+    command: python main_agent.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 1500m
+
+  demo-reset:
+    build:
+      context: ./demo-reset
+      dockerfile: Dockerfile
+    container_name: callcenter-demo-reset
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - backend
+    environment:
+      BACKEND_URL: http://backend:5000
+      WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER:-}
+      WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD:-}
+      TZ: UTC
+
+  demo-mcp-gateway:
+    build:
+      context: ./demo-mcp
+      dockerfile: Dockerfile
+    container_name: callcenter-demo-mcp
+    hostname: demo-mcp-gateway
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      # DEPLOY-M4: no demo/demo default — require real creds.
+      DEMO_MCP_USER: ${DEMO_MCP_USER:-mcpservice}
+      DEMO_MCP_PASSWORD: ${DEMO_MCP_PASSWORD:?set DEMO_MCP_PASSWORD}
+      SHOP_DB_PATH: /data/shop.db
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - demo_mcp_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -u ${DEMO_MCP_USER:-mcpservice}:${DEMO_MCP_PASSWORD} http://localhost:8100/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  nginx:
+    image: nginx:alpine
+    container_name: callcenter-nginx
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - backend
+      - frontend
+      - ai-agents
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - certbot_www:/var/www/certbot
+    ports:
+      - "80:80"
+      - "443:443"
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  demo_mcp_data:
+    driver: local
+  certbot_www:
+    driver: local
+
+networks:
+  default:
+    name: callcenter-network
+    driver: bridge

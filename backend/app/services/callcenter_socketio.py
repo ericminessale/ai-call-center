@@ -62,12 +62,26 @@ def emit_call_update(call):
 
     logger.info(f"Emitting call_update for call {call.id}, status: {call.status}")
 
-    # Emit to the general calls room (for supervisors and dashboards)
-    socketio.emit('call_update', {'call': call_data})
+    # Privacy (demo phone-verification): a call attributed to a specific
+    # persona (from their verified number) carries their caller number, AI
+    # context and notes — it must NOT hit the global broadcast every socket
+    # receives, or other visitors would passively see it. Emit only to the
+    # owner's room + the call room (which only authorized sockets can join).
+    from app.utils.demo_config import call_is_persona_owned
+    private = call_is_persona_owned(call)
+
+    # Emit to the general calls room (for supervisors and dashboards) — only
+    # for shared/unattributed calls.
+    if not private:
+        socketio.emit('call_update', {'call': call_data})
 
     # If there's an assigned user, also emit to their personal room
     if call.user_id:
         socketio.emit('call_update', {'call': call_data}, room=str(call.user_id))
+    # For private calls also target the assigned agent's room (post-takeover),
+    # so the human who took it keeps getting updates.
+    if private and call.assigned_agent_id and call.assigned_agent_id != call.user_id:
+        socketio.emit('call_update', {'call': call_data}, room=str(call.assigned_agent_id))
 
     # Emit to the call-specific room if there's a call SID
     if call.signalwire_call_sid:
@@ -91,11 +105,29 @@ def emit_call_event(call_id, event_type, data, call_sid=None):
         'data': data,
         'timestamp': datetime.utcnow().isoformat(),
     }
-    # Emit to call-specific room
+    # Emit to call-specific room (authorized joiners only)
     if call_sid:
         socketio.emit('call_event', event, room=call_sid)
-    # Also broadcast globally for supervisor panels
-    socketio.emit('call_event', event)
+
+    # Privacy (demo phone-verification): for a persona-owned (verified-number)
+    # call, don't broadcast events to every socket — scope to the owner's room
+    # instead. Only pay the ownership lookup in demo mode. Non-demo keeps the
+    # original global broadcast that supervisor dashboards rely on.
+    from app.utils.demo_config import is_demo_mode, call_is_persona_owned
+    private = False
+    if is_demo_mode() and call_id is not None:
+        try:
+            owner_call = Call.query.get(int(call_id)) if str(call_id).isdigit() else None
+            if owner_call is not None and call_is_persona_owned(owner_call):
+                private = True
+                socketio.emit('call_event', event, room=str(owner_call.user_id))
+                if owner_call.assigned_agent_id and owner_call.assigned_agent_id != owner_call.user_id:
+                    socketio.emit('call_event', event, room=str(owner_call.assigned_agent_id))
+        except Exception:
+            private = False
+    if not private:
+        # Broadcast globally for supervisor panels / shared floor.
+        socketio.emit('call_event', event)
     logger.debug(f"Call event emitted: {event_type} for call {call_id}")
 
 
@@ -218,7 +250,17 @@ def handle_transfer_call(data):
 
 @socketio.on('hold_call')
 def handle_hold_call(data):
-    """Handle call hold/resume."""
+    """Handle call hold/resume.
+
+    ISO-19 (2026-07-07 pre-deploy): require a valid token — this used to be
+    unauthenticated, so anyone could broadcast a fake ``call_hold_status``
+    into any call room. Cosmetic, but no reason to leave it open.
+    """
+    token = data.get('token') or request.headers.get('Authorization', '').replace('Bearer ', '')
+    if not verify_token(token):
+        emit('error', {'message': 'Invalid token'})
+        return
+
     call_id = data.get('callId')
     hold = data.get('hold', True)
 
@@ -381,7 +423,16 @@ def handle_join_tap(data):
 
     is_human_call = bool(call.conference_name and call.handler_type == 'human')
     required_flag = 'can_listen_human_calls' if is_human_call else 'can_listen_ai_calls'
-    if not user.has_permission(required_flag):
+    # Owner bypass: you may always listen to your OWN call (the call you
+    # initiated, are assigned to, or that's attributed to your verified
+    # number in demo mode). Otherwise fall back to the listen-permission
+    # check (supervisors/admins monitoring others' calls). Demo personas
+    # hold the listen flags so the observer UI renders, but the flags are
+    # self-scoped — they never grant tap audio on another visitor's call.
+    from app.utils.demo_config import demo_persona_self_scoped
+    is_owner = (call.user_id == user_id) or (call.assigned_agent_id == user_id)
+    flag_grants = user.has_permission(required_flag) and not demo_persona_self_scoped(user)
+    if not is_owner and not flag_grants:
         logger.warning(
             f"join_tap: user {user_id} lacks {required_flag} for call "
             f"{call.id} (human={is_human_call})"
@@ -445,6 +496,21 @@ def handle_end_call(data):
             if not call:
                 call = Call.find_by_sid(call_id)
             if call:
+                # ISO-8 (2026-07-07 pre-deploy): ownership gate — this handler
+                # ended ANY call by id/sid with no check, so a persona could
+                # hang up another visitor's live call. Only the owner/assigned
+                # agent or a supervisor/admin may end it.
+                user = User.find_by_id(user_id)
+                role = (user.role if user else '') or ''
+                is_owner = user and (
+                    call.user_id == user.id or call.assigned_agent_id == user.id
+                )
+                if not (is_owner or role in ('admin', 'supervisor')):
+                    logger.warning(
+                        f"end_call socket: user {user_id} denied ending call {call.id}"
+                    )
+                    emit('error', {'message': 'Not authorized for this call'})
+                    return
                 call.status = 'ended'
                 call.ended_at = datetime.utcnow()
                 db.session.commit()

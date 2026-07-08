@@ -184,6 +184,22 @@ def create_callback():
         if not phone_number:
             return jsonify({'error': 'phone_number is required'}), 400
 
+        # ISO-15 (2026-07-07 pre-deploy): caller_name/reason are visitor-typed
+        # free text that surfaces in the shared callback queue. Moderate them
+        # in demo mode, same as contact fields and AI-message injects.
+        if is_demo_mode():
+            from app.utils.moderation import is_text_acceptable
+            for field in ('caller_name', 'reason'):
+                val = data.get(field)
+                if val:
+                    ok, why = is_text_acceptable(val)
+                    if not ok:
+                        return jsonify({
+                            'error': why,
+                            'code': 'moderation_blocked',
+                            'field': field,
+                        }), 422
+
         call = None
         call_id_param = data.get('call_id')
         if call_id_param:
@@ -340,6 +356,26 @@ def record_outcome(callback_id):
         if err:
             return err
 
+        # ISO-15 (2026-07-07 pre-deploy): ownership gate — without it any agent
+        # could close any pending callback and drain the shared queue. Require
+        # the requester to be the claiming agent (or a supervisor/admin),
+        # mirroring release_callback.
+        role = request.current_user.role or ''
+        if role not in ('admin', 'supervisor') and cb.claimed_by_agent_id != request.current_user.id:
+            return jsonify({
+                'error': "You don't own this callback",
+                'detail': 'Claim it first, or ask a supervisor to record the outcome.',
+            }), 403
+
+        # ISO-15: notes are visitor-typed free text — moderate in demo mode.
+        if notes and is_demo_mode():
+            from app.utils.moderation import is_text_acceptable
+            ok, why = is_text_acceptable(notes)
+            if not ok:
+                return jsonify({
+                    'error': why, 'code': 'moderation_blocked', 'field': 'notes',
+                }), 422
+
         cb.complete(outcome, notes=notes)
         # If the agent wants to retry (e.g. no-answer / voicemail), bump
         # attempts and clear claim so the row goes back to pending.
@@ -385,17 +421,12 @@ def record_outcome(callback_id):
 def dial_callback(callback_id):
     """Initiate the outbound call to fulfil the callback.
 
-    Soft-blocked in DEMO_MODE — the UI still renders the form and shows
-    the recorded callback, but actually dialing out from a public demo
-    is a non-starter. We respond 403 with the standard 'demo_blocked'
-    payload so the frontend can render the toast.
+    In DEMO_MODE this is gated to the persona's own verified number (phone
+    verification) with a per-hour cap — a visitor can dial a callback they
+    scheduled to THEIR verified number, but the demo can't fan out real calls
+    to arbitrary numbers. Unverified / mismatched numbers get 403 so the UI
+    can prompt to verify.
     """
-    if is_demo_mode():
-        return jsonify({
-            'error': 'Outbound dialing is disabled in demo mode',
-            'code': 'demo_blocked',
-        }), 403
-
     try:
         cb, err = _find_callback_or_404(callback_id)
         if err:
@@ -404,6 +435,13 @@ def dial_callback(callback_id):
             return jsonify({'error': 'Callback already completed'}), 409
         if cb.is_expired:
             return jsonify({'error': 'Callback has expired'}), 409
+
+        # Demo outbound gate — own verified number only, capped.
+        if is_demo_mode():
+            from app.services.demo_verify import demo_outbound_denial
+            denial = demo_outbound_denial(request.current_user.id, cb.phone_number)
+            if denial:
+                return jsonify(denial[0]), denial[1]
 
         # Auto-claim on dial — UX shortcut so the agent doesn't have to
         # explicitly click claim before dial. Atomic so a race with another

@@ -158,8 +158,29 @@ def create_contact():
 @contacts_bp.route('/<int:contact_id>', methods=['PUT'])
 @jwt_required()
 def update_contact(contact_id):
-    """Update an existing contact."""
+    """Update an existing contact.
+
+    ISO-14 (2026-07-07 pre-deploy): blocked in demo mode — contacts are shared
+    seed data, so an unblocked update let any visitor rename / re-tag /
+    isBlocked=true records everyone else sees.
+
+    Phone-verification exception: a visitor who verified their phone number
+    OWNS the contact that matches it (it's their own record, created from
+    their inbound calls). They may edit that one contact; everything else
+    stays read-only in demo mode. Moderation still applies to what they type.
+    """
     contact = Contact.query.get_or_404(contact_id)
+
+    from app.utils.demo_config import is_demo_mode, DEMO_BLOCKED_RESPONSE
+    if is_demo_mode():
+        from app.services.demo_verify import is_number_verified_for_persona
+        from flask_jwt_extended import get_jwt_identity
+        owns_contact = contact.phone and is_number_verified_for_persona(
+            get_jwt_identity(), contact.phone
+        )
+        if not owns_contact:
+            return jsonify(DEMO_BLOCKED_RESPONSE), 403
+
     data = request.get_json()
 
     if not data:
@@ -257,6 +278,13 @@ def lookup_or_create_contact():
 
     if not phone:
         return jsonify({'error': 'Phone number required'}), 400
+
+    # ISO-14: create/update run visitor-typed fields through moderation;
+    # lookup-or-create skipped it, giving a moderation-bypass path into the
+    # shared CRM. Apply the same check here before persisting any new record.
+    flagged = _check_contact_payload_moderation(data)
+    if flagged:
+        return jsonify(flagged[0]), flagged[1]
 
     contact = Contact.find_by_phone(phone)
     created = False

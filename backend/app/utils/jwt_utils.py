@@ -67,18 +67,49 @@ def decode_token(token):
         return {'error': 'Invalid token'}
 
 
-def verify_token(token, token_type='access'):
-    """Verify a token and return the user_id if valid.
+def persona_claims_are_stale(payload):
+    """SEC-03: True if a decoded persona token no longer matches the live
+    lease state in Redis.
 
-    SEC-03 extension: tokens minted for a demo persona (carrying
-    ``persona=true``) are additionally checked against the live persona
-    state in Redis:
+    Non-persona payloads (real users) are never stale — returns False.
+    For payloads carrying ``persona=true``:
       1. The token's ``epoch`` claim must match the current persona epoch
          (bumped by ``demo_lease.release_lease``) — invalidates JWTs
          after an explicit release.
       2. There must be an active (non-TTL-expired) lease for the persona
          — invalidates JWTs after the lease lapses naturally.
-    Either check failing returns None (verification failure).
+
+    Shared by :func:`verify_token` (custom ``require_auth`` path) and the
+    flask-jwt-extended ``token_in_blocklist_loader`` registered in
+    ``create_app`` — so ``@jwt_required()`` routes (e.g. the Call Fabric
+    token mint in ``api/fabric.py``) enforce the same lease invariant.
+    """
+    if not payload.get('persona'):
+        return False
+    # Lazy import — demo_lease pulls in Redis + models, which can
+    # cause circular imports if loaded at module top.
+    try:
+        from app.services.demo_lease import get_persona_epoch, has_active_lease
+    except Exception:
+        # If demo_lease isn't importable for any reason, a persona
+        # claim is suspicious — be paranoid, reject.
+        return True
+    uid = payload.get('user_id')
+    if uid is None:
+        return True
+    # Epoch check — bumped on release_lease.
+    if payload.get('epoch', -1) != get_persona_epoch(uid):
+        return True
+    # Active-lease check — covers TTL-expiry case.
+    return not has_active_lease(uid)
+
+
+def verify_token(token, token_type='access'):
+    """Verify a token and return the user_id if valid.
+
+    SEC-03 extension: tokens minted for a demo persona (carrying
+    ``persona=true``) are additionally checked against the live persona
+    state in Redis via :func:`persona_claims_are_stale`.
 
     Non-persona tokens (real users) are unaffected and follow the
     original codepath.
@@ -91,25 +122,7 @@ def verify_token(token, token_type='access'):
     if payload.get('type') != token_type:
         return None
 
-    if payload.get('persona'):
-        # Lazy import — demo_lease pulls in Redis + models, which can
-        # cause circular imports if loaded at module top.
-        try:
-            from app.services.demo_lease import get_persona_epoch, has_active_lease
-        except Exception:
-            # If demo_lease isn't importable for any reason, a persona
-            # claim is suspicious — be paranoid, reject.
-            return None
-        uid = payload.get('user_id')
-        if uid is None:
-            return None
-        # Epoch check — bumped on release_lease.
-        token_epoch = payload.get('epoch', -1)
-        current_epoch = get_persona_epoch(uid)
-        if token_epoch != current_epoch:
-            return None
-        # Active-lease check — covers TTL-expiry case.
-        if not has_active_lease(uid):
-            return None
+    if persona_claims_are_stale(payload):
+        return None
 
     return payload.get('user_id')

@@ -5,6 +5,8 @@ from app.api import auth_bp
 from app.models import User
 from app.utils.jwt_utils import generate_tokens, verify_token
 from app.utils.decorators import validate_json
+from app.utils.demo_config import block_in_demo_mode
+from app.utils.rate_limit import rate_limit
 import re
 
 
@@ -25,6 +27,8 @@ def _public_registration_enabled() -> bool:
 
 
 @auth_bp.route('/register', methods=['POST'])
+@block_in_demo_mode
+@rate_limit('register', limit=5, window_seconds=60)
 @validate_json('email', 'password')
 def register():
     """Register a new user.
@@ -93,9 +97,15 @@ def register():
 
 
 @auth_bp.route('/login', methods=['POST'])
+@rate_limit('login', limit=10, window_seconds=60)
 @validate_json('email', 'password')
 def login():
-    """Login a user."""
+    """Login a user.
+
+    SEC-06: rate-limited per client IP — the hosted demo leaves this
+    endpoint reachable (real admins sign into the demo instance too),
+    so it needs brute-force protection on the public internet.
+    """
     data = request.get_json()
     email = data.get('email').lower().strip()
     password = data.get('password')

@@ -8,6 +8,7 @@ from app.services.queue_service import QueueService
 from app.services.redis_service import get_redis_client
 from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth
+from app.utils.demo_config import block_in_demo_mode, is_demo_mode
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.utils.webhook_auth import require_webhook_auth
 from app import db
@@ -384,9 +385,22 @@ def direct_inbound_queue(queue_slug):
             if not system_user:
                 system_user = db.session.query(User).first()
 
+            # Demo phone-verification attribution (see initial-call): a call
+            # from a verified number belongs to the persona that verified it,
+            # making it private to that visitor via the ownership checks.
+            owner_user_id = system_user.id
+            if is_demo_mode() and caller_number:
+                try:
+                    from app.services.demo_verify import get_persona_for_number
+                    persona_id = get_persona_for_number(caller_number)
+                    if persona_id:
+                        owner_user_id = persona_id
+                except Exception as exc:
+                    logger.warning("direct_inbound: verify attribution failed (non-fatal): %s", exc)
+
             call = Call(
                 signalwire_call_sid=call_id,
-                user_id=system_user.id,
+                user_id=owner_user_id,
                 from_number=caller_number,
                 destination=to_number or 'unknown',
                 destination_type='phone',
@@ -781,9 +795,13 @@ def get_all_queued_calls():
 
 @queues_bp.route('/mock/clear', methods=['POST'])
 @require_auth
+@block_in_demo_mode
 def clear_mock_data():
     """
     Clear all mock/demo calls from queues
+
+    Blocked in hosted-demo mode: any leased persona could otherwise wipe
+    queue state out from under every other visitor.
     """
     try:
         service = QueueService()
@@ -826,9 +844,13 @@ def clear_mock_data():
 
 @queues_bp.route('/mock/generate', methods=['POST'])
 @require_auth
+@block_in_demo_mode
 def generate_mock_data():
     """
     Generate mock queue data for demos
+
+    Blocked in hosted-demo mode: visitors get real calls, not mock rows,
+    and unbounded mock generation is a state-spam vector.
     """
     try:
         import random

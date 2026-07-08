@@ -345,7 +345,10 @@ def enqueue_and_build_swml(
                         # calling.ai.transcribe.conversation_log event -> wrap-up notes
                         # (handled in webhooks._apply_ai_wrapup_summary). This is the
                         # conference/human leg, so it captures the human conversation.
-                        # Keep the prompt in sync with the AI-leg start in api/swml.py.
+                        # CODE-8 (2026-07-07): this is now the canonical copy of the
+                        # wrap-up summary prompt — the old AI-leg copy in api/swml.py
+                        # was deleted. The only other copy is the REST manual-start
+                        # path in services/signalwire_api.py; keep the two in sync.
                         "ai_summary_prompt": (
                             "Summarize this call for an agent's CRM wrap-up in 2-4 "
                             "sentences of plain prose (no headings or lists). Cover ONLY "

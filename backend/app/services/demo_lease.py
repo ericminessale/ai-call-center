@@ -215,6 +215,12 @@ def heartbeat_lease(session_token: str) -> bool:
     ttl = _lease_ttl_seconds()
     redis_client.expire(_session_key(session_token), ttl)
     redis_client.expire(_user_key(user_id), ttl)
+    # Keep any phone-verification binding alive alongside the lease.
+    try:
+        from app.services.demo_verify import refresh_bindings
+        refresh_bindings(user_id)
+    except Exception:
+        pass
     return True
 
 
@@ -239,6 +245,14 @@ def release_lease(session_token: str) -> bool:
         return False
     redis_client.delete(_user_key(user_id))
     redis_client.delete(session_k)
+    # Clear any phone-verification bindings so the recycled persona starts
+    # clean for the next visitor (a stale verified number must never carry
+    # over to whoever leases this persona next).
+    try:
+        from app.services.demo_verify import clear_bindings
+        clear_bindings(user_id)
+    except Exception:
+        pass
     # SEC-03: bump the persona epoch so any JWT still in the wild for
     # this persona is invalidated on the next verify_token call. Without
     # this, visitor B who happens to lease the same persona would be

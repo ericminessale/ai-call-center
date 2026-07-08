@@ -3,8 +3,9 @@ from app import db, socketio, redis_client
 from app.api import calls_bp
 from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
-from app.utils.decorators import require_auth, require_permission, validate_json
-from app.utils.demo_config import block_in_demo_mode, is_demo_mode
+from app.utils.decorators import require_auth, require_permission, require_role, validate_json
+from app.utils.demo_config import block_in_demo_mode, is_demo_mode, call_is_persona_owned, DEMO_BLOCKED_RESPONSE
+from app.utils.webhook_auth import require_internal_auth
 from app.utils.moderation import is_text_acceptable
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.services.queue_service import QueueService
@@ -17,6 +18,52 @@ import json
 import os
 
 logger = logging.getLogger(__name__)
+
+
+def _require_call_ownership(call, user, allow_demo_ai_view=False):
+    """Return an (jsonify, status) abort tuple, or None to allow.
+
+    ISO-2/ISO-4 (2026-07-07 pre-deploy): the /api/calls/<id>/* routes gate
+    only on @require_auth with an enumerable integer id, so any authenticated
+    user (including a leased demo persona) could read or mutate any other
+    visitor's call by guessing the id. Reject unless the requester owns the
+    call (initiated it or is the assigned agent) OR holds supervisor/admin.
+
+    Mirrors call_control._require_call_ownership so the two call-control
+    surfaces share one authorization model.
+
+    ``allow_demo_ai_view``: for READ endpoints only. Inbound demo calls are
+    owned by the synthetic system user, so a leased persona is never the
+    "owner" of the AI call it's watching. When this is set and we're in demo
+    mode and the call is AI-handled (not a human conference), permit read
+    access — this is the demo's "watch the AI triage" flow (same allowance
+    as socketio join_call). Human-handled calls are never opened this way.
+    Do NOT pass this on mutating endpoints.
+    """
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+    role = getattr(user, 'role', '') or ''
+    if role in ('admin', 'supervisor'):
+        return None
+    if call.assigned_agent_id == user.id or call.user_id == user.id:
+        return None
+    # Shared-floor read allowance: any demo persona may read an AI-handled
+    # call — UNLESS it's private to another persona (attributed to their
+    # verified number). call_is_persona_owned excludes those.
+    if (
+        allow_demo_ai_view
+        and is_demo_mode()
+        and (call.handler_type or 'ai') != 'human'
+        and not call_is_persona_owned(call)
+    ):
+        return None
+    return jsonify({
+        'error': "You don't have access to this call",
+        'detail': (
+            'Only the call owner or assigned agent (or a supervisor/admin) '
+            'can act on this call.'
+        ),
+    }), 403
 
 
 @calls_bp.route('/cost-rates', methods=['GET'])
@@ -96,14 +143,14 @@ def get_call_cost(call_sid):
 
 @calls_bp.route('/initiate', methods=['POST'])
 @require_auth
-@block_in_demo_mode
 @validate_json('destination', 'destination_type')
 def initiate_call():
     """Initiate a new outbound call.
 
-    Soft-blocked in DEMO_MODE — visitors see the dial form but submit
-    returns 403 with code 'demo_blocked' so the UI can render a clear
-    "not available in demo" toast.
+    In DEMO_MODE this is gated to "your own verified number only" (phone
+    verification): a persona may dial the number it verified via the pairing
+    flow, nothing else. Unverified visitors / non-phone destinations get 403
+    'demo_verify_required' / 'demo_blocked' so the UI can prompt to verify.
     """
     logger.info("INITIATE CALL REQUEST")
     try:
@@ -117,6 +164,16 @@ def initiate_call():
         # Validate destination type
         if destination_type not in ['phone', 'sip']:
             return jsonify({'error': 'Invalid destination_type. Must be "phone" or "sip"'}), 400
+
+        # Demo outbound gate: phone-to-own-verified-number only. SIP has no
+        # number to verify against, so it stays blocked in demo.
+        if is_demo_mode():
+            if destination_type != 'phone':
+                return jsonify(DEMO_BLOCKED_RESPONSE), 403
+            from app.services.demo_verify import demo_outbound_denial
+            denial = demo_outbound_denial(request.current_user.id, destination)
+            if denial:
+                return jsonify(denial[0]), denial[1]
 
         # Get SignalWire API client
         sw_api = get_signalwire_api()
@@ -193,6 +250,11 @@ def update_transcription(call_sid):
         if not call:
             return jsonify({'error': 'Call not found'}), 404
 
+        # ISO-4: transcription control mutates call state — owner/privileged
+        # only (no demo-view allowance for a mutation).
+        owner_check = _require_call_ownership(call, request.current_user)
+        if owner_check is not None:
+            return owner_check
 
         # Get SignalWire API client
         sw_api = get_signalwire_api()
@@ -254,6 +316,13 @@ def get_call(call_id):
             logger.error(f"Call not found in database: {call_id}")
             return jsonify({'error': 'Call not found'}), 404
 
+        # ISO-4: read gate — owner/privileged, or (demo mode) any persona
+        # viewing an AI-handled call it's monitoring.
+        owner_check = _require_call_ownership(
+            call, request.current_user, allow_demo_ai_view=True
+        )
+        if owner_check is not None:
+            return owner_check
 
         # Get transcriptions for the call
         transcriptions = Transcription.find_by_call(call.id)
@@ -636,10 +705,35 @@ def list_calls():
         }
 
         # For AI active calls, show all calls to all agents (no user_id filter)
-        # For other calls, only show user's own calls
-        if status_filters and 'ai_active' in status_filters:
-            # AI calls are visible to all agents - no user_id filter
+        # For other calls, only show user's own calls.
+        #
+        # ISO-13 (2026-07-07 pre-deploy): the unfiltered ai_active list
+        # returns every visitor's live AI call WITH full transcripts. That
+        # cross-visitor visibility is the hosted demo's explicit design
+        # ("watch the floor"), but on a clone-and-own deployment a regular
+        # agent should not see calls they're not on. So: in demo mode keep
+        # the all-visible behavior; otherwise restrict the unfiltered view to
+        # supervisors/admins and fall back to own-calls for regular agents.
+        role = request.current_user.role or ''
+        show_all_ai = status_filters and 'ai_active' in status_filters and (
+            is_demo_mode() or role in ('admin', 'supervisor')
+        )
+        if show_all_ai:
             query = db.session.query(Call)
+            # In demo mode a plain persona sees the shared floor (calls owned
+            # by the system user) plus its own — but NOT calls private to
+            # another persona (attributed to their verified number). Admins/
+            # supervisors still see everything.
+            if is_demo_mode() and role not in ('admin', 'supervisor'):
+                from app.models import User
+                from app.utils.demo_config import DEMO_AGENT_ROLE
+                persona_ids = db.session.query(User.id).filter(User.role == DEMO_AGENT_ROLE)
+                query = query.filter(
+                    db.or_(
+                        Call.user_id == request.current_user.id,
+                        Call.user_id.notin_(persona_ids),
+                    )
+                )
         else:
             # User's own calls only
             query = db.session.query(Call).filter_by(user_id=request.current_user.id)
@@ -758,6 +852,12 @@ def end_call(call_id):
             logger.error(f"Call not found in database: {call_id}")
             return jsonify({'error': 'Call not found'}), 404
 
+        # ISO-4: ending a call is a mutation across all visitors' calls —
+        # owner/privileged only (this is the ISO-1-class harm scoped to a
+        # single call by id).
+        owner_check = _require_call_ownership(call, request.current_user)
+        if owner_check is not None:
+            return owner_check
 
         logger.info(f"Attempting to end call via SignalWire API: {call.signalwire_call_sid}")
 
@@ -849,6 +949,13 @@ def get_full_transcript(call_sid):
         if not call:
             return jsonify({'error': 'Call not found'}), 404
 
+        # ISO-4: read gate — owner/privileged, or (demo) a persona viewing an
+        # AI-handled call. The transcript is the most sensitive read surface.
+        owner_check = _require_call_ownership(
+            call, request.current_user, allow_demo_ai_view=True
+        )
+        if owner_check is not None:
+            return owner_check
 
         # Get full transcript
         transcript = Transcription.get_full_transcript(call.id)
@@ -912,6 +1019,16 @@ def send_ai_message(call_id):
         if not call:
             return jsonify({'error': 'Call not found'}), 404
 
+        # ISO-2 (2026-07-07 pre-deploy): this injects a message the live AI
+        # agent immediately speaks/acts on. Without an ownership check any
+        # authenticated user (incl. a leased demo persona) could steer
+        # another visitor's AI call by guessing an enumerable call id. Only
+        # the call's owner/assigned agent — or a supervisor/admin — may do
+        # this, mirroring ai_control.inject_system_message's gate.
+        owner_check = _require_call_ownership(call, request.current_user)
+        if owner_check is not None:
+            return owner_check
+
         # Use the resolved SignalWire SID from the call record, not the
         # caller-supplied identifier (which may be a numeric DB id).
         call_sid = call.signalwire_call_sid
@@ -937,11 +1054,15 @@ def send_ai_message(call_id):
 
 
 @calls_bp.route('/<call_db_id>/register-ai-leg', methods=['POST'])
+@require_internal_auth
 def register_ai_leg(call_db_id):
     """Register the AI agent's B-leg call SID for later use (e.g., takeover).
 
-    Called by the AI agent's capture_base_url callback when it starts handling a call.
-    No auth required - called internally from ai-agents container.
+    Called by the AI agent's capture_base_url callback when it starts handling
+    a call. ISO-9 (2026-07-07 pre-deploy): now requires internal HTTP Basic
+    auth (WEBHOOK_AUTH creds) — previously unauthenticated and publicly
+    reachable via nginx `location /api`, so anyone could corrupt takeover
+    routing by registering a bogus B-leg SID on an enumerable call id.
 
     Request body:
     {
@@ -978,11 +1099,15 @@ def register_ai_leg(call_db_id):
 
 
 @calls_bp.route('/<call_db_id>/sentiment', methods=['POST'])
+@require_internal_auth
 def report_sentiment(call_db_id):
     """Receive real-time sentiment updates from AI agents during a call.
 
     Called by the AI agent's report_sentiment SWAIG tool (fire-and-forget).
-    No auth required - called internally from ai-agents container.
+    ISO-9 (2026-07-07 pre-deploy): now requires internal HTTP Basic auth
+    (WEBHOOK_AUTH creds) — previously unauthenticated and publicly reachable,
+    so anyone could set an arbitrary sentiment on any call by id (and trigger
+    the unroomed sentiment_update broadcast + contact-average recompute).
 
     Request body:
     {
@@ -1321,6 +1446,13 @@ def update_call_status(call_id):
             logger.error(f"Call not found: {call_id}")
             return jsonify({'error': 'Call not found'}), 404
 
+        # ISO-4: mutates status + flips handler_type to human — owner/
+        # privileged only (a non-owner could force-flip another visitor's
+        # AI call to human-handled and disrupt it).
+        owner_check = _require_call_ownership(call, request.current_user)
+        if owner_check is not None:
+            return owner_check
+
         old_status = call.status
 
         # Update status
@@ -1446,6 +1578,18 @@ def update_wrap_up(call_id):
         if agent_notes is not None and len(agent_notes) > 5000:
             return jsonify({'error': 'agent_notes must be 5000 characters or fewer'}), 400
 
+        # ISO-14/demo: agent notes are free text a visitor types and that
+        # surfaces in the shared CRM — moderate them in demo mode, same as
+        # contact fields and AI-message injects.
+        if is_demo_mode() and agent_notes:
+            ok, reason = is_text_acceptable(agent_notes)
+            if not ok:
+                return jsonify({
+                    'error': reason,
+                    'code': 'moderation_blocked',
+                    'field': 'agent_notes',
+                }), 422
+
         # Look up by numeric ID first, then SignalWire call_sid.
         call = None
         if str(call_id).isdigit():
@@ -1454,6 +1598,12 @@ def update_wrap_up(call_id):
             call = Call.find_by_sid(call_id)
         if not call:
             return jsonify({'error': 'Call not found'}), 404
+
+        # ISO-4: wrap-up writes notes/disposition onto a call — owner/
+        # privileged only (was writable on ANY call by enumerable id).
+        owner_check = _require_call_ownership(call, request.current_user)
+        if owner_check is not None:
+            return owner_check
 
         changed = False
         if 'disposition_code' in data:
@@ -1504,11 +1654,19 @@ def update_wrap_up(call_id):
 
 @calls_bp.route('/cleanup-stale', methods=['POST'])
 @require_auth
+@require_role('supervisor', 'admin')
 def cleanup_stale_calls():
     """Clean up stale calls that are stuck in ringing/active status.
 
     Marks calls as 'ended' if they've been in ringing/active status for too long.
     This handles cases where webhooks didn't fire properly.
+
+    ISO-1 (2026-07-07 pre-deploy): this ends live calls across ALL users, so
+    it's restricted to supervisor/admin (was @require_auth only — any leased
+    demo persona could have ended every visitor's call with one request). The
+    ``force=true`` shortcut (end EVERY non-terminal call regardless of age) is
+    additionally blocked in demo mode — even a real supervisor shouldn't be
+    able to nuke every visitor's in-progress call on the shared instance.
 
     Query params:
     - force=true: Clean ALL non-terminal calls regardless of age (for dev)
@@ -1517,6 +1675,12 @@ def cleanup_stale_calls():
     try:
         force = request.args.get('force', 'false').lower() == 'true'
         max_age_minutes = request.args.get('max_age_minutes', 60, type=int)
+
+        if force and is_demo_mode():
+            return jsonify({
+                'error': 'Force cleanup is disabled on the shared demo instance.',
+                'code': 'demo_blocked',
+            }), 403
 
         if force:
             # Clean ALL non-terminal calls

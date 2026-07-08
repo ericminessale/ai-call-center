@@ -65,10 +65,20 @@ services:
       SWML_BASIC_AUTH_USER: ${SWML_BASIC_AUTH_USER}
       SWML_BASIC_AUTH_PASSWORD: ${SWML_BASIC_AUTH_PASSWORD}
 
-      # Security
-      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-secret-key-in-production}
-      SECRET_KEY: ${SECRET_KEY:-another-secret-key-for-flask}
+      # Security — NO committed fallbacks (DEPLOY-C2). A default here would
+      # defeat the _require_env fail-fast in app/__init__.py: an operator who
+      # forgot to set these would boot with a publicly-known JWT signing key,
+      # letting anyone mint valid admin tokens. Leave them unset and the app
+      # refuses to start until real values are provided (generate with
+      # `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      SECRET_KEY: ${SECRET_KEY}
       SUBSCRIBER_PASSWORD_KEY: ${SUBSCRIBER_PASSWORD_KEY}
+      # First-admin seed (consumed by entrypoint.sh after migrations). If
+      # ADMIN_PASSWORD is unset the seed step is skipped — no default admin
+      # with a known password is ever created (DEPLOY-C3).
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
 
       # Webhook/internal HTTP Basic auth (SEC-01) — shared with ai-agents.
       # Backend VALIDATES these on /api/webhooks/* and /api/internal/*.
@@ -95,6 +105,12 @@ services:
       DEMO_POOL_SIZE: ${DEMO_POOL_SIZE:-20}
       DEMO_LEASE_TTL_SECONDS: ${DEMO_LEASE_TTL_SECONDS:-300}
       DEMO_INBOUND_CAP_PER_HOUR: ${DEMO_INBOUND_CAP_PER_HOUR:-10}
+      # Trusted reverse-proxy hop count (SEC-07). Default 1 because the
+      # in-compose nginx always fronts /api — with 0, request.remote_addr
+      # is the nginx container IP for every client and the per-IP rate
+      # limits collapse into one shared global bucket. Set 2 with
+      # Cloudflare in front; 0 only if you expose :5000 directly.
+      TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-1}
       # OpenAI moderation key (optional). Only consulted when
       # DEMO_MODE=true; production-shape deployments aren't affected.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -107,7 +123,10 @@ services:
       - ./backend:/app
     ports:
       - "5000:5000"
-    command: sh -c "python wait-for-redis.py && gunicorn --workers 4 --threads 100 --bind 0.0.0.0:5000 --timeout 120 wsgi:app"
+    # entrypoint.sh runs wait-for-redis + flask db upgrade + admin seed ONCE,
+    # then execs the gunicorn command passed as args (DEPLOY-H1).
+    entrypoint: ["sh", "/app/entrypoint.sh"]
+    command: ["gunicorn", "--workers", "4", "--threads", "100", "--bind", "0.0.0.0:5000", "--timeout", "120", "wsgi:app"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s

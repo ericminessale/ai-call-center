@@ -39,14 +39,16 @@ api.interceptors.response.use(
   (response) => response,
   async (error) => {
     // Hosted-demo soft-blocks return 403 with code 'demo_blocked'.
-    // Content-moderation rejections return 422 with code
-    // 'moderation_blocked'. Both surface a single user-visible toast
-    // and re-reject so callers can short-circuit cleanly (the
-    // request was intentionally refused, not a transient failure
-    // to retry).
+    // Self-scope refusals (acting on a call that isn't yours in the demo)
+    // return 403 with code 'demo_scope' — their message explains how to
+    // unlock via phone verification, so prefer the server text. Content-
+    // moderation rejections return 422 with code 'moderation_blocked'.
+    // All surface a single user-visible toast and re-reject so callers
+    // can short-circuit cleanly (the request was intentionally refused,
+    // not a transient failure to retry).
     const code = error.response?.data?.code;
     if (
-      (error.response?.status === 403 && code === 'demo_blocked') ||
+      (error.response?.status === 403 && (code === 'demo_blocked' || code === 'demo_scope')) ||
       (error.response?.status === 422 && code === 'moderation_blocked')
     ) {
       // Lazy import to avoid circular dep on the toast lib at module
@@ -57,7 +59,11 @@ api.interceptors.response.use(
           code === 'moderation_blocked'
             ? 'Your input was flagged. Please rephrase.'
             : 'That action is not available in demo mode.';
-        toast.error(error.response.data.error || fallback);
+        const message =
+          code === 'demo_scope'
+            ? [error.response.data.error, error.response.data.detail].filter(Boolean).join(' ')
+            : error.response.data.error;
+        toast.error(message || fallback);
       } catch {
         // Toast lib unavailable — error still bubbles via the reject below.
       }
@@ -143,6 +149,22 @@ export const demoApi = {
   end: () => api.post<{ ok: boolean; released: boolean }>('/api/demo/end'),
   status: () =>
     api.get<{ leased: boolean; persona: any | null }>('/api/demo/status'),
+  // Phone verification (pairing-code flow).
+  pairingCode: () =>
+    api.post<{ code: string }>('/api/demo/verify/pairing-code'),
+  verifyStatus: () =>
+    api.get<{ verified: boolean; code: string | null; masked_number: string | null }>(
+      '/api/demo/verify/status'
+    ),
+  // "Have the AI call me" — outbound AI call to the visitor's verified number.
+  // agent_type must be a known outbound agent id (see AI_AGENTS in ai_control).
+  callMe: (agent_type: string = 'outbound-sales') =>
+    api.post<{ success: boolean }>('/api/ai/outbound-call', {
+      // Backend derives the destination from the persona's verified number;
+      // it ignores any client-supplied number in demo mode (own-number gate).
+      phone: 'verified',
+      agent_type,
+    }),
 };
 
 export const callsApi = {

@@ -230,15 +230,30 @@ def _scan_once(app) -> int:
     return reaped
 
 
+# Redis key for the cross-worker singleton lock (DEPLOY-H4).
+_WATCHDOG_LOCK_KEY = 'call_watchdog_lock'
+_WATCHDOG_LOCK_TTL = max(30, WATCHDOG_INTERVAL_SECONDS * 3)
+
+
 def _run_loop(app) -> None:
     """Background loop. Runs forever; logs and continues on any error."""
     from app import socketio
+    from app.services.redis_service import get_redis_client
     logger.warning(
         f"[call_watchdog] started (interval={WATCHDOG_INTERVAL_SECONDS}s, "
         f"age caps={STALE_MAX_AGE})"
     )
     while True:
         try:
+            # Refresh the singleton lock so it survives while we're alive but
+            # frees for another worker if this one dies (mirrors the queue
+            # monitor). Best-effort — a Redis blip shouldn't stop the sweep.
+            try:
+                rc = get_redis_client()
+                if rc:
+                    rc.set(_WATCHDOG_LOCK_KEY, '1', ex=_WATCHDOG_LOCK_TTL)
+            except Exception:
+                pass
             n = _scan_once(app)
             if n:
                 logger.warning(f"[call_watchdog] swept {n} stale calls this pass")
@@ -253,9 +268,26 @@ def _run_loop(app) -> None:
 def start(app) -> None:
     """Spawn the watchdog as a Socket.IO background task.
 
-    Called once at app startup from app.__init__. Idempotent at the module
-    level — multiple calls would spawn duplicate workers, so callers must
-    only invoke once.
+    Called once per worker at app startup from app.__init__. DEPLOY-H4: under
+    ``gunicorn --workers 4`` this fires in every worker, so 4 reapers used to
+    run concurrently and emit duplicate events (the "4x in logs" symptom).
+    A Redis ``SET NX EX`` lock — the same guard the queue monitor uses — lets
+    exactly one worker own the watchdog; the loop refreshes the lock and it
+    expires if that worker dies so another can take over.
     """
     from app import socketio
+    from app.services.redis_service import get_redis_client
+
+    try:
+        rc = get_redis_client()
+        if rc is not None:
+            acquired = rc.set(_WATCHDOG_LOCK_KEY, '1', nx=True, ex=_WATCHDOG_LOCK_TTL)
+            if not acquired:
+                logger.info("[call_watchdog] already running in another worker — not starting")
+                return
+    except Exception as e:
+        # If Redis is unreachable, fall through and start anyway — a possibly
+        # duplicated watchdog is better than none (idempotent reaping).
+        logger.warning(f"[call_watchdog] lock check failed ({e}) — starting unguarded")
+
     socketio.start_background_task(_run_loop, app)

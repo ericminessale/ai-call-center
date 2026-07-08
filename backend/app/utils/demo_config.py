@@ -41,6 +41,77 @@ def is_demo_mode() -> bool:
     return os.getenv('DEMO_MODE', '').strip().lower() == 'true'
 
 
+def call_is_persona_owned(call) -> bool:
+    """True if this call is attributed to a specific demo persona.
+
+    Phone-verification (see services/demo_verify) sets ``call.user_id`` to the
+    leased persona for calls from a visitor's verified number. Such a call is
+    PRIVATE to that visitor — the isolation checks use this to exclude it from
+    the shared-floor allowances that otherwise let any demo persona watch any
+    AI call. Shared/unattributed calls stay owned by the synthetic system user
+    (role != demo_agent) and return False here. Cheap: reads the ORM backref,
+    one PK lookup at most.
+    """
+    if call is None:
+        return False
+    owner = getattr(call, 'user', None)
+    return owner is not None and (getattr(owner, 'role', '') or '') == DEMO_AGENT_ROLE
+
+
+def demo_persona_self_scoped(user) -> bool:
+    """True when ``user`` is a leased demo persona on the hosted demo.
+
+    Demo personas carry the FULL permission set (see ROLE_PERMISSION_DEFAULTS
+    in models/user.py) so the coach / recording / observer surfaces render and
+    work — but their permissions are self-scoped: a flag never extends their
+    reach to a call they don't own. Call sites that would honor a permission
+    flag across calls must check this first and fall back to the ownership
+    test (``demo_persona_call_guard`` for REST, inline owner checks for
+    sockets). Always False outside demo mode, so clone-and-own deployments
+    keep plain flag semantics.
+    """
+    if not is_demo_mode():
+        return False
+    return (getattr(user, 'role', '') or '') == DEMO_AGENT_ROLE
+
+
+def demo_persona_owns_call(call, user) -> bool:
+    """True when the demo persona owns this call.
+
+    Ownership = assigned agent on the call, initiated it, or the call is
+    attributed to them (``call.user_id``) — which is how phone-verification
+    (services/demo_verify) marks inbound calls from a visitor's verified
+    number. This is the "gated to the contact/number you verified" rule.
+    """
+    if call is None or user is None:
+        return False
+    return call.user_id == user.id or call.assigned_agent_id == user.id
+
+
+def demo_persona_call_guard(call, user):
+    """403 a demo persona acting on a call it doesn't own; None to allow.
+
+    Companion to the permission flip in ROLE_PERMISSION_DEFAULTS['demo_agent']:
+    apply AFTER @require_permission on any endpoint whose flag would otherwise
+    let a persona reach another visitor's call (monitor, AI inject/hold,
+    whisper escalation, ...). No-op for real users and outside demo mode.
+    """
+    if not demo_persona_self_scoped(user):
+        return None
+    if demo_persona_owns_call(call, user):
+        return None
+    from flask import jsonify
+    return jsonify({
+        'error': 'In the demo this action only works on your own calls.',
+        'detail': (
+            'Verify your phone number from the demo banner, then call in '
+            'from it — calls from your verified number belong to you and '
+            'unlock the full control surface.'
+        ),
+        'code': 'demo_scope',
+    }), 403
+
+
 def demo_phone_numbers() -> list[dict]:
     """The demo phone numbers + labels surfaced on the landing card.
 

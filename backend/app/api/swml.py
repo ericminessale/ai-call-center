@@ -95,12 +95,32 @@ def initial_call():
             contact.last_interaction_at = datetime.utcnow()
             contact.total_calls = (contact.total_calls or 0) + 1
 
+        # Demo phone-verification attribution: if this caller's number was
+        # verified by a leased demo persona, the call belongs to THAT persona
+        # (not the shared system user). This is the link that makes the
+        # pre-deploy ownership checks private the call — other visitors can't
+        # join its room, read its transcript, or take it over. Falls back to
+        # the system user for unverified / non-demo callers.
+        owner_user_id = system_user.id
+        if is_demo_mode() and from_number:
+            try:
+                from app.services.demo_verify import get_persona_for_number
+                persona_id = get_persona_for_number(from_number)
+                if persona_id:
+                    owner_user_id = persona_id
+                    logger.info(
+                        "initial-call: attributed call %s to verified persona %s",
+                        call_id, persona_id,
+                    )
+            except Exception as exc:
+                logger.warning("initial-call: verify attribution failed (non-fatal): %s", exc)
+
         # Create new call record
         # Calls coming to /initial-call are INBOUND (SignalWire calling us when someone dials our number)
         # Also set handler_type to 'ai' since we're transferring to AI agent
         call = Call(
             signalwire_call_sid=call_id,
-            user_id=system_user.id,
+            user_id=owner_user_id,
             contact_id=contact_id,  # Link to contact
             from_number=from_number,  # Store caller's number
             destination=to_number or 'unknown',
@@ -697,6 +717,20 @@ def ai_agent_proxy():
     agent_route = request.args.get('agent', '/receptionist')
     conf = request.args.get('conf', '')
     call_db_id = request.args.get('call_db_id', '')
+
+    # ISO-10 (2026-07-07 pre-deploy): this proxy attaches internal Basic
+    # creds and forwards to a CLIENT-SUPPLIED destination. Left open,
+    # ?agent=@evil-host/x credential-leaks to an attacker's host and
+    # ?agent=/<anything> reaches any ai-agents route. Restrict `agent` to a
+    # fixed allowlist of the real agent routes — no host component, exact
+    # match only. (This endpoint is public via nginx `location /api`.)
+    _ALLOWED_AGENT_ROUTES = {
+        '/receptionist', '/sales', '/support', '/sales-ai', '/support-ai',
+        '/outbound-sales', '/outbound-support', '/hold-ai',
+    }
+    if agent_route not in _ALLOWED_AGENT_ROUTES:
+        logger.warning("[AI-PROXY] rejected disallowed agent route: %r", agent_route)
+        return jsonify({'error': 'Unknown agent route'}), 400
 
     # Build the internal URL to the AI agent
     query_parts = []

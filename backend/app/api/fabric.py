@@ -307,6 +307,14 @@ def list_subscribers():
     rather than emitting the bogus fabricated form.
     """
     from app.models import User
+    # ISO-18 (2026-07-07 pre-deploy): this returns every subscriber's email,
+    # Fabric address and metadata. Restrict to supervisors/admins — a leased
+    # demo persona (or any plain agent) has no reason to enumerate the roster,
+    # and on the shared instance it leaked all personas' details.
+    from flask_jwt_extended import get_jwt_identity
+    _requester = User.find_by_id(get_jwt_identity())
+    if not _requester or (_requester.role or '') not in ('admin', 'supervisor'):
+        return jsonify({'error': 'Insufficient permissions'}), 403
     try:
         try:
             resp = sw_client.get_client().fabric.subscribers.list(page_size=100)

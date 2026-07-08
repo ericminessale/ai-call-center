@@ -38,8 +38,10 @@ from app.services.demo_lease import (
     lease_persona,
     release_lease,
 )
-from app.utils.demo_config import is_demo_mode, runtime_config
+from app.utils.demo_config import DEMO_AGENT_ROLE, is_demo_mode, runtime_config
+from app.utils.decorators import require_auth
 from app.utils.jwt_utils import generate_tokens
+from app.utils.rate_limit import rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,7 @@ def get_runtime_config():
 
 
 @demo_bp.route('/demo/start', methods=['POST'])
+@rate_limit('demo_start', limit=10, window_seconds=60)
 def start_demo_session():
     """Lease a demo persona for the visitor's anonymous session.
 
@@ -206,6 +209,59 @@ def end_demo_session():
     response = make_response(jsonify({'ok': True, 'released': released}), 200)
     _clear_session_cookie(response)
     return response
+
+
+# ---------------------------------------------------------------------------
+# Phone-number verification (pairing-code flow)
+# ---------------------------------------------------------------------------
+
+
+def _require_demo_persona():
+    """Return (persona_user, None) or (None, error_response).
+
+    Verify endpoints are only meaningful for a leased demo persona. Gate on
+    DEMO_MODE + the demo_agent role so a real user can't mint pairing codes.
+    Must be used after @require_auth (reads request.current_user).
+    """
+    if not is_demo_mode():
+        return None, _refuse_when_demo_off()
+    user = getattr(request, 'current_user', None)
+    if user is None or (user.role or '') != DEMO_AGENT_ROLE:
+        return None, (jsonify({'error': 'Not a demo session'}), 403)
+    return user, None
+
+
+@demo_bp.route('/demo/verify/pairing-code', methods=['POST'])
+@rate_limit('demo_verify_code', limit=10, window_seconds=60)
+@require_auth
+def create_pairing_code():
+    """Issue (or refresh) the visitor's 4-digit pairing code.
+
+    The visitor TEXTS this code to the demo number; the inbound-SMS webhook
+    (``webhooks.sms_inbound``) matches it and binds the sender's number to
+    their persona. Inbound-only — no outbound SMS, so no messaging campaign
+    or A2P/fraud surface. One live code per persona; issuing a new one
+    invalidates the old.
+    """
+    persona, err = _require_demo_persona()
+    if err:
+        return err
+    from app.services.demo_verify import generate_pairing_code
+    code = generate_pairing_code(persona.id)
+    if not code:
+        return jsonify({'error': 'Could not generate a code — try again.'}), 503
+    return jsonify({'code': code}), 200
+
+
+@demo_bp.route('/demo/verify/status', methods=['GET'])
+@require_auth
+def get_verify_status():
+    """Current verification state for the visitor: live code + masked number."""
+    persona, err = _require_demo_persona()
+    if err:
+        return err
+    from app.services.demo_verify import verify_status
+    return jsonify(verify_status(persona.id)), 200
 
 
 @demo_bp.route('/demo/status', methods=['GET'])

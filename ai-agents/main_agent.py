@@ -40,6 +40,16 @@ def _signed_webhook_url(url: str) -> str:
     return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params,
                        parsed.query, parsed.fragment))
 
+def _internal_auth():
+    """HTTP Basic tuple for the backend's private ``@require_internal_auth``
+    routes (register-ai-leg, sentiment). Returns None when creds aren't set
+    so ``requests`` sends no Authorization header (backend fail-loud handles
+    the misconfig). ISO-9 (2026-07-07 pre-deploy)."""
+    user = os.getenv('WEBHOOK_AUTH_USER')
+    pw = os.getenv('WEBHOOK_AUTH_PASSWORD')
+    return (user, pw) if (user and pw) else None
+
+
 # Configuration
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://backend:5000')
 DATABASE_URL = os.getenv('DATABASE_URL', '')
@@ -715,7 +725,8 @@ def capture_base_url(query_params, body_params, headers, agent):
                     import requests as http_requests
                     backend_url = os.getenv('BACKEND_URL', 'http://backend:5000')
                     url = f"{backend_url}/api/calls/{call_db_id}/register-ai-leg"
-                    http_requests.post(url, json={'signalwire_sid': b_leg_sid}, timeout=5)
+                    http_requests.post(url, json={'signalwire_sid': b_leg_sid},
+                                       auth=_internal_auth(), timeout=5)
                     print(f"Registered AI B-leg SID: {b_leg_sid} for call {call_db_id}", flush=True)
                 except Exception as e:
                     print(f"Warning: Failed to register AI leg SID: {e}", flush=True)
@@ -741,7 +752,8 @@ def add_sentiment_tool(agent):
                     import requests as http_requests
                     backend_url = os.getenv('BACKEND_URL', 'http://backend:5000')
                     url = f"{backend_url}/api/calls/{call_db_id}/sentiment"
-                    http_requests.post(url, json={'score': score, 'reason': reason}, timeout=5)
+                    http_requests.post(url, json={'score': score, 'reason': reason},
+                                       auth=_internal_auth(), timeout=5)
                 except Exception as exc:
                     # Non-fatal: sentiment is decorative, never block the call.
                     print(f"sentiment POST failed (non-fatal): {exc}", flush=True)

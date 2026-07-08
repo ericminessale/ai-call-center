@@ -59,6 +59,28 @@ def create_app():
     app = Flask(__name__)
     _app_instance = app
 
+    # SEC-07: honor X-Forwarded-For/-Proto from a known number of trusted
+    # reverse-proxy hops (e.g. 1 for kamal-proxy/nginx, 2 with Cloudflare in
+    # front). Fixes request.is_secure behind TLS termination so the demo
+    # session cookie gets its Secure flag, and makes request.remote_addr the
+    # real client IP for rate limiting. Default 0 (off) preserves the
+    # clone-and-own direct-exposure behavior; deliberately NOT trusting
+    # X-Forwarded-Host (see the SEC-05 note below — EXTERNAL_URL is the only
+    # trusted host source).
+    try:
+        trusted_proxies = int(os.getenv('TRUSTED_PROXY_COUNT', '0').strip() or '0')
+    except ValueError:
+        trusted_proxies = 0
+    if trusted_proxies > 0:
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=trusted_proxies,
+            x_proto=trusted_proxies,
+            x_host=0,
+            x_port=0,
+        )
+
     # Configuration — secrets are required, no fallback to a known string.
     app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -101,6 +123,17 @@ def create_app():
                      ping_interval=25)
     bcrypt.init_app(app)
     jwt.init_app(app)
+
+    # SEC-03 closure for the flask-jwt-extended path: @jwt_required()
+    # routes (Call Fabric token mint, contacts, …) don't go through our
+    # custom verify_token, so without this loader a demo persona whose
+    # lease was released or TTL-expired could still mint live subscriber
+    # tokens. The blocklist loader runs on every @jwt_required() request
+    # and treats a stale persona token as revoked (401).
+    @jwt.token_in_blocklist_loader
+    def _persona_token_revoked(_jwt_header, jwt_payload):
+        from app.utils.jwt_utils import persona_claims_are_stale
+        return persona_claims_are_stale(jwt_payload)
 
     # Initialize Redis with connection pooling and retries
     global redis_client
@@ -162,8 +195,19 @@ def create_app():
         from app.services import socketio_events  # Basic connection handlers
         from app.services import callcenter_socketio  # Call center specific handlers
 
-        # Start queue monitor after imports
-        callcenter_socketio.start_queue_monitor()
+    # Long-lived background boot tasks (queue monitor, fabric sync, stale-call
+    # watchdog, demo-persona seed) must NOT run when the app object is loaded
+    # for a short-lived CLI command like `flask db upgrade` — the process
+    # exits immediately, but any Redis singleton lock it grabbed would linger
+    # and make the real gunicorn workers skip the task (leaving e.g. the
+    # watchdog unstarted). entrypoint.sh sets SKIP_BOOT_TASKS=1 for the
+    # migrate/seed phase; the gunicorn exec runs without it.
+    _skip_boot_tasks = os.getenv('SKIP_BOOT_TASKS', '').strip() == '1'
+
+    if not _skip_boot_tasks:
+        with app.app_context():
+            # Start queue monitor after imports
+            callcenter_socketio.start_queue_monitor()
 
     # Health check route
     @app.route('/health')
@@ -171,38 +215,58 @@ def create_app():
         return {'status': 'healthy'}
 
     # Sync managed Fabric webhook URLs to current EXTERNAL_URL. Idempotent —
-    # safe to run on every worker boot; a no-op if URLs already match.
-    # Keeps the agent-conference-swml resource pointing at the live ngrok
-    # tunnel after rotation, without manual Dashboard edits.
-    try:
-        from app.services.fabric_sync import sync_all
-        result = sync_all(os.getenv('EXTERNAL_URL', ''))
-        # Warning level so it surfaces in gunicorn's default log config.
-        app.logger.warning(f"[fabric_sync] startup sync: {result}")
-    except Exception as e:
-        app.logger.warning(f"[fabric_sync] startup sync failed (non-fatal): {e}")
+    # a no-op if URLs already match. Keeps the agent-conference-swml resource
+    # pointing at the live tunnel after rotation, without manual Dashboard edits.
+    #
+    # DEPLOY-H4: this hits the SignalWire REST API and used to run in every
+    # gunicorn worker (4x per boot). Gate it behind a Redis SET NX lock so only
+    # the first worker performs the boot sync; the rest skip it. Also skipped
+    # entirely during the CLI/migrate phase (_skip_boot_tasks).
+    if not _skip_boot_tasks:
+        try:
+            _do_fabric_sync = True
+            try:
+                from app.services.redis_service import get_redis_client
+                _rc = get_redis_client()
+                if _rc is not None:
+                    _do_fabric_sync = bool(
+                        _rc.set('fabric_sync_boot_lock', '1', nx=True, ex=120)
+                    )
+            except Exception:
+                _do_fabric_sync = True  # Redis unavailable — better to sync than skip.
+            if _do_fabric_sync:
+                from app.services.fabric_sync import sync_all
+                result = sync_all(os.getenv('EXTERNAL_URL', ''))
+                # Warning level so it surfaces in gunicorn's default log config.
+                app.logger.warning(f"[fabric_sync] startup sync: {result}")
+            else:
+                app.logger.info("[fabric_sync] startup sync already done by another worker — skipping")
+        except Exception as e:
+            app.logger.warning(f"[fabric_sync] startup sync failed (non-fatal): {e}")
 
     # Start the stale-call watchdog. Background greenlet that reaps Call rows
     # whose SWML heartbeat key has expired in Redis — our only reliable signal
     # that a parked caller has dropped (see app/services/call_watchdog.py for
     # full rationale).
-    try:
-        from app.services.call_watchdog import start as start_call_watchdog
-        start_call_watchdog(app)
-    except Exception as e:
-        app.logger.error(f"[call_watchdog] start failed (non-fatal): {e}")
+    if not _skip_boot_tasks:
+        try:
+            from app.services.call_watchdog import start as start_call_watchdog
+            start_call_watchdog(app)
+        except Exception as e:
+            app.logger.error(f"[call_watchdog] start failed (non-fatal): {e}")
 
     # Top up the demo-persona pool when DEMO_MODE is on. Idempotent —
     # no-op on production-shape clone-and-own deployments.
-    try:
-        from app.utils.demo_config import is_demo_mode
-        if is_demo_mode():
-            with app.app_context():
-                from app.services.demo_seed import seed_demo_personas
-                seed_result = seed_demo_personas()
-                app.logger.warning(f"[demo_seed] startup: {seed_result}")
-    except Exception as e:
-        # Don't crash the app for a seed failure — log loudly so it gets fixed.
-        app.logger.error(f"[demo_seed] startup failed (non-fatal): {e}")
+    if not _skip_boot_tasks:
+        try:
+            from app.utils.demo_config import is_demo_mode
+            if is_demo_mode():
+                with app.app_context():
+                    from app.services.demo_seed import seed_demo_personas
+                    seed_result = seed_demo_personas()
+                    app.logger.warning(f"[demo_seed] startup: {seed_result}")
+        except Exception as e:
+            # Don't crash the app for a seed failure — log loudly so it gets fixed.
+            app.logger.error(f"[demo_seed] startup failed (non-fatal): {e}")
 
     return app

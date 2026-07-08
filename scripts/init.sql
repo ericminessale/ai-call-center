@@ -275,25 +275,13 @@ GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO ccuser;
 -- Seed data
 -- ============================================================
 
--- Default admin user (Password: Admin123!)
-INSERT INTO users (email, password_hash, name, role, is_active)
-VALUES (
-    'admin@callcenter.com',
-    '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY.hsF8U6FOvaPi',
-    'System Administrator',
-    'admin',
-    true
-) ON CONFLICT (email) DO NOTHING;
-
--- Default agent user (Password: Agent123!)
-INSERT INTO users (email, password_hash, name, role, is_active)
-VALUES (
-    'agent@callcenter.com',
-    '$2b$12$4g7zkPzbPc.M0K6V7WYAVOkBYZJpM0PglU9rBxPLlZQp8h6clImGS',
-    'Call Center Agent',
-    'agent',
-    true
-) ON CONFLICT (email) DO NOTHING;
+-- DEPLOY-C3 (2026-07-07 pre-deploy): the default admin/agent users with
+-- publicly-known passwords (Admin123! / Agent123!) were REMOVED from the
+-- seed. On a public instance those committed credentials let anyone sign in
+-- as admin. The first admin is now provisioned from ADMIN_EMAIL/ADMIN_PASSWORD
+-- by backend/seed_first_admin.py (run from entrypoint.sh after migrations);
+-- if those env vars are unset no admin is created at all. Do NOT reintroduce
+-- a hardcoded credential here.
 
 -- Default routing config
 INSERT INTO system_config (key, value) VALUES

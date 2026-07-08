@@ -9,6 +9,7 @@ from app.models.call import Call
 from app.models.call_leg import CallLeg
 from app.models import User
 from app.utils.decorators import require_auth, require_permission, require_role
+from app.utils.demo_config import demo_persona_call_guard
 from app.services.signalwire_api import get_signalwire_api
 from app.services.redis_service import get_redis_client
 from datetime import datetime
@@ -86,6 +87,13 @@ def _require_call_ownership(call, user):
     if role in ('admin', 'supervisor'):
         return None
     if call.assigned_agent_id == user.id:
+        return None
+    # Initiator/attributed owner counts too — mirrors the "initiated /
+    # assigned" owner definition join_call (ISO-3) and join_tap (RT-01)
+    # already use. In demo mode this is what lets a phone-verified visitor
+    # control their OWN inbound call (demo_verify attributes it via
+    # call.user_id) even while the AI is the handling agent.
+    if call.user_id == user.id:
         return None
     return jsonify({
         'error': "You don't have ownership of this call",
@@ -412,6 +420,14 @@ def start_recording(call_id):
     if not call:
         return jsonify({'error': 'Call not found'}), 404
 
+    # ISO-5 (2026-07-07 pre-deploy): ownership gate — RE-AUDIT-04 added
+    # this to play/DTMF/return-to-queue but skipped the recording/translate
+    # siblings, so any user with can_control_recording could start/stop
+    # recording on another visitor's call by id.
+    owner_check = _require_call_ownership(call, request.current_user)
+    if owner_check:
+        return owner_check
+
     try:
         sw_api = get_signalwire_api()
         result = sw_api.start_recording(call.signalwire_call_sid)
@@ -474,6 +490,11 @@ def stop_recording(call_id):
     if not call:
         return jsonify({'error': 'Call not found'}), 404
 
+    # ISO-5: ownership gate (see start_recording).
+    owner_check = _require_call_ownership(call, request.current_user)
+    if owner_check:
+        return owner_check
+
     try:
         # Get control_id from Redis
         redis_client = get_redis_client()
@@ -512,6 +533,12 @@ def start_translate(call_id):
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
+
+    # ISO-5: ownership gate — live_translate plays audio into the customer
+    # leg, so restrict to the assigned agent (or supervisor/admin).
+    owner_check = _require_call_ownership(call, request.current_user)
+    if owner_check:
+        return owner_check
 
     data = request.get_json() or {}
     from_lang = (data.get('from_lang') or call.caller_language or 'en-US').strip()
@@ -588,6 +615,11 @@ def stop_translate(call_id):
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
+
+    # ISO-5: ownership gate (see start_translate).
+    owner_check = _require_call_ownership(call, request.current_user)
+    if owner_check:
+        return owner_check
 
     try:
         sw_api = get_signalwire_api()
@@ -706,6 +738,12 @@ def start_monitor(call_id):
             'call_type': 'human' if is_human_call else 'ai',
         }), 403
 
+    # Demo personas hold the listen flags (so the observer UI renders) but
+    # they are self-scoped — audio of another visitor's call stays private.
+    scope_check = demo_persona_call_guard(call, user)
+    if scope_check:
+        return scope_check
+
     redis_client = get_redis_client()
 
     try:
@@ -803,6 +841,12 @@ def stop_monitor(call_id):
             'required_permissions': ['can_listen_ai_calls', 'can_listen_human_calls'],
         }), 403
 
+    # Same self-scope as start_monitor — a demo persona can only have a
+    # monitor running on its own call, so this never strands a session.
+    scope_check = demo_persona_call_guard(call, user)
+    if scope_check:
+        return scope_check
+
     redis_client = get_redis_client()
 
     try:
@@ -847,6 +891,13 @@ def request_backup(call_id):
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
+
+    # ISO-5: ownership gate — request_backup pulls another agent into THIS
+    # call's conference and fires a call assignment. Without ownership a
+    # persona could drag agents into any conference and spam assignments.
+    owner_check = _require_call_ownership(call, request.current_user)
+    if owner_check:
+        return owner_check
 
     if not call.conference_name:
         return jsonify({'error': 'Call must be in a conference to request backup'}), 400
@@ -949,6 +1000,14 @@ def escalate_to_supervisor(call_id):
     call = find_call(call_id)
     if not call:
         return jsonify({'error': 'Call not found'}), 404
+
+    # Demo personas may only escalate their own call — escalation rings a
+    # real supervisor/admin and mutates the conference, so it must not be
+    # reachable cross-visitor by call_id. Checked before the conference
+    # branch so the 400 doesn't disclose another visitor's call state.
+    scope_check = demo_persona_call_guard(call, request.current_user)
+    if scope_check:
+        return scope_check
 
     if not call.conference_name:
         return jsonify({'error': 'Call must be in a conference to escalate'}), 400

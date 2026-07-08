@@ -111,7 +111,8 @@ export function CallbackDetail({ callback, currentUserId, onUpdated, onClose }: 
       const code = err?.response?.data?.code;
       const msg = err?.response?.data?.error || 'Failed to dial';
       if (code === 'demo_blocked') {
-        toast('Outbound dialing is disabled in demo mode', { icon: 'ℹ️' });
+        // The global axios interceptor already toasted the demo-blocked
+        // message — a second toast here just doubles it up.
       } else {
         logger.error('Failed to dial callback', err);
         toast.error(msg);

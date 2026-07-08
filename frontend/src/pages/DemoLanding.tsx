@@ -85,12 +85,27 @@ export default function DemoLanding() {
             <h2 className="font-heading text-[30px] text-ink font-semibold leading-[1.1] tracking-heading">
               See an AI call center in action.
             </h2>
+            {/* UX-1: the "dial the number below" line only makes sense when
+                DEMO_PHONE_NUMBERS is configured (and the block below renders).
+                With no numbers set, point the visitor at the dashboard instead
+                of a phone number that isn't on the page. */}
             <p className="text-[13px] text-ink-muted mt-2 leading-relaxed">
-              You'll be dropped into the agent dashboard as one of our demo
-              agents. Dial the number below from your phone — the AI receptionist
-              picks up, gathers context, and routes the call. You'll see it all
-              live: live transcription, sentiment, AI tools invoked mid-call,
-              the queue, the works.
+              {phoneNumbers.length > 0 ? (
+                <>
+                  You'll be dropped into the agent dashboard as one of our demo
+                  agents. Dial the number below from your phone — the AI
+                  receptionist picks up, gathers context, and routes the call.
+                  You'll see it all live: live transcription, sentiment, AI
+                  tools invoked mid-call, the queue, the works.
+                </>
+              ) : (
+                <>
+                  You'll be dropped into the agent dashboard as one of our demo
+                  agents, already online. Watch AI-handled calls arrive, take
+                  one over, and see it all live: transcription, sentiment, the
+                  queue, the works.
+                </>
+              )}
             </p>
           </div>
 

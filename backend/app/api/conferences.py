@@ -1211,6 +1211,31 @@ def conference_status_callback(conference_name):
     return jsonify({'status': 'ok'})
 
 
+def _require_conference_control(conference, user):
+    """Return an (jsonify, status) abort tuple, or None to allow.
+
+    ISO-6 (2026-07-07 pre-deploy): conference control routes gated only on
+    @require_auth, and conference_name is derivable (``interaction-<call_sid>``),
+    so any authenticated user could move/mute participants or end another
+    visitor's conference. Allow only supervisors/admins or an agent who is an
+    active participant in this conference.
+    """
+    role = getattr(user, 'role', '') or ''
+    if role in ('admin', 'supervisor'):
+        return None
+    part = ConferenceParticipant.query.filter_by(
+        conference_id=conference.id,
+        participant_type='agent',
+        participant_id=str(user.id),
+        status='active',
+    ).first()
+    if part:
+        return None
+    return jsonify({
+        'error': "You are not a participant in this conference",
+    }), 403
+
+
 @conferences_bp.route('/<conference_name>/participants', methods=['GET'])
 @require_auth
 def get_conference_participants(conference_name):
@@ -1247,6 +1272,12 @@ def move_participant(conference_name):
     source_conference = Conference.get_active_by_name(conference_name)
     if not source_conference:
         return jsonify({'error': 'Source conference not found'}), 404
+
+    # ISO-6: only a participant of the source conference (or supervisor/admin)
+    # may move participants out of it.
+    control_check = _require_conference_control(source_conference, request.current_user)
+    if control_check is not None:
+        return control_check
 
     # Find target conference
     target_conference = Conference.get_active_by_name(target_conference_name)
@@ -1317,6 +1348,11 @@ def end_conference(conference_name):
     if not conference:
         return jsonify({'error': 'Conference not found'}), 404
 
+    # ISO-6: only a participant (or supervisor/admin) may end the conference.
+    control_check = _require_conference_control(conference, request.current_user)
+    if control_check is not None:
+        return control_check
+
     try:
         # Use SignalWire API to end the conference
         from app.services.signalwire_api import SignalWireAPI
@@ -1347,6 +1383,14 @@ def mute_participant(conference_name, participant_call_sid):
     """Mute or unmute a participant."""
     data = request.get_json() or {}
     muted = data.get('muted', True)
+
+    # ISO-6: resolve + authorize the conference before touching a participant.
+    conference = Conference.get_active_by_name(conference_name)
+    if not conference:
+        return jsonify({'error': 'Conference not found'}), 404
+    control_check = _require_conference_control(conference, request.current_user)
+    if control_check is not None:
+        return control_check
 
     participant = ConferenceParticipant.get_active_by_call_sid(participant_call_sid)
     if not participant:

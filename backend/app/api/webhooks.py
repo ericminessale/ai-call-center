@@ -1627,3 +1627,79 @@ def recording_status():
         return '', 500
 
 
+@webhooks_bp.route('/sms-inbound', methods=['POST'])
+@require_webhook_auth
+def sms_inbound():
+    """Inbound SMS webhook — demo phone verification via texted pairing code.
+
+    Point the demo number's "message received" webhook at this route (sign it
+    with the WEBHOOK_AUTH creds like every other webhook URL). The visitor's
+    dashboard shows a 4-digit code and tells them to TEXT it to the demo
+    number; when the MO message lands here we match the code and bind the
+    sender's number to their demo persona (services/demo_verify).
+
+    This direction needs NO messaging campaign — 10DLC/A2P registration gates
+    outbound application messages, and we never reply. The sender number on an
+    inbound SMS is also a stronger possession proof than voice caller-ID.
+
+    Accepts both webhook shapes: Compatibility form fields (From/To/Body) and
+    JSON (from_number/body). Always answers 200 with an empty LaML <Response/>
+    so the platform never retries or errors — outcomes are visible to the
+    visitor via the demo_phone_verified socket push and the verify/status
+    endpoint, not to the texter.
+    """
+    _laml_ok = ('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                200, {'Content-Type': 'application/xml'})
+
+    try:
+        from app.utils.demo_config import is_demo_mode
+        if not is_demo_mode():
+            # Production-shape deployment: acknowledge and drop.
+            return _laml_ok
+
+        data = request.form.to_dict() if request.form else (request.get_json(silent=True) or {})
+        from_number = (
+            data.get('From') or data.get('from_number') or data.get('from') or ''
+        )
+        body = (data.get('Body') or data.get('body') or '').strip()
+
+        logger.info(
+            "WEBHOOK: /api/webhooks/sms-inbound from=%s body=%r",
+            from_number, body[:40],
+        )
+
+        if not from_number or not body:
+            return _laml_ok
+
+        # Extract the first 4-digit group from the message — tolerate
+        # "1234", "code 1234", "1 2 3 4" etc.
+        import re as _re
+        compact = _re.sub(r'\s', '', body)
+        match = _re.search(r'(?<!\d)(\d{4})(?!\d)', compact)
+        if not match:
+            logger.info("sms-inbound: no 4-digit code in message — ignoring")
+            return _laml_ok
+
+        from app.services.demo_verify import pair_number, PAIR_OK
+        result = pair_number(match.group(1), from_number)
+        logger.info("sms-inbound: pair → %s", result.get('status'))
+
+        # On success, flip the visitor's UI live via their user room.
+        if result.get('status') == PAIR_OK and result.get('persona_id'):
+            try:
+                socketio.emit(
+                    'demo_phone_verified',
+                    {'masked_number': result.get('masked')},
+                    room=str(result['persona_id']),
+                )
+            except Exception as exc:
+                logger.warning("sms-inbound: socket notify failed: %s", exc)
+
+        return _laml_ok
+
+    except Exception as e:
+        logger.error(f"Error processing inbound SMS webhook: {str(e)}")
+        # Still 200 — never make the platform retry a verification text.
+        return _laml_ok
+
+

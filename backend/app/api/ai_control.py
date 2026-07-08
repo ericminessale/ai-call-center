@@ -13,12 +13,35 @@ import base64
 from datetime import datetime
 from base64 import b64encode
 
-from app.utils.demo_config import block_in_demo_mode
+from app.utils.demo_config import (
+    block_in_demo_mode,
+    call_is_persona_owned,
+    demo_persona_call_guard,
+    demo_persona_self_scoped,
+    is_demo_mode,
+)
 from app.utils.decorators import require_auth, require_permission
+from app.utils.webhook_auth import require_webhook_auth
 
 logger = logging.getLogger(__name__)
 
 ai_control_bp = Blueprint('ai_control', __name__)
+
+
+def _demo_scope_check_by_sid(call_sid):
+    """Self-scope guard for endpoints keyed on a SignalWire call UUID.
+
+    The AI Session Control endpoints act on the raw SignalWire call id, so
+    resolve it to our Call row before applying demo_persona_call_guard.
+    Demo personas are denied when the call can't be resolved (ownership is
+    unverifiable); real users are unaffected either way.
+    """
+    user = request.current_user
+    if not demo_persona_self_scoped(user):
+        return None
+    from app.models.call import Call
+    call = Call.find_by_sid(str(call_sid)) if call_sid else None
+    return demo_persona_call_guard(call, user)
 
 # Available AI agents - must match routes in ai-agents/main_agent.py
 AI_AGENTS = [
@@ -102,9 +125,25 @@ def get_active_ai_sessions():
 
         calls_data = response.json()
 
+        # Demo privacy: calls attributed to a persona's verified number are
+        # private to that visitor (same rule as list_calls' floor filter).
+        # This endpoint reads straight from SignalWire, so rebuild the
+        # exclusion set from our DB before enriching — otherwise another
+        # visitor's verified from_number would leak here.
+        excluded_sids = set()
+        if is_demo_mode() and demo_persona_self_scoped(request.current_user):
+            from app.models.call import Call
+            sids = [c.get('id') for c in calls_data.get('data', []) if c.get('id')]
+            if sids:
+                for row in Call.query.filter(Call.signalwire_call_sid.in_(sids)).all():
+                    if call_is_persona_owned(row) and row.user_id != request.current_user.id:
+                        excluded_sids.add(row.signalwire_call_sid)
+
         # Filter for AI agent calls and enrich with additional data
         ai_calls = []
         for call in calls_data.get('data', []):
+            if call.get('id') in excluded_sids:
+                continue
             # Check if this is an AI agent call (you might have specific markers)
             to_address = call.get('to', '')
 
@@ -170,6 +209,11 @@ def inject_system_message():
         if not call_id or not message_text:
             logger.error(f"🎯 Missing required fields - call_id: {call_id}, message: {message_text}")
             return jsonify({'error': 'call_id and message are required'}), 400
+
+        # Demo personas may steer the AI only on their own call.
+        scope_check = _demo_scope_check_by_sid(call_id)
+        if scope_check:
+            return scope_check
 
         # Log the intervention
         logger.info(f"Supervisor {supervisor_id} injecting message into call {call_id}: {message_text}")
@@ -240,6 +284,9 @@ def get_injection_history(call_id):
     into an AI agent's running session). Same threat class as AI-02's
     write side (/inject-message) — gated identically here.
     """
+    scope_check = _demo_scope_check_by_sid(call_id)
+    if scope_check:
+        return scope_check
     try:
         from app.services.redis_service import get_redis_client
         redis_client = get_redis_client()
@@ -435,12 +482,20 @@ def list_ai_agents():
 
 
 @ai_control_bp.route('/outbound-swml/<int:call_id>', methods=['POST', 'GET'])
+@require_webhook_auth
 def outbound_ai_swml(call_id):
     """SWML webhook called by SignalWire when the outbound call is answered.
 
     Looks up the Call record to determine which AI agent to transfer to and
     what context to pass along, then returns SWML that transfers the call
     to the appropriate AI agent URL with encoded context.
+
+    ISO-12 (2026-07-07 pre-deploy): now behind @require_webhook_auth. It was
+    unauthenticated (GET+POST) and returned SWML embedding the base64
+    ai_context_dict (triage-collected customer data) for any enumerable
+    call_id. The producer that hands this URL to SignalWire must sign it with
+    WEBHOOK_AUTH creds (see signed_webhook_url); soft mode is a no-op during
+    migration, enforce mode (default) rejects unsigned callers with 401.
     """
     from app import db
     from app.models import Call
@@ -528,12 +583,13 @@ def outbound_ai_swml(call_id):
 
 @ai_control_bp.route('/outbound-call', methods=['POST'])
 @jwt_required()
-@block_in_demo_mode
 def initiate_outbound_ai_call():
     """
     Initiate an outbound call handled by an AI agent.
 
-    Soft-blocked in DEMO_MODE — see calls.initiate_call comment.
+    This is the "have the AI call me" path. In DEMO_MODE it's gated to the
+    persona's own verified number (phone verification) with a per-hour cap —
+    a visitor can make the demo call THEM, but can't dial anyone else.
 
     Request body:
     {
@@ -560,6 +616,23 @@ def initiate_outbound_ai_call():
         contact_id = data.get('contact_id')
         agent_type = data.get('agent_type', 'sales')
         context = data.get('context', {})
+
+        # Demo outbound gate: FORCE the destination to the persona's own
+        # verified number — the client can't dial anywhere else, and doesn't
+        # even need to know the full number (the UI only shows it masked).
+        from app.utils.demo_config import is_demo_mode
+        if is_demo_mode():
+            from app.services.demo_verify import get_verified_number, demo_outbound_denial
+            verified = get_verified_number(user_id)
+            if not verified:
+                return jsonify({
+                    'error': 'Verify your phone number first, then the demo can call you.',
+                    'code': 'demo_verify_required',
+                }), 403
+            phone = verified  # ignore any client-supplied destination in demo
+            denial = demo_outbound_denial(user_id, phone)
+            if denial:
+                return jsonify(denial[0]), denial[1]
 
         if not phone:
             return jsonify({'error': 'phone is required'}), 400
@@ -600,10 +673,10 @@ def initiate_outbound_ai_call():
 
         # Build the SWML webhook URL that SignalWire will fetch when the call is answered
         base_url = get_base_url()
-        swml_url = f"{base_url}/api/ai/outbound-swml/{call.id}"
-        # Note: swml_url itself isn't a webhook into our backend (it's an SWML
-        # script endpoint), but it does carry sensitive context — leaving it
-        # unauthenticated for now until the agents grow proper webhook auth.
+        # ISO-12: the SWML endpoint carries base64 customer context, so it's
+        # now behind @require_webhook_auth. Sign the URL SignalWire calls back
+        # so the embedded Basic creds are replayed and the endpoint accepts it.
+        swml_url = signed_webhook_url(f"{base_url}/api/ai/outbound-swml/{call.id}")
         status_callback = signed_webhook_url(f"{base_url}/api/webhooks/call-status")
 
         logger.info(f"SWML URL for outbound AI call: {swml_url}")
@@ -653,6 +726,9 @@ def pause_ai_agent(call_id):
     400. (If the audit trail wants the reason it can stay on the
     application side via existing call_event emits.)
     """
+    scope_check = _demo_scope_check_by_sid(call_id)
+    if scope_check:
+        return scope_check
     try:
         payload = {
             "id": call_id,
@@ -690,6 +766,9 @@ def resume_ai_agent(call_id):
     REST verb. See pause_ai_agent docstring for the verb-rename
     context.
     """
+    scope_check = _demo_scope_check_by_sid(call_id)
+    if scope_check:
+        return scope_check
     try:
         payload = {
             "id": call_id,

@@ -1634,7 +1634,7 @@ def sms_inbound():
 
     Point the demo number's "message received" webhook at this route (sign it
     with the WEBHOOK_AUTH creds like every other webhook URL). The visitor's
-    dashboard shows a 4-digit code and tells them to TEXT it to the demo
+    dashboard shows a 6-digit code and tells them to TEXT it to the demo
     number; when the MO message lands here we match the code and bind the
     sender's number to their demo persona (services/demo_verify).
 
@@ -1671,14 +1671,37 @@ def sms_inbound():
         if not from_number or not body:
             return _laml_ok
 
-        # Extract the first 4-digit group from the message — tolerate
-        # "1234", "code 1234", "1 2 3 4" etc.
+        # Extract the first 6-digit group from the message — tolerate
+        # "123456", "code 123456", "123 456" etc. (6 digits since
+        # DEMO-SEC-06 moved codes to secrets-grade randomness).
         import re as _re
         compact = _re.sub(r'\s', '', body)
-        match = _re.search(r'(?<!\d)(\d{4})(?!\d)', compact)
+        match = _re.search(r'(?<!\d)(\d{6})(?!\d)', compact)
         if not match:
-            logger.info("sms-inbound: no 4-digit code in message — ignoring")
+            logger.info("sms-inbound: no 6-digit code in message — ignoring")
             return _laml_ok
+
+        # Per-sender pairing-attempt cap. Code entropy is the real auth on
+        # this webhook (the shared To-number carries no session context),
+        # so bound guessing explicitly instead of leaning on SMS costing
+        # the attacker money. Fail-open on Redis trouble, like the other
+        # demo limiters.
+        try:
+            from app.services.redis_service import get_redis_client
+            _r = get_redis_client()
+            if _r is not None:
+                _cap_key = f'demo:verify:sms_attempts:{from_number}'
+                _n = _r.incr(_cap_key)
+                if _n == 1:
+                    _r.expire(_cap_key, 3600)
+                if _n > 10:
+                    logger.warning(
+                        "sms-inbound: pairing-attempt cap hit for %s — ignoring",
+                        from_number,
+                    )
+                    return _laml_ok
+        except Exception:
+            pass
 
         from app.services.demo_verify import pair_number, PAIR_OK
         result = pair_number(match.group(1), from_number)

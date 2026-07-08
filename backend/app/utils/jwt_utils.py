@@ -104,6 +104,32 @@ def persona_claims_are_stale(payload):
     return not has_active_lease(uid)
 
 
+def extra_claims_for_refresh(payload):
+    """Claims to carry forward when re-minting tokens from a refresh token.
+
+    generate_tokens() bakes identity-scope claims into BOTH tokens
+    (persona/epoch today; workspace claims when tenancy lands). A bare
+    ``generate_tokens(user.id)`` on /refresh silently drops them — the
+    refreshed access token then skips persona_claims_are_stale entirely,
+    outliving the lease it was scoped to.
+
+    The epoch is COPIED from the already-validated payload, not re-read
+    from Redis: within a legitimate session the epoch never changes, and
+    re-reading opens a TOCTOU where the lease expires between validation
+    and re-mint, another visitor claims the persona (bumping the epoch),
+    and the re-read would stamp THEIR epoch onto the old visitor's new
+    token. Copying keeps the stale value, which then correctly fails the
+    epoch match. The payload must already have passed verify_token —
+    this function does no staleness checking itself.
+    """
+    if not payload.get('persona'):
+        return None
+    return {
+        'persona': True,
+        'epoch': payload.get('epoch'),
+    }
+
+
 def verify_token(token, token_type='access'):
     """Verify a token and return the user_id if valid.
 

@@ -334,8 +334,8 @@ export function UnifiedHeader({
                 availableQueues.length > 0 &&
                 !showStatusDropdown
               }
-              title="Almost there — pick a queue"
-              body="You're available but not signed up for any queues, so calls won't route to you. Click your status pill and check at least one."
+              title="Almost there — pick your queues"
+              body="You're available but not signed up for any queues, so calls won't route to you. Click your status pill and check the queues you want calls from — a call only rings you if its queue is checked."
               placement="bottom-end"
             />
 

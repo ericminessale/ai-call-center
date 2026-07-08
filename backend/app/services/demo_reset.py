@@ -25,10 +25,13 @@ from app import db, redis_client
 from app.models import (
     Call,
     CallLeg,
+    Callback,
     Conference,
     ConferenceParticipant,
     Contact,
+    QueueAgentAssignment,
     Transcription,
+    User,
     WebhookEvent,
 )
 from app.utils.demo_config import is_demo_mode
@@ -45,8 +48,15 @@ _WIPE_MODELS_IN_ORDER = (
     ConferenceParticipant,
     Conference,
     WebhookEvent,
+    Callback,    # references calls/contacts (SET NULL, but wipe explicitly)
     Call,        # parent of legs/transcriptions
     Contact,     # parent of calls (calls reference contact_id)
+    # Per-visitor queue opt-ins. The docstring always claimed these were
+    # wiped, but the table was missing from the list — leaving DB rows
+    # is_activated=True while FLUSHDB emptied the queue_agents:{slug}
+    # sets routing reads. Result: next day's visitor sees the checkbox
+    # ON while dispatch treats it as OFF and their call holds forever.
+    QueueAgentAssignment,
 )
 
 
@@ -73,9 +83,11 @@ def reset_demo_state() -> dict:
 def _wipe_mutable_db_state() -> dict[str, Any]:
     """Truncate the mutable-state tables.
 
-    Uses ORM-level ``delete()`` so SQLAlchemy events fire correctly.
-    Counts are best-effort (logged for the operator); they're not used
-    to gate anything downstream.
+    NOTE: ``query(model).delete(synchronize_session=False)`` is a BULK
+    delete — it skips ORM mapper events and relationship cascades.
+    Correctness rests entirely on _WIPE_MODELS_IN_ORDER being
+    children-first; don't add delete-event listeners and expect them to
+    fire here. Counts are best-effort (logged for the operator).
     """
     counts: dict[str, int] = {}
     for model in _WIPE_MODELS_IN_ORDER:
@@ -85,6 +97,20 @@ def _wipe_mutable_db_state() -> dict[str, Any]:
         except Exception as exc:
             logger.error("demo_reset: wipe of %s failed: %s", model.__tablename__, exc)
             counts[model.__tablename__] = -1
+    # Persona User rows are preserved, but a few columns on them are
+    # visitor-mutable state, not fixtures: /api/auth/me/languages is
+    # self-serve, so one visitor's language edit would permanently skew
+    # language-preferring routing for every later lessee. Reset to the
+    # seeded default.
+    try:
+        from app.utils.demo_config import DEMO_AGENT_ROLE
+        counts['persona_languages_reset'] = (
+            db.session.query(User)
+            .filter_by(role=DEMO_AGENT_ROLE)
+            .update({'languages': ['en-US']}, synchronize_session=False)
+        )
+    except Exception as exc:
+        logger.error("demo_reset: persona language reset failed: %s", exc)
     db.session.commit()
     return counts
 

@@ -63,11 +63,15 @@ def _user_key(user_id: int) -> str:
 # by replaying their JWT after release" gap the 2026-06-02 audit flagged.
 #
 # Epoch lives in a separate Redis key from the lease itself so it
-# persists across lease lifecycles. It's NOT bumped on TTL-expiry of the
-# lease (Redis doesn't fire keyspace events here by default) — that case
-# is covered by the companion :func:`has_active_lease` check in
-# verify_token, which rejects persona tokens whose lease has expired
-# regardless of epoch.
+# persists across lease lifecycles. It's bumped in TWO places:
+#   - release_lease: explicit "Leave demo" invalidates the visitor's JWTs
+#   - lease_persona (fresh claim): a TTL-expired lease never bumps the
+#     epoch (no keyspace events), so without this the previous visitor's
+#     un-expired JWT would pass both checks again the moment the persona
+#     is re-leased — has_active_lease flips back to True and the epoch
+#     still matches (DEMO-SEC-01). Bumping on claim means tokens from any
+#     prior lease die the instant a new visitor takes the persona.
+# Between TTL-expiry and the next claim, has_active_lease covers the gap.
 
 def _persona_epoch_key(user_id: int) -> str:
     return f'demo:persona_epoch:{int(user_id)}'
@@ -83,19 +87,36 @@ def get_persona_epoch(user_id: int) -> int:
     try:
         raw = redis_client.get(_persona_epoch_key(int(user_id)))
         return int(raw) if raw is not None else 0
-    except (TypeError, ValueError, Exception):
+    except Exception:
         return 0
 
 
 def bump_persona_epoch(user_id: int) -> int:
-    """Increment + return the new epoch. Called by :func:`release_lease`
-    to invalidate JWTs issued under the prior lease (SEC-03)."""
+    """Advance + return the persona epoch (invalidates JWTs minted under
+    any earlier epoch). Called on release AND on fresh lease claim.
+
+    The value is floored to a time-derived counter (unix minutes) so
+    epochs stay monotonic across the nightly reset: FLUSHDB wipes the
+    key, and a bare INCR would restart at 1 — re-issuing epoch values
+    already baked into yesterday's ~30-day refresh tokens, which would
+    validate again once the persona is re-leased. Time only moves
+    forward, so a wiped counter can never repeat an old epoch.
+    """
     redis_client = get_redis_client()
     if redis_client is None:
         return 0
+    key = _persona_epoch_key(int(user_id))
     try:
-        return int(redis_client.incr(_persona_epoch_key(int(user_id))))
-    except Exception:
+        new = int(redis_client.incr(key))
+        floor = int(datetime.utcnow().timestamp() // 60)
+        if new < floor:
+            redis_client.set(key, floor)
+            return floor
+        return new
+    except Exception as exc:
+        # A failed bump silently re-admits prior-lease JWTs for the next
+        # lease window (the exact DEMO-SEC-01 hole) — make it loud.
+        logger.error("bump_persona_epoch failed for user %s: %s", user_id, exc)
         return 0
 
 
@@ -182,6 +203,20 @@ def lease_persona(session_token: str) -> Optional[User]:
         won = redis_client.set(_user_key(user.id), payload, nx=True, ex=ttl)
         if not won:
             continue  # someone else holds this one
+        # DEMO-SEC-01: invalidate any JWTs minted under a prior lease of
+        # this persona (TTL-abandoned leases never bumped the epoch).
+        # Must happen before the caller mints this visitor's tokens.
+        bump_persona_epoch(user.id)
+        # Same asymmetry for verify state (DEMO-SEC-07 residual): explicit
+        # release clears bindings + the outbound-cap counter, but a
+        # TTL-abandoned lease doesn't — the outbound counter (1h window)
+        # outlives the 5-min lease TTL, so without this the next visitor
+        # inherits the previous one's remaining call budget.
+        try:
+            from app.services.demo_verify import clear_bindings
+            clear_bindings(user.id)
+        except Exception:
+            pass
         # Mirror the reverse index so we can look up by session.
         redis_client.set(_session_key(session_token), str(user.id), ex=ttl)
         logger.info(

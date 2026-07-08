@@ -3,7 +3,12 @@ from flask import request, jsonify
 from app import db
 from app.api import auth_bp
 from app.models import User
-from app.utils.jwt_utils import generate_tokens, verify_token
+from app.utils.jwt_utils import (
+    decode_token,
+    extra_claims_for_refresh,
+    generate_tokens,
+    verify_token,
+)
 from app.utils.decorators import validate_json
 from app.utils.demo_config import block_in_demo_mode
 from app.utils.rate_limit import rate_limit
@@ -146,8 +151,16 @@ def refresh():
     if not user or not user.is_active:
         return jsonify({'error': 'User not found or inactive'}), 401
 
-    # Generate new tokens
-    tokens = generate_tokens(user.id)
+    # Re-attach identity-scope claims (persona/epoch) from the validated
+    # refresh payload — a bare re-mint would drop them and the new access
+    # token would bypass the persona lease checks for its whole lifetime.
+    payload = decode_token(refresh_token)
+    if 'error' in payload:
+        # Token expired/invalidated between verify_token above and here —
+        # abort rather than minting a claim-less token that would skip the
+        # persona lease checks.
+        return jsonify({'error': 'Invalid or expired refresh token'}), 401
+    tokens = generate_tokens(user.id, extra_claims=extra_claims_for_refresh(payload))
 
     return jsonify({
         'message': 'Token refreshed successfully',

@@ -235,7 +235,7 @@ def _require_demo_persona():
 @rate_limit('demo_verify_code', limit=10, window_seconds=60)
 @require_auth
 def create_pairing_code():
-    """Issue (or refresh) the visitor's 4-digit pairing code.
+    """Issue (or refresh) the visitor's 6-digit pairing code.
 
     The visitor TEXTS this code to the demo number; the inbound-SMS webhook
     (``webhooks.sms_inbound``) matches it and binds the sender's number to

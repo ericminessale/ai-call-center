@@ -159,13 +159,11 @@ def handle_agent_status_change(data):
     else:
         logger.warning("Redis not available for agent status update")
 
-    # Broadcast status change to supervisors
-    socketio.emit('agent_status_update', {
-        'agent_id': user_id,
-        'status': status,
-        'timestamp': datetime.utcnow().isoformat()
-    }, room='supervisors')
-
+    # NOTE: a former 'agent_status_update' emit to room='supervisors' was
+    # removed here (Phase 0 cleanup) — no handler ever joined that room, so
+    # it reached nobody. Supervisor UIs consume the 'agent_online_status'
+    # broadcast from socketio_events instead; when tenancy lands, THAT emit
+    # moves to the workspace room.
     logger.info(f"Agent {user_id} status changed to: {status}")
 
     # When an agent goes available, optionally auto-assign the next
@@ -248,29 +246,11 @@ def handle_transfer_call(data):
     })
 
 
-@socketio.on('hold_call')
-def handle_hold_call(data):
-    """Handle call hold/resume.
-
-    ISO-19 (2026-07-07 pre-deploy): require a valid token — this used to be
-    unauthenticated, so anyone could broadcast a fake ``call_hold_status``
-    into any call room. Cosmetic, but no reason to leave it open.
-    """
-    token = data.get('token') or request.headers.get('Authorization', '').replace('Bearer ', '')
-    if not verify_token(token):
-        emit('error', {'message': 'Invalid token'})
-        return
-
-    call_id = data.get('callId')
-    hold = data.get('hold', True)
-
-    # Broadcast hold status
-    socketio.emit('call_hold_status', {
-        'call_id': call_id,
-        'on_hold': hold
-    }, room=call_id)
-
-    logger.info(f"Call {call_id} {'on hold' if hold else 'resumed'}")
+# hold_call socket handler removed (Phase 0 pre-tenancy cleanup, 2026-07-07):
+# the Hold button was removed with the platform hold limitation (RE-AUDIT-01),
+# no frontend emitter exists, and the handler only rebroadcast a cosmetic
+# status into a room it mistargeted (DB id vs sid). Git history has it if
+# participant-level hold ever lands platform-side.
 
 
 @socketio.on('reject_call_assignment')
@@ -486,6 +466,7 @@ def handle_end_call(data):
         emit('error', {'message': 'Invalid token'})
         return
 
+    call = None
     # Update call status (only for real calls, not demo)
     if not call_id.startswith('demo_'):
         try:
@@ -517,11 +498,13 @@ def handle_end_call(data):
         except Exception as e:
             logger.error(f"Error ending call: {e}")
 
-    # Notify all listeners
+    # Notify listeners in the call room. join_call keys rooms by the
+    # SignalWire sid — resolve it when the client passed a DB id, else
+    # the emit targets a room with no members.
     socketio.emit('call_ended', {
         'call_id': call_id,
         'agent_id': user_id
-    }, room=call_id)
+    }, room=((call.signalwire_call_sid or call_id) if call else call_id))
 
     # Update agent status to after-call
     handle_agent_status_change({'status': 'after-call', 'token': token})
@@ -536,11 +519,13 @@ def check_and_assign_queued_call(agent_id: str) -> Optional[dict]:
     for queue_id in queues:
         call_data = dequeue_call(queue_id, agent_id)
         if call_data:
-            # Send call assignment
+            # Send call assignment. Rooms are joined as str(user_id) and
+            # agent_id arrives as the int from verify_token — an int room
+            # here has no members.
             socketio.emit('call_assigned', {
                 'call': call_data['call'],
                 'context': call_data['context']
-            }, room=agent_id)
+            }, room=str(agent_id))
             return call_data
 
     return None

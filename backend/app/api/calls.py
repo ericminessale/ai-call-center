@@ -212,12 +212,13 @@ def initiate_call():
 
         logger.info(f"Call saved to DB with id={call.id}, signalwire_call_sid={call.signalwire_call_sid}")
 
-        # Emit call initiated event
+        # Emit call initiated event. Rooms are joined as str(user_id) —
+        # an int here silently targets a room with no members.
         socketio.emit('call_initiated', {
             'call_sid': call_id,  # Frontend expects call_sid but we send call_id
             'destination': destination,
             'user_id': request.current_user.id
-        }, room=request.current_user.id)
+        }, room=str(request.current_user.id))
 
         return jsonify({
             'success': True,
@@ -1243,13 +1244,14 @@ def initiate_takeover(call_sid):
         call.user_id = request.current_user.id
         db.session.commit()
 
-        # Emit event to notify UI
+        # Emit event to notify UI. join_call joins the BARE sid as the
+        # room name — the old 'call_' prefix targeted a room nobody joins.
         socketio.emit('call_takeover_initiated', {
             'call_sid': call.signalwire_call_sid,
             'call_id': call.id,
             'agent_id': request.current_user.id,
             'leg_id': new_leg.id
-        }, room=f'call_{call.signalwire_call_sid}')
+        }, room=call.signalwire_call_sid)
 
         return jsonify({
             'success': True,

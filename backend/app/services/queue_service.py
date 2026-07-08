@@ -117,9 +117,6 @@ class QueueService:
         position = self._get_queue_position(queue_id, call_id)
         estimated_wait = self._estimate_wait_time(queue_id, position)
 
-        # Notify available agents
-        self._notify_agents(queue_id, call_id)
-
         # Log queue event
         logger.info(f"Call {call_id} enqueued to {queue_id} with priority {priority}")
 
@@ -298,11 +295,45 @@ class QueueService:
         # Best-effort: failures here must NEVER break the status write above.
         if status == 'available' and previous_status != 'available':
             try:
+                self._rehydrate_queue_activations(agent_id)
+            except Exception as e:
+                logger.warning(
+                    f"Queue-activation rehydrate for agent {agent_id} failed: {e}"
+                )
+            try:
                 self._push_dispatch_waiting_call(agent_id)
             except Exception as e:
                 logger.warning(
                     f"Push-dispatch on agent {agent_id} available failed: {e}"
                 )
+
+    def _rehydrate_queue_activations(self, agent_id: str) -> None:
+        """Re-assert this agent's ``queue_agents:{slug}`` memberships from
+        the DB before dispatch consults them.
+
+        Redis is the runtime routing source, but it loses state (restart,
+        demo-reset FLUSHDB) while ``QueueAgentAssignment.is_activated``
+        survives — the UI checkbox (DB-backed) then shows a queue ON that
+        routing (Redis-backed) treats as OFF, and with no all-agents
+        fallback the agent's calls hold forever. Healing on the available
+        transition closes the skew at exactly the moment the agent starts
+        expecting calls.
+        """
+        from app.models.queue import QueueAgentAssignment
+        try:
+            uid = int(agent_id)
+        except (TypeError, ValueError):
+            return
+        assignments = (
+            QueueAgentAssignment.query
+            .filter_by(user_id=uid, is_activated=True)
+            .all()
+        )
+        for assignment in assignments:
+            queue = getattr(assignment, 'queue', None)
+            if queue is None or not queue.slug:
+                continue
+            self.redis.sadd(f"queue_agents:{queue.slug}", str(uid))
 
     # ---- decline cooldown ---------------------------------------------
     # When an agent declines an assignment, we re-queue the call and free
@@ -640,17 +671,20 @@ class QueueService:
         if not queue_slug:
             return sorted(list(available))
 
-        # Filter by agents who have activated this queue
+        # Only agents who ACTIVATED this queue are candidates. No fallback
+        # to the full available pool: that silently overrode the queue-
+        # activation contract (agents got calls for queues they never
+        # opted into), and under workspace tenancy it becomes a hard
+        # cross-tenant mis-route. No activated agents -> empty list; the
+        # caller's no-agent path (hold / AI fallback) handles it honestly.
         queue_agents = self.redis.smembers(f"queue_agents:{queue_slug}")
-        if queue_agents:
-            filtered = list(available & queue_agents)
-            if filtered:
-                return sorted(filtered)
-            # If intersection is empty (agents available but none activated this queue),
-            # fall through to return all available agents as fallback
-
-        # Fallback: return all available if no queue-specific filtering matched
-        return sorted(list(available))
+        filtered = sorted(available & queue_agents)
+        if not filtered and available:
+            logger.info(
+                "get_available_agents: %d agent(s) available but none activated "
+                "queue '%s' — returning no candidates", len(available), queue_slug,
+            )
+        return filtered
 
     def select_agent(self, queue_slug: str, routing_strategy: str,
                      available_agents: List[str], skill_levels: Dict[str, int] = None,
@@ -915,24 +949,6 @@ class QueueService:
         if removed:
             logger.info(f"Removed call {call_id} from {removed} queue entries")
         return removed
-
-    def _notify_agents(self, queue_id: str, call_id: str) -> None:
-        """Notify available agents about new call in queue"""
-        available_agents = self.get_available_agents(queue_id)
-
-        if available_agents:
-            # Publish notification via Redis pub/sub
-            notification = {
-                "type": "new_call_in_queue",
-                "queue_id": queue_id,
-                "call_id": call_id,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-
-            channel = f"queue_notifications:{queue_id}"
-            self.redis.publish(channel, json.dumps(notification))
-
-            logger.info(f"Notified {len(available_agents)} agents about call {call_id}")
 
     def get_agent_metrics(self, agent_id: str, period_hours: int = 24) -> Dict[str, Any]:
         """Get performance metrics for an agent over a window.

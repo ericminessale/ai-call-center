@@ -10,9 +10,9 @@ visitors can't join the room, read the transcript, steer the AI, or take it
 over, and the visitor is allowed to dial *their own* number outbound.
 
 Verification method: an **inbound pairing code**, not outbound OTP. The
-visitor's dashboard shows a 4-digit code and asks them to TEXT it to the demo
-number; the inbound-SMS webhook (``/api/webhooks/sms-inbound``) matches the
-code and binds the sender's number. Receiving an MO message requires no
+visitor's dashboard shows a random 6-digit code and asks them to TEXT it to
+the demo number; the inbound-SMS webhook (``/api/webhooks/sms-inbound``)
+matches the code and binds the sender's number. Receiving an MO message requires no
 messaging campaign (10DLC/A2P gates outbound application traffic, and we
 never reply), it costs nothing to operate, and the SMS sender number is a
 stronger possession proof than voice caller-ID.
@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 from typing import Optional
 
 from app.services.demo_lease import (
@@ -95,16 +96,22 @@ def _persona_number_key(persona_id: int) -> str:
     return f'demo:verify:persona_number:{int(persona_id)}'
 
 
-def _gen_code(redis_client) -> Optional[str]:
-    """Allocate a 4-digit code not currently mapped to another persona.
+def _outbound_key(persona_id: int) -> str:
+    return f'demo:outbound:{int(persona_id)}'
 
-    Uses INCR on a rotating counter mapped into the 1000–9999 space so we
-    don't need Math.random-style entropy (and don't collide in a tight loop).
-    Falls back through a few candidates if a code is somehow live.
+
+def _gen_code(redis_client) -> Optional[str]:
+    """Allocate a random 6-digit code not currently mapped to another persona.
+
+    DEMO-SEC-06: the code is the ONLY thing binding an SMS sender to a
+    session (the shared demo number carries no other context), so it must
+    be unguessable — a predictable code lets a stranger bind THEIR phone
+    to someone else's session. 6 digits of secrets-grade randomness
+    against a handful of live codes, plus the per-sender attempt cap in
+    the sms-inbound webhook, is plenty.
     """
     for _ in range(12):
-        seq = redis_client.incr('demo:verify:code_seq')
-        code = str(1000 + (int(seq) % 9000))
+        code = str(secrets.randbelow(900000) + 100000)
         if not redis_client.exists(_code_key(code)):
             return code
     return None
@@ -305,6 +312,10 @@ def clear_bindings(persona_id: int) -> None:
         redis_client.delete(_code_key(_as_str(code)))
     redis_client.delete(_persona_number_key(persona_id))
     redis_client.delete(_persona_code_key(persona_id))
+    # DEMO-SEC-07: the outbound-cap counter is persona-keyed too — left
+    # behind, the next visitor to lease this persona inherits the previous
+    # visitor's remaining call budget.
+    redis_client.delete(_outbound_key(persona_id))
 
 
 # Per-persona outbound cap in demo mode — calls cost money, and even
@@ -335,7 +346,7 @@ def demo_outbound_denial(persona_id: int, destination: Optional[str]) -> Optiona
     redis_client = get_redis_client()
     if redis_client is not None:
         try:
-            key = f'demo:outbound:{int(persona_id)}'
+            key = _outbound_key(persona_id)
             n = redis_client.incr(key)
             if n == 1:
                 redis_client.expire(key, _OUTBOUND_WINDOW)

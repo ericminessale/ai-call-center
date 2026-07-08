@@ -14,8 +14,8 @@ import websocket from '../../services/websocket';
  *     production call center
  *   - the visitor's leased agent persona name
  *   - the demo phone numbers, dial-able with one click on mobile
- *   - phone verification: get a pairing code, read it to the AI on a call,
- *     and once verified the call becomes private + the AI can call you back
+ *   - phone verification: get a pairing code, TEXT it to the demo number,
+ *     and once verified your calls become private + the AI can call you back
  *
  * Renders nothing in production-shape clone-and-own deployments.
  */

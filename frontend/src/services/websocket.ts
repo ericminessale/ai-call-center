@@ -64,13 +64,10 @@ class WebSocketService {
     }
   }
 
-  joinRoom(room: string) {
-    this.emit('join', room);
-  }
-
-  leaveRoom(room: string) {
-    this.emit('leave', room);
-  }
+  // joinRoom/leaveRoom removed (Phase 0 cleanup): they emitted 'join'/'leave'
+  // events no backend handler implements, and nothing called them. Room
+  // membership is server-driven (auto-join on auth) or via the explicit
+  // join_call/join_tap/join_conference events on the SocketContext socket.
 }
 
 export default new WebSocketService();

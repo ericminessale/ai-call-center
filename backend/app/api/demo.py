@@ -129,7 +129,25 @@ def get_runtime_config():
 
     Unauthenticated by design — the frontend must be able to render the
     landing card before a session exists. Never include secrets here.
+
+    Tenancy (Phase 2): branding resolves from the visitor's session
+    cookie when it binds to a live workspace, so a visitor who set their
+    own product name/colors sees them again on reload/return — while a
+    cookie-less first visit gets the platform branding (no per-tenant
+    hostnames in v1, §8.3). Read-only resolution: loading the landing
+    page must not extend the workspace's life.
     """
+    ws_id = None
+    if is_demo_mode():
+        try:
+            from app.services.workspace_provision import peek_workspace_id
+            ws_id = peek_workspace_id(_request_session_token())
+        except Exception:
+            ws_id = None
+    if ws_id is not None:
+        from app.tenancy import workspace_context
+        with workspace_context(ws_id):
+            return jsonify(runtime_config())
     return jsonify(runtime_config())
 
 

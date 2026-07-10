@@ -13,13 +13,7 @@ import base64
 from datetime import datetime
 from base64 import b64encode
 
-from app.utils.demo_config import (
-    block_in_demo_mode,
-    call_is_persona_owned,
-    demo_persona_call_guard,
-    demo_persona_self_scoped,
-    is_demo_mode,
-)
+from app.utils.demo_config import is_demo_mode
 from app.utils.decorators import require_auth, require_permission
 from app.utils.webhook_auth import require_webhook_auth
 
@@ -28,20 +22,26 @@ logger = logging.getLogger(__name__)
 ai_control_bp = Blueprint('ai_control', __name__)
 
 
-def _demo_scope_check_by_sid(call_sid):
-    """Self-scope guard for endpoints keyed on a SignalWire call UUID.
+def _workspace_scope_check_by_sid(call_sid):
+    """Workspace guard for endpoints keyed on a raw SignalWire call UUID.
 
-    The AI Session Control endpoints act on the raw SignalWire call id, so
-    resolve it to our Call row before applying demo_persona_call_guard.
-    Demo personas are denied when the call can't be resolved (ownership is
-    unverifiable); real users are unaffected either way.
+    Replaces the old demo-persona self-scope guard (§9: safety comes from
+    scope). These endpoints act straight on the SignalWire call id, so a
+    workspace-bound user could otherwise drive another tenant's live call
+    by supplying its UUID. Resolve the sid to our Call row — the lookup
+    runs under the caller's g.workspace_id auto-filter, so a foreign
+    workspace's call simply doesn't resolve — and refuse when it doesn't.
+    Platform users (workspace NULL) act across workspaces, same as every
+    pre-tenancy real user.
     """
     user = request.current_user
-    if not demo_persona_self_scoped(user):
+    if getattr(user, 'workspace_id', None) is None:
         return None
     from app.models.call import Call
     call = Call.find_by_sid(str(call_sid)) if call_sid else None
-    return demo_persona_call_guard(call, user)
+    if call is None:
+        return jsonify({'error': 'Call not available'}), 404
+    return None
 
 # Available AI agents - must match routes in ai-agents/main_agent.py
 AI_AGENTS = [
@@ -125,24 +125,25 @@ def get_active_ai_sessions():
 
         calls_data = response.json()
 
-        # Demo privacy: calls attributed to a persona's verified number are
-        # private to that visitor (same rule as list_calls' floor filter).
-        # This endpoint reads straight from SignalWire, so rebuild the
-        # exclusion set from our DB before enriching — otherwise another
-        # visitor's verified from_number would leak here.
-        excluded_sids = set()
-        if is_demo_mode() and demo_persona_self_scoped(request.current_user):
+        # Tenancy privacy (replaces the persona exclusion set): this
+        # endpoint reads straight from SignalWire, which knows nothing of
+        # workspaces — a workspace-bound user must only see the platform
+        # calls that resolve INSIDE their workspace (the Call lookup runs
+        # under their g.workspace_id auto-filter). Platform users see all,
+        # same as pre-tenancy.
+        included_sids = None
+        if getattr(request.current_user, 'workspace_id', None) is not None:
             from app.models.call import Call
+            included_sids = set()
             sids = [c.get('id') for c in calls_data.get('data', []) if c.get('id')]
             if sids:
                 for row in Call.query.filter(Call.signalwire_call_sid.in_(sids)).all():
-                    if call_is_persona_owned(row) and row.user_id != request.current_user.id:
-                        excluded_sids.add(row.signalwire_call_sid)
+                    included_sids.add(row.signalwire_call_sid)
 
         # Filter for AI agent calls and enrich with additional data
         ai_calls = []
         for call in calls_data.get('data', []):
-            if call.get('id') in excluded_sids:
+            if included_sids is not None and call.get('id') not in included_sids:
                 continue
             # Check if this is an AI agent call (you might have specific markers)
             to_address = call.get('to', '')
@@ -211,7 +212,7 @@ def inject_system_message():
             return jsonify({'error': 'call_id and message are required'}), 400
 
         # Demo personas may steer the AI only on their own call.
-        scope_check = _demo_scope_check_by_sid(call_id)
+        scope_check = _workspace_scope_check_by_sid(call_id)
         if scope_check:
             return scope_check
 
@@ -284,7 +285,7 @@ def get_injection_history(call_id):
     into an AI agent's running session). Same threat class as AI-02's
     write side (/inject-message) — gated identically here.
     """
-    scope_check = _demo_scope_check_by_sid(call_id)
+    scope_check = _workspace_scope_check_by_sid(call_id)
     if scope_check:
         return scope_check
     try:
@@ -726,7 +727,7 @@ def pause_ai_agent(call_id):
     400. (If the audit trail wants the reason it can stay on the
     application side via existing call_event emits.)
     """
-    scope_check = _demo_scope_check_by_sid(call_id)
+    scope_check = _workspace_scope_check_by_sid(call_id)
     if scope_check:
         return scope_check
     try:
@@ -766,7 +767,7 @@ def resume_ai_agent(call_id):
     REST verb. See pause_ai_agent docstring for the verb-rename
     context.
     """
-    scope_check = _demo_scope_check_by_sid(call_id)
+    scope_check = _workspace_scope_check_by_sid(call_id)
     if scope_check:
         return scope_check
     try:

@@ -80,6 +80,25 @@ def _workspace_owner(workspace):
         )
 
 
+def peek_workspace_id(session_token: str):
+    """Read-only cookie→workspace resolution: the live workspace's int id,
+    or None. No activity touch, no session-side effects — for pre-auth
+    surfaces (runtime config branding) that must not extend a workspace's
+    life just because its landing page was loaded.
+    """
+    if not session_token:
+        return None
+    try:
+        ws = Workspace.query.filter_by(
+            session_token_hash=_hash_token(session_token)
+        ).first()
+    except Exception:
+        return None
+    if ws is None or ws.id == DEFAULT_WORKSPACE_ID or not ws.is_live():
+        return None
+    return ws.id
+
+
 def resume_workspace(session_token: str):
     """Return ``(workspace, owner_user)`` for a live cookie binding, else None.
 

@@ -4,7 +4,6 @@ from app.models import Conference, ConferenceParticipant, Call, CallLeg, User
 from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth
 from app.utils.url_utils import get_base_url, signed_webhook_url
-from app.utils.demo_config import block_in_demo_mode
 import logging
 import json
 import os
@@ -1432,14 +1431,16 @@ def get_active_conferences():
 
 @conferences_bp.route('/<conference_name>/dial-out', methods=['POST'])
 @require_auth
-@block_in_demo_mode
 def dial_out_to_conference(conference_name):
     """Initiate an outbound call and connect them to the agent's conference.
 
     This is used when an agent (already in their conference) wants to call someone.
     The called party, when they answer, is connected into the agent's conference.
 
-    Soft-blocked in DEMO_MODE.
+    Hosted mode: follows the same outbound policy as /api/calls (Phase 2
+    gate retriage replaced the old hard block) — a visitor may only dial
+    their own verified number, under the per-hour cap, so the conference
+    dial-out demo works without opening arbitrary PSTN dialing.
     """
     data = request.get_json()
     phone_number = data.get('phone_number')
@@ -1450,6 +1451,13 @@ def dial_out_to_conference(conference_name):
         return jsonify({'error': 'phone_number is required'}), 400
 
     current_user_id = request.current_user.id
+
+    from app.utils.demo_config import is_demo_mode
+    if is_demo_mode():
+        from app.services.demo_verify import demo_outbound_denial
+        denial = demo_outbound_denial(current_user_id, phone_number)
+        if denial:
+            return jsonify(denial[0]), denial[1]
 
     # Get or create conference record
     # For outbound calls, the conference may have been created on-the-fly

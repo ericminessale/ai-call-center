@@ -39,7 +39,16 @@ _capture_lock = threading.Lock()
 
 def capture_webhook_payload(kind: str, payload, *, latest: bool = True,
                             stream: bool = True) -> None:
-    """Write a webhook payload to captures/ for offline debugging."""
+    """Write a webhook payload to captures/ for offline debugging.
+
+    Hard-off in hosted tenancy mode (§8.3): these files aggregate every
+    tenant's raw payloads (transcripts, numbers, global_data) on shared
+    disk and survive every reset — a cross-tenant data pool no debug
+    convenience justifies on the public instance.
+    """
+    from app.utils.demo_config import tenancy_mode_active
+    if tenancy_mode_active():
+        return
     try:
         record = {
             'captured_at': datetime.utcnow().isoformat() + 'Z',

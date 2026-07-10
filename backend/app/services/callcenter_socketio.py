@@ -62,24 +62,27 @@ def emit_call_update(call):
 
     logger.info(f"Emitting call_update for call {call.id}, status: {call.status}")
 
-    # Privacy (demo phone-verification): a call attributed to a specific
-    # persona (from their verified number) carries their caller number, AI
-    # context and notes — it must NOT hit the global broadcast every socket
-    # receives, or other visitors would passively see it. Emit only to the
-    # owner's room + the call room (which only authorized sockets can join).
-    from app.utils.demo_config import call_is_persona_owned
-    private = call_is_persona_owned(call)
+    # Tenancy privacy (replaces the persona-owned check the shared floor
+    # used): in hosted mode a call's updates carry caller numbers, AI
+    # context and notes — they must never hit the global broadcast every
+    # visitor's socket receives. Scope to the involved users' personal
+    # rooms + the call room (which only workspace-authorized sockets can
+    # join). Clone-and-own keeps the original global broadcast that
+    # supervisor dashboards rely on; Phase 3's workspace rooms replace
+    # this per-user targeting.
+    from app.utils.demo_config import tenancy_mode_active
+    private = tenancy_mode_active()
 
     # Emit to the general calls room (for supervisors and dashboards) — only
-    # for shared/unattributed calls.
+    # outside hosted mode.
     if not private:
         socketio.emit('call_update', {'call': call_data})
 
     # If there's an assigned user, also emit to their personal room
     if call.user_id:
         socketio.emit('call_update', {'call': call_data}, room=str(call.user_id))
-    # For private calls also target the assigned agent's room (post-takeover),
-    # so the human who took it keeps getting updates.
+    # Also target the assigned agent's room (post-takeover), so the human
+    # who took it keeps getting updates.
     if private and call.assigned_agent_id and call.assigned_agent_id != call.user_id:
         socketio.emit('call_update', {'call': call_data}, room=str(call.assigned_agent_id))
 
@@ -109,24 +112,25 @@ def emit_call_event(call_id, event_type, data, call_sid=None):
     if call_sid:
         socketio.emit('call_event', event, room=call_sid)
 
-    # Privacy (demo phone-verification): for a persona-owned (verified-number)
-    # call, don't broadcast events to every socket — scope to the owner's room
-    # instead. Only pay the ownership lookup in demo mode. Non-demo keeps the
-    # original global broadcast that supervisor dashboards rely on.
-    from app.utils.demo_config import is_demo_mode, call_is_persona_owned
-    private = False
-    if is_demo_mode() and call_id is not None:
+    # Tenancy privacy (replaces the persona-owned check): in hosted mode
+    # never broadcast call events to every socket — scope to the involved
+    # users' rooms (the call room above already reaches authorized
+    # joiners). If the call can't be resolved, drop rather than leak.
+    # Clone-and-own keeps the original global broadcast that supervisor
+    # panels rely on; Phase 3's workspace rooms replace this.
+    from app.utils.demo_config import tenancy_mode_active
+    if tenancy_mode_active():
         try:
             owner_call = Call.query.get(int(call_id)) if str(call_id).isdigit() else None
-            if owner_call is not None and call_is_persona_owned(owner_call):
-                private = True
-                socketio.emit('call_event', event, room=str(owner_call.user_id))
-                if owner_call.assigned_agent_id and owner_call.assigned_agent_id != owner_call.user_id:
-                    socketio.emit('call_event', event, room=str(owner_call.assigned_agent_id))
         except Exception:
-            private = False
-    if not private:
-        # Broadcast globally for supervisor panels / shared floor.
+            owner_call = None
+        if owner_call is not None:
+            if owner_call.user_id:
+                socketio.emit('call_event', event, room=str(owner_call.user_id))
+            if owner_call.assigned_agent_id and owner_call.assigned_agent_id != owner_call.user_id:
+                socketio.emit('call_event', event, room=str(owner_call.assigned_agent_id))
+    else:
+        # Broadcast globally for supervisor panels.
         socketio.emit('call_event', event)
     logger.debug(f"Call event emitted: {event_type} for call {call_id}")
 
@@ -401,17 +405,24 @@ def handle_join_tap(data):
         emit('tap_error', {'message': 'Invalid token'})
         return
 
+    # Tenancy predicate (§9): tap audio never crosses workspaces. Socket
+    # handlers run unscoped, so enforce explicitly; platform users
+    # (workspace NULL) monitor across by design. Same message as the
+    # not-found path so probes can't distinguish.
+    if user.workspace_id is not None and call.workspace_id != user.workspace_id:
+        emit('tap_error', {'message': 'Tap not available'})
+        return
+
     is_human_call = bool(call.conference_name and call.handler_type == 'human')
     required_flag = 'can_listen_human_calls' if is_human_call else 'can_listen_ai_calls'
     # Owner bypass: you may always listen to your OWN call (the call you
-    # initiated, are assigned to, or that's attributed to your verified
-    # number in demo mode). Otherwise fall back to the listen-permission
-    # check (supervisors/admins monitoring others' calls). Demo personas
-    # hold the listen flags so the observer UI renders, but the flags are
-    # self-scoped — they never grant tap audio on another visitor's call.
-    from app.utils.demo_config import demo_persona_self_scoped
+    # initiated or are assigned to). Otherwise fall back to the
+    # listen-permission check (supervisors/admins monitoring others'
+    # calls) — plain flag semantics inside the workspace, same as
+    # clone-and-own; the old persona self-scope layer is gone with the
+    # shared floor.
     is_owner = (call.user_id == user_id) or (call.assigned_agent_id == user_id)
-    flag_grants = user.has_permission(required_flag) and not demo_persona_self_scoped(user)
+    flag_grants = user.has_permission(required_flag)
     if not is_owner and not flag_grants:
         logger.warning(
             f"join_tap: user {user_id} lacks {required_flag} for call "

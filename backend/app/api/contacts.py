@@ -4,45 +4,20 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
 from app.models import Contact, Call, CallLeg
-from app.utils.demo_config import block_in_demo_mode, is_demo_mode
-from app.utils.moderation import is_text_acceptable
+from app.utils.demo_config import is_demo_mode
 
 contacts_bp = Blueprint('contacts', __name__)
 
 
-# Fields a public demo visitor can type free-form text into. We
-# moderate every one before persisting in DEMO_MODE so a slur or
-# similar doesn't sit on a contact card until midnight reset.
-_MODERATED_CONTACT_FIELDS = (
-    'firstName', 'lastName', 'displayName',
-    'company', 'jobTitle', 'notes',
-    'email',  # cheap address-shaped sanity, mostly to catch slurs in
-              # the local-part — real validation should already block
-              # malformed addresses elsewhere.
-)
-
-
 def _check_contact_payload_moderation(data: dict):
-    """In demo mode, moderate every free-form text field on a contact
-    payload. Returns ``(body, status)`` tuple to bubble up on the
-    first flagged field, or ``None`` when everything passed.
+    """Always None — moderation dropped for contact fields (Phase 2 gate
+    retriage, §4.3): contacts are tenant-private per-workspace rows now;
+    the "next visitor sees it" rationale died with the shared floor, and
+    only the visitor's own verified phone can reach their workspace's AI.
+    Moderation stays where text reaches voice/TTS or the coach (AI message
+    inject, disposition notes, callback TTS fields). Kept as a stub so the
+    create/update call sites keep their shape for any future policy.
     """
-    if not is_demo_mode():
-        return None
-    for key in _MODERATED_CONTACT_FIELDS:
-        value = data.get(key)
-        if value is None:
-            continue
-        ok, reason = is_text_acceptable(str(value))
-        if not ok:
-            return (
-                {
-                    'error': reason,
-                    'code': 'moderation_blocked',
-                    'field': key,
-                },
-                422,
-            )
     return None
 
 
@@ -109,6 +84,11 @@ def get_contact(contact_id):
 @jwt_required()
 def create_contact():
     """Create a new contact."""
+    from app.utils.workspace_caps import cap_denial
+    capped = cap_denial('contacts')
+    if capped:
+        return jsonify(capped[0]), capped[1]
+
     data = request.get_json()
 
     if not data:
@@ -160,26 +140,12 @@ def create_contact():
 def update_contact(contact_id):
     """Update an existing contact.
 
-    ISO-14 (2026-07-07 pre-deploy): blocked in demo mode — contacts are shared
-    seed data, so an unblocked update let any visitor rename / re-tag /
-    isBlocked=true records everyone else sees.
-
-    Phone-verification exception: a visitor who verified their phone number
-    OWNS the contact that matches it (it's their own record, created from
-    their inbound calls). They may edit that one contact; everything else
-    stays read-only in demo mode. Moderation still applies to what they type.
+    (The old ISO-14 demo block + verified-number exception is gone with the
+    shared floor: contacts are per-workspace rows now, the lookup below runs
+    under the tenancy auto-filter, and the workspace admin may edit any
+    contact in their own workspace — same semantics as clone-and-own.)
     """
     contact = Contact.query.get_or_404(contact_id)
-
-    from app.utils.demo_config import is_demo_mode, DEMO_BLOCKED_RESPONSE
-    if is_demo_mode():
-        from app.services.demo_verify import is_number_verified_for_persona
-        from flask_jwt_extended import get_jwt_identity
-        owns_contact = contact.phone and is_number_verified_for_persona(
-            get_jwt_identity(), contact.phone
-        )
-        if not owns_contact:
-            return jsonify(DEMO_BLOCKED_RESPONSE), 403
 
     data = request.get_json()
 
@@ -235,14 +201,13 @@ def update_contact(contact_id):
 
 @contacts_bp.route('/<int:contact_id>', methods=['DELETE'])
 @jwt_required()
-@block_in_demo_mode
 def delete_contact(contact_id):
     """Delete a contact.
 
-    Soft-blocked in DEMO_MODE — visitors otherwise could nuke the
-    seeded contact list one row at a time, breaking the demo for
-    everyone until the nightly reset. Production-shape deployments
-    delete normally.
+    (Un-blocked in hosted mode by the Phase 2 gate retriage: contacts are
+    per-workspace rows now, so a visitor deleting their own data breaks
+    nothing for anyone else. Cross-workspace ids don't resolve under the
+    tenancy auto-filter.)
     """
     contact = Contact.query.get_or_404(contact_id)
 
@@ -290,6 +255,13 @@ def lookup_or_create_contact():
     created = False
 
     if not contact:
+        # Cap applies only to the CREATE branch — a workspace at its
+        # contact cap must still resolve EXISTING contacts (the live-call
+        # contact-card flow), it just can't add new rows.
+        from app.utils.workspace_caps import cap_denial
+        capped = cap_denial('contacts')
+        if capped:
+            return jsonify(capped[0]), capped[1]
         contact = Contact(
             phone=Contact.normalize_phone(phone),
             first_name=data.get('firstName'),

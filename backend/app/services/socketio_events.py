@@ -3,7 +3,7 @@ from flask import request
 from app import socketio
 from app.models import Call, User
 from app.utils.jwt_utils import verify_token
-from app.utils.demo_config import is_demo_mode, call_is_persona_owned, demo_persona_self_scoped
+from app.utils.demo_config import is_demo_mode
 from app.services.redis_service import add_to_set, remove_from_set
 import logging
 
@@ -204,27 +204,28 @@ def handle_join_call(data):
         emit('error', {'message': 'Call not available'})
         return
 
+    # Tenancy predicate (§9: safety comes from scope, not flags): a
+    # workspace-bound user may only enter rooms for calls in their own
+    # workspace. Socket handlers run with no g.workspace_id, so the ORM
+    # auto-filter doesn't apply here — enforce explicitly. Platform users
+    # (workspace NULL) see across workspaces by design. Same message as
+    # the not-found path so cross-tenant probes can't distinguish
+    # "exists elsewhere" from "doesn't exist".
+    if user.workspace_id is not None and call.workspace_id != user.workspace_id:
+        emit('error', {'message': 'Call not available'})
+        return
+
     role = user.role or ''
     is_owner = (call.user_id == user.id) or (call.assigned_agent_id == user.id)
     is_privileged = role in ('admin', 'supervisor')
     is_human_call = bool(call.conference_name and call.handler_type == 'human')
     listen_flag = 'can_listen_human_calls' if is_human_call else 'can_listen_ai_calls'
-    # Demo personas hold the listen flags (feature availability) but the
-    # flags are self-scoped — cross-visitor access flows only through the
-    # shared-floor allowance below, which excludes human and persona-owned
-    # calls.
-    flag_grants = user.has_permission(listen_flag) and not demo_persona_self_scoped(user)
+    # The old persona self-scope layer and shared-floor allowance are gone
+    # with the shared floor itself (§10.4): a hosted visitor is the admin
+    # of their own workspace, so within the workspace plain flag/role
+    # semantics apply — identical to clone-and-own.
+    flag_grants = user.has_permission(listen_flag)
     authorized = is_owner or is_privileged or flag_grants
-
-    # Demo-mode allowance: the hosted demo's headline flow is "watch the AI
-    # triage a call live". Unattributed inbound calls are owned by the
-    # synthetic system user, so any leased persona may watch those AI calls.
-    # BUT a call from a visitor's VERIFIED number is attributed to that
-    # persona (call_is_persona_owned) — it's private, and only its owner (or a
-    # supervisor/admin) may join. So the shared-floor allowance applies only
-    # to non-human, non-persona-owned calls.
-    if not authorized and is_demo_mode() and not is_human_call and not call_is_persona_owned(call):
-        authorized = True
 
     if not authorized:
         logger.warning(

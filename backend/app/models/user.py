@@ -39,17 +39,10 @@ ROLE_PERMISSION_DEFAULTS = {
         'can_use_coach':          True,   # opt-in via in-call toggle; defaults to off per-call
         'can_return_to_queue':    True,   # default-on, revokable for abuse cases per 2p spec
     },
-    # Hosted-demo lease personas. All flags are True so every capability
-    # surface (coach, recording, observer/listen, return-to-queue) renders
-    # and works in the demo — the product should showcase itself. Safety
-    # comes from SCOPE, not flags: demo personas' permissions are
-    # self-scoped by demo_persona_call_guard / demo_persona_self_scoped
-    # (app/utils/demo_config.py) at every cross-call enforcement site, so
-    # a flag never grants reach into a call the persona doesn't own
-    # (assigned to it, initiated it, or inbound from their verified
-    # number — see services/demo_verify). Flipping a flag False here only
-    # hides the feature; it is NOT the isolation mechanism.
-    'demo_agent': {k: True for k in PERMISSION_FLAGS},
+    # (The old 'demo_agent' persona role is gone with the shared floor —
+    # hosted visitors are ordinary workspace-scoped 'admin' users whose
+    # isolation is structural: tenancy auto-filtering plus the workspace
+    # predicates at the socket auth points.)
 }
 
 

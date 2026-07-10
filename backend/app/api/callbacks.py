@@ -184,9 +184,14 @@ def create_callback():
         if not phone_number:
             return jsonify({'error': 'phone_number is required'}), 400
 
+        from app.utils.workspace_caps import cap_denial
+        capped = cap_denial('callbacks')
+        if capped:
+            return jsonify(capped[0]), capped[1]
+
         # ISO-15 (2026-07-07 pre-deploy): caller_name/reason are visitor-typed
-        # free text that surfaces in the shared callback queue. Moderate them
-        # in demo mode, same as contact fields and AI-message injects.
+        # free text; kept under moderation (§4.3) because callback dial-out
+        # announces them over TTS.
         if is_demo_mode():
             from app.utils.moderation import is_text_acceptable
             for field in ('caller_name', 'reason'):
@@ -379,6 +384,22 @@ def record_outcome(callback_id):
         cb.complete(outcome, notes=notes)
         # If the agent wants to retry (e.g. no-answer / voicemail), bump
         # attempts and clear claim so the row goes back to pending.
+        # The retry row counts against the workspace callback cap like any
+        # other create — without this check, claim→no-answer→retry loops
+        # would mint unlimited rows past the cap. At the cap the outcome
+        # still records; only the fresh retry row is skipped.
+        retry_capped = None
+        if retry and outcome in ('no-answer', 'voicemail'):
+            from app.utils.workspace_caps import cap_denial
+            retry_capped = cap_denial('callbacks')
+        if retry and outcome in ('no-answer', 'voicemail') and retry_capped:
+            db.session.commit()
+            _emit_callback_event('completed', cb)
+            return jsonify({
+                'callback': cb.to_dict(include_contact=True),
+                'retry': None,
+                'retry_skipped': retry_capped[0],
+            }), 200
         if retry and outcome in ('no-answer', 'voicemail'):
             # We complete first so a record of the attempt exists, then
             # spawn a fresh row that points at the same call/contact.

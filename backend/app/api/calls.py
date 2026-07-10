@@ -4,7 +4,7 @@ from app.api import calls_bp
 from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth, require_permission, require_role, validate_json
-from app.utils.demo_config import block_in_demo_mode, is_demo_mode, call_is_persona_owned, DEMO_BLOCKED_RESPONSE
+from app.utils.demo_config import is_demo_mode, DEMO_BLOCKED_RESPONSE
 from app.utils.webhook_auth import require_internal_auth
 from app.utils.moderation import is_text_acceptable
 from app.utils.url_utils import get_base_url, signed_webhook_url
@@ -32,13 +32,10 @@ def _require_call_ownership(call, user, allow_demo_ai_view=False):
     Mirrors call_control._require_call_ownership so the two call-control
     surfaces share one authorization model.
 
-    ``allow_demo_ai_view``: for READ endpoints only. Inbound demo calls are
-    owned by the synthetic system user, so a leased persona is never the
-    "owner" of the AI call it's watching. When this is set and we're in demo
-    mode and the call is AI-handled (not a human conference), permit read
-    access — this is the demo's "watch the AI triage" flow (same allowance
-    as socketio join_call). Human-handled calls are never opened this way.
-    Do NOT pass this on mutating endpoints.
+    ``allow_demo_ai_view``: retained for signature compatibility; the
+    shared-floor read allowance it used to enable is gone with the shared
+    floor (hosted visitors are admins of their own workspace and pass the
+    role check; tenancy auto-filtering stops cross-workspace lookups).
     """
     if not call:
         return jsonify({'error': 'Call not found'}), 404
@@ -47,16 +44,10 @@ def _require_call_ownership(call, user, allow_demo_ai_view=False):
         return None
     if call.assigned_agent_id == user.id or call.user_id == user.id:
         return None
-    # Shared-floor read allowance: any demo persona may read an AI-handled
-    # call — UNLESS it's private to another persona (attributed to their
-    # verified number). call_is_persona_owned excludes those.
-    if (
-        allow_demo_ai_view
-        and is_demo_mode()
-        and (call.handler_type or 'ai') != 'human'
-        and not call_is_persona_owned(call)
-    ):
-        return None
+    # (The old shared-floor read allowance for demo personas is gone with
+    # the shared floor itself — hosted visitors are admins of their own
+    # workspace and pass the role check above; the tenancy auto-filter
+    # already stops cross-workspace call lookups from resolving at all.)
     return jsonify({
         'error': "You don't have access to this call",
         'detail': (
@@ -717,24 +708,15 @@ def list_calls():
         # supervisors/admins and fall back to own-calls for regular agents.
         role = request.current_user.role or ''
         show_all_ai = status_filters and 'ai_active' in status_filters and (
-            is_demo_mode() or role in ('admin', 'supervisor')
+            role in ('admin', 'supervisor')
         )
         if show_all_ai:
+            # Unfiltered within the caller's scope: hosted visitors are the
+            # admin of their own workspace, so the tenancy auto-filter keeps
+            # this to their rows; clone-and-own admins/supervisors see all,
+            # same as baseline. (The old demo-persona floor filter is gone
+            # with the shared floor.)
             query = db.session.query(Call)
-            # In demo mode a plain persona sees the shared floor (calls owned
-            # by the system user) plus its own — but NOT calls private to
-            # another persona (attributed to their verified number). Admins/
-            # supervisors still see everything.
-            if is_demo_mode() and role not in ('admin', 'supervisor'):
-                from app.models import User
-                from app.utils.demo_config import DEMO_AGENT_ROLE
-                persona_ids = db.session.query(User.id).filter(User.role == DEMO_AGENT_ROLE)
-                query = query.filter(
-                    db.or_(
-                        Call.user_id == request.current_user.id,
-                        Call.user_id.notin_(persona_ids),
-                    )
-                )
         else:
             # User's own calls only
             query = db.session.query(Call).filter_by(user_id=request.current_user.id)
@@ -1678,9 +1660,17 @@ def cleanup_stale_calls():
         force = request.args.get('force', 'false').lower() == 'true'
         max_age_minutes = request.args.get('max_age_minutes', 60, type=int)
 
-        if force and is_demo_mode():
+        # Phase 2 gate retriage (§9): force cleanup is fine INSIDE a
+        # workspace (the calls query below runs auto-scoped, so a visitor
+        # admin only nukes their own in-progress calls) but stays blocked
+        # for unscoped platform users in hosted mode — one request would
+        # end every visitor's live call.
+        if (
+            force and is_demo_mode()
+            and getattr(request.current_user, 'workspace_id', None) is None
+        ):
             return jsonify({
-                'error': 'Force cleanup is disabled on the shared demo instance.',
+                'error': 'Force cleanup is disabled platform-wide on the hosted demo.',
                 'code': 'demo_blocked',
             }), 403
 

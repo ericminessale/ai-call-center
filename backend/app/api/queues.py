@@ -800,8 +800,10 @@ def clear_mock_data():
     """
     Clear all mock/demo calls from queues
 
-    Blocked in hosted-demo mode: any leased persona could otherwise wipe
-    queue state out from under every other visitor.
+    Stays blocked in hosted mode (Phase 2 gate retriage kept this one):
+    Redis queue keys are slug-global until the Phase 3 ws:{id}: re-key,
+    so a visitor clearing "their" queues would wipe live queue state for
+    every workspace sharing the slug.
     """
     try:
         service = QueueService()
@@ -849,8 +851,9 @@ def generate_mock_data():
     """
     Generate mock queue data for demos
 
-    Blocked in hosted-demo mode: visitors get real calls, not mock rows,
-    and unbounded mock generation is a state-spam vector.
+    Stays blocked in hosted mode (Phase 2 gate retriage kept this one):
+    mock rows land in the slug-global Redis queues every workspace shares
+    until Phase 3, and unbounded generation is a state-spam vector.
     """
     try:
         import random

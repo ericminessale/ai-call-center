@@ -116,6 +116,14 @@ services:
       WORKSPACE_TTL_DAYS: ${WORKSPACE_TTL_DAYS:-7}
       MAX_WORKSPACES: ${MAX_WORKSPACES:-200}
       DEMO_INBOUND_CAP_PER_HOUR: ${DEMO_INBOUND_CAP_PER_HOUR:-10}
+      # Per-workspace resource ceilings (utils/workspace_caps.py, §4.3).
+      # Only enforced in TENANCY_MODE; empty = module defaults.
+      WORKSPACE_CAP_QUEUES: ${WORKSPACE_CAP_QUEUES:-}
+      WORKSPACE_CAP_COLLECTIONS: ${WORKSPACE_CAP_COLLECTIONS:-}
+      WORKSPACE_CAP_DOCUMENTS: ${WORKSPACE_CAP_DOCUMENTS:-}
+      WORKSPACE_CAP_CONTACTS: ${WORKSPACE_CAP_CONTACTS:-}
+      WORKSPACE_CAP_USERS: ${WORKSPACE_CAP_USERS:-}
+      WORKSPACE_CAP_CALLBACKS: ${WORKSPACE_CAP_CALLBACKS:-}
       # Trusted reverse-proxy hop count (SEC-07). Default 1 because the
       # in-compose nginx always fronts /api — with 0, request.remote_addr
       # is the nginx container IP for every client and the per-IP rate

@@ -9,7 +9,6 @@ from app.models.call import Call
 from app.models.call_leg import CallLeg
 from app.models import User
 from app.utils.decorators import require_auth, require_permission, require_role
-from app.utils.demo_config import demo_persona_call_guard
 from app.services.signalwire_api import get_signalwire_api
 from app.services.redis_service import get_redis_client
 from datetime import datetime
@@ -738,11 +737,9 @@ def start_monitor(call_id):
             'call_type': 'human' if is_human_call else 'ai',
         }), 403
 
-    # Demo personas hold the listen flags (so the observer UI renders) but
-    # they are self-scoped — audio of another visitor's call stays private.
-    scope_check = demo_persona_call_guard(call, user)
-    if scope_check:
-        return scope_check
+    # (Persona self-scope gone with the shared floor: the call lookup runs
+    # under the tenancy auto-filter, so another workspace's call already
+    # 404s before this point.)
 
     redis_client = get_redis_client()
 
@@ -841,11 +838,7 @@ def stop_monitor(call_id):
             'required_permissions': ['can_listen_ai_calls', 'can_listen_human_calls'],
         }), 403
 
-    # Same self-scope as start_monitor — a demo persona can only have a
-    # monitor running on its own call, so this never strands a session.
-    scope_check = demo_persona_call_guard(call, user)
-    if scope_check:
-        return scope_check
+    # (Persona self-scope gone — see start_monitor.)
 
     redis_client = get_redis_client()
 
@@ -1001,13 +994,9 @@ def escalate_to_supervisor(call_id):
     if not call:
         return jsonify({'error': 'Call not found'}), 404
 
-    # Demo personas may only escalate their own call — escalation rings a
-    # real supervisor/admin and mutates the conference, so it must not be
-    # reachable cross-visitor by call_id. Checked before the conference
-    # branch so the 400 doesn't disclose another visitor's call state.
-    scope_check = demo_persona_call_guard(call, request.current_user)
-    if scope_check:
-        return scope_check
+    # (Persona self-scope gone with the shared floor: cross-workspace
+    # call ids don't resolve under the tenancy auto-filter, so escalation
+    # can't be reached for another tenant's call.)
 
     if not call.conference_name:
         return jsonify({'error': 'Call must be in a conference to escalate'}), 400

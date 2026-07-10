@@ -10,30 +10,28 @@ from app.utils.jwt_utils import verify_token
 from app.utils.url_utils import get_base_url
 from app.services import signalwire_client as sw_client
 
-from app.utils.demo_config import DEMO_AGENT_ROLE
-
-# Roles a real admin is allowed to assign via the User Management UI.
-# ``demo_agent`` is intentionally NOT in this set: the role is reserved
-# for hosted-demo personas seeded at boot (see services/demo_seed.py),
-# never something an admin should grant manually.
+# Roles an admin is allowed to assign via the User Management UI.
+# (The old reserved ``demo_agent`` persona role is gone with the shared
+# floor — hosted visitors are ordinary workspace-scoped admins now.)
 VALID_USER_ROLES = ('admin', 'supervisor', 'agent')
 
 
-def _refuse_if_demo_persona(user) -> tuple[dict, int] | None:
-    """Refuse mutation on a hosted-demo persona row.
-
-    Demo agents are pool fixtures owned by the seed layer, not human
-    team members. The admin UI never lists them and these endpoints
-    won't touch them either, so a curl-with-the-id attempt also fails.
-    Returns a (body, status) error tuple to bubble up, or None when the
-    user is a real teammate that can be modified normally.
+def _require_platform_admin():
+    """403 body for workspace-bound admins on PLATFORM-resource endpoints
+    (§9): phone-number routing, fabric webhook sync, demo stats, and
+    subscriber provisioning act on install-wide SignalWire state that no
+    single tenant may touch. Platform admins (workspace NULL — the
+    operator, and every clone-and-own admin) pass. Returns None to allow.
     """
-    if user is not None and user.role == DEMO_AGENT_ROLE:
-        return (
-            {'error': 'Demo personas cannot be modified through admin endpoints'},
-            403,
-        )
-    return None
+    if getattr(request.current_user, 'workspace_id', None) is None:
+        return None
+    return (
+        {
+            'error': 'This is a platform-level operation not available inside a workspace.',
+            'code': 'platform_only',
+        },
+        403,
+    )
 
 
 @admin_bp.before_request
@@ -94,6 +92,10 @@ def sync_fabric_webhooks():
     operation for on-demand triggering (e.g. after a URL change without a
     container recreate).
     """
+    platform_only = _require_platform_admin()
+    if platform_only:
+        return jsonify(platform_only[0]), platform_only[1]
+
     from app.services.fabric_sync import sync_all
     result = sync_all(get_base_url())
     status = 200 if all(
@@ -282,6 +284,11 @@ def list_queues():
 def create_queue():
     """Create a new queue."""
     try:
+        from app.utils.workspace_caps import cap_denial
+        capped = cap_denial('queues')
+        if capped:
+            return jsonify(capped[0]), capped[1]
+
         data = request.get_json()
         if not data or not data.get('slug') or not data.get('display_name'):
             return jsonify({'error': 'slug and display_name are required'}), 400
@@ -477,6 +484,11 @@ def list_collections():
 def create_collection():
     """Create a new document collection."""
     try:
+        from app.utils.workspace_caps import cap_denial
+        capped = cap_denial('collections')
+        if capped:
+            return jsonify(capped[0]), capped[1]
+
         data = request.get_json()
         if not data or not data.get('name') or not data.get('display_name'):
             return jsonify({'error': 'name and display_name are required'}), 400
@@ -574,6 +586,11 @@ def list_documents(collection_id):
 def create_document(collection_id):
     """Create a new document in a collection."""
     try:
+        from app.utils.workspace_caps import cap_denial
+        capped = cap_denial('documents')
+        if capped:
+            return jsonify(capped[0]), capped[1]
+
         collection = DocumentCollection.query.get(collection_id)
         if not collection:
             return jsonify({'error': 'Collection not found'}), 404
@@ -799,19 +816,80 @@ def update_agent_assignments():
 # User Management
 # =============================================================================
 
+@admin_bp.route('/users', methods=['POST'])
+@require_auth
+def create_user():
+    """Create a team member (Phase 2 — the invite-a-colleague demo).
+
+    A workspace admin creates users INSIDE their workspace (the flush
+    stamper takes g.workspace_id, so the row lands scoped); a platform
+    admin's creations stay platform-level, matching clone-and-own's
+    user model. Hosted-mode colleagues exist for routing/wallboard
+    realism and to demo the surface — they cannot password-login
+    (hosted login only matches platform users), and if no password is
+    supplied the account gets an unusable random one.
+    """
+    try:
+        from app.utils.workspace_caps import cap_denial
+        capped = cap_denial('users')
+        if capped:
+            return jsonify(capped[0]), capped[1]
+
+        data = request.get_json() or {}
+        email = (data.get('email') or '').strip().lower()
+        name = (data.get('name') or '').strip()
+        role = (data.get('role') or 'agent').strip()
+
+        if not email or '@' not in email:
+            return jsonify({'error': 'A valid email is required'}), 400
+        if not name:
+            return jsonify({'error': 'name is required'}), 400
+        if role not in VALID_USER_ROLES:
+            return jsonify({
+                'error': f'role must be one of: {", ".join(VALID_USER_ROLES)}'
+            }), 400
+
+        # Per-workspace uniqueness (COALESCE(workspace_id,0)+email index):
+        # this lookup runs auto-scoped, so it checks exactly the right layer
+        # for both workspace and platform admins.
+        if User.query.filter_by(email=email).first():
+            return jsonify({'error': 'A user with this email already exists'}), 409
+
+        password = data.get('password')
+        if password is not None and len(str(password)) < 12:
+            return jsonify({'error': 'password must be at least 12 characters'}), 400
+
+        import secrets as _secrets
+        user = User(
+            email=email,
+            name=name,
+            role=role,
+            is_active=True,
+            languages=data.get('languages') or ['en-US'],
+            permissions={},
+        )
+        user.set_password(str(password) if password else _secrets.token_urlsafe(32))
+        db.session.add(user)
+        db.session.commit()
+
+        return jsonify({'success': True, 'user': user.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Failed to create user: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
 @admin_bp.route('/users', methods=['GET'])
 @require_auth
 def list_users():
-    """List all users for admin management.
+    """List users for admin management.
 
-    Demo personas (``role='demo_agent'``) are filtered out — they're
-    pool fixtures, not human team members. The admin doesn't manage
-    them through this view.
+    Auto-scoped by tenancy: a workspace admin sees their workspace's
+    members; platform admins (workspace NULL) see everyone.
     """
     try:
         users = (
             User.query
-            .filter(User.role != DEMO_AGENT_ROLE)
             .order_by(User.created_at.desc())
             .all()
         )
@@ -839,9 +917,6 @@ def update_user(user_id):
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
-    refused = _refuse_if_demo_persona(user)
-    if refused:
-        return jsonify(refused[0]), refused[1]
 
     # Prevent admins from demoting themselves — avoids lockout when there is
     # only one admin left.
@@ -884,9 +959,6 @@ def update_user_languages(user_id):
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
-    refused = _refuse_if_demo_persona(user)
-    if refused:
-        return jsonify(refused[0]), refused[1]
 
     try:
         user.languages = languages
@@ -923,9 +995,6 @@ def update_user_kb_factbook_mode(user_id):
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
-    refused = _refuse_if_demo_persona(user)
-    if refused:
-        return jsonify(refused[0]), refused[1]
 
     try:
         user.kb_factbook_mode = mode
@@ -975,9 +1044,6 @@ def update_user_coach_settings(user_id):
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
-    refused = _refuse_if_demo_persona(user)
-    if refused:
-        return jsonify(refused[0]), refused[1]
 
     try:
         user.coach_intensity = intensity
@@ -1018,6 +1084,10 @@ def reset_user_subscriber(user_id):
 
     Admin-only. Refuses on demo personas (they auto-recreate via demo_seed).
     """
+    platform_only = _require_platform_admin()
+    if platform_only:
+        return jsonify(platform_only[0]), platform_only[1]
+
     # Reusing the role gate pattern from other admin endpoints — only
     # admins can wipe subscribers, including their own.
     if getattr(request.current_user, 'role', None) != 'admin':
@@ -1027,9 +1097,6 @@ def reset_user_subscriber(user_id):
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
-    refused = _refuse_if_demo_persona(user)
-    if refused:
-        return jsonify(refused[0]), refused[1]
 
     sw_delete_error = None
     deleted_subscriber_id = user.signalwire_subscriber_id
@@ -1166,9 +1233,6 @@ def update_user_permissions(user_id):
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
-    refused = _refuse_if_demo_persona(user)
-    if refused:
-        return jsonify(refused[0]), refused[1]
 
     try:
         user.permissions = permissions
@@ -1197,9 +1261,6 @@ def delete_user(user_id):
         if not user:
             return jsonify({'error': 'User not found'}), 404
 
-        refused = _refuse_if_demo_persona(user)
-        if refused:
-            return jsonify(refused[0]), refused[1]
 
         user_email = user.email
 
@@ -1349,6 +1410,10 @@ def _parse_phone_routing_loose(url):
 @require_auth
 def list_phone_numbers():
     """List SignalWire phone numbers and flag which are routed to this app."""
+    platform_only = _require_platform_admin()
+    if platform_only:
+        return jsonify(platform_only[0]), platform_only[1]
+
     if not sw_client.is_configured():
         return jsonify({'error': 'SignalWire credentials not configured'}), 500
 
@@ -1424,6 +1489,10 @@ def update_phone_number(number_sid):
 
     Body for ``unassign``: ``{action: 'unassign'}``.
     """
+    platform_only = _require_platform_admin()
+    if platform_only:
+        return jsonify(platform_only[0]), platform_only[1]
+
     data = request.get_json() or {}
     action = data.get('action')
 
@@ -1660,6 +1729,10 @@ def demo_stats():
     carries the new numbers. Works (harmlessly) on clone-and-own too:
     demo_mode false, zero visitor workspaces.
     """
+    platform_only = _require_platform_admin()
+    if platform_only:
+        return jsonify(platform_only[0]), platform_only[1]
+
     from app.models import SubscriberSeat, Workspace
     from app.tenancy import DEFAULT_WORKSPACE_ID, workspace_context
     from app.utils.demo_config import is_demo_mode

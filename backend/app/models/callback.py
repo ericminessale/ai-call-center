@@ -20,6 +20,7 @@ Lifecycle:
 """
 from datetime import datetime, timedelta
 from app import db
+from app.tenancy import WorkspaceScoped
 import json
 
 
@@ -39,12 +40,18 @@ CALLBACK_OUTCOMES = (
 DEFAULT_EXPIRY_HOURS = 24
 
 
-class Callback(db.Model):
+class Callback(WorkspaceScoped, db.Model):
     """A caller-requested or agent-scheduled callback row."""
 
     __tablename__ = 'callbacks'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+
+    # Tenancy: scopes find_pending so one workspace's callback board never
+    # shows another's requests.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=False, index=True,
+    )
 
     # Origin call that triggered the request. Nullable so an agent can also
     # schedule a callback without a current call (e.g. proactive outbound).

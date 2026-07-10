@@ -1,13 +1,18 @@
 from datetime import datetime
 from app import db
+from app.tenancy import WorkspaceScoped
 
 
-class Transcription(db.Model):
+class Transcription(WorkspaceScoped, db.Model):
     """Transcription model to store call transcriptions."""
 
     __tablename__ = 'transcriptions'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Tenancy: nullable — derived from the parent call at flush.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=True,
+    )
     call_id = db.Column(db.Integer, db.ForeignKey('calls.id'), nullable=False)
     transcript = db.Column(db.Text)
     summary = db.Column(db.Text)

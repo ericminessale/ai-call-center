@@ -1,5 +1,6 @@
 from datetime import datetime
 from app import db
+from app.tenancy import WorkspaceScoped
 import json
 
 
@@ -28,12 +29,18 @@ def _estimated_cost(call):
         return None
 
 
-class Call(db.Model):
+class Call(WorkspaceScoped, db.Model):
     """Call model to track SignalWire calls."""
 
     __tablename__ = 'calls'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Tenancy: denormalized owning workspace (hot path — attribution, list
+    # filters, emit routing must not join through users). Backfilled from
+    # user_id; auto-stamped at flush from context or the owning user.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=False, index=True,
+    )
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     contact_id = db.Column(db.Integer, db.ForeignKey('contacts.id'), nullable=True, index=True)  # Link to contact (customer)
     signalwire_call_sid = db.Column(db.String(255), unique=True, index=True)  # IMPORTANT: Stores SignalWire call_id (not SID - that's Twilio terminology)

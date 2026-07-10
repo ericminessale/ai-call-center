@@ -7,9 +7,10 @@ def generate_tokens(user_id, extra_claims=None):
     """Generate access and refresh tokens for a user.
 
     Optional ``extra_claims`` (dict) get merged into BOTH the access and
-    refresh payloads. SEC-03 uses this for demo personas, baking in
-    ``persona=true`` + the current ``epoch`` so ``verify_token`` can reject
-    tokens issued under a prior lease (see :mod:`app.services.demo_lease`).
+    refresh payloads. Tenancy bakes in ``wsid`` (workspace public_id) for
+    query scoping, and — for hosted-demo visitors — ``persona=true`` +
+    the workspace ``epoch`` so ``verify_token`` can reject tokens issued
+    under a prior session (see :mod:`app.services.workspace_session`).
     """
     access_payload = {
         'user_id': user_id,
@@ -68,40 +69,39 @@ def decode_token(token):
 
 
 def persona_claims_are_stale(payload):
-    """SEC-03: True if a decoded persona token no longer matches the live
-    lease state in Redis.
+    """SEC-03: True if a decoded visitor token no longer matches the live
+    workspace state.
 
-    Non-persona payloads (real users) are never stale — returns False.
-    For payloads carrying ``persona=true``:
-      1. The token's ``epoch`` claim must match the current persona epoch
-         (bumped by ``demo_lease.release_lease``) — invalidates JWTs
-         after an explicit release.
-      2. There must be an active (non-TTL-expired) lease for the persona
-         — invalidates JWTs after the lease lapses naturally.
+    Non-persona payloads (real users — clone-and-own logins, the platform
+    operator admin) are never stale: their optional ``wsid`` claim scopes
+    queries but carries no lifetime semantics, exactly like pre-tenancy
+    real-user tokens. For payloads carrying ``persona=true`` (hosted-demo
+    visitors), the workspace-session checks apply:
+      1. The token's ``epoch`` claim must match the workspace's current
+         epoch (bumped on release/reap — kills replayed JWTs).
+      2. The workspace session must be alive (Redis fast path with a DB
+         rehydrate — covers idle expiry).
+    A persona token WITHOUT a ``wsid`` claim predates the workspace model
+    (old persona-pool tokens) and is always stale — the pool is gone.
 
     Shared by :func:`verify_token` (custom ``require_auth`` path) and the
     flask-jwt-extended ``token_in_blocklist_loader`` registered in
     ``create_app`` — so ``@jwt_required()`` routes (e.g. the Call Fabric
-    token mint in ``api/fabric.py``) enforce the same lease invariant.
+    token mint in ``api/fabric.py``) enforce the same invariant.
     """
     if not payload.get('persona'):
         return False
-    # Lazy import — demo_lease pulls in Redis + models, which can
+    if payload.get('user_id') is None or not payload.get('wsid'):
+        return True
+    # Lazy import — workspace_session pulls in Redis + models, which can
     # cause circular imports if loaded at module top.
     try:
-        from app.services.demo_lease import get_persona_epoch, has_active_lease
+        from app.services.workspace_session import workspace_claims_are_stale
     except Exception:
-        # If demo_lease isn't importable for any reason, a persona
+        # If the session layer isn't importable for any reason, a visitor
         # claim is suspicious — be paranoid, reject.
         return True
-    uid = payload.get('user_id')
-    if uid is None:
-        return True
-    # Epoch check — bumped on release_lease.
-    if payload.get('epoch', -1) != get_persona_epoch(uid):
-        return True
-    # Active-lease check — covers TTL-expiry case.
-    return not has_active_lease(uid)
+    return workspace_claims_are_stale(payload)
 
 
 def extra_claims_for_refresh(payload):
@@ -113,29 +113,34 @@ def extra_claims_for_refresh(payload):
     refreshed access token then skips persona_claims_are_stale entirely,
     outliving the lease it was scoped to.
 
-    The epoch is COPIED from the already-validated payload, not re-read
-    from Redis: within a legitimate session the epoch never changes, and
-    re-reading opens a TOCTOU where the lease expires between validation
-    and re-mint, another visitor claims the persona (bumping the epoch),
-    and the re-read would stamp THEIR epoch onto the old visitor's new
-    token. Copying keeps the stale value, which then correctly fails the
-    epoch match. The payload must already have passed verify_token —
-    this function does no staleness checking itself.
+    All claims are COPIED from the already-validated payload, not re-read
+    from Redis/DB: within a legitimate session the epoch never changes, and
+    re-reading opens a TOCTOU where the session expires between validation
+    and re-mint, the workspace is re-provisioned (bumping the epoch), and
+    the re-read would stamp the NEW epoch onto the old visitor's token.
+    Copying keeps the stale value, which then correctly fails the epoch
+    match. The payload must already have passed verify_token — this
+    function does no staleness checking itself.
+
+    ``wsid`` (workspace public_id) rides on BOTH visitor and real-user
+    tokens (it's what scopes g.workspace_id), so it's copied outside the
+    persona branch.
     """
-    if not payload.get('persona'):
-        return None
-    return {
-        'persona': True,
-        'epoch': payload.get('epoch'),
-    }
+    claims = {}
+    if payload.get('wsid'):
+        claims['wsid'] = payload['wsid']
+    if payload.get('persona'):
+        claims['persona'] = True
+        claims['epoch'] = payload.get('epoch')
+    return claims or None
 
 
 def verify_token(token, token_type='access'):
     """Verify a token and return the user_id if valid.
 
-    SEC-03 extension: tokens minted for a demo persona (carrying
-    ``persona=true``) are additionally checked against the live persona
-    state in Redis via :func:`persona_claims_are_stale`.
+    SEC-03 extension: tokens minted for a hosted-demo visitor (carrying
+    ``persona=true``) are additionally checked against the live workspace
+    session via :func:`persona_claims_are_stale`.
 
     Non-persona tokens (real users) are unaffected and follow the
     original codepath.

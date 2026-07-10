@@ -1,28 +1,33 @@
 """
 Hosted-demo endpoints — public surface for the demo landing flow.
 
-Routes:
+Phase 1 tenancy: these routes keep their paths and response shapes (the
+frontend's authStore/demoApi contract is unchanged) but are backed by
+per-visitor WORKSPACES instead of the old shared persona pool:
+
   - ``GET  /api/config/runtime`` — public (no auth). Tells the
-    frontend whether this instance is in DEMO_MODE and exposes the
-    demo phone numbers to display on the landing card. Always
-    available; returns ``demo_mode: false`` on a normal clone-and-own
-    deployment.
-  - ``POST /api/demo/start``     — gated 404 in production. In demo
-    mode: leases a demo persona for the visitor's anonymous session,
-    mints a JWT for that persona, sets the session cookie, returns
+    frontend whether this instance is hosted-demo mode and exposes the
+    demo phone numbers for the landing card. Always available; returns
+    ``demo_mode: false`` on a normal clone-and-own deployment.
+  - ``POST /api/demo/start``     — gated 404 in production. In tenancy
+    mode: resumes the cookie's workspace or provisions a fresh one
+    (queues/KB/config cloned from the template workspace), mints a JWT
+    for the workspace's admin user, sets the session cookie, returns
     ``{access_token, refresh_token, user}``.
-  - ``POST /api/demo/heartbeat`` — refreshes the lease TTL while a
-    visitor's tab is open. Frontend calls this on an interval.
-  - ``POST /api/demo/end``       — releases the lease, clears cookie.
-    Called on browser unload / explicit "leave demo" actions.
+  - ``POST /api/demo/heartbeat`` — refreshes workspace liveness + the
+    WebRTC seat lease while a visitor's tab is open.
+  - ``POST /api/demo/end``       — releases the workspace (expires it,
+    bumps the JWT epoch, frees the seat), clears the cookie.
 
-Lease semantics: see :mod:`app.services.demo_lease`. The defensive
-invariant is that the backend never mints a Call Fabric token for a
-persona while another session holds its lease, so two visitors can
-never operate as the same agent identity simultaneously.
+Session semantics: see :mod:`app.services.workspace_provision` and
+:mod:`app.services.workspace_session`. The visitor's JWTs carry
+``{persona: true, wsid: <workspace public_id>, epoch}`` — both token
+verification paths reject them the moment the workspace is released or
+expires.
 
-When DEMO_MODE is off, every demo route returns ``404`` — we don't
-even hint that a demo path exists on a production-shape instance.
+When neither TENANCY_MODE nor DEMO_MODE is set, every demo route returns
+``404`` — we don't even hint that a demo path exists on a
+production-shape instance.
 """
 
 from __future__ import annotations
@@ -32,13 +37,13 @@ import secrets
 
 from flask import Blueprint, jsonify, request, make_response
 
-from app.services.demo_lease import (
-    get_lease_for_session,
-    heartbeat_lease,
-    lease_persona,
-    release_lease,
+from app.services.workspace_provision import (
+    provision_workspace,
+    release_workspace,
+    resume_workspace,
 )
-from app.utils.demo_config import DEMO_AGENT_ROLE, is_demo_mode, runtime_config
+from app.services.workspace_session import get_workspace_epoch
+from app.utils.demo_config import is_demo_mode, runtime_config
 from app.utils.decorators import require_auth
 from app.utils.jwt_utils import generate_tokens
 from app.utils.rate_limit import rate_limit
@@ -49,11 +54,13 @@ demo_bp = Blueprint('demo', __name__)
 
 
 # Cookie name carrying the visitor's anonymous session token. Random
-# UUID. HttpOnly so JS can't read it; SameSite=Lax so cross-site
-# embeds can't lease on someone's behalf. Cookie outlives the lease
-# (24h vs 5min) — a stale cookie just gets a fresh lease on next start.
+# URL-safe secret. HttpOnly so JS can't read it; SameSite=Lax so
+# cross-site embeds can't provision on someone's behalf. The cookie is
+# the workspace-resume credential, so its lifetime tracks the workspace
+# idle TTL (7 days) rather than the old 24h/5-min lease asymmetry —
+# only its sha256 ever touches the database.
 _SESSION_COOKIE = 'demo_session'
-_SESSION_COOKIE_MAX_AGE = 24 * 60 * 60  # 24h
+_SESSION_COOKIE_MAX_AGE = 7 * 24 * 60 * 60
 
 
 def _request_session_token() -> str | None:
@@ -95,6 +102,22 @@ def _refuse_when_demo_off():
     return jsonify({'error': 'Not found'}), 404
 
 
+def _mint_visitor_tokens(workspace, user) -> dict:
+    """JWTs for a workspace visitor. verify_token + the flask-jwt-extended
+    blocklist loader cross-reference persona/wsid/epoch against the live
+    workspace session on every auth-gated request, so the tokens only work
+    while the workspace is alive AND its epoch hasn't been bumped by a
+    release."""
+    return generate_tokens(
+        user.id,
+        extra_claims={
+            'persona': True,
+            'wsid': workspace.public_id,
+            'epoch': get_workspace_epoch(workspace.public_id),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public — runtime config
 # ---------------------------------------------------------------------------
@@ -118,13 +141,13 @@ def get_runtime_config():
 @demo_bp.route('/demo/start', methods=['POST'])
 @rate_limit('demo_start', limit=10, window_seconds=60)
 def start_demo_session():
-    """Lease a demo persona for the visitor's anonymous session.
+    """Resume or provision the visitor's workspace.
 
     Side effects:
       - sets the demo session cookie if not present
-      - claims a free persona from the pool (or refreshes the existing
-        lease for repeat clicks / page reloads)
-      - mints a JWT for the leased persona's ``User`` row
+      - resumes the cookie's live workspace, or creates + template-seeds a
+        fresh one (own queues, own editable KB, own config — no colleagues)
+      - mints a JWT for the workspace's admin ``User`` row
       - returns the same shape ``authApi.login`` does, so the frontend
         can hand the response straight to the existing auth handlers
     """
@@ -132,80 +155,86 @@ def start_demo_session():
         return _refuse_when_demo_off()
 
     session_token = _request_session_token() or _new_session_token()
-    persona = lease_persona(session_token)
+    result = provision_workspace(session_token)
 
-    if persona is None:
-        # Pool exhausted — every persona is held by another session.
-        # 503 + a short retry hint is the honest answer.
-        logger.warning(
-            "demo/start: pool exhausted (every persona is leased)"
-        )
+    if result is None:
+        # Global workspace cap reached — the tenancy analog of the old
+        # pool-exhausted 503. Honest answer + short retry hint.
+        logger.warning("demo/start: MAX_WORKSPACES cap reached")
         resp = make_response(
             jsonify({'error': 'Demo currently full — please try again in a few minutes.'}),
             503,
         )
-        # Don't set the cookie yet — they have no lease, no need to track.
+        # Don't set the cookie yet — they have no workspace, no need to track.
         return resp
 
-    # SEC-03: bake the persona marker + current epoch into the JWT.
-    # verify_token cross-references both claims against demo_lease's Redis
-    # state on every auth-gated request, so the token only works while
-    # the lease is alive AND the epoch hasn't been bumped by a release.
-    from app.services.demo_lease import get_persona_epoch
-    tokens = generate_tokens(
-        persona.id,
-        extra_claims={
-            'persona': True,
-            'epoch': get_persona_epoch(persona.id),
-        },
-    )
+    workspace, user = result
+    tokens = _mint_visitor_tokens(workspace, user)
     body = {
         'message': 'Demo session started',
-        'user': persona.to_dict(),
+        'user': user.to_dict(),
+        'workspace': workspace.to_dict(),
         **tokens,
     }
     response = make_response(jsonify(body), 200)
     _set_session_cookie(response, session_token)
     logger.info(
-        "demo/start: persona %s leased to session %s",
-        persona.email, session_token[:8],
+        "demo/start: workspace %s for session %s",
+        workspace.public_id, session_token[:8],
     )
     return response
 
 
 @demo_bp.route('/demo/heartbeat', methods=['POST'])
 def heartbeat_demo_session():
-    """Refresh the lease TTL while the visitor's tab is open.
+    """Keep the visitor's workspace + WebRTC seat alive while the tab is open.
 
     Idempotent. Returns ``{ok: true}`` on a refresh, ``404`` when the
-    lease has already expired (frontend should re-call /api/demo/start
-    to lease a fresh persona).
+    workspace has expired/been released (frontend should re-call
+    /api/demo/start for a fresh one).
     """
     if not is_demo_mode():
         return _refuse_when_demo_off()
     session_token = _request_session_token()
     if not session_token:
         return jsonify({'error': 'No active demo session'}), 404
-    if not heartbeat_lease(session_token):
-        return jsonify({'error': 'Lease expired'}), 404
-    return jsonify({'ok': True})
+    result = resume_workspace(session_token)
+    if result is None:
+        return jsonify({'error': 'Session expired'}), 404
+    workspace, user = result
+    # Seat lease + phone-verify bindings ride the same heartbeat the old
+    # persona lease used. seat_held=False means no live seat lease (never
+    # leased, or the TTL lapsed — and the seat password rotates on
+    # re-claim, so a lapsed browser's registration is dead); the FE should
+    # re-hit /api/fabric/token before its next WebRTC use.
+    seat_held = False
+    try:
+        from app.services.seat_lease import heartbeat_seat_for_user
+        seat_held = bool(heartbeat_seat_for_user(user.id))
+    except Exception:
+        pass
+    try:
+        from app.services.demo_verify import refresh_bindings
+        refresh_bindings(user.id)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'seat_held': seat_held})
 
 
 @demo_bp.route('/demo/end', methods=['POST'])
 def end_demo_session():
-    """Explicitly release the visitor's lease.
+    """Explicitly release the visitor's workspace.
 
-    Called on ``beforeunload`` / explicit "leave demo" actions. Always
-    returns 200; the lease may already be expired, that's fine — the
-    cookie still gets cleared so a fresh "Start demo" click leases a
-    new persona.
+    Called on explicit "leave demo" actions. Always returns 200; the
+    workspace may already be expired, that's fine — the cookie still gets
+    cleared so a fresh "Start demo" click provisions a new workspace.
     """
     if not is_demo_mode():
         return _refuse_when_demo_off()
     session_token = _request_session_token()
     released = False
     if session_token:
-        released = release_lease(session_token)
+        released = release_workspace(session_token)
     response = make_response(jsonify({'ok': True, 'released': released}), 200)
     _clear_session_cookie(response)
     return response
@@ -216,17 +245,18 @@ def end_demo_session():
 # ---------------------------------------------------------------------------
 
 
-def _require_demo_persona():
-    """Return (persona_user, None) or (None, error_response).
+def _require_demo_visitor():
+    """Return (visitor_user, None) or (None, error_response).
 
-    Verify endpoints are only meaningful for a leased demo persona. Gate on
-    DEMO_MODE + the demo_agent role so a real user can't mint pairing codes.
-    Must be used after @require_auth (reads request.current_user).
+    Verify endpoints are only meaningful for a workspace-scoped hosted-demo
+    visitor. Gate on tenancy mode + a workspace-bound user so a platform
+    user can't mint pairing codes. Must be used after @require_auth
+    (reads request.current_user).
     """
     if not is_demo_mode():
         return None, _refuse_when_demo_off()
     user = getattr(request, 'current_user', None)
-    if user is None or (user.role or '') != DEMO_AGENT_ROLE:
+    if user is None or user.workspace_id is None:
         return None, (jsonify({'error': 'Not a demo session'}), 403)
     return user, None
 
@@ -239,15 +269,16 @@ def create_pairing_code():
 
     The visitor TEXTS this code to the demo number; the inbound-SMS webhook
     (``webhooks.sms_inbound``) matches it and binds the sender's number to
-    their persona. Inbound-only — no outbound SMS, so no messaging campaign
-    or A2P/fraud surface. One live code per persona; issuing a new one
-    invalidates the old.
+    their user (workspace attribution rides on the user row until the
+    Phase 4 number→workspace re-key). Inbound-only — no outbound SMS, so no
+    messaging campaign or A2P/fraud surface. One live code per visitor;
+    issuing a new one invalidates the old.
     """
-    persona, err = _require_demo_persona()
+    visitor, err = _require_demo_visitor()
     if err:
         return err
     from app.services.demo_verify import generate_pairing_code
-    code = generate_pairing_code(persona.id)
+    code = generate_pairing_code(visitor.id)
     if not code:
         return jsonify({'error': 'Could not generate a code — try again.'}), 503
     return jsonify({'code': code}), 200
@@ -257,27 +288,28 @@ def create_pairing_code():
 @require_auth
 def get_verify_status():
     """Current verification state for the visitor: live code + masked number."""
-    persona, err = _require_demo_persona()
+    visitor, err = _require_demo_visitor()
     if err:
         return err
     from app.services.demo_verify import verify_status
-    return jsonify(verify_status(persona.id)), 200
+    return jsonify(verify_status(visitor.id)), 200
 
 
 @demo_bp.route('/demo/status', methods=['GET'])
 def get_demo_session_status():
-    """Lightweight status probe — does this session still hold a lease?
+    """Lightweight status probe — does this session still have a live workspace?
 
-    Useful for the frontend to detect "lease expired while idle" on
-    page focus and prompt for a fresh start. Not strictly required.
+    Useful for the frontend to detect "expired while idle" on page focus
+    and prompt for a fresh start. Response keys keep the pre-tenancy names
+    the frontend consumes (``leased``/``persona``).
     """
     if not is_demo_mode():
         return _refuse_when_demo_off()
     session_token = _request_session_token()
     if not session_token:
-        return jsonify({'leased': False})
-    persona = get_lease_for_session(session_token)
+        return jsonify({'leased': False, 'persona': None})
+    result = resume_workspace(session_token)
     return jsonify({
-        'leased': persona is not None,
-        'persona': persona.to_dict() if persona else None,
+        'leased': result is not None,
+        'persona': result[1].to_dict() if result else None,
     })

@@ -1,5 +1,5 @@
 from functools import wraps
-from flask import request, jsonify
+from flask import request, jsonify, g
 from app.models import User
 from app.utils.jwt_utils import verify_token
 
@@ -32,6 +32,11 @@ def require_auth(f):
 
         # Add user to request context
         request.current_user = user
+        # Tenancy: the user row is the authoritative workspace binding.
+        # NULL (platform-level user) leaves queries unscoped by design;
+        # a workspace id turns on the do_orm_execute auto-filter for the
+        # rest of the request (see app/tenancy.py).
+        g.workspace_id = user.workspace_id
 
         return f(*args, **kwargs)
 

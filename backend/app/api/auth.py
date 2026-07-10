@@ -115,8 +115,16 @@ def login():
     email = data.get('email').lower().strip()
     password = data.get('password')
 
-    # Find user
-    user = User.find_by_email(email)
+    # Find user. In hosted tenancy mode only PLATFORM users (workspace
+    # NULL — the operator admin) may password-login: visitor users have
+    # unusable passwords by construction, but visitor-created colleague
+    # rows could carry real ones, and email is only unique per workspace
+    # now — an unscoped lookup could land on an arbitrary tenant's row.
+    from app.utils.demo_config import tenancy_mode_active
+    query = User.query.filter_by(email=email)
+    if tenancy_mode_active():
+        query = query.filter(User.workspace_id.is_(None))
+    user = query.first()
     if not user or not user.check_password(password):
         return jsonify({'error': 'Invalid email or password'}), 401
 
@@ -124,8 +132,12 @@ def login():
     if not user.is_active:
         return jsonify({'error': 'Account is deactivated'}), 403
 
-    # Generate tokens
-    tokens = generate_tokens(user.id)
+    # Generate tokens. wsid scopes queries for workspace-bound users;
+    # platform users (workspace NULL) carry no wsid and stay unscoped.
+    extra_claims = None
+    if user.workspace_id is not None and user.workspace is not None:
+        extra_claims = {'wsid': user.workspace.public_id}
+    tokens = generate_tokens(user.id, extra_claims=extra_claims)
 
     return jsonify({
         'message': 'Login successful',

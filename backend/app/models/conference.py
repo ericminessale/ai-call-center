@@ -1,13 +1,19 @@
 from datetime import datetime
 from app import db
+from app.tenancy import WorkspaceScoped
 
 
-class Conference(db.Model):
+class Conference(WorkspaceScoped, db.Model):
     """Model to track active conferences for agents and AI handlers."""
 
     __tablename__ = 'conferences'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Tenancy: nullable — derived from the owner user at flush when
+    # resolvable; conference names stay globally unique.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=True, index=True,
+    )
     conference_name = db.Column(db.String(255), unique=True, nullable=False, index=True)
     conference_type = db.Column(db.String(50), nullable=False)  # 'agent', 'ai', 'hold'
 

@@ -1,14 +1,20 @@
 from datetime import datetime
 from app import db
+from app.tenancy import WorkspaceScoped
 
 
-class Queue(db.Model):
+class Queue(WorkspaceScoped, db.Model):
     """Configurable call queue."""
 
     __tablename__ = 'queues'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    slug = db.Column(db.String(50), unique=True, nullable=False, index=True)
+    # Tenancy: slug uniqueness is per-workspace (every workspace gets its
+    # own sales/support/billing clones).
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=False,
+    )
+    slug = db.Column(db.String(50), nullable=False, index=True)
     display_name = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=True)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
@@ -39,6 +45,8 @@ class Queue(db.Model):
         'QueueAgentAssignment', backref='queue',
         cascade='all, delete-orphan', lazy='dynamic'
     )
+
+    __table_args__ = (db.UniqueConstraint('workspace_id', 'slug', name='uq_queues_workspace_slug'),)
 
     def to_dict(self, include_agent_count=False):
         result = {

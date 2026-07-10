@@ -1,14 +1,20 @@
 from datetime import datetime
 from app import db
+from app.tenancy import WorkspaceScoped
 import json
 
 
-class WebhookEvent(db.Model):
+class WebhookEvent(WorkspaceScoped, db.Model):
     """WebhookEvent model to log all webhook events."""
 
     __tablename__ = 'webhook_events'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Tenancy: nullable — NULL rows are platform-level log lines (events
+    # with no call attribution); call-linked rows derive at flush.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=True, index=True,
+    )
     call_id = db.Column(db.Integer, db.ForeignKey('calls.id'), nullable=True)
     event_type = db.Column(db.String(100), nullable=False)
     payload = db.Column(db.JSON, nullable=False)

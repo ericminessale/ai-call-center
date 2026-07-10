@@ -1,5 +1,6 @@
 from datetime import datetime
 from app import db, bcrypt
+from app.tenancy import WorkspaceScoped
 from sqlalchemy.dialects.postgresql import JSON
 import os
 import base64
@@ -52,13 +53,20 @@ ROLE_PERMISSION_DEFAULTS = {
 }
 
 
-class User(db.Model):
+class User(WorkspaceScoped, db.Model):
     """User model for authentication."""
 
     __tablename__ = 'users'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    # Tenancy: NULL = platform-level user (operator admin, clone-and-own
+    # users). Email uniqueness is per-workspace via a COALESCE(workspace_id,
+    # 0) expression index in the DB (uq_users_workspace_email) — not
+    # expressible as a plain UniqueConstraint here.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=True, index=True,
+    )
+    email = db.Column(db.String(255), nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
     name = db.Column(db.String(255), nullable=True)
     role = db.Column(db.String(50), default='agent', nullable=False)
@@ -114,6 +122,8 @@ class User(db.Model):
     assigned_calls = db.relationship('Call', backref='assigned_agent', lazy='dynamic',
                                      foreign_keys='Call.assigned_agent_id')
 
+    workspace = db.relationship('Workspace', backref='users')
+
     def __repr__(self):
         return f'<User {self.email}>'
 
@@ -160,6 +170,7 @@ class User(db.Model):
         """Convert user to dictionary."""
         return {
             'id': self.id,
+            'workspace_id': self.workspace_id,
             'email': self.email,
             'name': self.name,
             'role': self.role,

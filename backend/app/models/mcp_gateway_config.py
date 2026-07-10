@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from app import db
+from app.tenancy import WorkspaceScoped
 from app.utils.secrets_box import decrypt_secret, encrypt_secret
 
 
@@ -28,12 +29,17 @@ from app.utils.secrets_box import decrypt_secret, encrypt_secret
 AUTH_TYPES = ('none', 'basic', 'bearer')
 
 
-class McpGatewayConfig(db.Model):
+class McpGatewayConfig(WorkspaceScoped, db.Model):
     """One configured MCP Gateway connection."""
 
     __tablename__ = 'mcp_gateway_configs'
 
     id = db.Column(db.Integer, primary_key=True)
+    # Tenancy: gateways bind per workspace; agent-slug bindings resolve per
+    # (workspace, slug) once the AI callback becomes tenant-aware (Phase 4).
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=False,
+    )
     name = db.Column(db.String(120), nullable=False)
     description = db.Column(db.Text, nullable=True)
     gateway_url = db.Column(db.String(500), nullable=False)

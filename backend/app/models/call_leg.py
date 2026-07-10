@@ -1,13 +1,18 @@
 from datetime import datetime
 from app import db
+from app.tenancy import WorkspaceScoped
 
 
-class CallLeg(db.Model):
+class CallLeg(WorkspaceScoped, db.Model):
     """Model to track individual segments/legs of a call as it moves between handlers."""
 
     __tablename__ = 'call_legs'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Tenancy: nullable — derived from the parent call at flush.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=True,
+    )
     call_id = db.Column(db.Integer, db.ForeignKey('calls.id'), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)  # Human agent (null for AI legs)
 

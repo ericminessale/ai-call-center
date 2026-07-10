@@ -96,14 +96,25 @@ services:
       # Application
       FLASK_APP: app
       FLASK_ENV: ${FLASK_ENV:-production}
-      # DEMO_MODE gates the hosted-demo behavior (landing card, demo
-      # personas, /api/demo/start). Defaults OFF — clone-and-own
-      # deployments stay in production shape. Set DEMO_MODE=true in
-      # .env (and DEMO_PHONE_NUMBERS=...) to flip to demo mode.
+      # TENANCY_MODE gates the hosted-demo behavior (landing card,
+      # per-visitor workspaces, /api/demo/start, subscriber seat pool).
+      # Defaults OFF — clone-and-own deployments stay in production shape
+      # with one implicit workspace. DEMO_MODE is the legacy alias (the
+      # shared-floor persona model it named is gone; both flags mean
+      # workspaces now). Set TENANCY_MODE=true in .env (and
+      # DEMO_PHONE_NUMBERS=...) to flip to hosted-demo mode.
+      TENANCY_MODE: ${TENANCY_MODE:-false}
       DEMO_MODE: ${DEMO_MODE:-false}
       DEMO_PHONE_NUMBERS: ${DEMO_PHONE_NUMBERS:-}
+      # Subscriber seat pool = max concurrently-online browsers (falls back
+      # to DEMO_POOL_SIZE); workspaces are capped separately (idle-expire
+      # after WORKSPACE_TTL_DAYS, hard 503 at MAX_WORKSPACES).
+      SEAT_POOL_SIZE: ${SEAT_POOL_SIZE:-20}
       DEMO_POOL_SIZE: ${DEMO_POOL_SIZE:-20}
+      SEAT_LEASE_TTL_SECONDS: ${SEAT_LEASE_TTL_SECONDS:-300}
       DEMO_LEASE_TTL_SECONDS: ${DEMO_LEASE_TTL_SECONDS:-300}
+      WORKSPACE_TTL_DAYS: ${WORKSPACE_TTL_DAYS:-7}
+      MAX_WORKSPACES: ${MAX_WORKSPACES:-200}
       DEMO_INBOUND_CAP_PER_HOUR: ${DEMO_INBOUND_CAP_PER_HOUR:-10}
       # Trusted reverse-proxy hop count (SEC-07). Default 1 because the
       # in-compose nginx always fronts /api — with 0, request.remote_addr

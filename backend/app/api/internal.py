@@ -112,10 +112,35 @@ def list_agent_assignments():
     ``GET /api/admin/agent-assignments``, which sits behind user-JWT
     ``require_auth`` that the service could never satisfy — that fetch 401'd
     silently and every agent ran on its hardcoded fallback collection.
+
+    Tenancy: the shared agent process serves the default/template
+    workspace's KB until Phase 4's per-request workspace resolution, so the
+    feed is pinned to it (an unscoped query would last-wins across every
+    visitor's clones). ``collection_name`` here is the SEARCH KEY the
+    agents build ``chunks_{name}`` from — it must be the globally-unique
+    ``physical_name`` (= display name for migrated default-workspace rows),
+    matching what the reindex proxy now writes.
     """
-    assignments = AgentCollectionAssignment.query.all()
+    from app.tenancy import DEFAULT_WORKSPACE_ID
+    assignments = AgentCollectionAssignment.query.filter_by(
+        workspace_id=DEFAULT_WORKSPACE_ID
+    ).all()
     return jsonify({
-        'assignments': [a.to_dict() for a in assignments]
+        'assignments': [
+            {
+                'id': a.id,
+                'agent_id': a.agent_id,
+                'collection_id': a.collection_id,
+                'collection_name': (
+                    (a.collection.physical_name or a.collection.name)
+                    if a.collection else None
+                ),
+                'collection_display_name': (
+                    a.collection.display_name if a.collection else None
+                ),
+            }
+            for a in assignments
+        ]
     })
 
 

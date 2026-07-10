@@ -1,3 +1,5 @@
+from .workspace import Workspace
+from .subscriber_seat import SubscriberSeat
 from .user import User
 from .call import Call
 from .call_leg import CallLeg
@@ -13,6 +15,8 @@ from .mcp_gateway_config import McpGatewayConfig
 from .callback import Callback
 
 __all__ = [
+    'Workspace',
+    'SubscriberSeat',
     'User',
     'Call',
     'CallLeg',

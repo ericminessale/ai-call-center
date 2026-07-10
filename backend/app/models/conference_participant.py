@@ -1,13 +1,18 @@
 from datetime import datetime
 from app import db
+from app.tenancy import WorkspaceScoped
 
 
-class ConferenceParticipant(db.Model):
+class ConferenceParticipant(WorkspaceScoped, db.Model):
     """Model to track participants in a conference."""
 
     __tablename__ = 'conference_participants'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Tenancy: nullable — derived from the linked call/conference at flush.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=True,
+    )
     conference_id = db.Column(db.Integer, db.ForeignKey('conferences.id'), nullable=False, index=True)
     call_id = db.Column(db.Integer, db.ForeignKey('calls.id'), nullable=True)  # Link to Call record if applicable
 

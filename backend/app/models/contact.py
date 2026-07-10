@@ -1,20 +1,27 @@
 from datetime import datetime
 from app import db
+from app.tenancy import WorkspaceScoped
 import json
 
 
-class Contact(db.Model):
+class Contact(WorkspaceScoped, db.Model):
     """Contact model representing customers/callers in the call center."""
 
     __tablename__ = 'contacts'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
 
+    # Tenancy: phone uniqueness is per-workspace — the same customer number
+    # can exist as a separate, private contact in every workspace.
+    workspace_id = db.Column(
+        db.Integer, db.ForeignKey('workspaces.id'), nullable=False,
+    )
+
     # Identity
     first_name = db.Column(db.String(100), nullable=True)
     last_name = db.Column(db.String(100), nullable=True)
     display_name = db.Column(db.String(200), nullable=True)  # Computed or manual override
-    phone = db.Column(db.String(20), unique=True, nullable=False, index=True)  # Primary phone (E.164 format)
+    phone = db.Column(db.String(20), nullable=False, index=True)  # Primary phone (E.164 format)
     email = db.Column(db.String(255), nullable=True, index=True)
     avatar_url = db.Column(db.String(500), nullable=True)
 
@@ -47,6 +54,8 @@ class Contact(db.Model):
 
     # Relationships
     calls = db.relationship('Call', backref='contact', lazy='dynamic')
+
+    __table_args__ = (db.UniqueConstraint('workspace_id', 'phone', name='uq_contacts_workspace_phone'),)
 
     def __repr__(self):
         return f'<Contact {self.display_name or self.phone}>'

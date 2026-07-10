@@ -188,7 +188,16 @@ def _create_permanent_subscriber(user):
 def get_subscriber_token():
     """
     Generate a Call Fabric subscriber token for the authenticated user.
-    Automatically creates a permanent subscriber on first use.
+
+    Two credential paths:
+      - Tenancy mode, workspace-bound user (hosted-demo visitor): lease a
+        seat from the shared subscriber pool (services/seat_lease) and mint
+        against the seat's credentials. Seats are the concurrency cap —
+        exhausted pool answers 503 ``no_seats_available`` while the rest of
+        the workspace stays usable.
+      - Otherwise (clone-and-own users, platform users): the original
+        per-user path — auto-creates a permanent subscriber on first use
+        and mints against the columns on the user row.
     """
     try:
         user_id = get_jwt_identity()
@@ -198,24 +207,43 @@ def get_subscriber_token():
         if not user:
             return jsonify({'error': 'User not found'}), 404
 
-        # Check if user has a permanent subscriber
-        if not user.signalwire_subscriber_id:
-            logger.info(f"User {user_id} has no subscriber, creating one...")
-            try:
-                subscriber = _create_permanent_subscriber(user)
-            except Exception as e:
-                logger.error(f"Failed to create subscriber: {e}")
-                return jsonify({'error': 'Failed to create subscriber'}), 500
+        from app.utils.demo_config import tenancy_mode_active
+        if tenancy_mode_active() and user.workspace_id is not None:
+            from app.services.seat_lease import acquire_seat_for_user
+            seat = acquire_seat_for_user(user)
+            if seat is None:
+                return jsonify({
+                    'error': 'All live demo seats are busy right now — please try again shortly.',
+                    'code': 'no_seats_available',
+                }), 503
+            reference = seat.signalwire_username
+            password = seat.get_subscriber_password()
+            if not reference or not password:
+                logger.error(f"Seat {seat.id} has subscriber ID but missing credentials")
+                return jsonify({'error': 'Invalid subscriber credentials'}), 500
+            subscriber_id = seat.signalwire_subscriber_id
+            address = seat.signalwire_address
         else:
-            logger.info(f"User {user_id} has existing subscriber: {user.signalwire_subscriber_id}")
+            # Check if user has a permanent subscriber
+            if not user.signalwire_subscriber_id:
+                logger.info(f"User {user_id} has no subscriber, creating one...")
+                try:
+                    subscriber = _create_permanent_subscriber(user)
+                except Exception as e:
+                    logger.error(f"Failed to create subscriber: {e}")
+                    return jsonify({'error': 'Failed to create subscriber'}), 500
+            else:
+                logger.info(f"User {user_id} has existing subscriber: {user.signalwire_subscriber_id}")
 
-        # Get permanent credentials
-        reference = user.signalwire_username
-        password = user.get_subscriber_password()
+            # Get permanent credentials
+            reference = user.signalwire_username
+            password = user.get_subscriber_password()
 
-        if not reference or not password:
-            logger.error(f"User {user_id} has subscriber ID but missing credentials")
-            return jsonify({'error': 'Invalid subscriber credentials'}), 500
+            if not reference or not password:
+                logger.error(f"User {user_id} has subscriber ID but missing credentials")
+                return jsonify({'error': 'Invalid subscriber credentials'}), 500
+            subscriber_id = user.signalwire_subscriber_id
+            address = user.signalwire_address
 
         # Request token from SignalWire using permanent credentials
         try:
@@ -233,8 +261,8 @@ def get_subscriber_token():
             'token': token_data.get('token'),
             'expires_at': token_data.get('expires_at'),
             'reference': reference,
-            'subscriber_id': user.signalwire_subscriber_id,
-            'address': user.signalwire_address
+            'subscriber_id': subscriber_id,
+            'address': address
         })
 
     except Exception as e:

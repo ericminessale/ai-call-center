@@ -1186,12 +1186,26 @@ def self_subscribe_queue(queue_id):
 
 @queues_bp.route('/config/active', methods=['GET'])
 def get_active_queue_config():
-    """Public endpoint: returns all active queues.
+    """Public endpoint: returns the default workspace's active queues.
     Used by AI agents at startup to build dynamic triage contexts.
     No auth required — internal use only.
+
+    Tenancy: this endpoint is unauthenticated, so the workspace auto-filter
+    is off — an unqualified query would return every visitor workspace's
+    queue clones too, and the duplicate slugs crash the ai-agents boot
+    (ContextBuilder raises on a repeated context name). Pin it to the
+    default/template workspace: in clone-and-own that is ALL queues
+    (identical to pre-tenancy), in hosted mode it is the template set the
+    shared agent process serves until Phase 4's per-request resolution.
     """
     try:
-        queues = Queue.get_active_queues()
+        from app.tenancy import DEFAULT_WORKSPACE_ID
+        queues = (
+            Queue.query
+            .filter_by(is_active=True, workspace_id=DEFAULT_WORKSPACE_ID)
+            .order_by(Queue.display_name)
+            .all()
+        )
         return jsonify({
             'queues': [q.to_dict() for q in queues]
         }), 200

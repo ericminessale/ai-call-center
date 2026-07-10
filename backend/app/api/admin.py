@@ -1,4 +1,4 @@
-from flask import request, jsonify
+from flask import request, jsonify, g
 from app import db
 from app.api import admin_bp
 from app.models import Call, Transcription, User, WebhookEvent
@@ -66,6 +66,10 @@ def _enforce_admin_role():
         }), 403
 
     request.current_user = user
+    # Tenancy: workspace admins (hosted visitors) get every admin query
+    # auto-scoped to their workspace; platform admins (workspace NULL)
+    # stay unscoped. Mirrors require_auth (see app/tenancy.py).
+    g.workspace_id = user.workspace_id
 import logging
 import os
 import re
@@ -660,9 +664,13 @@ def reindex_collection(collection_id):
         if not documents:
             return jsonify({'error': 'No documents to index'}), 400
 
-        # Prepare payload for AI agents reindex endpoint
+        # Prepare payload for AI agents reindex endpoint.
+        # Tenancy: the chunk-table identity is physical_name (ws{ID}_{name}
+        # for clones, = name for the default workspace's migrated rows) —
+        # NEVER the per-workspace display name, or every workspace's
+        # "sales_knowledge" reindex would clobber the same chunks_ table.
         payload = {
-            'collection_name': collection.name,
+            'collection_name': collection.physical_name or collection.name,
             'documents': [
                 {'title': d.title, 'content': d.content}
                 for d in documents
@@ -1643,23 +1651,38 @@ def list_webhook_event_types():
 
 @admin_bp.route('/demo/stats', methods=['GET'])
 def demo_stats():
-    """Hosted-demo pool health for the real admin (M6 telemetry, minimal cut).
+    """Hosted-demo health for the real admin (M6 telemetry, tenancy cut).
 
-    Reports how deep the persona pool is and how many leases are live
-    right now — the "are we ever at the cap?" question from the demo
-    plan. Works (harmlessly) on clone-and-own too: demo_mode false,
-    zero pool, zero leases.
+    Post-tenancy the scarce resource is the subscriber SEAT pool and the
+    unit of occupancy is a live WORKSPACE — the "are we ever at the cap?"
+    question. Response keeps the old key names (pool_size/provisioned/
+    active_leases) so the admin UI needs no change; a `workspaces` block
+    carries the new numbers. Works (harmlessly) on clone-and-own too:
+    demo_mode false, zero visitor workspaces.
     """
-    from app.services.demo_lease import count_active_leases
+    from app.models import SubscriberSeat, Workspace
+    from app.tenancy import DEFAULT_WORKSPACE_ID, workspace_context
     from app.utils.demo_config import is_demo_mode
 
-    pool = User.query.filter_by(role=DEMO_AGENT_ROLE, is_active=True)
-    pool_size = pool.count()
-    provisioned = pool.filter(User.signalwire_subscriber_id.isnot(None)).count()
+    with workspace_context(None):
+        pool_size = SubscriberSeat.query.count()
+        provisioned = SubscriberSeat.query.filter(
+            SubscriberSeat.signalwire_subscriber_id.isnot(None)).count()
+        leased = SubscriberSeat.query.filter(
+            SubscriberSeat.leased_by_user_id.isnot(None)).count()
+        active_workspaces = (
+            Workspace.query
+            .filter(Workspace.status == Workspace.STATUS_ACTIVE)
+            .filter(Workspace.id != DEFAULT_WORKSPACE_ID)
+            .count()
+        )
 
     return jsonify({
         'demo_mode': is_demo_mode(),
         'pool_size': pool_size,
         'provisioned': provisioned,
-        'active_leases': count_active_leases(),
+        'active_leases': leased,
+        'workspaces': {
+            'active': active_workspaces,
+        },
     }), 200

@@ -29,16 +29,31 @@ import os
 DEMO_AGENT_ROLE = 'demo_agent'
 
 
+def tenancy_mode_active() -> bool:
+    """True when this instance runs the per-visitor-workspace hosted demo.
+
+    Driven by ``TENANCY_MODE`` (the go-forward flag) or the legacy
+    ``DEMO_MODE`` env var. The shared-floor persona model is gone
+    (§10.4 of MULTI_TENANCY_DESIGN.md) so the two flags are synonyms
+    now: hosted mode = workspaces. Read at every call so an ops-side
+    env change takes effect on the next request without a redeploy.
+    """
+    return (
+        os.getenv('TENANCY_MODE', '').strip().lower() == 'true'
+        or os.getenv('DEMO_MODE', '').strip().lower() == 'true'
+    )
+
+
 def is_demo_mode() -> bool:
     """True if the running instance is the public hosted demo.
 
-    Driven by the ``DEMO_MODE`` env var (case-insensitive). Anything
-    other than ``"true"`` (including unset) is treated as production.
-    Read at every call so an ops-side env change takes effect on the
-    next request without a code redeploy — desirable for operators who
-    want to flip the demo off in an emergency.
+    Alias of :func:`tenancy_mode_active` since the Phase 1 tenancy
+    refactor — every hosted-demo gate (verify flow, outbound caps,
+    inbound limiter, recording default, registration block, runtime
+    config) now keys off workspace mode. Kept as the name ~30 call
+    sites use; new code should call tenancy_mode_active().
     """
-    return os.getenv('DEMO_MODE', '').strip().lower() == 'true'
+    return tenancy_mode_active()
 
 
 def call_is_persona_owned(call) -> bool:

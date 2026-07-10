@@ -39,18 +39,47 @@ import re
 import secrets
 from typing import Optional
 
-from app.services.demo_lease import (
-    _lease_ttl_seconds,
-    has_active_lease,
-)
 from app.services.redis_service import get_redis_client
 
 logger = logging.getLogger(__name__)
 
-# Code lives as long as a lease idle-window — long enough for the visitor to
-# place the call, short enough that a stale code on screen expires with the
-# session. Reuses the lease TTL so the two never diverge.
-_CODE_TTL = _lease_ttl_seconds
+
+def _binding_ttl_seconds() -> int:
+    """Verify-binding idle window. Same knob + default the old persona
+    lease used (``DEMO_LEASE_TTL_SECONDS``, 300s, clamped [60, 3600]) —
+    bindings are refreshed by the workspace heartbeat, so a live tab keeps
+    them alive indefinitely. Phase 4 re-keys bindings number→workspace and
+    stretches the TTL to the workspace lifetime.
+    """
+    import os
+    raw = os.getenv('DEMO_LEASE_TTL_SECONDS', '300').strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 300
+    return max(60, min(n, 3600))
+
+
+def _lease_ttl_seconds() -> int:
+    # Internal alias kept for the pre-tenancy call sites below.
+    return _binding_ttl_seconds()
+
+
+def has_active_lease(user_id: int) -> bool:
+    """Liveness for a visitor user — post-tenancy this means "the user's
+    workspace session is alive" (see workspace_session.user_workspace_alive).
+    Name kept from the persona-lease era for the call sites below."""
+    try:
+        from app.services.workspace_session import user_workspace_alive
+        return user_workspace_alive(user_id)
+    except Exception:
+        return False
+
+
+# Code lives as long as a binding idle-window — long enough for the visitor
+# to place the call, short enough that a stale code on screen expires with
+# the session. Reuses the binding TTL so the two never diverge.
+_CODE_TTL = _binding_ttl_seconds
 
 
 def _norm(number: Optional[str]) -> Optional[str]:
@@ -204,12 +233,24 @@ def pair_number(code: str, number: str) -> dict:
     redis_client.delete(_persona_code_key(persona_id))
 
     # Retroactively attribute any currently-live call from this number to the
-    # persona, so a visitor who verifies while already on a call gets privacy
+    # visitor, so one who verifies while already on a call gets privacy
     # immediately (the inbound-attribution hook only covers NEW calls).
+    # Kept in Phase 1: unverified inbound still reaches the floor until the
+    # Phase 4 verify-first rejection lands — only then is this sweep dead
+    # code (nothing pre-verification will exist to re-parent).
     # Best-effort — pairing succeeds regardless.
     try:
         from app import db
-        from app.models import Call
+        from app.models import (
+            Call,
+            CallLeg,
+            Callback,
+            ConferenceParticipant,
+            Transcription,
+            User,
+            WebhookEvent,
+        )
+        visitor = User.query.get(persona_id)
         live = (
             Call.query
             .filter(Call.from_number.in_([norm, number]))
@@ -218,6 +259,25 @@ def pair_number(code: str, number: str) -> dict:
         )
         for call in live:
             call.user_id = persona_id
+            # Tenancy: visibility now rides on workspace_id — re-parent the
+            # call into the visitor's workspace too, or it stays quarantined
+            # in the default workspace where the visitor can't see it. The
+            # call's pre-verification children were stamped from the call's
+            # OLD workspace, so they must follow or the visitor gets a call
+            # with no transcript/legs in their scoped views. (Contacts are
+            # deliberately NOT moved: phone is per-workspace unique and the
+            # ws-1 contact may be shared by other quarantined calls —
+            # contact attribution is Phase 4's verify-first rework.)
+            if visitor is not None and visitor.workspace_id is not None:
+                call.workspace_id = visitor.workspace_id
+                for child in (Transcription, CallLeg, WebhookEvent,
+                              Callback, ConferenceParticipant):
+                    (
+                        child.query
+                        .filter_by(call_id=call.id)
+                        .update({'workspace_id': visitor.workspace_id},
+                                synchronize_session=False)
+                    )
         if live:
             db.session.commit()
     except Exception as exc:  # noqa: BLE001
@@ -277,10 +337,11 @@ def is_number_verified_for_persona(persona_id: int, number: str) -> bool:
 
 
 def refresh_bindings(persona_id: int) -> None:
-    """Extend the verified-number binding TTL to match a fresh lease heartbeat.
+    """Extend the verified-number binding TTL to match a fresh heartbeat.
 
-    Called from ``demo_lease.heartbeat_lease`` so the number stays verified for
-    as long as the visitor keeps their session alive.
+    Called from the workspace heartbeat (``/api/demo/heartbeat``) so the
+    number stays verified for as long as the visitor keeps their session
+    alive.
     """
     redis_client = get_redis_client()
     if redis_client is None:

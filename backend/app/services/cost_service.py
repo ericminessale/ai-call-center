@@ -25,17 +25,30 @@ _RATE_DEFAULTS = {
     'did_monthly': 0.50,              # per-number monthly, day-summary line only
 }
 
-_cache = {'rates': None, 'at': 0.0}
+# Tenancy: pricing.* resolves per workspace now (SystemConfig layering),
+# so the 30s cache is keyed by the current workspace id — one entry per
+# tenant, plus the None/global entry for unscoped contexts. Bounded reset
+# guards against unbounded tenant churn.
+_cache: dict = {}
 _TTL_SECONDS = 30.0
+_CACHE_MAX_ENTRIES = 1024
 
 
 def get_rates() -> dict:
     """Current rates: SystemConfig ``pricing.*`` overrides over list-rate
-    defaults. Cached ~30s so Call.to_dict can call this per row without a
-    DB read per key per call."""
+    defaults, resolved for the current workspace (global fallback).
+    Cached ~30s per workspace so Call.to_dict can call this per row
+    without a DB read per key per call."""
+    try:
+        from app.tenancy import current_workspace_id
+        cache_key = current_workspace_id()
+    except Exception:
+        cache_key = None
+
     now = time.monotonic()
-    if _cache['rates'] is not None and now - _cache['at'] < _TTL_SECONDS:
-        return _cache['rates']
+    hit = _cache.get(cache_key)
+    if hit is not None and now - hit['at'] < _TTL_SECONDS:
+        return hit['rates']
 
     rates = {}
     try:
@@ -49,8 +62,9 @@ def get_rates() -> dict:
     except Exception:
         rates = dict(_RATE_DEFAULTS)
 
-    _cache['rates'] = rates
-    _cache['at'] = now
+    if len(_cache) >= _CACHE_MAX_ENTRIES:
+        _cache.clear()
+    _cache[cache_key] = {'rates': rates, 'at': now}
     return rates
 
 

@@ -110,6 +110,13 @@ def create_app():
     db.init_app(app)
     migrate.init_app(app, db)
 
+    # Register the tenancy ORM listeners (do_orm_execute auto-scope +
+    # flush-time workspace stamping) before any session is used. Models
+    # import this module too; the explicit import just guarantees order.
+    # (``from``-form on purpose: ``import app.tenancy`` would rebind the
+    # local name ``app`` to the package and shadow the Flask instance.)
+    from app import tenancy as _tenancy  # noqa: F401
+
     cors_origins = _cors_origins()
     CORS(app, resources={r"/*": {"origins": cors_origins}}, supports_credentials=True)
     app.logger.info("CORS enabled for origins: %s", cors_origins)
@@ -126,14 +133,36 @@ def create_app():
 
     # SEC-03 closure for the flask-jwt-extended path: @jwt_required()
     # routes (Call Fabric token mint, contacts, …) don't go through our
-    # custom verify_token, so without this loader a demo persona whose
-    # lease was released or TTL-expired could still mint live subscriber
-    # tokens. The blocklist loader runs on every @jwt_required() request
-    # and treats a stale persona token as revoked (401).
+    # custom verify_token, so without this loader a hosted-demo visitor
+    # whose workspace was released or expired could still mint live
+    # subscriber tokens. The blocklist loader runs on every
+    # @jwt_required() request and treats a stale visitor token as
+    # revoked (401). It's also this path's ONLY per-request hook, so the
+    # tenancy scope (g.workspace_id) is resolved here from the token's
+    # wsid claim — mirroring what require_auth/admin before_request do on
+    # the custom-verify path (dual wiring, same as the SEC-03 fix).
     @jwt.token_in_blocklist_loader
-    def _persona_token_revoked(_jwt_header, jwt_payload):
+    def _visitor_token_revoked(_jwt_header, jwt_payload):
+        from flask import g
         from app.utils.jwt_utils import persona_claims_are_stale
-        return persona_claims_are_stale(jwt_payload)
+        if persona_claims_are_stale(jwt_payload):
+            return True
+        wsid = jwt_payload.get('wsid')
+        if wsid:
+            from app.services.workspace_session import resolve_workspace_id
+            ws_id = resolve_workspace_id(wsid)
+            if ws_id is None:
+                # A token claiming a workspace that no longer exists must
+                # be rejected, not downgraded to unscoped: g.workspace_id
+                # = None disables the tenancy auto-filter, so falling
+                # through here would show this token rows from EVERY
+                # workspace (e.g. nightly reset deleted the rows but the
+                # Redis flush failed, leaving the session key alive).
+                return True
+            g.workspace_id = ws_id
+        else:
+            g.workspace_id = None
+        return False
 
     # Initialize Redis with connection pooling and retries
     global redis_client
@@ -255,18 +284,41 @@ def create_app():
         except Exception as e:
             app.logger.error(f"[call_watchdog] start failed (non-fatal): {e}")
 
-    # Top up the demo-persona pool when DEMO_MODE is on. Idempotent —
-    # no-op on production-shape clone-and-own deployments.
+    # Tenancy boot tasks. The default/template workspace must exist in
+    # every mode (migrations create it; this covers db.create_all() dev
+    # paths). The subscriber seat pool is hosted-demo-only and hits the
+    # SignalWire API, so it runs behind a Redis NX lock like fabric_sync
+    # (one worker provisions, the rest skip).
     if not _skip_boot_tasks:
         try:
-            from app.utils.demo_config import is_demo_mode
-            if is_demo_mode():
-                with app.app_context():
-                    from app.services.demo_seed import seed_demo_personas
-                    seed_result = seed_demo_personas()
-                    app.logger.warning(f"[demo_seed] startup: {seed_result}")
+            with app.app_context():
+                from app.services.workspace_provision import ensure_default_workspace
+                ensure_default_workspace()
+        except Exception as e:
+            app.logger.error(f"[tenancy] default-workspace ensure failed (non-fatal): {e}")
+
+        try:
+            from app.utils.demo_config import tenancy_mode_active
+            if tenancy_mode_active():
+                _do_seat_pool = True
+                try:
+                    from app.services.redis_service import get_redis_client
+                    _rc = get_redis_client()
+                    if _rc is not None:
+                        _do_seat_pool = bool(
+                            _rc.set('seat_pool_boot_lock', '1', nx=True, ex=120)
+                        )
+                except Exception:
+                    _do_seat_pool = True
+                if _do_seat_pool:
+                    with app.app_context():
+                        from app.services.seat_pool import ensure_seat_pool
+                        seat_result = ensure_seat_pool()
+                        app.logger.warning(f"[seat_pool] startup: {seat_result}")
+                else:
+                    app.logger.info("[seat_pool] startup already done by another worker — skipping")
         except Exception as e:
             # Don't crash the app for a seed failure — log loudly so it gets fixed.
-            app.logger.error(f"[demo_seed] startup failed (non-fatal): {e}")
+            app.logger.error(f"[seat_pool] startup failed (non-fatal): {e}")
 
     return app

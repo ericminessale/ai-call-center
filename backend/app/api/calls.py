@@ -897,15 +897,15 @@ def end_call(call_id):
 
         # Also emit call_ended for comprehensive UI cleanup (matches webhook pattern)
         from app import socketio
+        from app.services.ws_rooms import workspace_room
         call_ended_data = {
             'callId': call.id,
             'call_sid': call.signalwire_call_sid,
             'conference_name': call.conference_name,
             'reset_ui': True
         }
-        if call.user_id:
-            socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
-        socketio.emit('call_ended', call_ended_data)
+        socketio.emit('call_ended', call_ended_data,
+                      room=workspace_room(call.workspace_id))
 
         return jsonify({
             'success': True,
@@ -1128,8 +1128,10 @@ def report_sentiment(call_db_id):
             'timestamp': datetime.utcnow().isoformat(),
         }
 
-        # Broadcast to anyone watching this call + the assigned agent
-        socketio.emit('sentiment_update', sentiment_data)
+        # To the call's workspace — its watchers + assigned agent (§8.1).
+        from app.services.ws_rooms import workspace_room
+        socketio.emit('sentiment_update', sentiment_data,
+                      room=workspace_room(call.workspace_id))
 
         # Also update the contact's average sentiment if linked
         if call.contact_id:
@@ -1374,14 +1376,15 @@ def take_queued_call(call_id):
 
         logger.info(f"Call {call_id} taken by agent {request.current_user.id}, conference: {call.conference_name}")
 
-        # Emit queue update to remove from other agents' queue displays
+        # Emit queue update to remove from the workspace's queue displays
         from app import socketio
+        from app.services.ws_rooms import workspace_room
         socketio.emit('queue_update', {
             'call': call.to_dict(include_contact=True),
             'queue_id': call.queue_id,
             'action': 'taken',
             'taken_by_agent_id': request.current_user.id
-        })
+        }, room=workspace_room(call.workspace_id))
 
         return jsonify({
             'success': True,
@@ -1456,11 +1459,12 @@ def update_call_status(call_id):
         db.session.commit()
         logger.info(f"Call {call_id} status updated: {old_status} -> {new_status}")
 
-        # Emit update to other clients
+        # Emit update to the call's workspace
         from app import socketio
+        from app.services.ws_rooms import workspace_room
         socketio.emit('call_update', {
             'call': call.to_dict(include_contact=True)
-        })
+        }, room=workspace_room(call.workspace_id))
 
         return jsonify({
             'success': True,

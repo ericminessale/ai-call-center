@@ -10,9 +10,11 @@ class WebSocketService {
 
     this.socket = io(WS_URL, {
       path: '/socket.io/',
-      auth: {
-        token,
-      },
+      // auth as a CALLBACK: auto-reconnects handshake with the CURRENT
+      // token instead of the one captured at connect() time. Since Phase 3
+      // every server emit is room-scoped (rooms joined at connect-time
+      // auth), a stale-token reconnect would silently receive nothing.
+      auth: (cb) => cb({ token: localStorage.getItem('access_token') || token }),
       transports: ['websocket', 'polling'],
     });
 

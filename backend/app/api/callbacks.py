@@ -37,16 +37,17 @@ callbacks_bp = Blueprint('callbacks', __name__)
 # -----------------------------------------------------------------------------
 
 def _emit_callback_event(event: str, callback: Callback):
-    """Push a real-time event to anyone watching the callback queue.
+    """Push a real-time event to the workspace watching the callback queue.
 
     A few events are namespaced under one channel so listeners can decide
     whether to refetch the list or surgically update a row.
     """
     try:
+        from app.services.ws_rooms import workspace_room
         socketio.emit('callback_event', {
             'event': event,
             'callback': callback.to_dict(include_contact=True),
-        })
+        }, room=workspace_room(callback.workspace_id))
     except Exception as exc:
         logger.warning('Failed to emit callback_event %s: %s', event, exc)
 

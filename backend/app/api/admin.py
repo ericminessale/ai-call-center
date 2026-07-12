@@ -308,6 +308,16 @@ def create_queue():
             return jsonify({
                 'error': "routing_transport must be 'conference' or 'bridge'",
             }), 400
+        # Hosted mode: bridge transport parks callers in SignalWire's NATIVE
+        # queue named by the bare slug — shared across every workspace, so
+        # one workspace's pickup would pop another's caller. Blocked until
+        # Phase 4's telephony re-key names native queues per workspace.
+        from app.utils.demo_config import tenancy_mode_active
+        if routing_transport == 'bridge' and tenancy_mode_active():
+            return jsonify({
+                'error': 'Bridge transport is not available in hosted mode yet.',
+                'code': 'demo_blocked',
+            }), 400
 
         queue = Queue(
             slug=slug,
@@ -324,7 +334,9 @@ def create_queue():
         db.session.commit()
 
         from app import socketio
-        socketio.emit('queue_config_changed', {'action': 'created', 'queue': queue.to_dict()})
+        from app.services.ws_rooms import workspace_room
+        socketio.emit('queue_config_changed', {'action': 'created', 'queue': queue.to_dict()},
+                      room=workspace_room(queue.workspace_id))
 
         return jsonify({'queue': queue.to_dict()}), 201
     except Exception as e:
@@ -351,6 +363,15 @@ def update_queue(queue_id):
             return jsonify({
                 'error': "routing_transport must be 'conference' or 'bridge'",
             }), 400
+        # Hosted mode: bridge transport blocked until Phase 4 names the
+        # NATIVE SignalWire queues per workspace (bare slug names are
+        # shared install-wide — cross-workspace caller pops).
+        from app.utils.demo_config import tenancy_mode_active
+        if data.get('routing_transport') == 'bridge' and tenancy_mode_active():
+            return jsonify({
+                'error': 'Bridge transport is not available in hosted mode yet.',
+                'code': 'demo_blocked',
+            }), 400
 
         for field in ['display_name', 'description', 'is_active', 'routing_strategy',
                       'routing_transport', 'ai_agent_route', 'default_priority',
@@ -361,7 +382,9 @@ def update_queue(queue_id):
         db.session.commit()
 
         from app import socketio
-        socketio.emit('queue_config_changed', {'action': 'updated', 'queue': queue.to_dict()})
+        from app.services.ws_rooms import workspace_room
+        socketio.emit('queue_config_changed', {'action': 'updated', 'queue': queue.to_dict()},
+                      room=workspace_room(queue.workspace_id))
 
         return jsonify({'queue': queue.to_dict()}), 200
     except Exception as e:
@@ -380,11 +403,14 @@ def delete_queue(queue_id):
             return jsonify({'error': 'Queue not found'}), 404
 
         slug = queue.slug
+        queue_ws_id = queue.workspace_id  # capture before the row is gone
         db.session.delete(queue)
         db.session.commit()
 
         from app import socketio
-        socketio.emit('queue_config_changed', {'action': 'deleted', 'queue_slug': slug})
+        from app.services.ws_rooms import workspace_room
+        socketio.emit('queue_config_changed', {'action': 'deleted', 'queue_slug': slug},
+                      room=workspace_room(queue_ws_id))
 
         return jsonify({'success': True, 'message': f'Queue "{slug}" deleted'}), 200
     except Exception as e:

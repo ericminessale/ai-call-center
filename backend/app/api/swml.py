@@ -194,12 +194,14 @@ def initial_call():
         'queueId': 'general'
     }
 
-    # Emit to ALL agents for AI calls (no room = broadcast to all)
-    # AI calls should be visible to all agents, assigned calls go to specific rooms
-    socketio.emit('call_update', {'call': call_data})
-    socketio.emit('call_status', call_data)
+    # To the call's workspace — its agents see the AI-active call (§8.1;
+    # was a broadcast to every socket on the install).
+    from app.services.ws_rooms import workspace_room
+    ws_room = workspace_room(call.workspace_id)
+    socketio.emit('call_update', {'call': call_data}, room=ws_room)
+    socketio.emit('call_status', call_data, room=ws_room)
 
-    logger.info(f"✓ Emitted AI call to all agents: {call_id}")
+    logger.info(f"✓ Emitted AI call to workspace agents: {call_id}")
 
     # Get the base URL for callbacks (uses EXTERNAL_URL env var if set)
     base_url = get_base_url()

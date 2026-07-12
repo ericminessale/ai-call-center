@@ -24,17 +24,16 @@ logger = logging.getLogger(__name__)
 
 queues_bp = Blueprint('queues', __name__)
 
-# Initialize queue service
-queue_service = None
+def get_queue_service(workspace_id=None):
+    """Build a queue service bound to a workspace (§8.2).
 
-
-def get_queue_service():
-    """Get or create queue service instance"""
-    global queue_service
-    if queue_service is None:
-        redis_client = get_redis_client()
-        queue_service = QueueService(redis_client)
-    return queue_service
+    Queue state keys are ``ws:{id}:``-prefixed, so the old module-global
+    singleton (one instance, no workspace) is gone — construction is two
+    attribute assignments, cheap enough per call. Pass the owning row's
+    workspace (``call.workspace_id`` / ``queue.workspace_id``); ``None``
+    resolves to the default workspace (= the deployment in clone-and-own).
+    """
+    return QueueService(get_redis_client(), workspace_id=workspace_id)
 
 
 @queues_bp.route('/<queue_id>/route', methods=['POST'])
@@ -228,11 +227,12 @@ def route_call_to_queue(queue_id):
 
                 if contact_updated:
                     logger.info(f"Updated contact {contact.id} ({contact.phone}) with AI-collected data")
-                    # Emit contact update via WebSocket so frontend can refresh
+                    # Emit contact update to the contact's workspace (§8.1)
                     from app import socketio
+                    from app.services.ws_rooms import workspace_room
                     socketio.emit('contact_update', {
                         'contact': contact.to_dict_minimal()
-                    })
+                    }, room=workspace_room(contact.workspace_id))
                     logger.info(f"Emitted contact_update for contact {contact.id}")
 
             except Exception as e:
@@ -244,9 +244,16 @@ def route_call_to_queue(queue_id):
         # Compute strategy params for the unified helper. /route gets richer
         # data than /direct-inbound (skill levels for skill_based/priority
         # routing, language-matched dispatch) — pass them through.
-        service = get_queue_service()
+        # Webhook context: no g.workspace_id, so pin both the queue-config
+        # lookup and the Redis keys to the call's workspace (slugs repeat
+        # across workspaces).
+        from app.tenancy import DEFAULT_WORKSPACE_ID
+        call_ws_id = (call.workspace_id if call else None) or DEFAULT_WORKSPACE_ID
+        service = get_queue_service(workspace_id=call_ws_id)
         available_agents = service.get_available_agents(queue_id)
-        queue_config = Queue.find_by_slug(queue_id)
+        queue_config = Queue.query.filter_by(
+            slug=queue_id, workspace_id=call_ws_id
+        ).first()
         routing_strategy = queue_config.routing_strategy if queue_config else 'round_robin'
 
         skill_levels = {}
@@ -301,16 +308,18 @@ def route_call_to_queue(queue_id):
                 call_to_end.ended_at = call_to_end.ended_at or datetime.utcnow()
                 db.session.commit()
                 from app import socketio
+                from app.services.ws_rooms import workspace_room
+                fail_room = workspace_room(call_to_end.workspace_id)
                 socketio.emit('call_ended', {
                     'callId': call_to_end.id,
                     'call_sid': call_to_end.signalwire_call_sid,
                     'reset_ui': True,
-                })
+                }, room=fail_room)
                 socketio.emit('queue_update', {
                     'call': call_to_end.to_dict(include_contact=True),
                     'queue_id': queue_id,
                     'action': 'ended',
-                })
+                }, room=fail_room)
                 try:
                     if get_redis_client():
                         get_queue_service().remove_call_from_all_queues(call_id)
@@ -504,7 +513,7 @@ def get_next_queued_call(queue_id):
         if not agent_id:
             return jsonify({"error": "User not authenticated"}), 403
 
-        service = get_queue_service()
+        service = get_queue_service(workspace_id=request.current_user.workspace_id)
 
         # Set agent as available if not already
         service.set_agent_status(agent_id, "available")
@@ -537,7 +546,7 @@ def get_queue_status(queue_id):
     Get current queue statistics
     """
     try:
-        service = get_queue_service()
+        service = get_queue_service(workspace_id=request.current_user.workspace_id)
         status = service.get_queue_status(queue_id)
         metrics = service.get_queue_metrics(queue_id)
 
@@ -565,7 +574,7 @@ def get_wallboard():
         from datetime import timedelta
         from sqlalchemy import func, case
 
-        service = get_queue_service()
+        service = get_queue_service(workspace_id=request.current_user.workspace_id)
         since = datetime.utcnow() - timedelta(hours=24)
 
         rows = []
@@ -619,7 +628,7 @@ def update_agent_status():
         if not agent_id:
             return jsonify({"error": "User not authenticated"}), 403
 
-        service = get_queue_service()
+        service = get_queue_service(workspace_id=request.current_user.workspace_id)
         current_call_id = data.get('current_call_id')
 
         service.set_agent_status(agent_id, new_status, current_call_id)
@@ -659,7 +668,7 @@ def get_agent_metrics():
 
         period_hours = request.args.get('period_hours', 24, type=int)
 
-        service = get_queue_service()
+        service = get_queue_service(workspace_id=request.current_user.workspace_id)
         metrics = service.get_agent_metrics(agent_id, period_hours)
         return jsonify(metrics)
 
@@ -713,12 +722,19 @@ def get_all_queues_status():
         if not redis_client:
             return jsonify({"error": "Redis not available"}), 503
 
-        # Define available queues
-        queue_ids = Queue.get_active_slugs()
+        # Define available queues — the request-scoped auto-filter limits
+        # these to the caller's workspace. Key each row by ITS OWN
+        # workspace, not the caller's: for a platform user (no filter) the
+        # list spans workspaces, and reading every row's depth from the
+        # caller's ws:1 keys would mislabel every non-default workspace's
+        # stats. Workspace users only ever see rows matching their own id.
+        from app.services.ws_rooms import ws_key
+        queues = Queue.get_active_queues()
 
         all_status = []
-        for queue_id in queue_ids:
-            queue_key = f"queue:{queue_id}"
+        for q in queues:
+            queue_id = q.slug
+            queue_key = ws_key(q.workspace_id, f"queue:{queue_id}")
             queue_depth = redis_client.zcard(queue_key)
 
             # Calculate wait times if there are calls
@@ -800,19 +816,20 @@ def clear_mock_data():
     """
     Clear all mock/demo calls from queues
 
-    Stays blocked in hosted mode (Phase 2 gate retriage kept this one):
-    Redis queue keys are slug-global until the Phase 3 ws:{id}: re-key,
-    so a visitor clearing "their" queues would wipe live queue state for
-    every workspace sharing the slug.
+    Stays blocked in hosted mode: the Phase 3 ws:{id}: re-key removed the
+    cross-workspace wipe risk that originally motivated the block, but
+    mock tooling on the hosted demo remains a state-spam surface —
+    unblocking for workspace admins is a product call, not a safety one.
     """
     try:
-        service = QueueService()
+        from app.services.ws_rooms import ws_key
+        redis_client = get_redis_client()
+        user_ws_id = request.current_user.workspace_id
         cleared_count = 0
 
         # Clear demo calls from all queues
         for queue_id in Queue.get_active_slugs():
-            queue_key = f"queue:{queue_id}"
-            redis_client = service.redis_client
+            queue_key = ws_key(user_ws_id, f"queue:{queue_id}")
 
             if redis_client:
                 # Get all calls in the queue
@@ -851,9 +868,9 @@ def generate_mock_data():
     """
     Generate mock queue data for demos
 
-    Stays blocked in hosted mode (Phase 2 gate retriage kept this one):
-    mock rows land in the slug-global Redis queues every workspace shares
-    until Phase 3, and unbounded generation is a state-spam vector.
+    Stays blocked in hosted mode: keys are workspace-scoped since Phase 3,
+    but unbounded generation is still a state-spam vector on the hosted
+    demo — unblocking is a product call.
     """
     try:
         import random
@@ -867,6 +884,8 @@ def generate_mock_data():
         except ImportError:
             fake = None
 
+        from app.services.ws_rooms import ws_key
+        user_ws_id = request.current_user.workspace_id
         redis_client = get_redis_client()
 
         if not redis_client:
@@ -875,7 +894,7 @@ def generate_mock_data():
 
         # Clear existing queue data
         for queue_id in Queue.get_active_slugs():
-            redis_client.delete(f"queue:{queue_id}")
+            redis_client.delete(ws_key(user_ws_id, f"queue:{queue_id}"))
 
         # Queue configurations for realistic demo data
         queue_configs = {
@@ -998,7 +1017,7 @@ def generate_mock_data():
                 }
 
                 # Enqueue the call directly to Redis
-                queue_key = f"queue:{queue_id}"
+                queue_key = ws_key(user_ws_id, f"queue:{queue_id}")
 
                 # Add enqueued_at timestamp
                 call_data['enqueued_at'] = datetime.utcnow().isoformat()
@@ -1034,7 +1053,7 @@ def generate_mock_data():
         # Get queue depths for response
         queue_depths = {}
         for queue_id in queue_configs.keys():
-            queue_key = f"queue:{queue_id}"
+            queue_key = ws_key(user_ws_id, f"queue:{queue_id}")
             depth = redis_client.zcard(queue_key)
             queue_depths[queue_id] = depth
 
@@ -1084,22 +1103,27 @@ def toggle_queue_activation(assignment_id):
         assignment.is_activated = data.get('is_activated', not assignment.is_activated)
         db.session.commit()
 
-        # Update Redis agent-queue membership for real-time routing
+        # Update Redis agent-queue membership for real-time routing —
+        # keyed by the queue row's workspace (§8.2)
+        from app.services.ws_rooms import workspace_room, ws_key
         redis_client = get_redis_client()
         if redis_client:
-            queue_agents_key = f"queue_agents:{assignment.queue.slug}"
+            queue_agents_key = ws_key(
+                assignment.queue.workspace_id,
+                f"queue_agents:{assignment.queue.slug}",
+            )
             if assignment.is_activated:
                 redis_client.sadd(queue_agents_key, str(user_id))
             else:
                 redis_client.srem(queue_agents_key, str(user_id))
 
-        # Broadcast activation change
+        # Broadcast activation change to the queue's workspace
         from app import socketio
         socketio.emit('agent_queue_activation', {
             'user_id': user_id,
             'queue_slug': assignment.queue.slug,
             'is_activated': assignment.is_activated,
-        })
+        }, room=workspace_room(assignment.queue.workspace_id))
 
         return jsonify({'success': True, 'assignment': assignment.to_dict()}), 200
     except Exception as e:
@@ -1167,18 +1191,22 @@ def self_subscribe_queue(queue_id):
 
         db.session.commit()
 
-        # Update Redis
+        # Update Redis — keyed by the queue row's workspace (§8.2)
+        from app.services.ws_rooms import workspace_room, ws_key
         redis_client = get_redis_client()
         if redis_client:
-            redis_client.sadd(f"queue_agents:{queue.slug}", str(user_id))
+            redis_client.sadd(
+                ws_key(queue.workspace_id, f"queue_agents:{queue.slug}"),
+                str(user_id),
+            )
 
-        # Broadcast
+        # Broadcast to the queue's workspace
         from app import socketio
         socketio.emit('agent_queue_activation', {
             'user_id': user_id,
             'queue_slug': queue.slug,
             'is_activated': True,
-        })
+        }, room=workspace_room(queue.workspace_id))
 
         return jsonify({'success': True, 'assignment': assignment.to_dict()}), 200
     except Exception as e:

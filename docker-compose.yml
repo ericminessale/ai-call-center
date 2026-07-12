@@ -245,9 +245,11 @@ services:
       timeout: 10s
       retries: 3
 
-  # demo-reset — daily cron that fires the backend's demo-reset
-  # endpoint at 00:00 UTC. Self-gates on DEMO_MODE; safe to leave
-  # running on a clone-and-own deployment (endpoint will no-op).
+  # demo-reset — workspace-GC cron (Phase 3 reaper): hourly
+  # /api/internal/workspace-gc reaps EXPIRED workspaces; nightly
+  # /api/internal/demo-reset adds MAX_WORKSPACES cap enforcement +
+  # template hygiene. No FLUSHDB, no whole-floor wipe. Self-gates on
+  # DEMO_MODE; safe to leave running on clone-and-own (no-ops).
   demo-reset:
     build:
       context: ./demo-reset

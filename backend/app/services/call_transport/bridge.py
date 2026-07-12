@@ -82,7 +82,7 @@ def build_ingress_swml(
     from app.services.callcenter_socketio import emit_call_update
 
     call_sid = call.signalwire_call_sid
-    qs = QueueService(get_redis_client())
+    qs = QueueService(get_redis_client(), workspace_id=call.workspace_id)
 
     # --- 1. Enqueue + announce to dashboard ---
     try:
@@ -105,11 +105,12 @@ def build_ingress_swml(
 
     try:
         from app import socketio
+        from app.services.ws_rooms import workspace_room
         socketio.emit('queue_update', {
             'call': call.to_dict(include_contact=True),
             'queue_id': queue_slug,
             'action': 'added',
-        })
+        }, room=workspace_room(call.workspace_id))
     except Exception as e:
         logger.warning(f"Bridge ingress: queue_update emit failed: {e}")
 

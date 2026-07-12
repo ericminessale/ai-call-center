@@ -960,12 +960,13 @@ def handle_call_conference_status(conference_name, event_type, participant_call_
         # Someone joined the conference
         logger.info(f"Participant {participant_call_sid} joined call conference {conference_name}")
 
-        # Emit socket event for UI updates
+        # Emit socket event for UI updates — to the call's workspace (§8.1)
+        from app.services.ws_rooms import workspace_room
         socketio.emit('call_conference_participant_joined', {
             'conference_name': conference_name,
             'call_id': call_id,
             'participant_call_sid': participant_call_sid
-        })
+        }, room=workspace_room(call.workspace_id))
 
     elif event_type in ['leave', 'participant-leave']:
         # Someone left the conference
@@ -982,12 +983,13 @@ def handle_call_conference_status(conference_name, event_type, participant_call_
             ai_leg.status = 'ended'
             db.session.commit()
 
-        # Emit socket event
+        # Emit socket event — to the call's workspace (§8.1)
+        from app.services.ws_rooms import workspace_room
         socketio.emit('call_conference_participant_left', {
             'conference_name': conference_name,
             'call_id': call_id,
             'participant_call_sid': participant_call_sid
-        })
+        }, room=workspace_room(call.workspace_id))
 
     elif event_type in ['end', 'conference-end']:
         # Conference ended - call is done
@@ -1319,13 +1321,14 @@ def move_participant(conference_name):
         db.session.add(new_participant)
         db.session.commit()
 
-        # Emit events
+        # Emit events — to the conference's workspace (§8.1)
         from app import socketio
+        from app.services.ws_rooms import workspace_room
         socketio.emit('participant_moved', {
             'from_conference': conference_name,
             'to_conference': target_conference_name,
             'participant_call_sid': participant_call_sid
-        })
+        }, room=workspace_room(source_conference.workspace_id))
 
         return jsonify({
             'success': True,
@@ -1362,12 +1365,13 @@ def end_conference(conference_name):
         conference.end_conference()
         db.session.commit()
 
-        # Emit event
+        # Emit event — to the conference's workspace (§8.1)
         from app import socketio
+        from app.services.ws_rooms import workspace_room
         socketio.emit('conference_ended', {
             'conference_name': conference_name,
             'conference_id': conference.id
-        })
+        }, room=workspace_room(conference.workspace_id))
 
         return jsonify({'success': True, 'conference_name': conference_name})
 
@@ -1650,13 +1654,13 @@ def call_state_webhook(conference_name):
         # Emit call_ended for terminal states (matches webhooks.py pattern)
         if new_status in ['ended', 'failed', 'completed']:
             from app import socketio
+            from app.services.ws_rooms import workspace_room
             call_ended_data = {
                 'callId': call.id,
                 'call_sid': call.signalwire_call_sid,
                 'reset_ui': True
             }
-            if call.user_id:
-                socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
-            socketio.emit('call_ended', call_ended_data)
+            socketio.emit('call_ended', call_ended_data,
+                          room=workspace_room(call.workspace_id))
 
     return jsonify({'status': 'ok'})

@@ -272,11 +272,12 @@ def call_status():
             # idempotent (dedups by call.id) so a double-fire is harmless.
             if was_pending and call.status == 'waiting':
                 try:
+                    from app.services.ws_rooms import workspace_room
                     socketio.emit('queue_update', {
                         'call': call.to_dict(include_contact=True),
                         'queue_id': call.queue_id,
                         'action': 'added',
-                    })
+                    }, room=workspace_room(call.workspace_id))
                     logger.info(
                         f"Emitted queue_update added for promoted call {call_id}"
                     )
@@ -324,14 +325,14 @@ def call_status():
             if call.user_id:
                 socketio.emit('call_status', call_data, room=str(call.user_id))
 
-            # Emit call_update for Agent Dashboard
-            # For AI-active calls, broadcast to ALL agents so they can see and take over
-            # For human-handled calls, emit to the specific user's room
-            if dashboard_status == 'ai_active' or not call.user_id:
-                logger.info(f"Broadcasting call_update to all agents (status: {dashboard_status}, user_id: {call.user_id})")
-                socketio.emit('call_update', {'call': call_data})  # Broadcast to all
-            else:
-                socketio.emit('call_update', {'call': call_data}, room=str(call.user_id))
+            # Emit call_update for Agent Dashboard — to the call's workspace
+            # room (§8.1, replaces the all-sockets AI-active broadcast).
+            # Everyone on that floor sees AI-active calls and can take over;
+            # other workspaces never receive them. In clone-and-own the
+            # single ws:1 room is the same floor-wide reach as before.
+            from app.services.ws_rooms import workspace_room
+            ws_room = workspace_room(call.workspace_id)
+            socketio.emit('call_update', {'call': call_data}, room=ws_room)
 
             # Special handling for ended status to reset UI
             if mapped_status == 'ended':
@@ -393,12 +394,11 @@ def call_status():
                     'assigned_agent_id': call.assigned_agent_id,
                     'reset_ui': True
                 }
-                # Emit to user room
-                socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
-                # Also emit to all (for AI calls visible to all agents)
-                socketio.emit('call_ended', call_ended_data)
-                # And emit call_update with ended status to all
-                socketio.emit('call_update', {'call': call_data})
+                # To the call's workspace (owner, agents watching AI calls,
+                # supervisors) — was a user-room emit + a global broadcast.
+                socketio.emit('call_ended', call_ended_data, room=ws_room)
+                # And emit call_update with ended status to the workspace
+                socketio.emit('call_update', {'call': call_data}, room=ws_room)
 
                 # Tell the Queue tab to drop this call. The frontend Queue list
                 # listens for `queue_update action='ended'` to remove rows;
@@ -411,7 +411,7 @@ def call_status():
                         'call': call_data,
                         'queue_id': call.queue_id,
                         'action': 'ended',
-                    })
+                    }, room=ws_room)
                 except Exception as e:
                     logger.warning(f"call_status: queue_update emit failed: {e}")
 
@@ -922,6 +922,11 @@ def queue_status():
         }
         action = action_map.get(result, 'updated')
         try:
+            # Workspace room (§8.1). Unresolvable calls fall back to the
+            # default workspace's room — in hosted mode that's platform
+            # operators only (nothing leaks to visitors), in clone-and-own
+            # it's the whole floor as before.
+            from app.services.ws_rooms import workspace_room
             socketio.emit('queue_update', {
                 'call': call.to_dict() if call else {'signalwireCallSid': call_id},
                 'queue_id': queue_name,
@@ -930,7 +935,7 @@ def queue_status():
                 'size': size,
                 'wait_time': wait_time,
                 'native_queue_event': result,
-            })
+            }, room=workspace_room(call.workspace_id if call else None))
             logger.info(
                 f"queue-status: emit queue_update action={action} "
                 f"queue={queue_name} call={call_id} pos={position}"
@@ -1449,14 +1454,14 @@ def post_prompt():
             # Only emit call_ended if the call is actually ended/completed
             # If status is 'waiting', the call is still active and should stay in the queue
             if call.status in ('ended', 'completed'):
+                from app.services.ws_rooms import workspace_room
                 call_ended_data = {
                     'callId': call.id,
                     'call_sid': call_id,
                     'reset_ui': True
                 }
-                if call.user_id:
-                    socketio.emit('call_ended', call_ended_data, room=str(call.user_id))
-                socketio.emit('call_ended', call_ended_data)
+                socketio.emit('call_ended', call_ended_data,
+                              room=workspace_room(call.workspace_id))
 
             # Also emit to call room
             socketio.emit('post_prompt_received', {

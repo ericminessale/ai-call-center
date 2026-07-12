@@ -139,22 +139,24 @@ def _reap_call(call) -> None:
         logger.warning(f"watchdog reap {call_sid}: commit failed: {e}")
         return
 
-    # Notify the UI.
+    # Notify the call's workspace (§8.1 — reaps were global broadcasts).
     try:
+        from app.services.ws_rooms import workspace_room
+        room = workspace_room(call.workspace_id)
         call_data = call.to_dict(include_contact=True)
-        socketio.emit('call_update', {'call': call_data})
+        socketio.emit('call_update', {'call': call_data}, room=room)
         socketio.emit('queue_update', {
             'call': call_data,
             'queue_id': call.queue_id,
             'action': 'ended',
-        })
+        }, room=room)
         socketio.emit('call_ended', {
             'callId': call.id,
             'call_sid': call_sid,
             'conference_name': call.conference_name,
             'assigned_agent_id': call.assigned_agent_id,
             'reset_ui': True,
-        })
+        }, room=room)
     except Exception as e:
         logger.warning(f"watchdog reap {call_sid}: socket emit failed: {e}")
 

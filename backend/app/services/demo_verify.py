@@ -126,6 +126,26 @@ def _persona_number_key(persona_id: int) -> str:
 
 
 def _outbound_key(persona_id: int) -> str:
+    """Outbound-cap counter, re-keyed ``ws:{id}:outbound`` (§4.3/§8.2).
+
+    The cap is now per WORKSPACE, not per user — a visitor's invited
+    colleagues share the visitor's hourly budget instead of multiplying
+    it. Falls back to a user-keyed name only when the user row can't be
+    resolved (shouldn't happen for live visitors), so a lookup blip
+    degrades to the old per-user behavior rather than an uncapped dial.
+    The workspace reaper's ``ws:{id}:*`` pattern delete clears it, and
+    :func:`clear_bindings` still deletes it explicitly.
+    """
+    try:
+        from app.models import User
+        from app.services.ws_rooms import ws_key
+        from app.tenancy import workspace_context
+        with workspace_context(None):
+            user = User.query.get(int(persona_id))
+        if user is not None:
+            return ws_key(user.workspace_id, 'outbound')
+    except Exception:
+        pass
     return f'demo:outbound:{int(persona_id)}'
 
 
@@ -269,6 +289,7 @@ def pair_number(code: str, number: str) -> dict:
             # ws-1 contact may be shared by other quarantined calls —
             # contact attribution is Phase 4's verify-first rework.)
             if visitor is not None and visitor.workspace_id is not None:
+                old_ws_id = call.workspace_id
                 call.workspace_id = visitor.workspace_id
                 for child in (Transcription, CallLeg, WebhookEvent,
                               Callback, ConferenceParticipant):
@@ -278,6 +299,58 @@ def pair_number(code: str, number: str) -> dict:
                         .update({'workspace_id': visitor.workspace_id},
                                 synchronize_session=False)
                     )
+                # Conference rows key by the SignalWire sid STRING, not the
+                # DB id, so the children loop above misses them — and
+                # conference-keyed emits (conference_ended,
+                # participant_moved) target workspace_room(conference.
+                # workspace_id), so a row left in quarantine would emit to
+                # the wrong room for the rest of the call.
+                from app.models import Conference as _Conference
+                (
+                    _Conference.query
+                    .filter_by(call_id=call.signalwire_call_sid)
+                    .update({'workspace_id': visitor.workspace_id},
+                            synchronize_session=False)
+                )
+                # Phase 3: queue state is workspace-keyed. A caller who was
+                # parked BEFORE verifying sits in the OLD (quarantine)
+                # workspace's zset, where the visitor's dispatch will never
+                # find them — move the entry to the new workspace's queue,
+                # preserving priority/context (enqueue_call keeps the
+                # original SLA clock from Call.created_at).
+                if call.status in ('waiting', 'assigned') and call.queue_id:
+                    try:
+                        import json as _json
+                        from app.services.queue_service import QueueService
+                        qs_new = QueueService(
+                            redis_client, workspace_id=visitor.workspace_id
+                        )
+                        removed = qs_new.remove_call_from_all_queues(
+                            call.signalwire_call_sid
+                        )
+                        if removed and call.status == 'waiting':
+                            try:
+                                ctx = _json.loads(call.ai_context) if call.ai_context else {}
+                            except (TypeError, ValueError):
+                                ctx = {}
+                            qs_new.enqueue_call(
+                                call_id=call.signalwire_call_sid,
+                                queue_id=call.queue_id,
+                                priority=ctx.get('priority', 5),
+                                context=ctx,
+                                caller_info={'number': call.from_number, 'name': None},
+                            )
+                            logger.info(
+                                "demo_verify: moved queued call %s from ws %s "
+                                "to ws %s queue '%s'",
+                                call.signalwire_call_sid, old_ws_id,
+                                visitor.workspace_id, call.queue_id,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "demo_verify: queued-call workspace move failed "
+                            "for %s: %s", call.signalwire_call_sid, exc,
+                        )
         if live:
             db.session.commit()
     except Exception as exc:  # noqa: BLE001

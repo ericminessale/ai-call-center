@@ -26,13 +26,44 @@ class QueuedCall:
 
 
 class QueueService:
-    """Service for managing call queues and agent availability"""
+    """Service for managing call queues and agent availability.
 
-    def __init__(self, redis_client: redis.Redis):
+    Tenancy (§8.2): queue state is keyed by SLUG, and slugs repeat across
+    workspaces (every visitor gets sales/support/billing clones), so the
+    slug-keyed keys — the parked-call zset, the agent-activation set and
+    the round-robin cursor — carry a ``ws:{workspace_id}:`` prefix.
+    Construct with the workspace that owns the queues being touched
+    (usually ``call.workspace_id`` or ``queue.workspace_id``); ``None``
+    resolves to the default workspace, which in clone-and-own IS the
+    deployment. Agent-status keys (``agent:{id}``, ``agents:{status}``,
+    ``agent_last_assigned:{id}``), decline cooldowns and the call-sid data
+    key stay unprefixed — their identifiers are globally unique.
+    """
+
+    def __init__(self, redis_client: redis.Redis, workspace_id=None):
         self.redis = redis_client
+        self.workspace_id = workspace_id
         self.queue_prefix = "queue:"
         self.agent_prefix = "agent:"
         self.call_prefix = "call:"
+
+    def _ws_queue_key(self, queue_id: str, workspace_id=None) -> str:
+        from app.services.ws_rooms import ws_key
+        return ws_key(
+            workspace_id if workspace_id is not None else self.workspace_id,
+            f"{self.queue_prefix}{queue_id}",
+        )
+
+    def _ws_agents_key(self, queue_slug: str, workspace_id=None) -> str:
+        from app.services.ws_rooms import ws_key
+        return ws_key(
+            workspace_id if workspace_id is not None else self.workspace_id,
+            f"queue_agents:{queue_slug}",
+        )
+
+    def _ws_rr_key(self, queue_slug: str) -> str:
+        from app.services.ws_rooms import ws_key
+        return ws_key(self.workspace_id, f"round_robin:{queue_slug}")
 
     def enqueue_call(
         self,
@@ -55,7 +86,7 @@ class QueueService:
         Returns:
             Queue position and estimated wait time
         """
-        queue_key = f"{self.queue_prefix}{queue_id}"
+        queue_key = self._ws_queue_key(queue_id)
 
         # Remove any existing entry for this call (prevents duplicates from hold loop retries)
         self._remove_call_from_set(queue_key, call_id)
@@ -138,7 +169,7 @@ class QueueService:
         Returns:
             Call data if available, None otherwise
         """
-        queue_key = f"{self.queue_prefix}{queue_id}"
+        queue_key = self._ws_queue_key(queue_id)
 
         # Get highest priority call (lowest score)
         calls = self.redis.zrange(queue_key, 0, 0)
@@ -179,7 +210,7 @@ class QueueService:
         Returns:
             Queue statistics
         """
-        queue_key = f"{self.queue_prefix}{queue_id}"
+        queue_key = self._ws_queue_key(queue_id)
 
         # Get all calls in queue
         calls = self.redis.zrange(queue_key, 0, -1, withscores=True)
@@ -221,7 +252,7 @@ class QueueService:
 
     def get_queue_depth(self, queue_id: str) -> int:
         """Get the number of calls in queue"""
-        queue_key = f"{self.queue_prefix}{queue_id}"
+        queue_key = self._ws_queue_key(queue_id)
         return self.redis.zcard(queue_key)
 
     def set_agent_status(
@@ -333,7 +364,11 @@ class QueueService:
             queue = getattr(assignment, 'queue', None)
             if queue is None or not queue.slug:
                 continue
-            self.redis.sadd(f"queue_agents:{queue.slug}", str(uid))
+            # Key by the QUEUE row's workspace — the assignment's queue and
+            # agent always share one, but the row is the authority.
+            self.redis.sadd(
+                self._ws_agents_key(queue.slug, queue.workspace_id), str(uid)
+            )
 
     # ---- decline cooldown ---------------------------------------------
     # When an agent declines an assignment, we re-queue the call and free
@@ -378,13 +413,33 @@ class QueueService:
         waiting, or the agent doesn't have a Call Fabric subscriber address
         the system can dial via the AGENT_CONFERENCE_RESOURCE.
         """
-        # Find queues this agent is activated for.
-        activation_prefix = "queue_agents:"
+        # Resolve the agent user FIRST — their workspace bounds everything
+        # below (§8.3): the activation scan, the Queue/Call lookups and the
+        # queue keys all stay inside ``ws:{agent's workspace}:``. Scanning
+        # the bare ``queue_agents:*`` namespace would sweep every
+        # workspace's activation sets and dispatch across tenants.
+        try:
+            from app.models import User
+            from app.tenancy import DEFAULT_WORKSPACE_ID
+        except Exception as e:
+            logger.error(f"Push-dispatch: failed to import User: {e}")
+            return
+        try:
+            agent_user = User.query.filter_by(id=int(agent_id)).first()
+        except (ValueError, TypeError):
+            agent_user = None
+        if not agent_user:
+            logger.warning(f"Push-dispatch: agent {agent_id} not in DB; skipping")
+            return
+        agent_ws_id = agent_user.workspace_id
+
+        # Find queues this agent is activated for — within their workspace.
+        activation_prefix = self._ws_agents_key('', agent_ws_id)
         activated_queues = []
         for raw_key in self.redis.scan_iter(f"{activation_prefix}*"):
             key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
-            slug = key.replace(activation_prefix, '')
-            if self.redis.sismember(key, agent_id):
+            slug = key[len(activation_prefix):]
+            if slug and self.redis.sismember(key, agent_id):
                 activated_queues.append(slug)
         if not activated_queues:
             return
@@ -399,7 +454,13 @@ class QueueService:
             from app.models import Queue, Call
             bridge_dispatched = False
             for slug in activated_queues:
-                q = Queue.query.filter_by(slug=slug, is_active=True).first()
+                # Slugs repeat across workspaces — pin lookups to the
+                # agent's workspace (this runs with no request context, so
+                # the auto-filter is off).
+                q = Queue.query.filter_by(
+                    slug=slug, is_active=True,
+                    workspace_id=agent_ws_id or DEFAULT_WORKSPACE_ID,
+                ).first()
                 if not q or (q.routing_transport or 'conference') != 'bridge':
                     continue
                 # Only dial if there's at least one waiting bridge-mode caller
@@ -408,6 +469,7 @@ class QueueService:
                 # available even when the queue is empty.
                 waiting = Call.query.filter_by(
                     queue_id=slug, status='waiting', transport='bridge',
+                    workspace_id=agent_ws_id or DEFAULT_WORKSPACE_ID,
                 ).count()
                 if waiting <= 0:
                     continue
@@ -422,7 +484,7 @@ class QueueService:
             )
 
         for slug in activated_queues:
-            queue_key = f"{self.queue_prefix}{slug}"
+            queue_key = self._ws_queue_key(slug, agent_ws_id)
             head = self.redis.zrange(queue_key, 0, 0)
             if not head:
                 continue
@@ -445,11 +507,11 @@ class QueueService:
                 )
                 continue
 
-            # Look up the Call + User ORM rows. We can't import them at module
-            # top — circular dep with app.__init__. Defer imports here.
+            # Look up the Call ORM row. We can't import at module top —
+            # circular dep with app.__init__. Defer imports here.
             try:
                 from app import db
-                from app.models import Call, User
+                from app.models import Call
                 from app.services.queue_dispatch import emit_call_assignment_to_agent
                 from datetime import datetime
             except Exception as e:
@@ -460,14 +522,18 @@ class QueueService:
             if not call:
                 logger.warning(f"Push-dispatch: call {call_sid} not in DB; skipping")
                 continue
+            # Belt-and-braces: the zset was already read from the agent's
+            # workspace prefix, but never bridge a call whose row says it
+            # belongs elsewhere (stale/quarantined entries).
+            if (call.workspace_id or DEFAULT_WORKSPACE_ID) != (
+                agent_ws_id or DEFAULT_WORKSPACE_ID
+            ):
+                logger.warning(
+                    f"Push-dispatch: call {call_sid} workspace "
+                    f"{call.workspace_id} != agent workspace {agent_ws_id}; skipping"
+                )
+                continue
 
-            try:
-                agent_user = User.query.filter_by(id=int(agent_id)).first()
-            except (ValueError, TypeError):
-                agent_user = None
-            if not agent_user:
-                logger.warning(f"Push-dispatch: agent {agent_id} not in DB; skipping")
-                return
             if not agent_user.signalwire_address:
                 logger.warning(
                     f"Push-dispatch: agent {agent_id} has no signalwire_address; "
@@ -677,7 +743,10 @@ class QueueService:
         # opted into), and under workspace tenancy it becomes a hard
         # cross-tenant mis-route. No activated agents -> empty list; the
         # caller's no-agent path (hold / AI fallback) handles it honestly.
-        queue_agents = self.redis.smembers(f"queue_agents:{queue_slug}")
+        # The activation set is workspace-prefixed, so even though
+        # ``agents:available`` is a global set of user ids, the
+        # intersection can only ever contain this workspace's agents.
+        queue_agents = self.redis.smembers(self._ws_agents_key(queue_slug))
         filtered = sorted(available & queue_agents)
         if not filtered and available:
             logger.info(
@@ -761,7 +830,7 @@ class QueueService:
 
     def _strategy_round_robin(self, queue_slug: str, available_agents: List[str]) -> str:
         """Round-robin: cycle through agents in order."""
-        rr_key = f"round_robin:{queue_slug}"
+        rr_key = self._ws_rr_key(queue_slug)
         last_index_raw = self.redis.get(rr_key)
         last_index = int(last_index_raw) if last_index_raw else -1
         next_index = (last_index + 1) % len(available_agents)
@@ -801,7 +870,13 @@ class QueueService:
     def get_skill_levels_for_queue(self, queue_slug: str, agent_ids: List[str]) -> Dict[str, int]:
         """Get skill levels for agents in a specific queue from database."""
         from app.models.queue import QueueAgentAssignment, Queue
-        queue = Queue.find_by_slug(queue_slug)
+        from app.tenancy import DEFAULT_WORKSPACE_ID
+        # Slugs repeat across workspaces and webhook callers have no
+        # request scope — pin to this service's workspace.
+        queue = Queue.query.filter_by(
+            slug=queue_slug,
+            workspace_id=self.workspace_id or DEFAULT_WORKSPACE_ID,
+        ).first()
         if not queue:
             return {}
 
@@ -904,7 +979,7 @@ class QueueService:
 
     def _get_queue_position(self, queue_id: str, call_id: str) -> int:
         """Get position of call in queue"""
-        queue_key = f"{self.queue_prefix}{queue_id}"
+        queue_key = self._ws_queue_key(queue_id)
         calls = self.redis.zrange(queue_key, 0, -1)
 
         for i, call_str in enumerate(calls):
@@ -939,10 +1014,17 @@ class QueueService:
         return removed
 
     def remove_call_from_all_queues(self, call_id: str) -> int:
-        """Remove a call from all queues. Called when a call ends (hangup, timeout, etc.)."""
+        """Remove a call from all queues. Called when a call ends (hangup, timeout, etc.).
+
+        Deliberately scans EVERY workspace's queue keys (``ws:*:queue:*``):
+        call sids are globally unique, so this can only ever remove this
+        call's own entries, and end-of-call cleanup paths (webhooks,
+        watchdog) shouldn't strand a zset entry just because the row was
+        re-parented between enqueue and hangup.
+        """
         removed = 0
-        # Scan all queue keys
-        for key in self.redis.scan_iter(f"{self.queue_prefix}*"):
+        # Scan all queue keys across workspaces
+        for key in self.redis.scan_iter(f"ws:*:{self.queue_prefix}*"):
             removed += self._remove_call_from_set(key, call_id)
         # Also clean up the call data key
         self.redis.delete(f"{self.call_prefix}{call_id}")

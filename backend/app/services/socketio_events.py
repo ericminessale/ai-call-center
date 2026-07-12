@@ -3,11 +3,34 @@ from flask import request
 from app import socketio
 from app.models import Call, User
 from app.utils.jwt_utils import verify_token
-from app.utils.demo_config import is_demo_mode
 from app.services.redis_service import add_to_set, remove_from_set
+from app.services.ws_rooms import WS_CLIENTS_PREFIX, workspace_room, ws_clients_key
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _join_workspace_room(user_id) -> None:
+    """Join the authenticated socket to its workspace room (§8.1).
+
+    Workspace-scoped emits (queue_update, call_update, call_ended,
+    wallboard, config changes, …) all target ``ws:{workspace_id}`` — this
+    server-side join is what makes them reach the user, on BOTH parallel
+    frontend sockets, with no client-side join protocol. Platform users
+    (workspace NULL — every clone-and-own user, plus the hosted operator)
+    land in the default workspace's room, which in clone-and-own is the
+    whole floor. Also records the sid in ``ws_clients:{id}`` so the
+    wallboard knows which workspaces have watchers.
+    """
+    try:
+        user = User.find_by_id(user_id)
+        ws_id = user.workspace_id if user else None
+        join_room(workspace_room(ws_id))
+        add_to_set(ws_clients_key(ws_id), request.sid)
+    except Exception as e:
+        # A failed workspace join degrades realtime (no dashboard pushes)
+        # but must not kill the connection handshake.
+        logger.warning(f"workspace room join failed for user {user_id}: {e}")
 
 
 @socketio.on('connect')
@@ -31,6 +54,7 @@ def handle_connect(auth=None):
             # Join user's room automatically
             join_room(str(user_id))
             add_to_set(f"user:{user_id}:clients", request.sid)
+            _join_workspace_room(user_id)
             logger.info(f"Socket auto-auth: {client_id} -> user {user_id} (joined room '{user_id}')")
             emit('authenticated', {
                 'message': 'Authentication successful',
@@ -106,6 +130,12 @@ def handle_disconnect():
                 key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
                 rdb.srem(key, client_id)
 
+        # And from the workspace client sets — the wallboard reads these to
+        # decide which workspaces still have watchers.
+        for raw_key in rdb.scan_iter(f'{WS_CLIENTS_PREFIX}*'):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            rdb.srem(key, client_id)
+
         # Offline the agent if this was their last live socket — i.e.
         # the per-user client set is now empty.
         if owning_user_id is not None:
@@ -151,6 +181,7 @@ def handle_authenticate(data):
     # Join user's room (MUST be string to match emit room format)
     join_room(str(user_id))
     add_to_set(f"user:{user_id}:clients", request.sid)
+    _join_workspace_room(user_id)
 
     emit('authenticated', {
         'message': 'Authentication successful',
@@ -314,11 +345,13 @@ def handle_set_agent_status(data):
             'user_id': user_id
         })
 
-        # Broadcast to all clients that agent status changed
+        # Tell the agent's workspace that their status changed (was a global
+        # broadcast — a visitor's presence is nobody else's wallboard data).
+        status_user = User.find_by_id(user_id)
         socketio.emit('agent_online_status', {
             'agent_id': user_id,
             'status': status
-        })
+        }, room=workspace_room(status_user.workspace_id if status_user else None))
     else:
         emit('error', {'message': 'Redis not available'})
 
@@ -368,6 +401,30 @@ def handle_join_conference(data):
     if not user_id:
         emit('error', {'message': 'Invalid or expired token'})
         return
+
+    # Tenancy predicate (§8.1): this handler used to check only token
+    # validity, so any authenticated socket could join any conference room
+    # by name (names are derivable: interaction-<call_sid>). A workspace-
+    # bound user may only enter rooms for conferences whose call is in
+    # their own workspace; unresolvable conference/call fails CLOSED for
+    # them. Platform users (workspace NULL — clone-and-own users and the
+    # hosted operator) keep today's behavior. Same error message as any
+    # other failure so probes can't distinguish.
+    user = User.find_by_id(user_id)
+    if not user:
+        emit('error', {'message': 'Invalid or expired token'})
+        return
+    if user.workspace_id is not None:
+        from app.models import Conference
+        conference = Conference.get_active_by_name(conference_name)
+        conf_call = Call.find_by_sid(conference.call_id) if conference else None
+        if conf_call is None or conf_call.workspace_id != user.workspace_id:
+            logger.warning(
+                f"join_conference: user {user_id} denied room for "
+                f"conference {conference_name} (cross-workspace or unresolvable)"
+            )
+            emit('error', {'message': 'Conference not available'})
+            return
 
     # Join the conference room
     room_name = f'conference:{conference_name}'
@@ -440,6 +497,21 @@ def handle_agent_answered(data):
     from app.models import Conference
     conference = Conference.get_active_by_name(conference_name)
     conf_call = Call.find_by_sid(conference.call_id) if conference else None
+    # Tenancy predicate (deviation 22): every hosted visitor is 'admin' of
+    # their own workspace, so the role check below no longer bounds this
+    # handler — without a workspace gate a visitor could bridge a leg into
+    # another workspace's live conference. Workspace-bound users must
+    # resolve the conference to a call in THEIR workspace; platform users
+    # (workspace NULL) stay unscoped.
+    if user.workspace_id is not None and (
+        conf_call is None or conf_call.workspace_id != user.workspace_id
+    ):
+        logger.warning(
+            f"agent_answered: user {user_id} denied cross-workspace bridge "
+            f"into conference {conference_name}"
+        )
+        emit('error', {'message': 'Not authorized for this conference'})
+        return
     role = user.role or ''
     authorized = role in ('admin', 'supervisor') or (
         conf_call is not None

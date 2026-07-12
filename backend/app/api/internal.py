@@ -26,9 +26,8 @@ import logging
 
 from flask import Blueprint, jsonify, request
 
-from app import socketio
 from app.models import AgentCollectionAssignment, McpGatewayConfig
-from app.services.demo_reset import reset_demo_state
+from app.services.demo_reset import nightly_safety_pass, reap_expired_workspaces
 from app.utils.demo_config import is_demo_mode
 from app.utils.webhook_auth import require_internal_auth
 
@@ -144,44 +143,51 @@ def list_agent_assignments():
     })
 
 
+@internal_bp.route('/workspace-gc', methods=['POST'])
+@require_internal_auth
+def trigger_workspace_gc():
+    """Hourly workspace GC (Phase 3, §4.2 — replaces the nightly wipe).
+
+    Reaps every EXPIRED workspace: rows in dependency order, its
+    ``ws:{id}:*`` Redis keys, verify bindings, seat leases; epoch bumped
+    so surviving JWTs die. Live workspaces are untouched — visitors keep
+    their 7-day workspaces. NO FLUSHDB (shared Redis carries every live
+    workspace's state plus the Socket.IO message queue).
+
+    Triggered by the ``demo-reset`` cron container hourly. No-ops when
+    hosted-demo mode is off. Hard-requires HTTP Basic auth
+    (``require_internal_auth``) regardless of ``WEBHOOK_AUTH_REQUIRED``.
+    """
+    if not is_demo_mode():
+        return jsonify({'skipped': 'DEMO_MODE not set'}), 200
+
+    summary = reap_expired_workspaces()
+    if summary.get('reaped'):
+        logger.warning("workspace_gc: %s", summary)
+    return jsonify({'ok': True, 'summary': summary}), 200
+
+
 @internal_bp.route('/demo-reset', methods=['POST'])
 @require_internal_auth
 def trigger_demo_reset():
-    """Run the daily demo wipe + reseed.
+    """Nightly safety pass (Phase 3 — the whole-floor wipe is gone).
 
-    Refuses outright in production (``DEMO_MODE`` unset). When DEMO
-    mode is on:
-      1. Truncate mutable per-day tables (calls, contacts, etc.) —
-         users + queues + KB + MCP config preserved.
-      2. ``FLUSHDB`` the Redis namespace (leases, queue state,
-         ratelimits — all ephemeral demo state).
-      3. Defensively re-run the idempotent persona seed.
-      4. Broadcast a ``demo:reset`` SocketIO event so active visitor
-         tabs reload cleanly rather than running on dead lease state.
+    Runs the same per-workspace GC as /workspace-gc, then enforces the
+    ``MAX_WORKSPACES`` cap (reaping oldest-idle live workspaces beyond
+    it), clears interaction rows quarantined into the template
+    workspace, and defensively re-runs the idempotent seat-pool seed.
+    Per-workspace ``demo:reset`` events are emitted to each reaped
+    workspace's room by the reaper itself — there is deliberately no
+    install-wide broadcast anymore (live visitors are unaffected).
 
-    Triggered by the ``demo-reset`` cron container at 00:00 UTC.
-    Available for manual operator-side testing too — just call it
-    yourself (you'll need ``WEBHOOK_AUTH_USER`` / ``..._PASSWORD`` in
-    the request URL). This route is destructive, so it hard-requires
-    HTTP Basic auth (``require_internal_auth``) regardless of the global
-    ``WEBHOOK_AUTH_REQUIRED`` flag, on top of the ``DEMO_MODE`` gate.
+    Triggered by the ``demo-reset`` cron container at 00:00 UTC. Kept at
+    this route name so existing ops wiring keeps working. Refuses when
+    hosted-demo mode is off (a self-hosted deployment's workspace must
+    never be GC'd). Hard-requires HTTP Basic auth.
     """
     if not is_demo_mode():
-        # Ignore silently — the cron may fire against a production
-        # backend if someone misconfigures, and we'd rather no-op
-        # than half-wipe.
         return jsonify({'skipped': 'DEMO_MODE not set'}), 200
 
-    summary = reset_demo_state()
-    logger.warning("demo_reset: completed: %s", summary)
-
-    # Broadcast to every connected socket so any visitor mid-session
-    # can show a "demo refreshing" toast and reload. Frontend handles
-    # the UX; this is fire-and-forget on the backend.
-    try:
-        socketio.emit('demo:reset', {'message': 'Demo refresh — please reload'})
-    except Exception as exc:
-        # Reset already succeeded; broadcast failure is cosmetic.
-        logger.warning("demo_reset: socket broadcast failed: %s", exc)
-
+    summary = nightly_safety_pass()
+    logger.warning("demo_reset (nightly safety pass): completed: %s", summary)
     return jsonify({'ok': True, 'summary': summary}), 200

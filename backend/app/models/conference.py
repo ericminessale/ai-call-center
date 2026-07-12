@@ -175,13 +175,28 @@ class Conference(WorkspaceScoped, db.Model):
         if existing:
             return existing
 
+        # Tenancy: the flush-time stamper can't derive a workspace from
+        # this row (call_id is a SignalWire sid STRING, not an FK), so it
+        # would quarantine every interaction conference to the default
+        # workspace and conference-keyed emits would miss the visitor.
+        # Resolve the owning Call row explicitly.
+        workspace_id = None
+        try:
+            from app.models.call import Call
+            owning_call = Call.find_by_sid(call_id)
+            if owning_call is not None:
+                workspace_id = owning_call.workspace_id
+        except Exception:
+            workspace_id = None
+
         conference = cls(
             conference_name=conference_name,
             conference_type='interaction',
             call_id=call_id,
             queue_id=queue_id,
             owner_user_id=agent_user_id,
-            status='active'
+            status='active',
+            workspace_id=workspace_id,
         )
         db.session.add(conference)
         db.session.flush()  # Get the ID

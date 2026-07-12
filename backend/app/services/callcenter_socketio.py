@@ -62,29 +62,14 @@ def emit_call_update(call):
 
     logger.info(f"Emitting call_update for call {call.id}, status: {call.status}")
 
-    # Tenancy privacy (replaces the persona-owned check the shared floor
-    # used): in hosted mode a call's updates carry caller numbers, AI
-    # context and notes — they must never hit the global broadcast every
-    # visitor's socket receives. Scope to the involved users' personal
-    # rooms + the call room (which only workspace-authorized sockets can
-    # join). Clone-and-own keeps the original global broadcast that
-    # supervisor dashboards rely on; Phase 3's workspace rooms replace
-    # this per-user targeting.
-    from app.utils.demo_config import tenancy_mode_active
-    private = tenancy_mode_active()
-
-    # Emit to the general calls room (for supervisors and dashboards) — only
-    # outside hosted mode.
-    if not private:
-        socketio.emit('call_update', {'call': call_data})
-
-    # If there's an assigned user, also emit to their personal room
-    if call.user_id:
-        socketio.emit('call_update', {'call': call_data}, room=str(call.user_id))
-    # Also target the assigned agent's room (post-takeover), so the human
-    # who took it keeps getting updates.
-    if private and call.assigned_agent_id and call.assigned_agent_id != call.user_id:
-        socketio.emit('call_update', {'call': call_data}, room=str(call.assigned_agent_id))
+    # Workspace room (§8.1) — replaces both the pre-tenancy global broadcast
+    # and the Phase 2 personal-room stopgap with one scheme: everyone in the
+    # call's workspace (owner, assigned agent, their supervisors/colleagues)
+    # gets the update; nobody outside it ever does. In clone-and-own every
+    # authenticated socket is in the single ws:1 room, so the reach is the
+    # same floor-wide fanout as the old broadcast.
+    from app.services.ws_rooms import workspace_room
+    socketio.emit('call_update', {'call': call_data}, room=workspace_room(call.workspace_id))
 
     # Emit to the call-specific room if there's a call SID
     if call.signalwire_call_sid:
@@ -112,26 +97,20 @@ def emit_call_event(call_id, event_type, data, call_sid=None):
     if call_sid:
         socketio.emit('call_event', event, room=call_sid)
 
-    # Tenancy privacy (replaces the persona-owned check): in hosted mode
-    # never broadcast call events to every socket — scope to the involved
-    # users' rooms (the call room above already reaches authorized
-    # joiners). If the call can't be resolved, drop rather than leak.
-    # Clone-and-own keeps the original global broadcast that supervisor
-    # panels rely on; Phase 3's workspace rooms replace this.
-    from app.utils.demo_config import tenancy_mode_active
-    if tenancy_mode_active():
-        try:
-            owner_call = Call.query.get(int(call_id)) if str(call_id).isdigit() else None
-        except Exception:
-            owner_call = None
-        if owner_call is not None:
-            if owner_call.user_id:
-                socketio.emit('call_event', event, room=str(owner_call.user_id))
-            if owner_call.assigned_agent_id and owner_call.assigned_agent_id != owner_call.user_id:
-                socketio.emit('call_event', event, room=str(owner_call.assigned_agent_id))
-    else:
-        # Broadcast globally for supervisor panels.
-        socketio.emit('call_event', event)
+    # Workspace room (§8.1) — replaces the pre-tenancy global broadcast AND
+    # the Phase 2 personal-room stopgap. Supervisor panels in the call's
+    # workspace get the event stream; other workspaces never do. An
+    # unresolvable call falls back to the default workspace's room: in
+    # clone-and-own that IS the floor (today's broadcast reach); in hosted
+    # mode only platform operators sit in ws:1, so nothing leaks to
+    # visitors.
+    from app.services.ws_rooms import workspace_room
+    try:
+        owner_call = Call.query.get(int(call_id)) if str(call_id).isdigit() else None
+    except Exception:
+        owner_call = None
+    ws_id = owner_call.workspace_id if owner_call is not None else None
+    socketio.emit('call_event', event, room=workspace_room(ws_id))
     logger.debug(f"Call event emitted: {event_type} for call {call_id}")
 
 
@@ -295,13 +274,30 @@ def handle_reject_call_assignment(data):
         logger.warning(f"Reject: call {call_id} not found")
         return
 
+    # Tenancy predicate (deviation 22): this handler mutates call state and
+    # re-queues by id/sid — without a workspace check any visitor's socket
+    # could requeue another workspace's live call (unassigning its agent).
+    # Workspace-bound users may only reject calls in their own workspace;
+    # platform users (workspace NULL) stay unscoped.
+    rejecting_user = User.find_by_id(user_id)
+    if rejecting_user is None or (
+        rejecting_user.workspace_id is not None
+        and call.workspace_id != rejecting_user.workspace_id
+    ):
+        logger.warning(
+            f"Reject: user {user_id} denied rejecting call {call.id} "
+            f"(cross-workspace)"
+        )
+        emit('error', {'message': 'Not authorized for this call'})
+        return
+
     queue_id = call.queue_id
     declining_agent = str(user_id)
 
     try:
         from app.services.queue_service import QueueService
         from app.services.redis_service import get_redis_client
-        qs = QueueService(get_redis_client())
+        qs = QueueService(get_redis_client(), workspace_id=call.workspace_id)
 
         # Record the decline BEFORE we flip the agent to available below.
         # Otherwise set_agent_status('available') re-triggers push-dispatch,
@@ -336,12 +332,13 @@ def handle_reject_call_assignment(data):
         if agent_state and agent_state.get('current_call_id') == call.signalwire_call_sid:
             qs.set_agent_status(declining_agent, 'available')
 
-        # Notify dashboard listeners — call is back in the queue.
+        # Notify the workspace's dashboards — call is back in the queue.
+        from app.services.ws_rooms import workspace_room
         socketio.emit('queue_update', {
             'call': call.to_dict(include_contact=True),
             'queue_id': queue_id,
             'action': 'added',
-        })
+        }, room=workspace_room(call.workspace_id))
 
         logger.info(
             f"Re-queued call {call.id} into '{queue_id}' after agent "
@@ -493,6 +490,25 @@ def handle_end_call(data):
                 # hang up another visitor's live call. Only the owner/assigned
                 # agent or a supervisor/admin may end it.
                 user = User.find_by_id(user_id)
+                # Tenancy predicate (deviation 22): the role gate below no
+                # longer bounds this handler — every hosted visitor is
+                # 'admin' of their own workspace, so without a workspace
+                # check any visitor could still end any workspace's live
+                # call by id/sid. Workspace-bound users may only touch
+                # calls in their workspace; platform users (NULL) stay
+                # unscoped. Same message as the authz failure so probes
+                # can't distinguish.
+                if (
+                    user is None
+                    or (user.workspace_id is not None
+                        and call.workspace_id != user.workspace_id)
+                ):
+                    logger.warning(
+                        f"end_call socket: user {user_id} denied ending call "
+                        f"{call.id} (cross-workspace)"
+                    )
+                    emit('error', {'message': 'Not authorized for this call'})
+                    return
                 role = (user.role if user else '') or ''
                 is_owner = user and (
                     call.user_id == user.id or call.assigned_agent_id == user.id
@@ -521,14 +537,29 @@ def handle_end_call(data):
     handle_agent_status_change({'status': 'after-call', 'token': token})
 
 
+def _agent_workspace_id(agent_id) -> Optional[int]:
+    """Workspace of an agent user id (None for platform users / unknown)."""
+    try:
+        user = User.find_by_id(int(agent_id))
+        return user.workspace_id if user else None
+    except (TypeError, ValueError):
+        return None
+
+
 def check_and_assign_queued_call(agent_id: str) -> Optional[dict]:
     """Check queues and assign next call to available agent."""
-    # Check each queue for waiting calls
+    # Check each queue for waiting calls — only the agent's own workspace's
+    # queues (socket handlers run unscoped, so an unqualified slug query
+    # would sweep every workspace's clones; slugs repeat across workspaces).
     from app.models.queue import Queue
-    queues = Queue.get_active_slugs()
+    from app.tenancy import DEFAULT_WORKSPACE_ID
+    ws_id = _agent_workspace_id(agent_id) or DEFAULT_WORKSPACE_ID
+    queues = [
+        q.slug for q in Queue.query.filter_by(is_active=True, workspace_id=ws_id).all()
+    ]
 
     for queue_id in queues:
-        call_data = dequeue_call(queue_id, agent_id)
+        call_data = dequeue_call(queue_id, agent_id, workspace_id=ws_id)
         if call_data:
             # Send call assignment. Rooms are joined as str(user_id) and
             # agent_id arrives as the int from verify_token — an int room
@@ -542,14 +573,17 @@ def check_and_assign_queued_call(agent_id: str) -> Optional[dict]:
     return None
 
 
-def dequeue_call(queue_id: str, agent_id: str) -> Optional[dict]:
+def dequeue_call(queue_id: str, agent_id: str, workspace_id=None) -> Optional[dict]:
     """Get next call from queue and assign to agent."""
+    from app.services.ws_rooms import ws_key
     redis_client = get_redis_client()
     if not redis_client:
         logger.error("Redis not available for dequeuing call")
         return None
 
-    queue_key = f"queue:{queue_id}"
+    if workspace_id is None:
+        workspace_id = _agent_workspace_id(agent_id)
+    queue_key = ws_key(workspace_id, f"queue:{queue_id}")
 
     # Get highest priority call from Redis sorted set
     calls = redis_client.zrange(queue_key, 0, 0)
@@ -578,89 +612,120 @@ def dequeue_call(queue_id: str, agent_id: str) -> Optional[dict]:
 
 
 def broadcast_queue_updates():
-    """Broadcast queue statistics to all connected agents."""
+    """Push the queue wallboard to each workspace that has watchers (§8.1).
+
+    Was one install-wide broadcast built from an unscoped slug list; under
+    tenancy that both leaked every workspace's depths to everyone and
+    collided on repeated slugs. Now: iterate only workspaces with at least
+    one connected socket (the ``ws_clients:{id}`` sets maintained by
+    connect/disconnect), compute each workspace's stats from its own
+    ``ws:{id}:queue:{slug}`` keys, and emit to its ``ws:{id}`` room. In
+    clone-and-own everything lives in the single default workspace, so this
+    degenerates to exactly one iteration and the same floor-wide payload.
+    """
     redis_client = get_redis_client()
     if not redis_client:
         logger.error("Redis not available for queue updates")
         return
 
-    queues_data = []
-
     from app.models.queue import Queue
-    for queue_id in Queue.get_active_slugs():
-        queue_key = f"queue:{queue_id}"
-        queue_depth = redis_client.zcard(queue_key)
+    from app.services.ws_rooms import (
+        active_socket_workspace_ids, workspace_room, ws_key,
+    )
 
-        # Calculate wait times
-        calls = redis_client.zrange(queue_key, 0, -1)
-        wait_times = []
-        now = datetime.utcnow()
+    for ws_id in active_socket_workspace_ids(redis_client):
+        queues_data = []
+        slugs = [
+            q.slug
+            for q in Queue.query.filter_by(is_active=True, workspace_id=ws_id).all()
+        ]
+        for queue_id in slugs:
+            queue_key = ws_key(ws_id, f"queue:{queue_id}")
+            queue_depth = redis_client.zcard(queue_key)
 
-        for call_json in calls:
-            call_data = json.loads(call_json)
-            enqueued = datetime.fromisoformat(call_data['enqueued_at'])
-            wait_times.append((now - enqueued).total_seconds())
+            # Calculate wait times
+            calls = redis_client.zrange(queue_key, 0, -1)
+            wait_times = []
+            now = datetime.utcnow()
 
-        avg_wait = sum(wait_times) / len(wait_times) if wait_times else 0
-        longest_wait = max(wait_times) if wait_times else 0
+            for call_json in calls:
+                call_data = json.loads(call_json)
+                enqueued = datetime.fromisoformat(call_data['enqueued_at'])
+                wait_times.append((now - enqueued).total_seconds())
 
-        # Determine severity
-        severity = 'critical' if queue_depth > 10 else 'warning' if queue_depth > 5 else 'normal'
+            avg_wait = sum(wait_times) / len(wait_times) if wait_times else 0
+            longest_wait = max(wait_times) if wait_times else 0
 
-        queues_data.append({
-            'id': queue_id,
-            'name': queue_id.capitalize(),
-            'waiting': queue_depth,
-            'avgWait': int(avg_wait),
-            'longest': int(longest_wait),
-            'severity': severity,
-            'trend': 'stable',  # Calculate based on history
-            'waitingCalls': []  # Add actual call previews if needed
-        })
+            # Determine severity
+            severity = 'critical' if queue_depth > 10 else 'warning' if queue_depth > 5 else 'normal'
 
-    # Broadcast to all connected agents
-    socketio.emit('queue_update', queues_data)
+            queues_data.append({
+                'id': queue_id,
+                'name': queue_id.capitalize(),
+                'waiting': queue_depth,
+                'avgWait': int(avg_wait),
+                'longest': int(longest_wait),
+                'severity': severity,
+                'trend': 'stable',  # Calculate based on history
+                'waitingCalls': []  # Add actual call previews if needed
+            })
+
+        socketio.emit('queue_update', queues_data, room=workspace_room(ws_id))
 
 
 # Schedule periodic queue updates
 _monitor_started = False
 
 def start_queue_monitor():
-    """Start background task to broadcast queue updates."""
+    """Start the wallboard broadcaster thread (one lock-holder at a time).
+
+    The thread always starts; the Redis lock decides which worker actually
+    broadcasts each tick. The old shape ("couldn't grab the lock at boot →
+    never start, never retry") left the install with NO wallboard after a
+    quick restart: the dead worker's lock outlived it by up to 10s, the new
+    worker gave up permanently. Now every worker runs the loop and contends
+    for the lock per-tick, so the broadcaster survives restarts and worker
+    deaths with at most one lost interval.
+    """
     global _monitor_started
 
-    # Prevent multiple monitors
+    # Prevent multiple monitors in THIS process
     if _monitor_started:
         return
 
+    import uuid
     from threading import Thread
     import time
 
-    # Try to acquire a lock in Redis
-    redis_client = get_redis_client()
-    if redis_client:
+    worker_token = str(uuid.uuid4())
+
+    def _holds_or_acquires_lock(redis_client) -> bool:
+        """One lock-holder across workers; we broadcast only while owning it."""
+        if not redis_client:
+            return True  # no Redis → single-worker dev shape, just broadcast
         try:
-            # Set a key with NX (only if not exists) and EX (expire after 10 seconds)
-            # This acts as a distributed lock
-            lock_acquired = redis_client.set('queue_monitor_lock', '1', nx=True, ex=10)
-            if not lock_acquired:
-                logger.info("Queue monitor already running in another worker")
-                return
+            if redis_client.set('queue_monitor_lock', worker_token, nx=True, ex=10):
+                return True
+            current = redis_client.get('queue_monitor_lock')
+            current = current.decode() if isinstance(current, bytes) else current
+            if current == worker_token:
+                redis_client.expire('queue_monitor_lock', 10)
+                return True
+            return False
         except Exception as e:
-            logger.warning(f"Could not acquire queue monitor lock: {e}")
+            logger.warning(f"Queue monitor lock check failed: {e}")
+            return True  # Redis blip → duplicate broadcasts beat none
 
     def monitor_queues():
         # Import Flask app for context in background thread
         from app import create_app_context
         while True:
             try:
-                # Refresh the lock
-                if redis_client:
-                    redis_client.set('queue_monitor_lock', '1', ex=10)
-                # broadcast_queue_updates uses SQLAlchemy models (Queue),
-                # so it needs the Flask app context in this background thread
-                with create_app_context():
-                    broadcast_queue_updates()
+                if _holds_or_acquires_lock(get_redis_client()):
+                    # broadcast_queue_updates uses SQLAlchemy models (Queue),
+                    # so it needs the Flask app context in this background thread
+                    with create_app_context():
+                        broadcast_queue_updates()
             except Exception as e:
                 logger.error(f"Error broadcasting queue updates: {e}")
             time.sleep(5)  # Update every 5 seconds

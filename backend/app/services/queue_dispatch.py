@@ -49,26 +49,33 @@ def play_caller_pre_join_announcement(call_sid: str) -> None:
 
 
 def start_position_announcement_loop(
-    app, call_sid: str, queue_slug: str, interval_seconds: int = 30
+    app, call_sid: str, queue_slug: str, interval_seconds: int = 30,
+    workspace_id=None,
 ) -> None:
     """Spawn an eventlet background task that periodically plays the caller's
     current queue position via play_tts. Self-terminates when the call is no
     longer in the queue zset (dispatched / hung up / abandoned).
 
     ``app`` must be the actual Flask app object (not the current_app proxy)
-    so the background greenlet can push its own context.
+    so the background greenlet can push its own context. ``workspace_id``
+    picks which workspace's queue zset to watch (queue keys are
+    ``ws:{id}:queue:{slug}`` — slugs repeat across workspaces).
     """
     from app import socketio
     socketio.start_background_task(
-        _announcement_loop, app, call_sid, queue_slug, interval_seconds
+        _announcement_loop, app, call_sid, queue_slug, interval_seconds,
+        workspace_id,
     )
 
 
-def _announcement_loop(app, call_sid: str, queue_slug: str, interval_seconds: int) -> None:
+def _announcement_loop(
+    app, call_sid: str, queue_slug: str, interval_seconds: int, workspace_id=None
+) -> None:
     """Internal — runs in an eventlet greenlet."""
     from app import socketio
     from app.services.redis_service import get_redis_client
     from app.services.signalwire_api import get_signalwire_api
+    from app.services.ws_rooms import ws_key
 
     with app.app_context():
         redis = get_redis_client()
@@ -76,7 +83,7 @@ def _announcement_loop(app, call_sid: str, queue_slug: str, interval_seconds: in
             logger.warning(f"Announcement loop {call_sid}: Redis unavailable, exiting")
             return
 
-        queue_key = f"queue:{queue_slug}"
+        queue_key = ws_key(workspace_id, f"queue:{queue_slug}")
         # Initial delay so the caller has time to actually land in the
         # conference before we try to play anything to them.
         socketio.sleep(interval_seconds)
@@ -192,8 +199,8 @@ def enqueue_and_build_swml(
     except Exception:
         db.session.rollback()
 
-    # Enqueue in Redis.
-    qs = QueueService(get_redis_client())
+    # Enqueue in Redis — keyed to the call's workspace (§8.2).
+    qs = QueueService(get_redis_client(), workspace_id=call.workspace_id)
     queue_position = 1
     try:
         queue_result = qs.enqueue_call(
@@ -211,13 +218,14 @@ def enqueue_and_build_swml(
     except Exception as e:
         logger.warning(f"enqueue_and_build_swml: enqueue failed (non-fatal): {e}")
 
-    # Emit queue_update so the dashboard Queue tab + counts update.
+    # Emit queue_update so the workspace's Queue tab + counts update.
     try:
+        from app.services.ws_rooms import workspace_room
         socketio.emit('queue_update', {
             'call': call.to_dict(include_contact=True),
             'queue_id': queue_slug,
             'action': 'added',
-        })
+        }, room=workspace_room(call.workspace_id))
     except Exception as e:
         logger.warning(f"enqueue_and_build_swml: queue_update emit failed: {e}")
 
@@ -314,7 +322,8 @@ def enqueue_and_build_swml(
     if not agent_dispatched:
         try:
             start_position_announcement_loop(
-                current_app._get_current_object(), call_sid, queue_slug
+                current_app._get_current_object(), call_sid, queue_slug,
+                workspace_id=call.workspace_id,
             )
         except Exception as e:
             logger.warning(f"enqueue_and_build_swml: announcement loop failed to start: {e}")

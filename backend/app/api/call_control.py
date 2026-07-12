@@ -301,7 +301,7 @@ def return_call_to_queue(call_id):
         # 5. Free the agent's Redis status.
         try:
             from app.services.queue_service import QueueService
-            qs = QueueService(get_redis_client())
+            qs = QueueService(get_redis_client(), workspace_id=call.workspace_id)
             agent_state = qs.get_agent_status(str(user.id))
             if agent_state and agent_state.get('current_call_id') == call.signalwire_call_sid:
                 qs.set_agent_status(str(user.id), 'available')
@@ -327,6 +327,7 @@ def return_call_to_queue(call_id):
         # for whoever's next, AND clears it from the supervisor's
         # active-calls view since we're back to waiting.
         from app.services.callcenter_socketio import emit_call_update
+        from app.services.ws_rooms import workspace_room
         emit_call_update(call)
         socketio.emit('queue_update', {
             'call': call.to_dict(include_contact=True),
@@ -334,7 +335,7 @@ def return_call_to_queue(call_id):
             'action': 'added',
             'return_count': call.return_count,
             'last_return_reason': call.last_return_reason,
-        })
+        }, room=workspace_room(call.workspace_id))
         emit_call_event(call.id, 'return_to_queue', {
             'agent': user.email,
             'reason': reason,
@@ -901,7 +902,7 @@ def request_backup(call_id):
     try:
         redis_client = get_redis_client()
         from app.services.queue_service import QueueService
-        queue_service = QueueService(redis_client)
+        queue_service = QueueService(redis_client, workspace_id=call.workspace_id)
 
         # Get available agents excluding the requesting agent
         available = queue_service.get_available_agents(queue_slug)

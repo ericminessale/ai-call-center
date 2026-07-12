@@ -46,7 +46,11 @@ export function SocketProvider({ children }: SocketProviderProps) {
       const newSocket = io('/', {
         path: '/socket.io/',
         transports: ['websocket', 'polling'],
-        auth: { token },
+        // auth as a CALLBACK so every (re)connection handshakes with the
+        // CURRENT token. A captured token object goes stale after a JWT
+        // refresh, and since Phase 3 every server emit is room-scoped —
+        // a reconnect that fails auth would silently receive nothing.
+        auth: (cb) => cb({ token: localStorage.getItem('access_token') || '' }),
         reconnection: true,
         reconnectionAttempts: Infinity,
         reconnectionDelay: 1000,
@@ -58,9 +62,12 @@ export function SocketProvider({ children }: SocketProviderProps) {
       setSocket(newSocket);
 
       newSocket.on('connect', () => {
+        // Fires on every (re)connection — re-authenticate with the CURRENT
+        // token so the server re-joins our user + workspace rooms.
         logger.debug('[Socket] Connected:', newSocket.id);
         setConnectionStatus('connected');
-        newSocket.emit('authenticate', { token });
+        const currentToken = localStorage.getItem('access_token') || token;
+        newSocket.emit('authenticate', { token: currentToken });
       });
 
       newSocket.on('authenticated', (data) => {
@@ -76,25 +83,25 @@ export function SocketProvider({ children }: SocketProviderProps) {
         }
       });
 
-      newSocket.on('reconnect_attempt', (attemptNumber) => {
+      // Reconnect lifecycle events fire on the MANAGER (socket.io v4), not
+      // the socket — the previous socket-level listeners never fired.
+      newSocket.io.on('reconnect_attempt', (attemptNumber) => {
         logger.debug('[Socket] Reconnecting, attempt', attemptNumber);
         setConnectionStatus('reconnecting');
       });
 
-      newSocket.on('reconnect', (attemptNumber) => {
+      newSocket.io.on('reconnect', (attemptNumber) => {
+        // Room re-join happens in the 'connect' handler above; this is
+        // status-only.
         logger.debug('[Socket] Reconnected after', attemptNumber, 'attempts');
         setConnectionStatus('connected');
-        const currentToken = localStorage.getItem('access_token');
-        if (currentToken) {
-          newSocket.emit('authenticate', { token: currentToken });
-        }
       });
 
-      newSocket.on('reconnect_error', (error) => {
+      newSocket.io.on('reconnect_error', (error) => {
         logger.error('[Socket] Reconnection error:', error);
       });
 
-      newSocket.on('reconnect_failed', () => {
+      newSocket.io.on('reconnect_failed', () => {
         logger.error('[Socket] Reconnection failed after all attempts');
         setConnectionStatus('disconnected');
       });

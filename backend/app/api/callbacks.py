@@ -461,7 +461,7 @@ def dial_callback(callback_id):
         # Demo outbound gate — own verified number only, capped.
         if is_demo_mode():
             from app.services.demo_verify import demo_outbound_denial
-            denial = demo_outbound_denial(request.current_user.id, cb.phone_number)
+            denial = demo_outbound_denial(request.current_user.workspace_id, cb.phone_number)
             if denial:
                 return jsonify(denial[0]), denial[1]
 

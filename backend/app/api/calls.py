@@ -162,7 +162,7 @@ def initiate_call():
             if destination_type != 'phone':
                 return jsonify(DEMO_BLOCKED_RESPONSE), 403
             from app.services.demo_verify import demo_outbound_denial
-            denial = demo_outbound_denial(request.current_user.id, destination)
+            denial = demo_outbound_denial(request.current_user.workspace_id, destination)
             if denial:
                 return jsonify(denial[0]), denial[1]
 

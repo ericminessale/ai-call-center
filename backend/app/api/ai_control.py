@@ -526,13 +526,18 @@ def outbound_ai_swml(call_id):
     # AI agents are exposed on port 8080 behind the same proxy/ngrok,
     # but on a different path from the backend. The agent routes are at the root.
     # Use EXTERNAL_URL for the agent host since nginx routes /receptionist, /sales-ai, etc. to ai-agents.
-    agent_url = f"{base_url}{agent_route}"
+    # Carry the signed call_db_id so the outbound AI agent resolves THIS
+    # workspace's config via call-context (§7.1), same as inbound. Without
+    # it the agent would run template config on the visitor's own call.
+    from app.utils.url_utils import call_context_token
+    _ctk = call_context_token(call.id)
+    agent_url = f"{base_url}{agent_route}?call_db_id={call.id}&ctk={_ctk}"
 
     # Encode context as base64 query param (same pattern as queue routing)
     if context:
         context_json = json.dumps(context)
         context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
-        agent_url = f"{agent_url}?ctx={context_b64}"
+        agent_url = f"{agent_url}&ctx={context_b64}"
 
     status_callback = signed_webhook_url(f"{base_url}/api/webhooks/call-status")
 
@@ -618,20 +623,23 @@ def initiate_outbound_ai_call():
         agent_type = data.get('agent_type', 'sales')
         context = data.get('context', {})
 
-        # Demo outbound gate: FORCE the destination to the persona's own
+        # Demo outbound gate: FORCE the destination to the workspace's own
         # verified number — the client can't dial anywhere else, and doesn't
         # even need to know the full number (the UI only shows it masked).
         from app.utils.demo_config import is_demo_mode
         if is_demo_mode():
+            from app.models import User
             from app.services.demo_verify import get_verified_number, demo_outbound_denial
-            verified = get_verified_number(user_id)
+            caller = User.find_by_id(user_id)
+            caller_ws_id = caller.workspace_id if caller else None
+            verified = get_verified_number(caller_ws_id)
             if not verified:
                 return jsonify({
                     'error': 'Verify your phone number first, then the demo can call you.',
                     'code': 'demo_verify_required',
                 }), 403
             phone = verified  # ignore any client-supplied destination in demo
-            denial = demo_outbound_denial(user_id, phone)
+            denial = demo_outbound_denial(caller_ws_id, phone)
             if denial:
                 return jsonify(denial[0]), denial[1]
 

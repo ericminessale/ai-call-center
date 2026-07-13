@@ -1,4 +1,6 @@
 """URL utilities for handling external URLs and proxies."""
+import hashlib
+import hmac
 import os
 from urllib.parse import quote, urlparse, urlunparse
 
@@ -7,6 +9,38 @@ from flask import request
 # External URL for SignalWire callbacks (e.g., ngrok URL)
 # Set this in .env when developing locally so SignalWire can reach your server
 EXTERNAL_URL = os.getenv('EXTERNAL_URL')
+
+
+def call_context_token(call_db_id) -> str:
+    """Unforgeable per-call token binding a ``call_db_id`` to backend intent.
+
+    Phase 4 (§7.1 hardening): the AI agent routes are PUBLIC and resolve
+    their tenant config from ``?call_db_id=`` via /api/internal/call-context.
+    call_db_id is a sequential DB id, so without a signature an
+    unauthenticated attacker could hit ``/receptionist?call_db_id=N`` and
+    have the agent render another workspace's queue/branding config
+    (confused deputy). The BACKEND mints this token when it hands an agent
+    URL to SignalWire; call-context rejects any call_db_id whose token
+    doesn't verify. The agent only ever FORWARDS the token it received — it
+    never mints one — so a caller who can't produce a valid token for a
+    call_db_id gets the inert template config instead of a tenant's.
+
+    HMAC over the shared WEBHOOK_AUTH secret (already the backend↔agent
+    trust anchor). Truncated to 32 hex chars — ample against online
+    guessing given call-context also sits behind internal Basic auth.
+    """
+    key = (os.getenv('WEBHOOK_AUTH_PASSWORD')
+           or os.getenv('JWT_SECRET_KEY') or '').encode()
+    msg = f'call-context:{call_db_id}'.encode()
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:32]
+
+
+def verify_call_context_token(call_db_id, token) -> bool:
+    """Constant-time check of a :func:`call_context_token`. False on any
+    missing/blank/mismatched token (fail closed)."""
+    if not token:
+        return False
+    return hmac.compare_digest(call_context_token(call_db_id), str(token))
 
 
 def get_base_url():

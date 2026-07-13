@@ -317,11 +317,12 @@ def release_workspace(session_token: str) -> bool:
             release_seat_for_user(member.id)
         except Exception:
             pass
-        try:
-            from app.services.demo_verify import clear_bindings
-            clear_bindings(member.id)
-        except Exception:
-            pass
+    # Verify bindings are workspace-keyed (§6.2) — one clear, not per member.
+    try:
+        from app.services.demo_verify import clear_bindings
+        clear_bindings(ws.id)
+    except Exception:
+        pass
 
     ws.status = Workspace.STATUS_EXPIRED
     ws.session_token_hash = None  # frees the cookie binding for a fresh start

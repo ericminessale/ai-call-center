@@ -53,39 +53,87 @@ def initial_call():
 
     # Store or update call in database
     call = Call.find_by_sid(call_id)
-    if not call:
-        # Try to find a system user or the first user for now
-        from app.models import User
-        system_user = User.find_by_email('system@signalwire.local')
-        if not system_user:
-            # Get the first user or create a system user
-            system_user = db.session.query(User).first()
-            if not system_user:
-                # Create a system user
-                system_user = User(
-                    email='system@signalwire.local',
-                    is_active=True
-                )
-                # Synthetic system user satisfies the FK on Call.user_id; no
-                # one ever logs in as this user, so the password never matters.
-                # Generate something unguessable rather than ship a literal.
-                system_user.set_password(secrets.token_urlsafe(32))
-                db.session.add(system_user)
-                db.session.flush()  # Get the ID before committing
 
-        # Look up or create contact based on from_number
+    # Verify-first gate (§6.1/§10.1, hosted mode only): NEW inbound calls
+    # are accepted ONLY from numbers bound to a live workspace. Unverified
+    # → polite reject SWML, NO Call/Contact rows (one telemetry log line +
+    # a Redis counter). Outbound-originated dials hit this endpoint too,
+    # but their Call row was pre-created by the initiate path, so they
+    # resolve above and never reach the gate.
+    # NOTE: the gate is NOT conditioned on ``direction`` — that field is
+    # attacker-controlled request body, and gating on it would let a
+    # spoofed ``direction: outbound`` skip verify-first and mint an
+    # unverified Call/Contact row (I3). Outbound-originated dials never
+    # reach here as a NEW row: the initiate path pre-creates their Call, so
+    # ``call`` is already truthy above and the gate is skipped for them.
+    ws_binding = None
+    if not call and is_demo_mode():
+        from app.services.demo_verify import (
+            get_workspace_for_number,
+            note_rejected_inbound,
+            unverified_reject_swml,
+        )
+        ws_binding = get_workspace_for_number(from_number)
+        if ws_binding is None:
+            logger.info(
+                "initial-call: rejecting inbound from unverified number (call %s)",
+                call_id,
+            )
+            note_rejected_inbound(from_number, 'initial-call')
+            return jsonify(unverified_reject_swml())
+
+    if not call:
+        owner_user_id = None
+        ws_id = None
+        if ws_binding is not None:
+            # Verified inbound: the call (and its contact) belong to the
+            # bound workspace, attributed to the visitor who paired the
+            # number. All downstream privacy rides on these two columns.
+            ws_id, owner_user_id = ws_binding
+            logger.info(
+                "initial-call: attributed call %s to workspace %s (user %s)",
+                call_id, ws_id, owner_user_id,
+            )
+        else:
+            # Clone-and-own: the synthetic system user satisfies the FK on
+            # Call.user_id (nobody ever logs in as it). Hosted mode never
+            # reaches this branch for inbound — the verify-first gate above
+            # already rejected unbound callers.
+            from app.models import User
+            system_user = User.find_by_email('system@signalwire.local')
+            if not system_user:
+                # Get the first user or create a system user
+                system_user = db.session.query(User).first()
+                if not system_user:
+                    system_user = User(
+                        email='system@signalwire.local',
+                        is_active=True
+                    )
+                    # Generate something unguessable rather than ship a literal.
+                    system_user.set_password(secrets.token_urlsafe(32))
+                    db.session.add(system_user)
+                    db.session.flush()  # Get the ID before committing
+            owner_user_id = system_user.id
+
+        # Look up or create contact based on from_number — scoped to the
+        # attributed workspace in hosted mode (phone is per-workspace
+        # unique; an unscoped lookup could bind another tenant's contact).
         contact = None
         contact_id = None
         if from_number:
             from app.models import Contact
-            contact = Contact.query.filter_by(phone=from_number).first()
+            contact_q = Contact.query.filter_by(phone=from_number)
+            if ws_id is not None:
+                contact_q = contact_q.filter_by(workspace_id=ws_id)
+            contact = contact_q.first()
             if not contact:
                 # Create a new contact for unknown caller
                 contact = Contact(
                     phone=from_number,
                     display_name=from_number,  # Use phone as display name initially
                     account_tier='free',
-                    account_status='prospect'
+                    account_status='prospect',
+                    workspace_id=ws_id,  # None → flush stamper defaults (clone-and-own)
                 )
                 db.session.add(contact)
                 db.session.flush()  # Get the ID
@@ -94,26 +142,6 @@ def initial_call():
             # Update last interaction timestamp
             contact.last_interaction_at = datetime.utcnow()
             contact.total_calls = (contact.total_calls or 0) + 1
-
-        # Demo phone-verification attribution: if this caller's number was
-        # verified by a leased demo persona, the call belongs to THAT persona
-        # (not the shared system user). This is the link that makes the
-        # pre-deploy ownership checks private the call — other visitors can't
-        # join its room, read its transcript, or take it over. Falls back to
-        # the system user for unverified / non-demo callers.
-        owner_user_id = system_user.id
-        if is_demo_mode() and from_number:
-            try:
-                from app.services.demo_verify import get_persona_for_number
-                persona_id = get_persona_for_number(from_number)
-                if persona_id:
-                    owner_user_id = persona_id
-                    logger.info(
-                        "initial-call: attributed call %s to verified persona %s",
-                        call_id, persona_id,
-                    )
-            except Exception as exc:
-                logger.warning("initial-call: verify attribution failed (non-fatal): %s", exc)
 
         # Create new call record
         # Calls coming to /initial-call are INBOUND (SignalWire calling us when someone dials our number)
@@ -128,7 +156,8 @@ def initial_call():
             direction=direction or 'inbound',  # Use direction from SignalWire, default to inbound
             handler_type='ai',  # Initial calls go to AI agent
             status=call_state or 'initiated',
-            transcription_active=True
+            transcription_active=True,
+            workspace_id=ws_id,  # None → flush stamper derives/defaults
         )
         db.session.add(call)
         logger.info(f"Created new call {call_id} with from_number: {from_number}, contact_id: {contact_id}")
@@ -294,11 +323,17 @@ def initial_call():
             }
         })
 
+    # Sign call_db_id so the public agent route can't be used as a confused
+    # deputy to render another workspace's config (§7.1 hardening) — the
+    # agent forwards this token to /api/internal/call-context, which rejects
+    # any unsigned/forged call_db_id.
+    from app.utils.url_utils import call_context_token
+    _ctk = call_context_token(call.id)
     post_answer.append(
         # Transfer to AI agent — caller's A-leg runs the AI agent's SWML directly
         {
             "transfer": {
-                "dest": f"{base_url}{initial_handler}?call_db_id={call.id}"
+                "dest": f"{base_url}{initial_handler}?call_db_id={call.id}&ctk={_ctk}"
             }
         }
     )

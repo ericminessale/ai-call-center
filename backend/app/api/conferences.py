@@ -1459,7 +1459,7 @@ def dial_out_to_conference(conference_name):
     from app.utils.demo_config import is_demo_mode
     if is_demo_mode():
         from app.services.demo_verify import demo_outbound_denial
-        denial = demo_outbound_denial(current_user_id, phone_number)
+        denial = demo_outbound_denial(request.current_user.workspace_id, phone_number)
         if denial:
             return jsonify(denial[0]), denial[1]
 

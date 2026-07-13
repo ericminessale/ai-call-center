@@ -416,7 +416,75 @@ def get_active_queues():
     return fallback
 
 
-def attach_knowledge_search(agent):
+# ---------------------------------------------------------------------------
+# Per-call tenant config (§7.1 — Phase 4)
+#
+# The backend appends ?call_db_id={id} to every agent URL it hands the
+# platform. GET /api/internal/call-context resolves that call's WORKSPACE
+# server-side (agent routes are public, so nothing tenant-shaped is ever
+# trusted from the URL itself) and returns the workspace's queues, KB
+# assignments, MCP gateways and agent config in one payload. The dynamic-
+# config callback shapes the ephemeral agent from it; requests without a
+# call_db_id (health checks, direct pokes) run on the boot/template config,
+# which carries no tenant data.
+# ---------------------------------------------------------------------------
+_CTX_TTL_SECONDS = 30.0
+_ctx_cache = {}  # call_db_id(str) -> (payload_or_None, fetched_at)
+_ctx_cache_lock = threading.Lock()
+
+
+def fetch_call_context(call_db_id, ctk=None):
+    """Tenant config for one call, cached per call_db_id for the TTL.
+
+    Synchronous with a short timeout — worst case one internal HTTP call
+    per call per 30s window; every SWAIG request for the same call reuses
+    the cache. Failures negative-cache so a down backend costs one timeout
+    per window, not per request. Returns None → template config.
+
+    ``ctk`` is the backend-minted call-context token (§7.1); call-context
+    403s without it, so a caller who hits a public agent route with a
+    forged call_db_id gets template config, not a tenant's.
+    """
+    import time
+    import requests
+    if not call_db_id:
+        return None
+    # Cache key includes the token: an unsigned/forged request must NOT be
+    # served a payload cached by a legitimate signed request for the same
+    # (currently-active, enumerable) call_db_id — that would bypass the
+    # backend's confused-deputy check within the TTL window.
+    key = f"{call_db_id}:{ctk or ''}"
+    with _ctx_cache_lock:
+        hit = _ctx_cache.get(key)
+        if hit and time.time() - hit[1] < _CTX_TTL_SECONDS:
+            return hit[0]
+    payload = None
+    try:
+        resp = requests.get(
+            f"{BACKEND_URL}/api/internal/call-context",
+            params={'call_db_id': str(call_db_id), 'ctk': ctk or ''},
+            auth=_internal_auth(),
+            timeout=3,
+        )
+        if resp.ok:
+            payload = resp.json()
+        elif resp.status_code == 403:
+            # Forged/unsigned call_db_id — do NOT cache (a legit signed
+            # retry for the same id should still resolve).
+            print(f"Warning: call-context {key} rejected (403) — serving template config", flush=True)
+            return None
+        else:
+            print(f"Warning: call-context {key} returned HTTP {resp.status_code}", flush=True)
+    except Exception as e:
+        print(f"Warning: call-context fetch failed for {key}: {e}", flush=True)
+    with _ctx_cache_lock:
+        if len(_ctx_cache) > 512:
+            _ctx_cache.clear()
+        _ctx_cache[key] = (payload, time.time())
+    return payload
+
+
+def attach_knowledge_search(agent, collection_override=None):
     """Attach native_vector_search to the per-request ephemeral agent.
 
     Called from the dynamic-config callback, which the SDK runs on a fresh
@@ -430,6 +498,9 @@ def attach_knowledge_search(agent):
 
     Agents opt in by setting ``_kb_agent_id`` (assignment slug) and
     optionally ``_kb_fallback_collection`` in __init__.
+    ``collection_override`` is the per-call tenant assignment from
+    call-context (physical collection name); without it the template
+    cache / fallback applies.
     """
     agent_id = getattr(agent, '_kb_agent_id', None)
     if not agent_id:
@@ -438,7 +509,11 @@ def attach_knowledge_search(agent):
         print(f"Warning: DATABASE_URL not set, skipping knowledge search for {agent_id}", flush=True)
         return
 
-    collection = get_kb_collection(agent_id) or getattr(agent, '_kb_fallback_collection', None)
+    collection = (
+        collection_override
+        or get_kb_collection(agent_id)
+        or getattr(agent, '_kb_fallback_collection', None)
+    )
     if not collection:
         return
 
@@ -470,57 +545,173 @@ def attach_knowledge_search(agent):
         print(f"Warning: Failed to attach knowledge search for {agent_id}: {e}", flush=True)
 
 
-def add_mcp_gateways(agent, agent_id):
-    """Load every admin-configured MCP Gateway bound to this agent slug.
+# ---------------------------------------------------------------------------
+# MCP gateway skills — per-request since Phase 4 (§7.2).
+#
+# Boot registration is GONE: _create_ephemeral_copy re-loads boot skills
+# into every per-request copy first, and a duplicate instance key makes the
+# stale boot gateway win over the tenant's (the same duplicate-skip trap
+# the KB skill dodged by being callback-only). Gateways now attach in the
+# dynamic-config callback: from the call-context payload (the call's
+# workspace's rows) when a call_db_id is present, else from this template
+# cache (default-workspace rows — identical to the old boot behavior).
+# ---------------------------------------------------------------------------
+_MCP_TTL_SECONDS = 30.0
+_mcp_cache = {'map': {}, 'fetched_at': 0.0}  # agent_id -> [gateway entries]
+_mcp_refresh_lock = threading.Lock()
+_mcp_refreshing = False
+_mcp_last_logged = {}
+# Negative cache of gateway_urls whose skill setup() failed (unreachable
+# endpoint), so a dead gateway is re-probed at most once per window rather
+# than on every SWML render / SWAIG execution.
+_mcp_setup_failures = {}  # gateway_url -> failed_at (epoch seconds)
+_mcp_fail_lock = threading.Lock()
+_MCP_FAIL_TTL_SECONDS = 60.0
 
-    Customer-supplied external tool integrations: each McpGatewayConfig
-    row in the backend tells us a gateway URL, credentials, and which
-    agent slugs should load it. We pull the matching configs from the
-    backend's internal endpoint and register one ``mcp_gateway`` skill
-    instance per gateway. The skill itself handles tool discovery,
-    session lifecycle, and bridging MCP calls to SWAIG functions.
 
-    Failures are non-fatal — if the backend isn't reachable or auth is
-    misconfigured, we log and skip MCP rather than blocking agent boot.
-    """
-    backend_url = os.getenv('BACKEND_URL', 'http://backend:5000')
-    auth_user = os.getenv('WEBHOOK_AUTH_USER')
-    auth_password = os.getenv('WEBHOOK_AUTH_PASSWORD')
-    auth = (auth_user, auth_password) if (auth_user and auth_password) else None
-
+def _fetch_mcp_gateways(agent_id):
+    """GET the template (default-workspace) gateway list for one slug."""
+    import requests as http_requests
     try:
-        import requests as http_requests
         resp = http_requests.get(
-            f"{backend_url}/api/internal/mcp-gateways",
+            f"{BACKEND_URL}/api/internal/mcp-gateways",
             params={'agent_id': agent_id},
-            auth=auth,
+            auth=_internal_auth(),
             timeout=5,
         )
         resp.raise_for_status()
-        payload = resp.json()
+        return resp.json().get('gateways') or []
     except Exception as e:
         print(f"Warning: Could not fetch MCP gateways for {agent_id}: {e}", flush=True)
+        return None
+
+
+_MCP_AGENT_SLUGS = (
+    'receptionist', 'sales-ai', 'support-ai', 'outbound-sales', 'outbound-support',
+)
+
+
+def prime_mcp_gateways():
+    """Synchronously load the template gateway map at boot (mirrors
+    prime_kb_assignments) so the first calls don't block on HTTP."""
+    import time
+    fresh = {}
+    for slug in _MCP_AGENT_SLUGS:
+        entries = _fetch_mcp_gateways(slug)
+        if entries is not None:
+            fresh[slug] = entries
+    _mcp_cache['map'] = fresh
+    _mcp_cache['fetched_at'] = time.time()
+    print(
+        "MCP template gateways primed: "
+        + ", ".join(f"{k}={len(v)}" for k, v in fresh.items()),
+        flush=True,
+    )
+
+
+def _refresh_mcp_cache_async():
+    """Single-flight background refresh of the template gateway map."""
+    global _mcp_refreshing
+    with _mcp_refresh_lock:
+        if _mcp_refreshing:
+            return
+        _mcp_refreshing = True
+
+    def worker():
+        global _mcp_refreshing
+        import time
+        try:
+            fresh = {}
+            ok = True
+            for slug in _MCP_AGENT_SLUGS:
+                entries = _fetch_mcp_gateways(slug)
+                if entries is None:
+                    ok = False
+                    break
+                fresh[slug] = entries
+            if ok:
+                _mcp_cache['map'] = fresh
+            _mcp_cache['fetched_at'] = time.time()
+        finally:
+            with _mcp_refresh_lock:
+                _mcp_refreshing = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def get_template_mcp_gateways(agent_id):
+    """Template gateway entries for a slug (stale-while-revalidate)."""
+    import time
+    if time.time() - _mcp_cache['fetched_at'] > _MCP_TTL_SECONDS:
+        _refresh_mcp_cache_async()
+    return _mcp_cache['map'].get(agent_id, [])
+
+
+def attach_mcp_gateways(agent, call_ctx=None):
+    """Register the agent's MCP gateway skills on the ephemeral copy.
+
+    Customer-supplied external tool integrations: each gateway entry
+    carries a URL, credentials, and which agent slugs should load it. One
+    ``mcp_gateway`` skill instance per gateway; the skill handles tool
+    discovery, session lifecycle, and bridging MCP calls to SWAIG
+    functions. Failures are non-fatal per gateway.
+
+    ``call_ctx`` is the call-context payload — its ``mcp_gateways`` list
+    is the call's WORKSPACE's rows (a tenant can unbind the shared
+    DemoShop or add their own gateway, §7.4). Without it the template
+    cache serves the default workspace's rows.
+    """
+    agent_id = getattr(agent, '_mcp_agent_id', None)
+    if not agent_id:
         return
 
-    gateways = payload.get('gateways') or []
-    if not gateways:
-        print(f"No MCP gateways bound to {agent_id}", flush=True)
-        return
+    if call_ctx is not None and call_ctx.get('mcp_gateways') is not None:
+        entries = [
+            g for g in call_ctx['mcp_gateways']
+            if agent_id in (g.get('bound_agent_ids') or [])
+        ]
+        source = f"workspace {call_ctx.get('workspace_id')}"
+    else:
+        entries = get_template_mcp_gateways(agent_id)
+        source = 'template'
 
-    for entry in gateways:
+    import time
+    for entry in entries:
         name = entry.get('name', '<unnamed>')
         config = entry.get('config') or {}
+        gateway_url = config.get('gateway_url')
+        # Negative cache (I1 regression fix): the skill's setup() does a
+        # synchronous health GET against the gateway. Since Phase 4 moved
+        # attach from boot into this per-request callback, an unreachable
+        # gateway would otherwise stall EVERY render/execution (config now
+        # emits a 5s request_timeout, but 5s × every call is still bad).
+        # Skip a gateway whose setup failed within the last window so one
+        # timeout per window replaces one per request — matching the old
+        # boot behavior where a dead gateway just meant "no MCP tools".
+        with _mcp_fail_lock:
+            failed_at = _mcp_setup_failures.get(gateway_url)
+        if failed_at and time.time() - failed_at < _MCP_FAIL_TTL_SECONDS:
+            continue
         try:
             agent.add_skill("mcp_gateway", config)
-            print(
-                f"Added MCP gateway '{name}' to {agent_id} "
-                f"(url={config.get('gateway_url')!r})",
-                flush=True,
-            )
+            with _mcp_fail_lock:
+                _mcp_setup_failures.pop(gateway_url, None)
+            log_key = (agent_id, name, source)
+            if _mcp_last_logged.get(log_key) != gateway_url:
+                _mcp_last_logged[log_key] = gateway_url
+                print(
+                    f"Attached MCP gateway '{name}' to {agent_id} [{source}] "
+                    f"(url={gateway_url!r})",
+                    flush=True,
+                )
         except Exception as e:
-            # One bad gateway should not poison the agent. Log + continue.
+            # One bad gateway should not poison the agent. Negative-cache it
+            # so the next calls don't repeat the (timeout-bounded) probe.
+            with _mcp_fail_lock:
+                _mcp_setup_failures[gateway_url] = time.time()
             print(
-                f"Warning: failed to add MCP gateway '{name}' to {agent_id}: {e}",
+                f"Warning: failed to add MCP gateway '{name}' to {agent_id} "
+                f"(negative-cached {_MCP_FAIL_TTL_SECONDS}s): {e}",
                 flush=True,
             )
 
@@ -542,6 +733,11 @@ def start_admin_api():
 
             if not collection_name:
                 return JSONResponse({'error': 'collection_name is required'}, status_code=400)
+            # §7.3: the collection name is interpolated into SQL identifiers
+            # (chunks_{name}) — apply the same guard do_search has. Without
+            # it this unauthenticated port is a SQL-identifier injection.
+            if not _COLLECTION_NAME_RE.match(collection_name):
+                return JSONResponse({'error': 'invalid collection_name'}, status_code=400)
             if not documents:
                 return JSONResponse({'error': 'No documents provided'}, status_code=400)
             if not DATABASE_URL:
@@ -624,12 +820,70 @@ def capture_base_url(query_params, body_params, headers, agent):
     """Dynamic config callback - captures external URL and sets post_prompt_url.
 
     Also reads 'ctx' query param (base64-encoded JSON) to inject customer context
-    as global_data for outbound AI calls, and binds the agent's knowledge-base
-    skill to its currently assigned collection (live reassignment, no restart).
+    as global_data for outbound AI calls, and shapes the ephemeral agent for
+    the CALL'S WORKSPACE (§7.1/§7.2): tenant queues rebuild the triage
+    contexts (fixes AI-06's boot-frozen queue list as a side effect), the KB
+    skill binds to the workspace's assigned collection, MCP gateway skills
+    attach from the workspace's rows, and tenant branding lands as a prompt
+    section. No call_db_id (health checks, direct pokes) → inert template
+    config, no tenant data.
     """
-    # Bind KB search to the current admin-assigned collection. Runs on the
-    # ephemeral copy, so each request reflects assignments within the TTL.
-    attach_knowledge_search(agent)
+    # Per-call tenant config — resolved SERVER-SIDE from the Call row via
+    # the internal call-context endpoint (agent routes are public; a URL
+    # workspace param would be forgeable).
+    #
+    # call_db_id is on the query string for the SWML RENDER, but SWAIG tool
+    # EXECUTIONS POST to the function webhook and carry it in global_data
+    # instead (the render stashed it there via set_global_data). The
+    # callback runs on the ephemeral copy for BOTH, and KB/MCP bind here —
+    # so resolve from either source or a tenant's tool call (KB search)
+    # would silently fall back to the template workspace's collection.
+    call_db_id = query_params.get('call_db_id')
+    ctk = query_params.get('ctk')
+    if not call_db_id:
+        gd = body_params.get('global_data') or {}
+        call_db_id = gd.get('call_db_id')
+        ctk = ctk or gd.get('ctk')
+    tenant_ctx = fetch_call_context(call_db_id, ctk)
+
+    # Bind KB search to the workspace's assigned collection (falls back to
+    # the template cache / hardcoded fallback without tenant context). Runs
+    # on the ephemeral copy, so each request reflects assignments within
+    # the TTL.
+    kb_override = None
+    if tenant_ctx is not None:
+        kb_override = (tenant_ctx.get('kb_assignments') or {}).get(
+            getattr(agent, '_kb_agent_id', None)
+        )
+    attach_knowledge_search(agent, collection_override=kb_override)
+
+    # MCP gateway skills — per-request since Phase 4 (boot registration
+    # removed; see attach_mcp_gateways for the duplicate-skip rationale).
+    attach_mcp_gateways(agent, tenant_ctx)
+
+    # Triage only: rebuild the queue-shaped config (contexts, routing map,
+    # hints, post-prompt enum) from the workspace's queues.
+    if getattr(agent, '_is_triage', False) and tenant_ctx is not None \
+            and tenant_ctx.get('queues') is not None:
+        try:
+            configure_triage_queues(agent, tenant_ctx['queues'])
+        except Exception as e:
+            # A failed rebuild leaves the deep-copied template contexts in
+            # place — degraded (template queues) but functional.
+            print(f"Warning: triage queue rebuild failed: {e}", flush=True)
+
+    # Tenant branding (v1: company name only — §7.2). New section name, so
+    # it can't collide with the boot sections deep-copied into this copy.
+    company_name = ((tenant_ctx or {}).get('agent_config') or {}).get('company_name')
+    if company_name:
+        try:
+            agent.prompt_add_section(
+                "Company",
+                f"You work for {company_name}. When the company name comes up, "
+                f"it is {company_name} — never any other name."
+            )
+        except Exception as e:
+            print(f"Warning: company-name section failed: {e}", flush=True)
 
     existing_global = body_params.get('global_data', {})
     new_global = {}
@@ -696,10 +950,15 @@ def capture_base_url(query_params, body_params, headers, agent):
         new_global['conf'] = conf_param
         print(f"Conference name from query param: {conf_param}", flush=True)
 
-    call_db_id = query_params.get('call_db_id')
+    # Reuse the render-or-execution resolved id (query param on render,
+    # global_data on SWAIG execution) so it stays in global_data either way.
+    # ctk rides alongside so SWAIG executions and downstream specialist
+    # transfers can re-present the backend-minted call-context token.
     if call_db_id:
         new_global['call_db_id'] = call_db_id
-        print(f"Call DB ID from query param: {call_db_id}", flush=True)
+        if ctk:
+            new_global['ctk'] = ctk
+        print(f"Call DB ID: {call_db_id}", flush=True)
 
     # Read context from query params (for outbound AI calls)
     ctx_param = query_params.get('ctx')
@@ -815,6 +1074,171 @@ WRAP_UP_POST_PROMPT_FIELDS = (
 )
 
 
+def configure_triage_queues(agent, queues):
+    """(Re)build everything queue-shaped on a triage agent.
+
+    Contexts, the slug→AI-route transfer map, speech hints, and the
+    post-prompt department enum all derive from the queue list. Runs at
+    BOOT on the persistent agent (template queues from get_active_queues)
+    and PER REQUEST on the ephemeral copy with the call's workspace's
+    queues from call-context (§7.2) — which is also the AI-06 fix: queue
+    config changes apply to the next call, no container restart.
+
+    On the ephemeral copy the deep-copied boot ContextBuilder is discarded
+    and rebuilt fresh (add_context raises on duplicates, so re-adding onto
+    the copied builder would crash).
+    """
+    # Defensive de-dup: duplicate slugs (or a slug literally named
+    # 'default') would raise in add_context and kill the render. Keep
+    # first occurrence, order preserved.
+    seen = set()
+    clean = []
+    for q in queues or []:
+        slug = q.get('slug')
+        if not slug or slug == 'default' or slug in seen:
+            continue
+        seen.add(slug)
+        clean.append(q)
+    queues = clean
+
+    queue_slugs = [q['slug'] for q in queues]
+    agent._queue_ai_map = {
+        q['slug']: q.get('ai_agent_route') or f"/{q['slug']}-ai" for q in queues
+    }
+
+    # Speech recognition hints. add_hints only appends, and the ephemeral
+    # copy already carries the boot queue hints (deep-copied from the
+    # persistent agent), so a naive re-add would duplicate every queue hint
+    # on every render. Add, then de-dup _hints in place (order-preserving)
+    # so the rendered SWML matches the boot shape exactly.
+    agent.add_hints([q['display_name'] for q in queues] + queue_slugs)
+    try:
+        seen_h = set()
+        deduped = []
+        for h in agent._hints:
+            marker = h if isinstance(h, str) else repr(h)
+            if marker in seen_h:
+                continue
+            seen_h.add(marker)
+            deduped.append(h)
+        agent._hints = deduped
+    except Exception:
+        pass
+
+    # Department enum for the post_prompt summary
+    dept_options = '/'.join(queue_slugs + ['unknown'])
+    agent.set_post_prompt(
+        f'Summarize this call as a JSON object: {{"customer_name": "name or null", '
+        f'"department": "{dept_options}", '
+        '"reason": "brief reason for call", '
+        '"outcome": "transferred_to_human/transferred_to_ai/abandoned", '
+        '"notes": "any important details", '
+        f'{WRAP_UP_POST_PROMPT_FIELDS}}}'
+    )
+    agent.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
+
+    # Fresh ContextBuilder — discard whatever the agent had (boot: nothing;
+    # ephemeral copy: the deep-copied template contexts).
+    agent._contexts_builder = None
+    agent._contexts_defined = False
+    contexts = agent.define_contexts()
+
+    # ============================================================
+    # TRIAGE CONTEXT (default) - Greeting and routing
+    # ============================================================
+    triage_ctx = contexts.add_context("default")
+
+    # Build department info for step prompts
+    queue_descriptions = []
+    for q in queues:
+        desc = q.get('description', '')
+        queue_descriptions.append(
+            f"{q['display_name']} ({q['slug']}): {desc}" if desc
+            else f"{q['display_name']} ({q['slug']})"
+        )
+
+    dept_list_text = "\n".join(queue_descriptions)
+    route_instructions = "\n".join(
+        [f"- {q['display_name']}-related: switch to the '{q['slug']}' context" for q in queues]
+    )
+
+    dept_names = [q['display_name'] for q in queues]
+    if len(dept_names) > 1:
+        dept_menu = ', '.join(dept_names[:-1]) + ' or ' + dept_names[-1]
+    else:
+        dept_menu = dept_names[0] if dept_names else 'general assistance'
+
+    # Step 1: Greet and get name (also detects caller's language)
+    triage_ctx.add_step("greeting") \
+        .add_section("Goal",
+            "Welcome the caller and get their name. Introduce yourself as Sam. "
+            "Be warm but brief — this should take one exchange. "
+            "Detect their language from their first words and respond in kind.") \
+        .add_section("Handling Eager Callers",
+            "If the caller gives you their name AND mentions what they need in the same breath, "
+            "great — note both. You can skip asking about the department in the next step.") \
+        .set_step_criteria("The customer has stated their name and you have called set_caller_language") \
+        .set_valid_steps(["route_department"]) \
+        .set_functions(["report_sentiment", "set_caller_language"])
+
+    # Step 2: Determine department
+    triage_ctx.add_step("route_department") \
+        .add_section("Goal",
+            "Figure out which department the caller needs. If they already told you during "
+            "the greeting, route them immediately — no need to ask again.") \
+        .add_section("If You Need to Ask",
+            f"Ask naturally which area they need help with: {dept_menu}.") \
+        .add_section("Departments", dept_list_text) \
+        .add_section("Routing",
+            "Once you know the department, move to that context seamlessly:\n" + route_instructions) \
+        .set_step_criteria("Customer has indicated which department they need") \
+        .set_valid_contexts(queue_slugs) \
+        .set_functions(["report_sentiment", "set_caller_language"])
+
+    # ============================================================
+    # DYNAMIC QUEUE CONTEXTS - One per configured queue
+    # ============================================================
+    for q in queues:
+        slug = q['slug']
+        display = q['display_name']
+
+        queue_ctx = contexts.add_context(slug) \
+            .set_consolidate(True)
+
+        queue_ctx.add_section("Context",
+            f"The caller needs {display.lower()} help. You still have their name and "
+            "what they told you from the greeting. Use it naturally.")
+
+        # Step 1: Ask what they need help with
+        queue_ctx.add_step("gather_reason") \
+            .add_section("Goal",
+                f"Briefly ask what they need help with so you can pass useful context "
+                "to the specialist. One question is enough — don't interrogate them.") \
+            .add_section("If They Already Told You",
+                "If the caller already described their issue during the greeting, "
+                "you have what you need. Move on to offering transfer options.") \
+            .set_step_criteria("You have a basic understanding of what the caller needs help with") \
+            .set_valid_steps(["offer_transfer"]) \
+            .set_functions(["report_sentiment"])
+
+        # Step 2: Offer transfer choice
+        queue_ctx.add_step("offer_transfer") \
+            .add_section("Goal",
+                f"Offer to connect them with a {display.lower()} specialist, "
+                "or let them know our AI assistant can help right away. Let them choose.") \
+            .add_section("Handling Questions",
+                "If they ask you a question about their issue, acknowledge it and "
+                "let them know a specialist can help with that. Then offer the transfer options.") \
+            .add_section("Transferring",
+                "Once they choose:\n"
+                "- Human specialist: use the transfer_to_human tool\n"
+                "- AI assistant: use the transfer_to_ai_specialist tool\n\n"
+                f"Always include: customer_name, reason, department='{slug}', urgency, additional_info") \
+            .set_step_criteria("Customer has chosen human or AI assistance") \
+            .set_valid_steps([]) \
+            .set_functions(["transfer_to_human", "transfer_to_ai_specialist", "report_sentiment"])
+
+
 class CallCenterAgent(AgentBase):
     """Project-wide base for every agent class in this file.
 
@@ -906,7 +1330,7 @@ class CallCenterTriageAgent(CallCenterAgent):
 
         self.set_dynamic_config_callback(capture_base_url)
         add_sentiment_tool(self)
-        add_mcp_gateways(self, 'receptionist')
+        self._mcp_agent_id = 'receptionist'  # MCP gateways attach per-request (callback), not at boot
 
         # Voice and speech configuration
         # Multiple languages so the receptionist can greet/converse in the caller's
@@ -956,14 +1380,12 @@ class CallCenterTriageAgent(CallCenterAgent):
             "One moment...", "Sure, one second...",
         ])
 
-        # Fetch active queues from backend (dynamic at startup)
+        # Fetch active queues from backend (dynamic at startup). These are
+        # the TEMPLATE queues — per-call tenant queues rebuild this whole
+        # block on the ephemeral copy via configure_triage_queues (§7.2).
+        self._is_triage = True
+        self.add_hints(["SignalWire"])  # brand hint, queue-independent
         queues = get_active_queues()
-        queue_slugs = [q['slug'] for q in queues]
-        self._queue_ai_map = {q['slug']: q.get('ai_agent_route', f"/{q['slug']}-ai") for q in queues}
-
-        # Speech recognition hints
-        hint_words = ["SignalWire"] + [q['display_name'] for q in queues] + queue_slugs
-        self.add_hints(hint_words)
 
         # ============================================================
         # GLOBAL PROMPT - Personality and role boundaries
@@ -1011,110 +1433,10 @@ class CallCenterTriageAgent(CallCenterAgent):
             ]
         )
 
-        # Build department list for post_prompt
-        dept_options = '/'.join(queue_slugs + ['unknown'])
-        self.set_post_prompt(
-            f'Summarize this call as a JSON object: {{"customer_name": "name or null", '
-            f'"department": "{dept_options}", '
-            '"reason": "brief reason for call", '
-            '"outcome": "transferred_to_human/transferred_to_ai/abandoned", '
-            '"notes": "any important details", '
-            f'{WRAP_UP_POST_PROMPT_FIELDS}}}'
-        )
-        self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
-
-        # Define the contexts and steps
-        contexts = self.define_contexts()
-
-        # ============================================================
-        # TRIAGE CONTEXT (default) - Greeting and routing
-        # ============================================================
-        triage_ctx = contexts.add_context("default")
-
-        # Build department info for step prompts
-        queue_descriptions = []
-        for q in queues:
-            desc = q.get('description', '')
-            queue_descriptions.append(f"{q['display_name']} ({q['slug']}): {desc}" if desc else f"{q['display_name']} ({q['slug']})")
-
-        dept_list_text = "\n".join(queue_descriptions)
-        route_instructions = "\n".join([f"- {q['display_name']}-related: switch to the '{q['slug']}' context" for q in queues])
-
-        dept_names = [q['display_name'] for q in queues]
-        if len(dept_names) > 1:
-            dept_menu = ', '.join(dept_names[:-1]) + ' or ' + dept_names[-1]
-        else:
-            dept_menu = dept_names[0] if dept_names else 'general assistance'
-
-        # Step 1: Greet and get name (also detects caller's language)
-        triage_ctx.add_step("greeting") \
-            .add_section("Goal",
-                "Welcome the caller and get their name. Introduce yourself as Sam. "
-                "Be warm but brief — this should take one exchange. "
-                "Detect their language from their first words and respond in kind.") \
-            .add_section("Handling Eager Callers",
-                "If the caller gives you their name AND mentions what they need in the same breath, "
-                "great — note both. You can skip asking about the department in the next step.") \
-            .set_step_criteria("The customer has stated their name and you have called set_caller_language") \
-            .set_valid_steps(["route_department"]) \
-            .set_functions(["report_sentiment", "set_caller_language"])
-
-        # Step 2: Determine department
-        triage_ctx.add_step("route_department") \
-            .add_section("Goal",
-                "Figure out which department the caller needs. If they already told you during "
-                "the greeting, route them immediately — no need to ask again.") \
-            .add_section("If You Need to Ask",
-                f"Ask naturally which area they need help with: {dept_menu}.") \
-            .add_section("Departments", dept_list_text) \
-            .add_section("Routing",
-                "Once you know the department, move to that context seamlessly:\n" + route_instructions) \
-            .set_step_criteria("Customer has indicated which department they need") \
-            .set_valid_contexts(queue_slugs) \
-            .set_functions(["report_sentiment", "set_caller_language"])
-
-        # ============================================================
-        # DYNAMIC QUEUE CONTEXTS - One per configured queue
-        # ============================================================
-        for q in queues:
-            slug = q['slug']
-            display = q['display_name']
-
-            queue_ctx = contexts.add_context(slug) \
-                .set_consolidate(True)
-
-            queue_ctx.add_section("Context",
-                f"The caller needs {display.lower()} help. You still have their name and "
-                "what they told you from the greeting. Use it naturally.")
-
-            # Step 1: Ask what they need help with
-            queue_ctx.add_step("gather_reason") \
-                .add_section("Goal",
-                    f"Briefly ask what they need help with so you can pass useful context "
-                    "to the specialist. One question is enough — don't interrogate them.") \
-                .add_section("If They Already Told You",
-                    "If the caller already described their issue during the greeting, "
-                    "you have what you need. Move on to offering transfer options.") \
-                .set_step_criteria("You have a basic understanding of what the caller needs help with") \
-                .set_valid_steps(["offer_transfer"]) \
-                .set_functions(["report_sentiment"])
-
-            # Step 2: Offer transfer choice
-            queue_ctx.add_step("offer_transfer") \
-                .add_section("Goal",
-                    f"Offer to connect them with a {display.lower()} specialist, "
-                    "or let them know our AI assistant can help right away. Let them choose.") \
-                .add_section("Handling Questions",
-                    "If they ask you a question about their issue, acknowledge it and "
-                    "let them know a specialist can help with that. Then offer the transfer options.") \
-                .add_section("Transferring",
-                    "Once they choose:\n"
-                    "- Human specialist: use the transfer_to_human tool\n"
-                    "- AI assistant: use the transfer_to_ai_specialist tool\n\n"
-                    f"Always include: customer_name, reason, department='{slug}', urgency, additional_info") \
-                .set_step_criteria("Customer has chosen human or AI assistance") \
-                .set_valid_steps([]) \
-                .set_functions(["transfer_to_human", "transfer_to_ai_specialist", "report_sentiment"])
+        # Everything queue-shaped (contexts, routing map, hints, post-prompt
+        # enum) builds through the same function the per-request callback
+        # uses with tenant queues.
+        configure_triage_queues(self, queues)
 
         # Tools registered via @AgentBase.tool() decorators below
 
@@ -1208,13 +1530,22 @@ class CallCenterTriageAgent(CallCenterAgent):
         # Pass conference name and call DB ID to specialist (conference-first architecture)
         conf = global_data.get('conf', '')
         call_db_id = global_data.get('call_db_id', '')
+        # Forward the backend-minted call-context token (§7.1) so the
+        # specialist resolves THIS workspace's config. The agent only
+        # forwards what it received at render — it never mints tokens.
+        ctk = global_data.get('ctk', '')
 
         specialist_route = self._queue_ai_map.get(department, f"/{department}-ai")
         transfer_url = f"{base_url}{specialist_route}"
+        params = []
         if conf:
-            transfer_url += f"?conf={conf}"
+            params.append(f"conf={conf}")
         if call_db_id:
-            transfer_url += f"&call_db_id={call_db_id}" if '?' in transfer_url else f"?call_db_id={call_db_id}"
+            params.append(f"call_db_id={call_db_id}")
+        if ctk:
+            params.append(f"ctk={ctk}")
+        if params:
+            transfer_url += '?' + '&'.join(params)
 
         result = FunctionResult('')  # Silent transfer
         result.update_global_data({
@@ -1286,7 +1617,7 @@ class SalesAISpecialist(CallCenterAgent):
         # applies to new calls without a restart.
         self._kb_agent_id = 'sales-ai'
         self._kb_fallback_collection = 'sales_knowledge'
-        add_mcp_gateways(self, 'sales-ai')
+        self._mcp_agent_id = 'sales-ai'  # MCP gateways attach per-request (callback), not at boot
 
         self.set_post_prompt(
             'Summarize this sales consultation as a JSON object: '
@@ -1426,7 +1757,7 @@ class SupportAISpecialist(CallCenterAgent):
         # KB search binds per request in capture_base_url (see SalesAISpecialist).
         self._kb_agent_id = 'support-ai'
         self._kb_fallback_collection = 'support_knowledge'
-        add_mcp_gateways(self, 'support-ai')
+        self._mcp_agent_id = 'support-ai'  # MCP gateways attach per-request (callback), not at boot
 
         self.set_post_prompt(
             'Summarize this support consultation as a JSON object: '
@@ -1576,7 +1907,7 @@ class OutboundSalesAgent(CallCenterAgent):
         # KB search binds per request in capture_base_url (see SalesAISpecialist).
         self._kb_agent_id = 'outbound-sales'
         self._kb_fallback_collection = 'sales_knowledge'
-        add_mcp_gateways(self, 'outbound-sales')
+        self._mcp_agent_id = 'outbound-sales'  # MCP gateways attach per-request (callback), not at boot
 
         self.set_post_prompt(
             'Summarize this outbound sales call as a JSON object: '
@@ -1714,7 +2045,7 @@ class OutboundSupportAgent(CallCenterAgent):
         # KB search binds per request in capture_base_url (see SalesAISpecialist).
         self._kb_agent_id = 'outbound-support'
         self._kb_fallback_collection = 'support_knowledge'
-        add_mcp_gateways(self, 'outbound-support')
+        self._mcp_agent_id = 'outbound-support'  # MCP gateways attach per-request (callback), not at boot
 
         self.set_post_prompt(
             'Summarize this outbound support call as a JSON object: '
@@ -1836,10 +2167,12 @@ if __name__ == '__main__':
     outbound_sales = OutboundSalesAgent()
     outbound_support = OutboundSupportAgent()
 
-    # Prime the KB assignment cache now that the backend is reachable (the
-    # triage agent's get_active_queues just blocked on it) so the very first
-    # calls bind to admin-assigned collections instead of fallbacks.
+    # Prime the KB assignment + template-MCP caches now that the backend is
+    # reachable (the triage agent's get_active_queues just blocked on it) so
+    # the very first calls bind to admin-assigned collections and gateways
+    # instead of fallbacks.
     prime_kb_assignments()
+    prime_mcp_gateways()
 
     # Register agents
     server.register(triage, '/receptionist')

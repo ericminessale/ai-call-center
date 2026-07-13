@@ -1435,10 +1435,27 @@ def _parse_phone_routing_loose(url):
 @admin_bp.route('/phone-numbers', methods=['GET'])
 @require_auth
 def list_phone_numbers():
-    """List SignalWire phone numbers and flag which are routed to this app."""
-    platform_only = _require_platform_admin()
-    if platform_only:
-        return jsonify(platform_only[0]), platform_only[1]
+    """List SignalWire phone numbers and flag which are routed to this app.
+
+    §6.4 split: WORKSPACE admins get a read-only view — the shared entry
+    numbers (the landing-card list) + their own verified-number status,
+    never the install's real DIDs/SIDs (no re-route surface; the POST
+    below stays platform-only). Platform admins (workspace NULL) keep the
+    full management tab.
+    """
+    if request.current_user.workspace_id is not None:
+        from app.services.demo_verify import verify_status
+        from app.utils.demo_config import demo_phone_numbers
+        vs = verify_status(request.current_user.workspace_id)
+        return jsonify({
+            'read_only': True,
+            'phone_numbers': [],
+            'webhook_url': '',
+            'is_configured': True,
+            'entry_numbers': demo_phone_numbers(),
+            'verified': vs.get('verified', False),
+            'verified_masked': vs.get('masked_number'),
+        })
 
     if not sw_client.is_configured():
         return jsonify({'error': 'SignalWire credentials not configured'}), 500

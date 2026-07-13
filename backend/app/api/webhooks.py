@@ -1721,13 +1721,16 @@ def sms_inbound():
         result = pair_number(match.group(1), from_number)
         logger.info("sms-inbound: pair → %s", result.get('status'))
 
-        # On success, flip the visitor's UI live via their user room.
-        if result.get('status') == PAIR_OK and result.get('persona_id'):
+        # On success, flip the visitor's UI live via their workspace room
+        # (§6.2 — the binding is workspace-keyed now, and every member's
+        # socket sits in the room).
+        if result.get('status') == PAIR_OK and result.get('workspace_id'):
             try:
+                from app.services.ws_rooms import workspace_room
                 socketio.emit(
                     'demo_phone_verified',
                     {'masked_number': result.get('masked')},
-                    room=str(result['persona_id']),
+                    room=workspace_room(result['workspace_id']),
                 )
             except Exception as exc:
                 logger.warning("sms-inbound: socket notify failed: %s", exc)

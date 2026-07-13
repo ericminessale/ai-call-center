@@ -148,14 +148,16 @@ def reap_workspace(ws: Workspace) -> dict[str, Any]:
 
     members = User.query.filter(User.workspace_id == ws_id).all()
     redis_client = get_redis_client()
+    # Verify bindings are workspace-keyed (§6.2) — clear once, BEFORE the
+    # ws:{id}:* pattern delete removes the reverse keys the clear reads.
+    try:
+        from app.services.demo_verify import clear_bindings
+        clear_bindings(ws_id)
+    except Exception:
+        pass
     for member in members:
         try:
             release_seat_for_user(member.id)
-        except Exception:
-            pass
-        try:
-            from app.services.demo_verify import clear_bindings
-            clear_bindings(member.id)
         except Exception:
             pass
         # Agent-status residue: the agents:{status} sets have no TTL and

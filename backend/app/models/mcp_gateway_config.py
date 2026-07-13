@@ -127,7 +127,12 @@ class McpGatewayConfig(WorkspaceScoped, db.Model):
         for the contract. We only emit keys with meaningful values so
         the SDK falls back to its own defaults for unset options.
         """
-        config: dict[str, Any] = {'gateway_url': self.gateway_url}
+        # Short request timeout so an unreachable gateway can't stall the
+        # per-request skill setup (Phase 4 moved MCP attach from boot into
+        # the dynamic-config callback; without a tight bound one dead
+        # gateway would hang every SWML render past SignalWire's webhook
+        # timeout). The agent additionally negative-caches a failed setup.
+        config: dict[str, Any] = {'gateway_url': self.gateway_url, 'request_timeout': 5}
         if self.auth_type == 'basic':
             config['auth_user'] = self.auth_user or ''
             config['auth_password'] = self.get_auth_password() or ''

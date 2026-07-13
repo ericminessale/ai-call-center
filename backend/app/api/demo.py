@@ -233,7 +233,7 @@ def heartbeat_demo_session():
         pass
     try:
         from app.services.demo_verify import refresh_bindings
-        refresh_bindings(user.id)
+        refresh_bindings(user.workspace_id)
     except Exception:
         pass
     return jsonify({'ok': True, 'seat_held': seat_held})
@@ -287,16 +287,16 @@ def create_pairing_code():
 
     The visitor TEXTS this code to the demo number; the inbound-SMS webhook
     (``webhooks.sms_inbound``) matches it and binds the sender's number to
-    their user (workspace attribution rides on the user row until the
-    Phase 4 number→workspace re-key). Inbound-only — no outbound SMS, so no
-    messaging campaign or A2P/fraud surface. One live code per visitor;
-    issuing a new one invalidates the old.
+    their WORKSPACE (§6.2 — the code carries the requesting user too, so
+    inbound attribution can stamp Call.user_id). Inbound-only — no outbound
+    SMS, so no messaging campaign or A2P/fraud surface. One live code per
+    workspace; issuing a new one invalidates the old.
     """
     visitor, err = _require_demo_visitor()
     if err:
         return err
     from app.services.demo_verify import generate_pairing_code
-    code = generate_pairing_code(visitor.id)
+    code = generate_pairing_code(visitor.workspace_id, visitor.id)
     if not code:
         return jsonify({'error': 'Could not generate a code — try again.'}), 503
     return jsonify({'code': code}), 200
@@ -310,7 +310,7 @@ def get_verify_status():
     if err:
         return err
     from app.services.demo_verify import verify_status
-    return jsonify(verify_status(visitor.id)), 200
+    return jsonify(verify_status(visitor.workspace_id)), 200
 
 
 @demo_bp.route('/demo/status', methods=['GET'])

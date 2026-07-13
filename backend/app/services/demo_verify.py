@@ -1,35 +1,42 @@
 """
-Phone-number verification for hosted-demo visitors (2026-07-07).
+Phone-number verification for hosted-demo workspaces (§6.2, re-keyed Phase 4).
 
-Gives the shared demo the one thing it structurally lacked: a link between
-an anonymous browser visitor (their leased ``demo_agent`` persona) and a real
-phone number they control. Once a number is verified, the pre-deploy
-ownership checks already in place light up automatically — inbound calls from
-that number are attributed to the persona (``call.user_id``), so other
-visitors can't join the room, read the transcript, steer the AI, or take it
-over, and the visitor is allowed to dial *their own* number outbound.
+Binds an anonymous visitor's WORKSPACE to a real phone number they control.
+The binding is the telephony attribution invariant (§10.1, verify-first):
+inbound calls on the shared DIDs are accepted ONLY from verified numbers and
+land in the bound workspace; outbound may dial ONLY that same number. Total
+telephony surface per workspace = the visitor calling themselves.
 
 Verification method: an **inbound pairing code**, not outbound OTP. The
 visitor's dashboard shows a random 6-digit code and asks them to TEXT it to
 the demo number; the inbound-SMS webhook (``/api/webhooks/sms-inbound``)
-matches the code and binds the sender's number. Receiving an MO message requires no
-messaging campaign (10DLC/A2P gates outbound application traffic, and we
-never reply), it costs nothing to operate, and the SMS sender number is a
-stronger possession proof than voice caller-ID.
+matches the code and binds the sender's number. Receiving an MO message
+requires no messaging campaign (10DLC/A2P gates outbound application
+traffic, and we never reply), it costs nothing to operate, and the SMS
+sender number is a stronger possession proof than voice caller-ID.
 
-Everything is **lease-scoped**: personas are recycled between visitors, so
-all bindings carry the lease TTL, are refreshed on heartbeat, and are cleared
-on release / nightly reset. Storage layout in Redis:
+Storage layout in Redis (workspace INT id; values carry the code-creator's
+user id so inbound attribution can stamp ``Call.user_id``):
 
-    demo:verify:code:<CODE>            → "<persona_id>"   (one-time, code TTL)
-    demo:verify:persona_code:<pid>     → "<CODE>"         (reverse, for display/clear)
-    demo:verify:number:<E164>          → "<persona_id>"   (verified binding, lease TTL)
-    demo:verify:persona_number:<pid>   → "<E164>"         (reverse)
+    demo:verify:code:<CODE>     → "<ws_id>:<user_id>"  (one-time, code TTL)
+    demo:verify:number:<E164>   → "<ws_id>:<user_id>"  (binding, workspace TTL)
+    ws:<id>:verify_code         → "<CODE>"             (reverse, for display/clear)
+    ws:<id>:verify_number       → "<E164>"             (reverse)
 
-The ``number:*`` binding is authoritative for attribution + the outbound
-own-number gate. ``get_persona_for_number`` additionally confirms the persona
-still holds a live lease, so a number binding that outlived its lease (belt +
-suspenders on the TTL) never grants access.
+Binding TTL = the workspace TTL (7 days by default, §6.2 — decoupled from
+the old 5-minute persona lease), refreshed by the demo heartbeat. The
+number is also mirrored into ``workspaces.verified_number`` for recovery /
+operator visibility. The reverse keys live under ``ws:{id}:`` so the
+workspace reaper's pattern delete clears them; :func:`clear_bindings`
+clears both directions explicitly on release/reap.
+
+``get_workspace_for_number`` additionally confirms the workspace row is
+still live, so a binding that outlives its workspace never grants access.
+
+(Pre-Phase-4 this module was keyed by the visitor's user id and included a
+retroactive call-attribution sweep for "verify while already on a call".
+Verify-first rejection means no pre-verification calls can exist, so the
+sweep is gone; old ``demo:verify:persona_*`` keys are inert residue.)
 """
 
 from __future__ import annotations
@@ -37,7 +44,7 @@ from __future__ import annotations
 import logging
 import re
 import secrets
-from typing import Optional
+from typing import Optional, Tuple
 
 from app.services.redis_service import get_redis_client
 
@@ -45,41 +52,30 @@ logger = logging.getLogger(__name__)
 
 
 def _binding_ttl_seconds() -> int:
-    """Verify-binding idle window. Same knob + default the old persona
-    lease used (``DEMO_LEASE_TTL_SECONDS``, 300s, clamped [60, 3600]) —
-    bindings are refreshed by the workspace heartbeat, so a live tab keeps
-    them alive indefinitely. Phase 4 re-keys bindings number→workspace and
-    stretches the TTL to the workspace lifetime.
+    """Verified-number binding lifetime = the workspace lifetime (§6.2).
+
+    Refreshed on the demo heartbeat and re-asserted on every re-pair, so a
+    live workspace's binding never lapses before the workspace does.
     """
-    import os
-    raw = os.getenv('DEMO_LEASE_TTL_SECONDS', '300').strip()
+    from app.services.workspace_session import workspace_ttl_seconds
+    return workspace_ttl_seconds()
+
+
+# Codes are one-shot, secrets-grade random, and attempt-capped at the SMS
+# webhook — an hour on screen is convenience, not risk. (Decoupled from the
+# binding TTL now that bindings live as long as the workspace.)
+_CODE_TTL_SECONDS = 3600
+
+
+def _workspace_live(workspace_id) -> bool:
+    """Fail-closed liveness for a workspace int id."""
     try:
-        n = int(raw)
-    except ValueError:
-        n = 300
-    return max(60, min(n, 3600))
-
-
-def _lease_ttl_seconds() -> int:
-    # Internal alias kept for the pre-tenancy call sites below.
-    return _binding_ttl_seconds()
-
-
-def has_active_lease(user_id: int) -> bool:
-    """Liveness for a visitor user — post-tenancy this means "the user's
-    workspace session is alive" (see workspace_session.user_workspace_alive).
-    Name kept from the persona-lease era for the call sites below."""
-    try:
-        from app.services.workspace_session import user_workspace_alive
-        return user_workspace_alive(user_id)
+        from app.models import Workspace
+        from app import db
+        ws = db.session.get(Workspace, int(workspace_id))
+        return bool(ws is not None and ws.is_live())
     except Exception:
         return False
-
-
-# Code lives as long as a binding idle-window — long enough for the visitor
-# to place the call, short enough that a stale code on screen expires with
-# the session. Reuses the binding TTL so the two never diverge.
-_CODE_TTL = _binding_ttl_seconds
 
 
 def _norm(number: Optional[str]) -> Optional[str]:
@@ -101,7 +97,7 @@ def _norm(number: Optional[str]) -> Optional[str]:
 
 
 def mask_number(number: Optional[str]) -> Optional[str]:
-    """Human-facing masked form, e.g. '+1 ••• ••• 4567'. Last 4 shown."""
+    """Human-facing masked form, e.g. '••• ••• 4567'. Last 4 shown."""
     norm = _norm(number)
     if not norm:
         return None
@@ -113,49 +109,51 @@ def _code_key(code: str) -> str:
     return f'demo:verify:code:{code}'
 
 
-def _persona_code_key(persona_id: int) -> str:
-    return f'demo:verify:persona_code:{int(persona_id)}'
-
-
 def _number_key(norm_number: str) -> str:
     return f'demo:verify:number:{norm_number}'
 
 
-def _persona_number_key(persona_id: int) -> str:
-    return f'demo:verify:persona_number:{int(persona_id)}'
+def _ws_code_key(workspace_id: int) -> str:
+    from app.services.ws_rooms import ws_key
+    return ws_key(workspace_id, 'verify_code')
 
 
-def _outbound_key(persona_id: int) -> str:
-    """Outbound-cap counter, re-keyed ``ws:{id}:outbound`` (§4.3/§8.2).
+def _ws_number_key(workspace_id: int) -> str:
+    from app.services.ws_rooms import ws_key
+    return ws_key(workspace_id, 'verify_number')
 
-    The cap is now per WORKSPACE, not per user — a visitor's invited
-    colleagues share the visitor's hourly budget instead of multiplying
-    it. Falls back to a user-keyed name only when the user row can't be
-    resolved (shouldn't happen for live visitors), so a lookup blip
-    degrades to the old per-user behavior rather than an uncapped dial.
-    The workspace reaper's ``ws:{id}:*`` pattern delete clears it, and
-    :func:`clear_bindings` still deletes it explicitly.
-    """
+
+def _outbound_key(workspace_id: int) -> str:
+    """Outbound-cap counter, ``ws:{id}:outbound`` (§4.3/§8.2) — per
+    WORKSPACE, so a visitor's invited colleagues share one hourly budget.
+    Cleared by :func:`clear_bindings` and by the reaper's pattern delete."""
+    from app.services.ws_rooms import ws_key
+    return ws_key(workspace_id, 'outbound')
+
+
+def _pack(workspace_id: int, user_id: int) -> str:
+    return f'{int(workspace_id)}:{int(user_id)}'
+
+
+def _unpack(raw) -> Optional[Tuple[int, int]]:
+    """Parse a "<ws_id>:<user_id>" binding value. None on any legacy/garbage
+    value (old persona-keyed bindings were bare user ids — treated as unbound
+    rather than misattributed)."""
     try:
-        from app.models import User
-        from app.services.ws_rooms import ws_key
-        from app.tenancy import workspace_context
-        with workspace_context(None):
-            user = User.query.get(int(persona_id))
-        if user is not None:
-            return ws_key(user.workspace_id, 'outbound')
-    except Exception:
-        pass
-    return f'demo:outbound:{int(persona_id)}'
+        s = _as_str(raw)
+        ws_part, user_part = s.split(':', 1)
+        return int(ws_part), int(user_part)
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _gen_code(redis_client) -> Optional[str]:
-    """Allocate a random 6-digit code not currently mapped to another persona.
+    """Allocate a random 6-digit code not currently mapped to a workspace.
 
     DEMO-SEC-06: the code is the ONLY thing binding an SMS sender to a
-    session (the shared demo number carries no other context), so it must
+    workspace (the shared demo number carries no other context), so it must
     be unguessable — a predictable code lets a stranger bind THEIR phone
-    to someone else's session. 6 digits of secrets-grade randomness
+    to someone else's workspace. 6 digits of secrets-grade randomness
     against a handful of live codes, plus the per-sender attempt cap in
     the sms-inbound webhook, is plenty.
     """
@@ -166,20 +164,21 @@ def _gen_code(redis_client) -> Optional[str]:
     return None
 
 
-def generate_pairing_code(persona_id: int) -> Optional[str]:
-    """Create (or replace) the pairing code for a persona. Returns the code.
+def generate_pairing_code(workspace_id: int, user_id: int) -> Optional[str]:
+    """Create (or replace) the pairing code for a workspace. Returns the code.
 
-    Idempotent-ish: replacing an existing code invalidates the previous one so
-    only one code is ever live per persona.
+    ``user_id`` is the requesting visitor — it rides in the binding value so
+    inbound attribution can stamp ``Call.user_id`` with a real member of the
+    workspace. Replacing an existing code invalidates the previous one so
+    only one code is ever live per workspace.
     """
     redis_client = get_redis_client()
     if redis_client is None:
         return None
-    persona_id = int(persona_id)
-    ttl = _CODE_TTL()
+    workspace_id = int(workspace_id)
 
-    # Drop any prior code for this persona so it can't still pair.
-    prior = redis_client.get(_persona_code_key(persona_id))
+    # Drop any prior code for this workspace so it can't still pair.
+    prior = redis_client.get(_ws_code_key(workspace_id))
     if prior:
         redis_client.delete(_code_key(_as_str(prior)))
 
@@ -187,8 +186,8 @@ def generate_pairing_code(persona_id: int) -> Optional[str]:
     if code is None:
         logger.warning("demo_verify: could not allocate a free pairing code")
         return None
-    redis_client.set(_code_key(code), str(persona_id), ex=ttl)
-    redis_client.set(_persona_code_key(persona_id), code, ex=ttl)
+    redis_client.set(_code_key(code), _pack(workspace_id, user_id), ex=_CODE_TTL_SECONDS)
+    redis_client.set(_ws_code_key(workspace_id), code, ex=_CODE_TTL_SECONDS)
     return code
 
 
@@ -203,18 +202,19 @@ PAIR_NO_NUMBER = 'NO_NUMBER'
 
 
 def pair_number(code: str, number: str) -> dict:
-    """Bind a verified phone number to the persona that owns ``code``.
+    """Bind a verified phone number to the workspace that owns ``code``.
 
     Called from the inbound-SMS webhook when the visitor texts their pairing
     code to the demo number. Returns a dict with a ``status`` key:
-      - PAIRED       → {status, persona_id, masked}
+      - PAIRED       → {status, workspace_id, user_id, masked}
       - INVALID_CODE → code unknown/expired
-      - NUMBER_TAKEN → number already verified by a different live persona
+      - NUMBER_TAKEN → number already verified by a different LIVE workspace
       - NO_NUMBER    → sender number missing/unusable
 
-    Side effects on PAIRED: writes both number bindings (lease TTL), consumes
-    the one-time code, and retroactively attributes any currently-live call
-    from that number to the persona (covers "verify while already on a call").
+    Side effects on PAIRED: writes both number bindings (workspace TTL),
+    consumes the one-time code, and mirrors the number into
+    ``workspaces.verified_number``. One number ↔ one live workspace (§10.6):
+    a binding held by an expired workspace is silently claimable.
     """
     redis_client = get_redis_client()
     if redis_client is None:
@@ -225,249 +225,155 @@ def pair_number(code: str, number: str) -> dict:
         return {'status': PAIR_NO_NUMBER}
 
     code = (code or '').strip()
-    raw_pid = redis_client.get(_code_key(code))
-    if raw_pid is None:
+    binding = _unpack(redis_client.get(_code_key(code)))
+    if binding is None:
         return {'status': PAIR_INVALID}
-    try:
-        persona_id = int(_as_str(raw_pid))
-    except (TypeError, ValueError):
+    workspace_id, user_id = binding
+    if not _workspace_live(workspace_id):
+        # A code can't outlive its workspace by much (1h TTL), but never
+        # bind into a released/expired workspace.
         return {'status': PAIR_INVALID}
 
-    # One number ↔ one active persona. If this number is already bound to a
-    # DIFFERENT persona that still holds a live lease, refuse — otherwise the
-    # binding is stale (lease gone) and we take it over.
-    existing_owner = redis_client.get(_number_key(norm))
-    if existing_owner is not None:
-        try:
-            existing_pid = int(_as_str(existing_owner))
-        except (TypeError, ValueError):
-            existing_pid = None
-        if existing_pid and existing_pid != persona_id and has_active_lease(existing_pid):
+    # One number ↔ one live workspace. If this number is already bound to a
+    # DIFFERENT workspace that is still live, refuse — otherwise the binding
+    # is stale (workspace gone) and we take it over.
+    existing = _unpack(redis_client.get(_number_key(norm)))
+    if existing is not None:
+        existing_ws, _existing_uid = existing
+        if existing_ws != workspace_id and _workspace_live(existing_ws):
             return {'status': PAIR_NUMBER_TAKEN}
 
-    ttl = _lease_ttl_seconds()
-    redis_client.set(_number_key(norm), str(persona_id), ex=ttl)
-    redis_client.set(_persona_number_key(persona_id), norm, ex=ttl)
+    ttl = _binding_ttl_seconds()
+    redis_client.set(_number_key(norm), _pack(workspace_id, user_id), ex=ttl)
+    redis_client.set(_ws_number_key(workspace_id), norm, ex=ttl)
     # One-time code: consume it so it can't be replayed.
     redis_client.delete(_code_key(code))
-    redis_client.delete(_persona_code_key(persona_id))
+    redis_client.delete(_ws_code_key(workspace_id))
 
-    # Retroactively attribute any currently-live call from this number to the
-    # visitor, so one who verifies while already on a call gets privacy
-    # immediately (the inbound-attribution hook only covers NEW calls).
-    # Kept in Phase 1: unverified inbound still reaches the floor until the
-    # Phase 4 verify-first rejection lands — only then is this sweep dead
-    # code (nothing pre-verification will exist to re-parent).
-    # Best-effort — pairing succeeds regardless.
+    # Durable mirror for recovery / operator visibility (§6.2). Best-effort —
+    # the Redis binding is authoritative.
     try:
         from app import db
-        from app.models import (
-            Call,
-            CallLeg,
-            Callback,
-            ConferenceParticipant,
-            Transcription,
-            User,
-            WebhookEvent,
-        )
-        visitor = User.query.get(persona_id)
-        live = (
-            Call.query
-            .filter(Call.from_number.in_([norm, number]))
-            .filter(Call.status.in_(['initiated', 'ringing', 'answered', 'ai_active', 'waiting', 'assigned', 'active']))
-            .all()
-        )
-        for call in live:
-            call.user_id = persona_id
-            # Tenancy: visibility now rides on workspace_id — re-parent the
-            # call into the visitor's workspace too, or it stays quarantined
-            # in the default workspace where the visitor can't see it. The
-            # call's pre-verification children were stamped from the call's
-            # OLD workspace, so they must follow or the visitor gets a call
-            # with no transcript/legs in their scoped views. (Contacts are
-            # deliberately NOT moved: phone is per-workspace unique and the
-            # ws-1 contact may be shared by other quarantined calls —
-            # contact attribution is Phase 4's verify-first rework.)
-            if visitor is not None and visitor.workspace_id is not None:
-                old_ws_id = call.workspace_id
-                call.workspace_id = visitor.workspace_id
-                for child in (Transcription, CallLeg, WebhookEvent,
-                              Callback, ConferenceParticipant):
-                    (
-                        child.query
-                        .filter_by(call_id=call.id)
-                        .update({'workspace_id': visitor.workspace_id},
-                                synchronize_session=False)
-                    )
-                # Conference rows key by the SignalWire sid STRING, not the
-                # DB id, so the children loop above misses them — and
-                # conference-keyed emits (conference_ended,
-                # participant_moved) target workspace_room(conference.
-                # workspace_id), so a row left in quarantine would emit to
-                # the wrong room for the rest of the call.
-                from app.models import Conference as _Conference
-                (
-                    _Conference.query
-                    .filter_by(call_id=call.signalwire_call_sid)
-                    .update({'workspace_id': visitor.workspace_id},
-                            synchronize_session=False)
-                )
-                # Phase 3: queue state is workspace-keyed. A caller who was
-                # parked BEFORE verifying sits in the OLD (quarantine)
-                # workspace's zset, where the visitor's dispatch will never
-                # find them — move the entry to the new workspace's queue,
-                # preserving priority/context (enqueue_call keeps the
-                # original SLA clock from Call.created_at).
-                if call.status in ('waiting', 'assigned') and call.queue_id:
-                    try:
-                        import json as _json
-                        from app.services.queue_service import QueueService
-                        qs_new = QueueService(
-                            redis_client, workspace_id=visitor.workspace_id
-                        )
-                        removed = qs_new.remove_call_from_all_queues(
-                            call.signalwire_call_sid
-                        )
-                        if removed and call.status == 'waiting':
-                            try:
-                                ctx = _json.loads(call.ai_context) if call.ai_context else {}
-                            except (TypeError, ValueError):
-                                ctx = {}
-                            qs_new.enqueue_call(
-                                call_id=call.signalwire_call_sid,
-                                queue_id=call.queue_id,
-                                priority=ctx.get('priority', 5),
-                                context=ctx,
-                                caller_info={'number': call.from_number, 'name': None},
-                            )
-                            logger.info(
-                                "demo_verify: moved queued call %s from ws %s "
-                                "to ws %s queue '%s'",
-                                call.signalwire_call_sid, old_ws_id,
-                                visitor.workspace_id, call.queue_id,
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "demo_verify: queued-call workspace move failed "
-                            "for %s: %s", call.signalwire_call_sid, exc,
-                        )
-        if live:
+        from app.models import Workspace
+        ws = db.session.get(Workspace, workspace_id)
+        if ws is not None:
+            ws.verified_number = norm
             db.session.commit()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("demo_verify: retroactive call attribution failed: %s", exc)
+        logger.warning("demo_verify: verified_number mirror write failed: %s", exc)
 
     logger.info(
-        "demo_verify: paired number %s → persona %s",
-        mask_number(norm), persona_id,
+        "demo_verify: paired number %s → workspace %s (user %s)",
+        mask_number(norm), workspace_id, user_id,
     )
-    return {'status': PAIR_OK, 'persona_id': persona_id, 'masked': mask_number(norm)}
+    return {
+        'status': PAIR_OK,
+        'workspace_id': workspace_id,
+        'user_id': user_id,
+        'masked': mask_number(norm),
+    }
 
 
-def get_verified_number(persona_id: int) -> Optional[str]:
-    """Normalized verified number for a persona, or None."""
+def get_verified_number(workspace_id) -> Optional[str]:
+    """Normalized verified number for a workspace, or None."""
+    if workspace_id is None:
+        return None
     redis_client = get_redis_client()
     if redis_client is None:
         return None
-    raw = redis_client.get(_persona_number_key(int(persona_id)))
-    return _as_str(raw) if raw is not None else None
+    raw = redis_client.get(_ws_number_key(int(workspace_id)))
+    return _as_str(raw) if raw else None
 
 
-def get_persona_for_number(number: str) -> Optional[int]:
-    """Persona that verified ``number`` AND still holds a live lease, else None.
+def get_workspace_for_number(number: str) -> Optional[Tuple[int, int]]:
+    """``(workspace_id, user_id)`` bound to a verified number, or None.
 
-    This is the authoritative read for inbound attribution + the outbound
-    own-number gate: a binding whose lease has lapsed grants nothing.
+    THE inbound-attribution lookup (§6.1). Confirms the workspace row is
+    still live — a binding that outlived its workspace never grants access
+    (fail closed).
     """
-    redis_client = get_redis_client()
-    if redis_client is None:
-        return None
     norm = _norm(number)
     if not norm:
         return None
-    raw = redis_client.get(_number_key(norm))
-    if raw is None:
+    redis_client = get_redis_client()
+    if redis_client is None:
         return None
-    try:
-        persona_id = int(_as_str(raw))
-    except (TypeError, ValueError):
+    binding = _unpack(redis_client.get(_number_key(norm)))
+    if binding is None:
         return None
-    if not has_active_lease(persona_id):
+    workspace_id, user_id = binding
+    if not _workspace_live(workspace_id):
         return None
-    return persona_id
+    return workspace_id, user_id
 
 
-def is_number_verified_for_persona(persona_id: int, number: str) -> bool:
-    """True iff ``number`` is the live verified number for this exact persona.
-
-    Used by the demo outbound gate: a persona may dial ONLY its own verified
-    number.
-    """
+def is_number_verified_for_workspace(workspace_id, number: str) -> bool:
+    """True iff ``number`` is this workspace's verified number."""
+    if workspace_id is None:
+        return False
     norm = _norm(number)
     if not norm:
         return False
-    verified = get_verified_number(persona_id)
-    return verified is not None and verified == norm
+    return get_verified_number(workspace_id) == norm
 
 
-def refresh_bindings(persona_id: int) -> None:
-    """Extend the verified-number binding TTL to match a fresh heartbeat.
-
-    Called from the workspace heartbeat (``/api/demo/heartbeat``) so the
-    number stays verified for as long as the visitor keeps their session
-    alive.
-    """
+def refresh_bindings(workspace_id) -> None:
+    """Re-assert binding TTLs on activity (demo heartbeat)."""
+    if workspace_id is None:
+        return
     redis_client = get_redis_client()
     if redis_client is None:
         return
-    persona_id = int(persona_id)
-    ttl = _lease_ttl_seconds()
-    norm = get_verified_number(persona_id)
+    workspace_id = int(workspace_id)
+    ttl = _binding_ttl_seconds()
+    norm = redis_client.get(_ws_number_key(workspace_id))
     if norm:
-        redis_client.expire(_number_key(norm), ttl)
-        redis_client.expire(_persona_number_key(persona_id), ttl)
-    code = redis_client.get(_persona_code_key(persona_id))
+        redis_client.expire(_number_key(_as_str(norm)), ttl)
+        redis_client.expire(_ws_number_key(workspace_id), ttl)
+    code = redis_client.get(_ws_code_key(workspace_id))
     if code:
-        redis_client.expire(_code_key(_as_str(code)), ttl)
-        redis_client.expire(_persona_code_key(persona_id), ttl)
+        redis_client.expire(_code_key(_as_str(code)), _CODE_TTL_SECONDS)
+        redis_client.expire(_ws_code_key(workspace_id), _CODE_TTL_SECONDS)
 
 
-def clear_bindings(persona_id: int) -> None:
-    """Delete all verify state for a persona. Called on lease release so the
-    recycled persona starts clean for the next visitor."""
+def clear_bindings(workspace_id) -> None:
+    """Delete all verify state for a workspace. Called on release/reap so
+    the number is immediately claimable by the visitor's next workspace."""
+    if workspace_id is None:
+        return
     redis_client = get_redis_client()
     if redis_client is None:
         return
-    persona_id = int(persona_id)
-    norm = redis_client.get(_persona_number_key(persona_id))
+    workspace_id = int(workspace_id)
+    norm = redis_client.get(_ws_number_key(workspace_id))
     if norm:
         redis_client.delete(_number_key(_as_str(norm)))
-    code = redis_client.get(_persona_code_key(persona_id))
+    code = redis_client.get(_ws_code_key(workspace_id))
     if code:
         redis_client.delete(_code_key(_as_str(code)))
-    redis_client.delete(_persona_number_key(persona_id))
-    redis_client.delete(_persona_code_key(persona_id))
-    # DEMO-SEC-07: the outbound-cap counter is persona-keyed too — left
-    # behind, the next visitor to lease this persona inherits the previous
-    # visitor's remaining call budget.
-    redis_client.delete(_outbound_key(persona_id))
+    redis_client.delete(_ws_number_key(workspace_id))
+    redis_client.delete(_ws_code_key(workspace_id))
+    # DEMO-SEC-07 lineage: the outbound-cap counter must not survive into
+    # the number's next binding.
+    redis_client.delete(_outbound_key(workspace_id))
 
 
-# Per-persona outbound cap in demo mode — calls cost money, and even
+# Per-workspace outbound cap in demo mode — calls cost money, and even
 # own-number dialing shouldn't be unbounded.
 _OUTBOUND_CAP = 5
 _OUTBOUND_WINDOW = 3600
 
 
-def demo_outbound_denial(persona_id: int, destination: Optional[str]) -> Optional[tuple]:
-    """Demo outbound policy. Returns None if this persona may place this
+def demo_outbound_denial(workspace_id, destination: Optional[str]) -> Optional[tuple]:
+    """Demo outbound policy. Returns None if this workspace may place this
     outbound call, else ``(error_dict, http_status)``.
 
-    Rule: in demo mode a persona may dial ONLY its own verified phone number,
-    and only up to a per-hour cap. Everything else stays blocked. Callers
-    invoke this only when ``is_demo_mode()`` is true.
+    Rule: in demo mode a workspace may dial ONLY its own verified phone
+    number, and only up to a per-hour cap. Everything else stays blocked.
+    Callers invoke this only when ``is_demo_mode()`` is true.
     """
-    if not is_number_verified_for_persona(persona_id, destination):
-        if get_verified_number(persona_id) is None:
+    if not is_number_verified_for_workspace(workspace_id, destination):
+        if get_verified_number(workspace_id) is None:
             return ({
                 'error': 'Verify your phone number first, then you can have the demo call you.',
                 'code': 'demo_verify_required',
@@ -480,7 +386,7 @@ def demo_outbound_denial(persona_id: int, destination: Optional[str]) -> Optiona
     redis_client = get_redis_client()
     if redis_client is not None:
         try:
-            key = _outbound_key(persona_id)
+            key = _outbound_key(int(workspace_id))
             n = redis_client.incr(key)
             if n == 1:
                 redis_client.expire(key, _OUTBOUND_WINDOW)
@@ -494,16 +400,66 @@ def demo_outbound_denial(persona_id: int, destination: Optional[str]) -> Optiona
     return None
 
 
-def verify_status(persona_id: int) -> dict:
+def verify_status(workspace_id) -> dict:
     """Frontend status payload: current code (if any) + verified number (masked)."""
     redis_client = get_redis_client()
-    if redis_client is None:
-        return {'verified': False, 'code': None, 'masked_number': None}
-    persona_id = int(persona_id)
-    code = redis_client.get(_persona_code_key(persona_id))
-    norm = get_verified_number(persona_id)
+    code = None
+    if redis_client is not None and workspace_id is not None:
+        raw = redis_client.get(_ws_code_key(int(workspace_id)))
+        code = _as_str(raw) if raw else None
+    verified = get_verified_number(workspace_id)
     return {
-        'verified': norm is not None,
-        'code': _as_str(code) if code else None,
-        'masked_number': mask_number(norm) if norm else None,
+        'verified': verified is not None,
+        'code': code,
+        'masked_number': mask_number(verified),
     }
+
+
+# ---------------------------------------------------------------------------
+# Verify-first inbound gate (§6.1 / §10.1)
+# ---------------------------------------------------------------------------
+
+REJECTED_COUNTER_KEY = 'demo:inbound:rejected'
+
+
+def unverified_reject_swml() -> dict:
+    """Polite reject SWML for inbound calls from numbers with no live
+    workspace binding. No Call/Contact rows are created for these."""
+    return {
+        'version': '1.0.0',
+        'sections': {
+            'main': [
+                'answer',
+                {
+                    'play': {
+                        'urls': [
+                            'say:This number is not linked to a demo workspace. '
+                            'Start a demo on the website and text your pairing '
+                            'code to link your phone. Goodbye.'
+                        ]
+                    }
+                },
+                'hangup',
+            ]
+        },
+    }
+
+
+def note_rejected_inbound(from_number: Optional[str], entry_point: str) -> None:
+    """Telemetry for verify-first rejections: one platform-scoped webhook
+    event log line + a Redis counter. Best-effort."""
+    try:
+        redis_client = get_redis_client()
+        if redis_client is not None:
+            redis_client.incr(REJECTED_COUNTER_KEY)
+    except Exception:
+        pass
+    try:
+        from app.models import WebhookEvent
+        WebhookEvent.log_event(
+            event_type='inbound_rejected_unverified',
+            payload={'from': mask_number(from_number), 'entry_point': entry_point},
+            call_id=None,
+        )
+    except Exception:
+        pass

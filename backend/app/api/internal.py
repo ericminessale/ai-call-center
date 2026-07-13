@@ -80,7 +80,15 @@ def list_mcp_gateways_for_agent():
         )
         return jsonify({'error': 'unknown agent_id'}), 400
 
-    rows = McpGatewayConfig.query.filter_by(enabled=True).all()
+    # Tenancy: this is the BOOT feed for the shared agent process — pin it
+    # to the default/template workspace like the other boot feeds
+    # (deviation 10). An unscoped query would register every visitor's
+    # gateway rows on the shared boot agents. Per-workspace gateways ride
+    # the per-request /internal/call-context payload instead (§7.2).
+    from app.tenancy import DEFAULT_WORKSPACE_ID
+    rows = McpGatewayConfig.query.filter_by(
+        enabled=True, workspace_id=DEFAULT_WORKSPACE_ID
+    ).all()
     matched = [
         {
             'id': row.id,
@@ -140,6 +148,97 @@ def list_agent_assignments():
             }
             for a in assignments
         ]
+    })
+
+
+@internal_bp.route('/call-context', methods=['GET'])
+@require_internal_auth
+def get_call_context():
+    """Per-request tenant config for the AI agents (§7.1 — the keystone).
+
+    Query params:
+        call_db_id (required): the Call row's DB id, appended to agent URLs
+            by the backend's own SWML (``?call_db_id={id}``). Agent routes
+            are public, so a bare ``wsid`` param would be forgeable — the
+            workspace is resolved SERVER-SIDE from the Call row instead;
+            nothing in the request is trusted beyond "which call".
+
+    Returns one payload with everything the dynamic-config callback needs
+    to shape the ephemeral agent for the call's workspace:
+        workspace_id, queues (active, in-workspace — rebuilds the triage
+        contexts per request, which also fixes AI-06's boot-frozen queue
+        list), kb_assignments {agent_slug: physical collection name},
+        mcp_gateways (workspace rows, cleartext creds — same trust
+        boundary as /mcp-gateways above), agent_config (v1: company name
+        from the workspace's branding layer).
+
+    Unknown call ids 404; the agent falls back to its boot/template
+    config, which carries no tenant data.
+    """
+    from app import db
+    from app.models import AgentCollectionAssignment as ACA
+    from app.models import Call
+    from app.models.queue import Queue
+    from app.models.system_config import SystemConfig
+    from app.tenancy import DEFAULT_WORKSPACE_ID, workspace_context
+
+    raw_id = (request.args.get('call_db_id') or '').strip()
+    if not raw_id.isdigit():
+        return jsonify({'error': 'call_db_id query param is required'}), 400
+    # Confused-deputy guard (§7.1 hardening): call_db_id is a sequential id
+    # arriving from a PUBLIC agent route, so require the backend-minted
+    # signature. Without a valid token we refuse rather than leak another
+    # workspace's config — the agent then serves inert template config.
+    from app.utils.url_utils import verify_call_context_token
+    if not verify_call_context_token(raw_id, request.args.get('ctk')):
+        logger.warning("call-context: rejected call_db_id=%s (bad/absent token)", raw_id)
+        return jsonify({'error': 'invalid or missing call token'}), 403
+    call = db.session.get(Call, int(raw_id))
+    if call is None:
+        return jsonify({'error': 'unknown call'}), 404
+
+    ws_id = call.workspace_id or DEFAULT_WORKSPACE_ID
+    with workspace_context(ws_id):
+        # Order by display_name to MATCH the boot feed (Queue.get_active_queues
+        # → /api/queues/config/active), so the per-request triage rebuild and
+        # the template render agree on context/menu ordering.
+        queues = (
+            Queue.query.filter_by(is_active=True).order_by(Queue.display_name).all()
+        )
+        assignments = ACA.query.all()
+        gateways = McpGatewayConfig.query.filter_by(enabled=True).all()
+        branding = SystemConfig.get_branding_config()
+
+    return jsonify({
+        'workspace_id': ws_id,
+        'call_db_id': call.id,
+        'queues': [
+            {
+                'slug': q.slug,
+                'display_name': q.display_name,
+                'description': q.description,
+                'ai_agent_route': q.ai_agent_route,
+                'default_priority': q.default_priority,
+            }
+            for q in queues
+        ],
+        'kb_assignments': {
+            a.agent_id: (a.collection.physical_name or a.collection.name)
+            for a in assignments
+            if a.collection is not None
+        },
+        'mcp_gateways': [
+            {
+                'id': row.id,
+                'name': row.name,
+                'bound_agent_ids': list(row.bound_agent_ids or []),
+                'config': row.to_skill_config(),
+            }
+            for row in gateways
+        ],
+        'agent_config': {
+            'company_name': (branding or {}).get('product_name'),
+        },
     })
 
 

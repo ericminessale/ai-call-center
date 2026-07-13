@@ -516,6 +516,11 @@ function PhoneNumbersTab() {
   const [updatingNumber, setUpdatingNumber] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [configuringNumber, setConfiguringNumber] = useState<PhoneNumber | null>(null);
+  // Workspace-admin read-only view (hosted mode): entry numbers + own
+  // verified status; the install's real DIDs stay platform-only.
+  const [readOnly, setReadOnly] = useState(false);
+  const [entryNumbers, setEntryNumbers] = useState<{ label: string; number: string }[]>([]);
+  const [verifiedMasked, setVerifiedMasked] = useState<string | null>(null);
 
   const loadNumbers = useCallback(async () => {
     try {
@@ -523,6 +528,11 @@ function PhoneNumbersTab() {
         adminApi.getPhoneNumbers(),
         adminApi.getQueues(),
       ]);
+      if (phonesResp.data.read_only) {
+        setReadOnly(true);
+        setEntryNumbers(phonesResp.data.entry_numbers || []);
+        setVerifiedMasked(phonesResp.data.verified ? phonesResp.data.verified_masked : null);
+      }
       setNumbers(phonesResp.data.phone_numbers);
       setWebhookUrl(phonesResp.data.webhook_url);
       setIsConfigured(phonesResp.data.is_configured);
@@ -645,6 +655,54 @@ function PhoneNumbersTab() {
   };
 
   if (loading) return <LoadingSpinner />;
+
+  if (readOnly) {
+    return (
+      <div className="max-w-6xl">
+        <div className="mb-5">
+          <div className="kicker mb-1">Inbound</div>
+          <h2 className="font-display text-[24px] text-ink leading-none mb-2">Phone numbers</h2>
+          <p className="text-[13px] text-ink-muted">
+            Your workspace's entry numbers. Calls from your verified phone land in your
+            workspace; number routing itself is managed by the platform.
+          </p>
+        </div>
+        <div className="panel rounded-md p-4 mb-5">
+          <div className="kicker mb-2">Verified number</div>
+          {verifiedMasked ? (
+            <p className="text-[13px] text-ink">
+              <span className="mono text-sw-turquoise">{verifiedMasked}</span>
+              <span className="text-ink-muted"> — inbound calls from this number reach your workspace, and it's the only number your workspace can dial.</span>
+            </p>
+          ) : (
+            <p className="text-[13px] text-ink-muted">
+              No verified number yet — text your pairing code from the banner to link your phone.
+            </p>
+          )}
+        </div>
+        {entryNumbers.length > 0 && (
+          <div className="panel rounded-md overflow-hidden">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-rule bg-canvas-sunken">
+                  <th className="text-left px-4 py-2.5 kicker">Entry number</th>
+                  <th className="text-left px-4 py-2.5 kicker">Line</th>
+                </tr>
+              </thead>
+              <tbody>
+                {entryNumbers.map((n) => (
+                  <tr key={n.number} className="border-b border-rule last:border-b-0">
+                    <td className="px-4 py-3 mono text-[13px] text-ink">{formatPhoneNumber(n.number)}</td>
+                    <td className="px-4 py-3 text-[13px] text-ink-muted">{n.label}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-6xl">

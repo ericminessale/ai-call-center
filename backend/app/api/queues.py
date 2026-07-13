@@ -126,26 +126,54 @@ def route_call_to_queue(queue_id):
         # Get priority from context or default
         priority = context.get('priority', 5)
 
-        # Create or update call record in database
+        # Create or update call record in database. In hosted mode the row
+        # normally EXISTS already (created + workspace-attributed at
+        # /initial-call before the AI transferred here); the new-row path
+        # below is the clone-and-own shape plus a verify-first backstop.
         call = Call.query.filter_by(signalwire_call_sid=call_id).first() if call_id else None
         if not call:
-            # Try to find existing call, or get system user for new calls
-            system_user = User.query.filter_by(email='system@signalwire.local').first()
-            if not system_user:
-                system_user = db.session.query(User).first()
-                if not system_user:
-                    # Create system user
-                    system_user = User(
-                        email='system@signalwire.local',
-                        is_active=True
+            route_ws_binding = None
+            owner_user_id = None
+            route_ws_id = None
+            if is_demo_mode():
+                # Verify-first backstop (§6.1): a NEW row here means the
+                # call skipped /initial-call somehow — apply the same gate.
+                from app.services.demo_verify import (
+                    get_workspace_for_number,
+                    note_rejected_inbound,
+                    unverified_reject_swml,
+                )
+                route_ws_binding = get_workspace_for_number(caller_number)
+                if route_ws_binding is None:
+                    logger.info(
+                        "/route: rejecting unattributed call %s from "
+                        "unverified number", call_id,
                     )
-                    system_user.set_password('system_password_change_me')
-                    db.session.add(system_user)
-                    db.session.flush()
+                    note_rejected_inbound(caller_number, 'route')
+                    return jsonify(unverified_reject_swml())
+                route_ws_id, owner_user_id = route_ws_binding
+            else:
+                # Clone-and-own: synthetic system user satisfies the FK.
+                system_user = User.query.filter_by(email='system@signalwire.local').first()
+                if not system_user:
+                    system_user = db.session.query(User).first()
+                    if not system_user:
+                        import secrets as _secrets
+                        system_user = User(
+                            email='system@signalwire.local',
+                            is_active=True
+                        )
+                        # Unguessable — nobody logs in as this user (was a
+                        # hardcoded literal here).
+                        system_user.set_password(_secrets.token_urlsafe(32))
+                        db.session.add(system_user)
+                        db.session.flush()
+                owner_user_id = system_user.id
 
             call = Call(
                 signalwire_call_sid=call_id,
-                user_id=system_user.id,
+                user_id=owner_user_id,
+                workspace_id=route_ws_id,  # None → flush stamper defaults
                 from_number=caller_number,
                 destination=call_data.get('to_number') or data.get('To'),
                 status='waiting',  # Start as 'waiting' in queue
@@ -167,11 +195,28 @@ def route_call_to_queue(queue_id):
             call.status = 'waiting'
         call.queue_id = queue_id
 
-        # Update Contact record with AI-collected information
+        # Update Contact record with AI-collected information — scoped to
+        # the call's workspace in hosted mode (phone is per-workspace
+        # unique; the unscoped helper could bind another tenant's contact).
         contact_id = None
         if caller_number:
             try:
-                contact = Contact.find_or_create_by_phone(caller_number)
+                if is_demo_mode() and call.workspace_id:
+                    contact = Contact.query.filter_by(
+                        phone=caller_number, workspace_id=call.workspace_id
+                    ).first()
+                    if not contact:
+                        contact = Contact(
+                            phone=caller_number,
+                            display_name=caller_number,
+                            account_tier='free',
+                            account_status='prospect',
+                            workspace_id=call.workspace_id,
+                        )
+                        db.session.add(contact)
+                        db.session.flush()
+                else:
+                    contact = Contact.find_or_create_by_phone(caller_number)
                 contact_id = contact.id
                 contact_updated = False
 
@@ -369,7 +414,51 @@ def direct_inbound_queue(queue_slug):
 
         logger.info(f"Direct inbound: call_id={call_id}, from={caller_number}, to={to_number}")
 
-        queue = Queue.query.filter_by(slug=queue_slug).first()
+        # Hosted demo: per-caller-ID inbound ratelimit — the same cheap
+        # Redis check /initial-call runs, previously missing here (§4.3).
+        from app.services.demo_inbound_ratelimit import (
+            reject_swml as demo_reject_swml,
+            should_reject_inbound,
+        )
+        if should_reject_inbound(caller_number):
+            logger.info(
+                "Direct inbound from %s rejected by demo ratelimit", caller_number,
+            )
+            return jsonify(demo_reject_swml())
+
+        # Create / hydrate Call record so webhooks + dashboard can track it
+        call = Call.query.filter_by(signalwire_call_sid=call_id).first() if call_id else None
+
+        # Verify-first gate (§6.1/§10.1, hosted mode only): NEW inbound
+        # calls are accepted ONLY from numbers bound to a live workspace —
+        # reject SWML, no Call/Contact rows otherwise.
+        ws_binding = None
+        if is_demo_mode():
+            from app.services.demo_verify import (
+                get_workspace_for_number,
+                note_rejected_inbound,
+                unverified_reject_swml,
+            )
+            ws_binding = get_workspace_for_number(caller_number)
+            if call is None and ws_binding is None:
+                logger.info(
+                    "direct_inbound: rejecting inbound from unverified number "
+                    "(call %s)", call_id,
+                )
+                note_rejected_inbound(caller_number, 'direct-inbound')
+                return jsonify(unverified_reject_swml())
+
+        # Resolve the queue INSIDE the attributed workspace — slugs repeat
+        # across workspaces and this webhook runs unscoped. Clone-and-own
+        # (no binding) pins to the default workspace, which holds all rows.
+        from app.tenancy import DEFAULT_WORKSPACE_ID
+        queue_ws_id = (
+            ws_binding[0] if ws_binding is not None
+            else (call.workspace_id if call is not None else None)
+        ) or DEFAULT_WORKSPACE_ID
+        queue = Queue.query.filter_by(
+            slug=queue_slug, workspace_id=queue_ws_id
+        ).first()
         if not queue:
             logger.warning(f"Direct inbound: unknown queue '{queue_slug}'")
             return jsonify({
@@ -387,29 +476,39 @@ def direct_inbound_queue(queue_slug):
         # path can derive it without DB lookup.
         conference_name = f"interaction-{call_id}"
 
-        # Create / hydrate Call record so webhooks + dashboard can track it
-        call = Call.query.filter_by(signalwire_call_sid=call_id).first() if call_id else None
         if not call:
-            system_user = User.query.filter_by(email='system@signalwire.local').first()
-            if not system_user:
-                system_user = db.session.query(User).first()
-
-            # Demo phone-verification attribution (see initial-call): a call
-            # from a verified number belongs to the persona that verified it,
-            # making it private to that visitor via the ownership checks.
-            owner_user_id = system_user.id
-            if is_demo_mode() and caller_number:
-                try:
-                    from app.services.demo_verify import get_persona_for_number
-                    persona_id = get_persona_for_number(caller_number)
-                    if persona_id:
-                        owner_user_id = persona_id
-                except Exception as exc:
-                    logger.warning("direct_inbound: verify attribution failed (non-fatal): %s", exc)
+            ws_id = None
+            if ws_binding is not None:
+                # Verified inbound: call + contact belong to the bound
+                # workspace, attributed to the visitor who paired the number.
+                ws_id, owner_user_id = ws_binding
+                logger.info(
+                    "direct_inbound: attributed call %s to workspace %s (user %s)",
+                    call_id, ws_id, owner_user_id,
+                )
+            else:
+                # Clone-and-own only — hosted inbound was gated above.
+                system_user = User.query.filter_by(email='system@signalwire.local').first()
+                if not system_user:
+                    system_user = db.session.query(User).first()
+                if not system_user:
+                    import secrets as _secrets
+                    system_user = User(
+                        email='system@signalwire.local',
+                        is_active=True,
+                    )
+                    # Unguessable password — nobody ever logs in as this user
+                    # (was a hardcoded literal here; initial-call already
+                    # generated a secret).
+                    system_user.set_password(_secrets.token_urlsafe(32))
+                    db.session.add(system_user)
+                    db.session.flush()
+                owner_user_id = system_user.id
 
             call = Call(
                 signalwire_call_sid=call_id,
                 user_id=owner_user_id,
+                workspace_id=ws_id,  # None → flush stamper derives/defaults
                 from_number=caller_number,
                 destination=to_number or 'unknown',
                 destination_type='phone',
@@ -435,11 +534,29 @@ def direct_inbound_queue(queue_slug):
         else:
             call.conference_name = conference_name
 
-        # Contact lookup / create
+        # Contact lookup / create — scoped to the attributed workspace in
+        # hosted mode (phone is per-workspace unique; the unscoped helper
+        # could bind another tenant's contact).
         contact_id = None
         if caller_number:
             try:
-                contact = Contact.find_or_create_by_phone(caller_number)
+                if ws_binding is not None:
+                    contact_ws_id = ws_binding[0]
+                    contact = Contact.query.filter_by(
+                        phone=caller_number, workspace_id=contact_ws_id
+                    ).first()
+                    if not contact:
+                        contact = Contact(
+                            phone=caller_number,
+                            display_name=caller_number,
+                            account_tier='free',
+                            account_status='prospect',
+                            workspace_id=contact_ws_id,
+                        )
+                        db.session.add(contact)
+                        db.session.flush()
+                else:
+                    contact = Contact.find_or_create_by_phone(caller_number)
                 call.contact_id = contact.id
                 contact_id = contact.id
                 contact.last_interaction_at = datetime.utcnow()

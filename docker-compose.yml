@@ -96,42 +96,13 @@ services:
       # Application
       FLASK_APP: app
       FLASK_ENV: ${FLASK_ENV:-production}
-      # TENANCY_MODE gates the hosted-demo behavior (landing card,
-      # per-visitor workspaces, /api/demo/start, subscriber seat pool).
-      # Defaults OFF — clone-and-own deployments stay in production shape
-      # with one implicit workspace. DEMO_MODE is the legacy alias (the
-      # shared-floor persona model it named is gone; both flags mean
-      # workspaces now). Set TENANCY_MODE=true in .env (and
-      # DEMO_PHONE_NUMBERS=...) to flip to hosted-demo mode.
-      TENANCY_MODE: ${TENANCY_MODE:-false}
-      DEMO_MODE: ${DEMO_MODE:-false}
-      DEMO_PHONE_NUMBERS: ${DEMO_PHONE_NUMBERS:-}
-      # Subscriber seat pool = max concurrently-online browsers (falls back
-      # to DEMO_POOL_SIZE); workspaces are capped separately (idle-expire
-      # after WORKSPACE_TTL_DAYS, hard 503 at MAX_WORKSPACES).
-      SEAT_POOL_SIZE: ${SEAT_POOL_SIZE:-20}
-      DEMO_POOL_SIZE: ${DEMO_POOL_SIZE:-20}
-      SEAT_LEASE_TTL_SECONDS: ${SEAT_LEASE_TTL_SECONDS:-300}
-      DEMO_LEASE_TTL_SECONDS: ${DEMO_LEASE_TTL_SECONDS:-300}
-      WORKSPACE_TTL_DAYS: ${WORKSPACE_TTL_DAYS:-7}
-      MAX_WORKSPACES: ${MAX_WORKSPACES:-200}
-      DEMO_INBOUND_CAP_PER_HOUR: ${DEMO_INBOUND_CAP_PER_HOUR:-10}
-      # Per-workspace resource ceilings (utils/workspace_caps.py, §4.3).
-      # Only enforced in TENANCY_MODE; empty = module defaults.
-      WORKSPACE_CAP_QUEUES: ${WORKSPACE_CAP_QUEUES:-}
-      WORKSPACE_CAP_COLLECTIONS: ${WORKSPACE_CAP_COLLECTIONS:-}
-      WORKSPACE_CAP_DOCUMENTS: ${WORKSPACE_CAP_DOCUMENTS:-}
-      WORKSPACE_CAP_CONTACTS: ${WORKSPACE_CAP_CONTACTS:-}
-      WORKSPACE_CAP_USERS: ${WORKSPACE_CAP_USERS:-}
-      WORKSPACE_CAP_CALLBACKS: ${WORKSPACE_CAP_CALLBACKS:-}
       # Trusted reverse-proxy hop count (SEC-07). Default 1 because the
       # in-compose nginx always fronts /api — with 0, request.remote_addr
       # is the nginx container IP for every client and the per-IP rate
       # limits collapse into one shared global bucket. Set 2 with
       # Cloudflare in front; 0 only if you expose :5000 directly.
       TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-1}
-      # OpenAI moderation key (optional). Only consulted when
-      # DEMO_MODE=true; production-shape deployments aren't affected.
+      # OpenAI moderation key (optional content moderation of user text).
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       # Where raw webhook payloads (post-prompt + debug events) are captured
       # for offline debugging. /app is the bind-mounted ./backend dir, so these
@@ -244,24 +215,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-
-  # demo-reset — workspace-GC cron (Phase 3 reaper): hourly
-  # /api/internal/workspace-gc reaps EXPIRED workspaces; nightly
-  # /api/internal/demo-reset adds MAX_WORKSPACES cap enforcement +
-  # template hygiene. No FLUSHDB, no whole-floor wipe. Self-gates on
-  # DEMO_MODE; safe to leave running on clone-and-own (no-ops).
-  demo-reset:
-    build:
-      context: ./demo-reset
-      dockerfile: Dockerfile
-    container_name: callcenter-demo-reset
-    depends_on:
-      - backend
-    environment:
-      BACKEND_URL: http://backend:5000
-      WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER:-}
-      WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD:-}
-      TZ: UTC
 
   # DemoShop MCP Gateway — bundled demo for the External Tools feature.
   # Runs the SDK's mcp-gateway CLI in front of a small SQLite-backed

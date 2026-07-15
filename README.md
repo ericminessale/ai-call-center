@@ -16,7 +16,6 @@ A production-ready demonstration of SignalWire's **Programmable Unified Communic
 - **Live Transcription** — Real-time transcription display with AI-generated summaries.
 - **Multilingual + Live Translate** — AI agents speak English, Spanish, and French natively. When a caller's language doesn't match an available agent, real-time bidirectional speech translation kicks in automatically on conference join (10 languages configured by default). Agents can toggle and swap language pairs mid-call.
 - **External Tools (MCP Gateway)** — Customer-configurable per-agent integrations. Paste an MCP gateway URL into Settings, the bound AI specialists gain whatever tools that gateway exposes (Salesforce, Zendesk, custom internal systems) as SWAIG functions. A bundled DemoShop gateway demonstrates the feature out-of-the-box.
-- **Hosted demo mode** — Same codebase supports a public demo deployment via a single `DEMO_MODE=true` flag: anonymous-session landing card, pre-provisioned subscriber pool with per-visitor leasing, outbound dial / contact delete / recording locked down, content moderation on visitor-typed text, daily reset cron. See the *Hosted Demo Mode* section below for the full picture.
 
 ## How It Works
 
@@ -399,39 +398,11 @@ docker-compose exec backend bash
 | `WEBHOOK_AUTH_PASSWORD` | (unset) | Counterpart to `WEBHOOK_AUTH_USER`. |
 | `WEBHOOK_AUTH_REQUIRED` | `true` | Enforce HTTP Basic on `/api/webhooks/*` + `/api/queues/<id>/route` callbacks. Default is enforce — set to `false` ONLY as a temporary rollout downgrade until every producer (AI agents, `/api/swml/initial-call`, phone-number assigns) signs its callback URLs. `/api/internal/*` always enforces independent of this flag. |
 | `CORS_ORIGINS` | `http://localhost,http://localhost:3000,http://localhost:5173` | Comma-separated origin allowlist. Browsers reject `*` when credentials are enabled, so list specific origins for production. |
-| `OPENAI_API_KEY` | (unset) | When set + `DEMO_MODE=true`, visitor-typed contact + AI-message text gets run through OpenAI's free moderation endpoint. Without a key the regex blocklist is the only check. |
-| `SKIP_AUTO_QUEUE_ASSIGN` | `false` | Local-sandbox knob: suppress auto-assignment of queued calls when an agent goes Available. Production + hosted demo both want auto-assign. |
-| `ENABLE_CALL_RECORDING` | `true` | Record calls as MP3 (forced off in `DEMO_MODE`). |
+| `OPENAI_API_KEY` | (unset) | Optional. When set, user-entered contact + AI-message text runs through OpenAI's moderation endpoint. Without a key the regex blocklist is the only check. |
+| `SKIP_AUTO_QUEUE_ASSIGN` | `false` | Local-sandbox knob: suppress auto-assignment of queued calls when an agent goes Available. |
+| `ENABLE_CALL_RECORDING` | `true` | Record calls as MP3. |
 | `ENABLE_TRANSCRIPTION` | `true` | Live transcription. |
 | `ENABLE_AI_SUMMARY` | `true` | AI-generated call summaries. |
-
-### Hosted demo mode (optional deployment shape)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DEMO_MODE` | `false` | Master flag. When `true`: landing card replaces login, demo personas seed at boot, lockdowns + moderation activate. Production-shape deployments leave it unset. |
-| `DEMO_PHONE_NUMBERS` | (unset) | Comma-separated `label\|+E164` pairs surfaced on the landing card and persistent banner. Example: `AI Line\|+15551234567,Sales Direct\|+15555678900` |
-| `DEMO_POOL_SIZE` | `20` | How many demo personas to seed (1..100). |
-| `DEMO_LEASE_TTL_SECONDS` | `300` | Idle timeout for a visitor's persona lease — heartbeat must arrive within this window or the persona returns to the pool. |
-| `DEMO_INBOUND_CAP_PER_HOUR` | `10` | Max inbound calls per caller-ID per hour before that number gets a polite "demo limit reached" SWML. |
-
-## Hosted demo mode
-
-The same codebase supports two deployment shapes:
-
-- **Clone-and-own** (default) — what this README's Quick Start gets you. `DEMO_MODE` unset, normal login, normal everything.
-- **Hosted demo** — public-facing instance for non-technical showcasing. Set `DEMO_MODE=true` + the `DEMO_*` variables above and recreate the backend.
-
-When demo mode is on:
-
-- **Landing card** replaces the login form. One-click "Start demo" assigns a leased persona from a pool of 20 (configurable). No signup, no email.
-- **Pre-provisioned subscriber pool** — 20 demo personas (Alex Sales, Jordan Support, Sam Receptionist, etc.) each with their own SignalWire Subscriber. Leased per visitor session via Redis with native TTL; releases on tab close (`navigator.sendBeacon`) or 5-min idle.
-- **Lockdowns** — outbound dial blocked (UI form still renders, submit shows toast); contact DELETE blocked; recording silently disabled in SWML; per-caller-ID inbound ratelimit; demo personas hidden from User Management and immutable from admin endpoints.
-- **Content moderation** — visitor-typed contact fields and AI-message-inject text run through OpenAI's free moderation endpoint (when `OPENAI_API_KEY` is set) plus a local blocklist with leet / vowel-tolerant / Unicode / per-letter-spacing normalization.
-- **Daily reset cron** — `demo-reset` Docker service hits `POST /api/internal/demo-reset` at 00:00 UTC, wipes mutable state (calls, contacts, transcriptions), preserves fixtures (users, queues, knowledge base, MCP gateways). Active sessions get a `demo:reset` SocketIO event and reload.
-- **Onboarding tips** — first-time visitors see a floating tip ("Set yourself available" → "Pick a queue") plus an inline tip in the queue dropdown explaining the checkboxes. Each dismisses independently via localStorage.
-
-See `FEATURES.md` → *Hosted demo mode* for the full feature description, and `SECURITY_AUDIT_CHECKLIST.md` for the merge-gate audit checklist that every demo-related PR passes through.
 
 ## Troubleshooting
 

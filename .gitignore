@@ -39,12 +39,15 @@ frontend/dist/
 # Claude Code local settings
 .claude/
 
-# Documentation — only README.md, FEATURES.md, SECURITY_AUDIT_CHECKLIST.md tracked.
+# Documentation — only README.md and FEATURES.md ship. Everything else
+# (internal design/audit docs, incl. SECURITY_AUDIT_CHECKLIST.md) stays local.
 *.md
 !README.md
 !FEATURES.md
-!SECURITY_AUDIT_CHECKLIST.md
 docs/
+
+# Hosted-demo local override — not shipped to clone-and-own downloaders.
+docker-compose.demo.yml
 
 # Design-session artifacts and vendored SDKs
 _design_tour/

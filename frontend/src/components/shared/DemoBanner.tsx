@@ -1,22 +1,21 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Clock, LogOut, Phone, PhoneCall, ShieldCheck, Sparkles } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useAuthStore } from '../../stores/authStore';
+import { useVerifyStore } from '../../stores/verifyStore';
 import { demoApi } from '../../services/api';
-import websocket from '../../services/websocket';
 
 /**
- * Persistent strip across the top of the agent dashboard, only
+ * Thin persistent chrome strip across the top of the agent dashboard, only
  * rendered when the backend's runtime config reports DEMO_MODE=true.
  *
- * Surfaces:
- *   - the "DEMO" label so visitors know they're not in a real
- *     production call center
- *   - that this is the visitor's own private workspace, and how long it
- *     lives (expiry rides the 60s heartbeat, so the chip stays honest)
- *   - the demo phone number, dial-able with one click on mobile
- *   - phone verification: get a pairing code, TEXT it to the demo number,
- *     and calls between you and your workspace go live
+ * Carries: the "DEMO" label, the visitor's private-workspace + lifetime,
+ * the demo number for reference, and Leave-demo. The VERIFICATION FLOW
+ * itself lives in the prominent PhoneVerificationCard below this strip
+ * (shown while unverified); once verified this strip shows a compact
+ * "Verified" badge plus the "have the AI call me" action. Verification
+ * state comes from the shared useVerifyStore (hydrated by
+ * useDemoVerification), not a local fetch.
  *
  * Renders nothing in production-shape clone-and-own deployments.
  */
@@ -43,53 +42,21 @@ function timeLeft(expiresAt: string | null | undefined): { label: string; soon: 
 
 export function DemoBanner() {
   const { runtimeConfig, user, workspace, logout } = useAuthStore();
-
-  const [code, setCode] = useState<string | null>(null);
-  const [verified, setVerified] = useState(false);
-  const [maskedNumber, setMaskedNumber] = useState<string | null>(null);
+  const verified = useVerifyStore((s) => s.verified);
+  const maskedNumber = useVerifyStore((s) => s.maskedNumber);
   const [busy, setBusy] = useState(false);
 
   const isDemo = !!runtimeConfig?.demo_mode;
-
-  // Hydrate verification state on mount (covers reload while already verified
-  // or with a live code), and listen for the "verified" push. Platform users
-  // skip it — the verify endpoints are visitor-only (403 for them).
-  useEffect(() => {
-    if (!isDemo || (user != null && user.workspace_id == null)) return;
-    let active = true;
-    demoApi
-      .verifyStatus()
-      .then((r) => {
-        if (!active) return;
-        setVerified(r.data.verified);
-        setMaskedNumber(r.data.masked_number);
-        if (!r.data.verified) setCode(r.data.code);
-      })
-      .catch(() => {});
-
-    const onVerified = (data: { masked_number?: string }) => {
-      setVerified(true);
-      setMaskedNumber(data?.masked_number ?? null);
-      setCode(null);
-      toast.success('Phone verified — call the demo number and your AI picks up');
-    };
-    websocket.on('demo_phone_verified', onVerified);
-    return () => {
-      active = false;
-      websocket.off('demo_phone_verified', onVerified);
-    };
-  }, [isDemo, user]);
-
   if (!isDemo) return null;
 
   const personaName = user?.name ?? user?.email ?? 'demo agent';
   const phoneNumbers = runtimeConfig?.demo_phone_numbers ?? [];
   const remaining = timeLeft(workspace?.expires_at);
+  const isPlatformUser = user != null && user.workspace_id == null;
+
   // Platform operator (workspace null) on a hosted install: the visitor
   // affordances (verify, workspace expiry, leave-demo) don't apply — the
   // verify endpoints refuse platform users. Show a minimal strip instead.
-  const isPlatformUser = user != null && user.workspace_id == null;
-
   if (isPlatformUser) {
     return (
       <div
@@ -109,18 +76,6 @@ export function DemoBanner() {
       </div>
     );
   }
-
-  const getCode = async () => {
-    setBusy(true);
-    try {
-      const r = await demoApi.pairingCode();
-      setCode(r.data.code);
-    } catch {
-      toast.error('Could not generate a code — try again.');
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const callMe = async () => {
     setBusy(true);
@@ -167,8 +122,10 @@ export function DemoBanner() {
         </span>
       )}
 
-      {/* Verification affordance */}
-      {verified ? (
+      {/* Verified badge + call-me. The UNVERIFIED flow is the prominent
+          PhoneVerificationCard below this strip, so nothing verify-related
+          renders here until it succeeds. */}
+      {verified && (
         <span className="inline-flex items-center gap-2">
           <span className="inline-flex items-center gap-1 text-ai-soft">
             <ShieldCheck className="h-3.5 w-3.5" />
@@ -188,38 +145,6 @@ export function DemoBanner() {
             Have the AI call me
           </button>
         </span>
-      ) : code ? (
-        <span className="inline-flex items-center gap-1.5">
-          <span className="text-ink-muted">Text</span>
-          <span className="font-mono text-[13px] tracking-[0.3em] text-ai font-semibold">
-            {code}
-          </span>
-          <span className="text-ink-muted">
-            to{' '}
-            {phoneNumbers.length > 0 ? (
-              <a
-                href={`sms:${phoneNumbers[0].number}?&body=${code}`}
-                className="font-mono text-ai-soft hover:text-ai transition-colors"
-              >
-                {phoneNumbers[0].number}
-              </a>
-            ) : (
-              'the demo number'
-            )}
-          </span>
-          <span className="text-ink-faint">to verify your phone</span>
-        </span>
-      ) : (
-        <button
-          type="button"
-          onClick={getCode}
-          disabled={busy}
-          className="inline-flex items-center gap-1.5 rounded border border-ai/40 px-2 py-0.5 text-ai-soft hover:text-ai hover:border-ai transition-colors disabled:opacity-50"
-          title="Verify your phone to unlock calling — your workspace accepts calls only from your verified number, and the AI can call you back"
-        >
-          <ShieldCheck className="h-3 w-3" />
-          Verify your phone to start calling
-        </button>
       )}
 
       {phoneNumbers.length > 0 && (

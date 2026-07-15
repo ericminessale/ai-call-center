@@ -1,10 +1,12 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Search, Phone } from 'lucide-react';
+import { Search, Phone, Lock, ShieldCheck } from 'lucide-react';
 import { Call, QueueConfig } from '../../types/callcenter';
 import { CallListSkeletonGroup } from '../shared/Skeleton';
 import { getQueueDisplayName } from '../../lib/queueColors';
 import { SegmentedControl, RailLiveCallRow } from '../restraint';
 import type { RestraintStatus } from '../restraint';
+import { useAuthStore } from '../../stores/authStore';
+import { useVerifyStore } from '../../stores/verifyStore';
 
 interface ActiveCallsListProps {
   calls: Call[];
@@ -154,6 +156,37 @@ export function ActiveCallsList({ calls, onSelectCall, isLoading, queueConfigs, 
 }
 
 function EmptyState() {
+  // In hosted demo, an unverified visitor CAN'T receive calls yet (inbound
+  // is rejected until their number is bound). Show the honest locked state
+  // that ties the empty list to the verification action, rather than a
+  // misleading "all quiet."
+  const isDemo = useAuthStore((s) => s.runtimeConfig?.demo_mode);
+  const isVisitor = useAuthStore((s) => s.user != null && s.user.workspace_id != null);
+  const verified = useVerifyStore((s) => s.verified);
+  const hydrated = useVerifyStore((s) => s.hydrated);
+
+  if (isDemo && isVisitor && hydrated && !verified) {
+    return (
+      <div className="p-8 text-center">
+        <div className="relative mx-auto mb-3 w-fit">
+          <Phone className="w-5 h-5 text-ink-dim" />
+          <Lock className="w-3 h-3 text-status-warning absolute -right-1.5 -bottom-1" />
+        </div>
+        <p className="text-[15px] font-semibold text-ink-muted mb-1">
+          Calls are locked
+        </p>
+        <p className="text-[12px] text-ink-dim leading-relaxed max-w-[240px] mx-auto">
+          Verify your phone to start receiving calls — then a call to the demo
+          number rings your AI and lands here.
+        </p>
+        <p className="mt-2 inline-flex items-center gap-1 text-[11.5px] text-ai-soft">
+          <ShieldCheck className="w-3 h-3" />
+          Use the “Verify your phone” card at the top.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="p-8 text-center">
       <Phone className="w-5 h-5 mx-auto mb-3 text-ink-dim" />

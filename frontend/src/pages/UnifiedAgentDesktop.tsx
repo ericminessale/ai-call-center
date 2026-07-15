@@ -5,7 +5,10 @@ import { useCallFabricContext, ConnectedCustomer } from '../contexts/CallFabricC
 import { useSocket } from '../hooks/useSocket';
 import { UnifiedHeader } from '../components/unified/UnifiedHeader';
 import { DemoBanner } from '../components/shared/DemoBanner';
+import { PhoneVerificationCard } from '../components/shared/PhoneVerificationCard';
 import { useDemoLeaseHeartbeat } from '../hooks/useDemoLeaseHeartbeat';
+import { useDemoVerification } from '../hooks/useDemoVerification';
+import { useVerifyStore } from '../stores/verifyStore';
 import { LeftPanel } from '../components/unified/LeftPanel';
 import { IncomingCallBanner } from '../components/unified/IncomingCallBanner';
 import { SettingsPanel } from '../components/unified/SettingsPanel';
@@ -33,11 +36,25 @@ export function UnifiedAgentDesktop() {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, logout } = useAuthStore();
+  const runtimeConfig = useAuthStore((s) => s.runtimeConfig);
+  const verifyHydrated = useVerifyStore((s) => s.hydrated);
+  const isVerified = useVerifyStore((s) => s.verified);
+  // Show the prominent verification card only for an UNVERIFIED demo
+  // visitor (not platform operators; not until the status has hydrated, so
+  // it doesn't flash for an already-verified returning visitor).
+  const showVerifyCard =
+    !!runtimeConfig?.demo_mode &&
+    user != null && user.workspace_id != null &&
+    verifyHydrated && !isVerified;
 
   // Hosted-demo only: keep the visitor's persona lease alive while
   // the dashboard is open, release it on tab close. No-op outside
   // demo mode.
   useDemoLeaseHeartbeat();
+  // Hosted-demo only: hydrate + live-update the shared phone-verification
+  // state consumed by the banner, the verification card, and the telephony
+  // lock hints. No-op outside demo mode / for platform operators.
+  useDemoVerification();
 
   // Determine initial view mode from URL
   const getInitialViewMode = (): ViewMode => {
@@ -738,6 +755,11 @@ export function UnifiedAgentDesktop() {
       {/* Hosted-demo strip — renders only when DEMO_MODE=true on the
           backend. No-op in production-shape deployments. */}
       <DemoBanner />
+
+      {/* Prominent verification card — only while an unverified demo visitor
+          hasn't linked their phone; collapses to the banner's Verified badge
+          on success. */}
+      {showVerifyCard && <PhoneVerificationCard />}
 
       {/* Incoming Call Banner - show for inbound calls */}
       {callFabric.callState === 'ringing' && callFabric.activeCall && callFabric.activeCall.direction === 'inbound' && (

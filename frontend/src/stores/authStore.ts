@@ -99,6 +99,8 @@ export const useAuthStore = create<AuthState>((set) => ({
     localStorage.removeItem('access_token');
     localStorage.removeItem('refresh_token');
     websocket.disconnect();
+    // Clear demo verification state so it can't leak into the next session.
+    void import('./verifyStore').then((m) => m.useVerifyStore.getState().reset());
     set({ user: null, workspace: null, isAuthenticated: false });
   },
 

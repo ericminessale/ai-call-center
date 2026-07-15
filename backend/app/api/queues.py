@@ -1252,11 +1252,30 @@ def toggle_queue_activation(assignment_id):
 @queues_bp.route('/available', methods=['GET'])
 @require_auth
 def get_available_queues():
-    """Returns all active queues annotated with the calling agent's assignment state.
-    Used by the status dropdown for queue opt-in."""
+    """Returns the caller's active queues annotated with their assignment state.
+    Used by the status dropdown for queue opt-in.
+
+    Scoped to the caller's workspace EXPLICITLY (not via the ambient
+    auto-filter): a platform user — the hosted operator, or a clone-and-own
+    admin — runs unscoped, and an unqualified query would return every
+    visitor workspace's cloned queues (the same leak `/config/active` was
+    hardened against). Falls back to the default/template workspace for a
+    platform user, which is the single workspace in clone-and-own and the
+    canonical queue set in hosted mode."""
     try:
+        from app.tenancy import current_workspace_id, DEFAULT_WORKSPACE_ID
         user_id = request.current_user.id
-        queues = Queue.get_active_queues()
+        ws_id = (
+            current_workspace_id()
+            or request.current_user.workspace_id
+            or DEFAULT_WORKSPACE_ID
+        )
+        queues = (
+            Queue.query
+            .filter_by(is_active=True, workspace_id=ws_id)
+            .order_by(Queue.display_name)
+            .all()
+        )
 
         # Build lookup of existing assignments for this user
         assignments = QueueAgentAssignment.query.filter_by(user_id=user_id).all()

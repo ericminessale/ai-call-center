@@ -38,6 +38,7 @@ import { PendingCallbackBanner } from './PendingCallbackBanner';
 import { ConferenceParticipants } from './ConferenceParticipants';
 import { ObserverControls } from '../shared/ObserverControls';
 import { useAuthStore } from '../../stores/authStore';
+import { useVerifyStore } from '../../stores/verifyStore';
 import { useCallCapabilities } from '../../hooks/useCallCapabilities';
 import { useContactPanelMode } from '../../hooks/useContactPanelMode';
 import { logger } from '../../lib/logger';
@@ -163,6 +164,13 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   const [isOnHold, setIsOnHold] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const { user: currentUser } = useAuthStore();
+  // Hosted-demo outbound is verify-first: an unverified visitor can't place
+  // calls, and even verified the demo only reaches their own number. Gate
+  // the contact "Call" button proactively so it isn't a click-to-fail.
+  const demoMode = useAuthStore((s) => !!s.runtimeConfig?.demo_mode);
+  const isDemoVisitor = useAuthStore((s) => s.user != null && s.user.workspace_id != null);
+  const verifyDone = useVerifyStore((s) => s.verified);
+  const demoCallGated = demoMode && isDemoVisitor;
 
   // Per-call capability set, used to gate transport-specific UI like
   // ObserverControls (Listen) and ConferenceParticipants. Bridge-mode calls
@@ -987,14 +995,27 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
                 <Button
                   variant="primary"
                   onClick={handleCall}
-                  disabled={isInitializing}
+                  disabled={isInitializing || demoCallGated}
                   icon={<Phone className="w-3.5 h-3.5" />}
+                  title={
+                    demoCallGated
+                      ? (verifyDone
+                          ? 'In the demo, calls go to your own verified number — use "Have the AI call me"'
+                          : 'Verify your phone to enable calling')
+                      : undefined
+                  }
                 >
                   {isInitializing ? 'Connecting…' : 'Call'}
                 </Button>
-                <Button variant="secondary" onClick={handleSendAI} icon={<Bot className="w-3.5 h-3.5" />}>
-                  Send AI agent
-                </Button>
+                {/* "Send AI agent" dials the CONTACT in production, but in the
+                    demo the backend forces the visitor's own verified number —
+                    so it would be misleading here. Hidden in demo; the banner's
+                    "Have the AI call me" is the honest equivalent. */}
+                {!demoCallGated && (
+                  <Button variant="secondary" onClick={handleSendAI} icon={<Bot className="w-3.5 h-3.5" />}>
+                    Send AI agent
+                  </Button>
+                )}
                 {contact.email && (
                   <Button
                     variant="secondary"

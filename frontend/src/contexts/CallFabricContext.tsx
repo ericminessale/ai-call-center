@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from 'react';
 import { useAuthStore } from '../stores/authStore';
+import { useVerifyStore } from '../stores/verifyStore';
 import { useSocketContext } from './SocketContext';
 import { conferencesApi, callsApi } from '../services/api';
 import type { Conference, ConferenceParticipant } from '../types/callcenter';
@@ -768,23 +769,38 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   // If agent is in conference (available), use server-side dial-out to add to conference
   // If agent is offline, auto-switch to available first, then dial-out
   const makeCall = useCallback(async (phoneNumber: string, context?: any) => {
-    // Hosted-demo lockdown: refuse all outbound dial at the source
-    // before any backend call or WebRTC session setup. The user-
-    // facing toast shows immediately; the form/buttons that called
-    // us still render normally per the demo's "show what the
-    // platform does, just don't let it dial out" approach.
-    //
-    // Defense in depth: backend endpoints
+    // Hosted-demo outbound is VERIFY-FIRST: a workspace's telephony surface
+    // is the visitor's own verified phone. Agent free-form WebRTC dial to an
+    // arbitrary number isn't part of that model, so we refuse it at the
+    // source (before backend/WebRTC setup) — but with an HONEST, verify-aware
+    // message that points to what actually works, not the old blanket
+    // "not available in demo mode." Backend endpoints
     // (/api/conferences/<n>/dial-out, /api/calls/initiate,
-    // /api/ai/outbound-call) also return 403 demo_blocked. This
-    // frontend gate exists because the agent-joins-outbound-
-    // conference path uses the Call Fabric SDK directly browser→SW,
-    // bypassing the backend entirely on the WebRTC half.
+    // /api/ai/outbound-call) enforce the real own-number-only rule; this
+    // gate covers the browser-direct SDK dial that bypasses the backend.
     const isDemo = useAuthStore.getState().runtimeConfig?.demo_mode;
     if (isDemo) {
       const { default: toast } = await import('react-hot-toast');
-      toast.error('Outbound dialing is not available in demo mode.');
-      const err: any = new Error('Outbound dialing not available in demo mode.');
+      const authUser = useAuthStore.getState().user;
+      const isVisitor = authUser != null && authUser.workspace_id != null;
+      if (!isVisitor) {
+        // Platform operator — no workspace / verified number of their own.
+        toast.error("Outbound calling isn't available on the operator account.");
+        const err: any = new Error('operator outbound unavailable');
+        err.code = 'demo_blocked';
+        throw err;
+      }
+      if (!useVerifyStore.getState().verified) {
+        toast.error('Verify your phone first — then the demo can place calls to your number.');
+        const err: any = new Error('verify required before outbound');
+        err.code = 'demo_verify_required';
+        throw err;
+      }
+      // Verified: the demo places calls to YOUR verified number only. The
+      // showcase outbound is "Have the AI call me" (AI dials your phone);
+      // free-form dial to some other number is intentionally out of scope.
+      toast.error('In the demo, outbound goes to your verified number — use "Have the AI call me."');
+      const err: any = new Error('demo dials the verified number only');
       err.code = 'demo_blocked';
       throw err;
     }

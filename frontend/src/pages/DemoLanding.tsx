@@ -8,13 +8,17 @@ import { BrandMark, useBrand } from '../components/shared/Brand';
  * Hosted-demo landing card.
  *
  * Replaces the production Login page when ``DEMO_MODE=true`` on the
- * backend. One-click "Start Demo" issues a JWT for a demo persona via
- * ``POST /api/demo/start`` and lands the visitor in the agent
- * dashboard already-online — no email, no password.
+ * backend. One-click "Start demo" provisions (or resumes) the visitor's
+ * own private WORKSPACE via ``POST /api/demo/start`` and lands them in
+ * the agent dashboard as its admin — no email, no password.
+ *
+ * The pitch is verify-first (§6.1): Start → text your pairing code →
+ * then dial. There is deliberately no "dial right now" framing — the
+ * workspace accepts inbound only from the visitor's verified number.
  *
  * The featured phone numbers come from the backend's runtime config
  * (env-driven via ``DEMO_PHONE_NUMBERS``). When unconfigured we just
- * skip the phone-number list and let the visitor explore the dashboard.
+ * skip the phone/verify steps and let the visitor explore the dashboard.
  *
  * In production-shape clone-and-own deployments this component is
  * never rendered — Login.tsx checks ``runtimeConfig.demo_mode`` and
@@ -35,6 +39,7 @@ export default function DemoLanding() {
   };
 
   const phoneNumbers = runtimeConfig?.demo_phone_numbers ?? [];
+  const ttlDays = runtimeConfig?.workspace_ttl_days ?? 7;
   const { productName, isWhiteLabeled } = useBrand();
 
   return (
@@ -83,35 +88,63 @@ export default function DemoLanding() {
               Try it
             </div>
             <h2 className="font-heading text-[30px] text-ink font-semibold leading-[1.1] tracking-heading">
-              See an AI call center in action.
+              Your own AI call center, in one click.
             </h2>
-            {/* UX-1: the "dial the number below" line only makes sense when
-                DEMO_PHONE_NUMBERS is configured (and the block below renders).
-                With no numbers set, point the visitor at the dashboard instead
-                of a phone number that isn't on the page. */}
             <p className="text-[13px] text-ink-muted mt-2 leading-relaxed">
+              Start a private workspace — your own queues, knowledge base, and
+              AI receptionist, yours to reconfigure as the admin.
               {phoneNumbers.length > 0 ? (
                 <>
-                  You'll be dropped into the agent dashboard as one of our demo
-                  agents. Dial the number below from your phone — the AI
-                  receptionist picks up, gathers context, and routes the call.
-                  You'll see it all live: live transcription, sentiment, AI
-                  tools invoked mid-call, the queue, the works.
+                  {' '}Link your phone and call in: the AI answers for your
+                  workspace, routes the call to you at the agent desk, and you
+                  watch transcription, sentiment, and routing decisions live.
                 </>
               ) : (
                 <>
-                  You'll be dropped into the agent dashboard as one of our demo
-                  agents, already online. Watch AI-handled calls arrive, take
-                  one over, and see it all live: transcription, sentiment, the
-                  queue, the works.
+                  {' '}Explore the agent desktop, tune the queues and knowledge
+                  base, and see how AI-first routing is put together.
                 </>
               )}
             </p>
           </div>
 
+          {/* Verify-first onboarding: calling requires pairing your phone
+              BEFORE any call — the workspace accepts inbound only from, and
+              dials outbound only to, the visitor's verified number. */}
+          {phoneNumbers.length > 0 && (
+            <div className="mb-6 space-y-2.5">
+              <div className="kicker">How it works</div>
+              {[
+                {
+                  n: 1,
+                  text: 'Start your workspace — instant, no signup.',
+                },
+                {
+                  n: 2,
+                  text: 'Text the pairing code from the dashboard to the demo number. That links your phone to your workspace.',
+                },
+                {
+                  n: 3,
+                  text: 'Call the demo number — your AI receptionist answers, and the call is yours end to end.',
+                },
+              ].map((step) => (
+                <div key={step.n} className="flex items-start gap-3">
+                  <span className="mt-0.5 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full border border-rule font-mono text-[10.5px] text-ai-soft">
+                    {step.n}
+                  </span>
+                  <span className="text-[12.5px] text-ink-muted leading-relaxed">
+                    {step.text}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
           {phoneNumbers.length > 0 && (
             <div className="mb-6 space-y-2">
-              <div className="kicker">Demo phone numbers</div>
+              <div className="kicker">
+                {phoneNumbers.length === 1 ? 'Demo number' : 'Demo numbers'}
+              </div>
               {phoneNumbers.map((p) => (
                 <div
                   key={p.number}
@@ -129,6 +162,10 @@ export default function DemoLanding() {
                   </a>
                 </div>
               ))}
+              <p className="text-[11px] text-ink-faint leading-relaxed">
+                Calls are accepted only from your verified phone — nobody else
+                can reach your workspace.
+              </p>
             </div>
           )}
 
@@ -150,14 +187,24 @@ export default function DemoLanding() {
 
           <div className="mt-6 pt-5 border-t border-rule text-center">
             <p className="text-[11.5px] text-ink-dim leading-relaxed">
-              This is a shared sandbox. Outbound dialing is disabled, and the
-              database resets nightly. No account, no email — just the platform.
+              Your workspace is private and lives for {ttlDays}{' '}
+              {ttlDays === 1 ? 'day' : 'days'} — each visit from this browser
+              extends it. No account, no email. Keep this browser to pick up
+              where you left off.
             </p>
           </div>
         </div>
 
         <p className="text-center mt-6 text-[11.5px] text-ink-dim">
           AI-first voice. Humans when it matters.
+        </p>
+        <p className="text-center mt-2 text-[10.5px]">
+          <a
+            href="/login?operator=1"
+            className="text-ink-faint hover:text-ink-muted transition-colors"
+          >
+            Operator sign-in
+          </a>
         </p>
       </div>
     </div>

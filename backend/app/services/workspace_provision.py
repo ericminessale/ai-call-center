@@ -203,6 +203,12 @@ def provision_workspace(session_token: str):
     bump_workspace_epoch(ws.public_id)
     mark_session_alive(ws.public_id)
 
+    try:
+        from app.services.demo_telemetry import bump_daily
+        bump_daily('ws_created')
+    except Exception:
+        pass
+
     logger.info("provisioned workspace %s (id=%d) for session %s",
                 ws.public_id, ws.id, session_token[:8])
     return ws, owner

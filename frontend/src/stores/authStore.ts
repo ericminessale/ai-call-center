@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { User } from '../types';
+import { DemoWorkspace, User } from '../types';
 import { authApi, demoApi, runtimeApi, RuntimeConfig } from '../services/api';
 import websocket from '../services/websocket';
 
@@ -19,12 +19,17 @@ interface AuthState {
   // hosted demo (in which case we render a landing card instead of the
   // login form). null until fetchRuntimeConfig() resolves on app boot.
   runtimeConfig: RuntimeConfig | null;
+  // Hosted demo only: the visitor's workspace (name/status/expires_at).
+  // Set by /demo/start, refreshed by the 60s heartbeat so the banner's
+  // lifetime display stays honest. null for real logins.
+  workspace: DemoWorkspace | null;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
   logout: () => void;
   checkAuth: () => Promise<void>;
   fetchRuntimeConfig: () => Promise<void>;
   startDemoSession: () => Promise<void>;
+  setWorkspace: (workspace: DemoWorkspace | null) => void;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
@@ -34,6 +39,7 @@ export const useAuthStore = create<AuthState>((set) => ({
   isCheckingAuth: true, // Start as true since we'll check on mount
   error: null,
   runtimeConfig: null,
+  workspace: null,
 
   login: async (email, password) => {
     set({ isLoading: true, error: null });
@@ -41,12 +47,18 @@ export const useAuthStore = create<AuthState>((set) => ({
       const response = await authApi.login(email, password);
       const { access_token, refresh_token, user } = response.data;
 
+      // A real password login supersedes any demo session this browser
+      // held (e.g. a platform operator who tried the demo first). Without
+      // this, checkAuth's demo-flag path silently swaps the operator back
+      // to the visitor workspace on the next reload.
+      localStorage.removeItem(DEMO_SESSION_FLAG);
+
       localStorage.setItem('access_token', access_token);
       localStorage.setItem('refresh_token', refresh_token);
 
       websocket.connect(access_token);
 
-      set({ user, isAuthenticated: true, isLoading: false });
+      set({ user, workspace: null, isAuthenticated: true, isLoading: false });
     } catch (error: any) {
       set({
         error: error.response?.data?.error || 'Login failed',
@@ -87,7 +99,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     localStorage.removeItem('access_token');
     localStorage.removeItem('refresh_token');
     websocket.disconnect();
-    set({ user: null, isAuthenticated: false });
+    set({ user: null, workspace: null, isAuthenticated: false });
   },
 
   checkAuth: async () => {
@@ -102,11 +114,11 @@ export const useAuthStore = create<AuthState>((set) => ({
     if (localStorage.getItem(DEMO_SESSION_FLAG) === '1') {
       try {
         const response = await demoApi.start();
-        const { access_token, refresh_token, user } = response.data;
+        const { access_token, refresh_token, user, workspace } = response.data;
         localStorage.setItem('access_token', access_token);
         localStorage.setItem('refresh_token', refresh_token);
         websocket.connect(access_token);
-        set({ user, isAuthenticated: true, isCheckingAuth: false });
+        set({ user, workspace: workspace ?? null, isAuthenticated: true, isCheckingAuth: false });
         return;
       } catch (error: any) {
         // Only drop the flag on definitive signals: demo turned off
@@ -141,7 +153,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       // Token is invalid or expired
       localStorage.removeItem('access_token');
       localStorage.removeItem('refresh_token');
-      set({ user: null, isAuthenticated: false, isCheckingAuth: false });
+      set({ user: null, workspace: null, isAuthenticated: false, isCheckingAuth: false });
     }
   },
 
@@ -165,14 +177,14 @@ export const useAuthStore = create<AuthState>((set) => ({
     set({ isLoading: true, error: null });
     try {
       const response = await demoApi.start();
-      const { access_token, refresh_token, user } = response.data;
+      const { access_token, refresh_token, user, workspace } = response.data;
       localStorage.setItem('access_token', access_token);
       localStorage.setItem('refresh_token', refresh_token);
       // Marks this browser as holding a demo session so checkAuth
       // restores it via /demo/start (lease-aware) instead of /auth/me.
       localStorage.setItem(DEMO_SESSION_FLAG, '1');
       websocket.connect(access_token);
-      set({ user, isAuthenticated: true, isLoading: false });
+      set({ user, workspace: workspace ?? null, isAuthenticated: true, isLoading: false });
     } catch (error: any) {
       set({
         error: error.response?.data?.error || 'Could not start demo session',
@@ -181,4 +193,6 @@ export const useAuthStore = create<AuthState>((set) => ({
       throw error;
     }
   },
+
+  setWorkspace: (workspace) => set({ workspace }),
 }));

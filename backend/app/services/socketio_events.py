@@ -192,6 +192,81 @@ def handle_authenticate(data):
     return True
 
 
+def _platform_user_from(data):
+    """Resolve the requesting PLATFORM user for the watch handlers, or None.
+
+    Workspace-bound sockets get exactly their own workspace room — a
+    visitor must never be able to watch another workspace, so anything
+    with a workspace_id is refused here, not just unauthenticated sockets.
+    """
+    token = (data or {}).get('token') or \
+        request.headers.get('Authorization', '').replace('Bearer ', '')
+    user_id = verify_token(token)
+    if not user_id:
+        emit('error', {'message': 'Invalid or expired token'})
+        return None
+    user = User.find_by_id(user_id)
+    if user is None or user.workspace_id is not None:
+        emit('error', {'message': 'Not available'})
+        return None
+    return user
+
+
+def _watched_workspace(data):
+    """Resolve the watch target Workspace row by public id, or None.
+
+    The template workspace is refused: it is the platform user's home room
+    (joined at connect), so watch would be a no-op and unwatch would cut
+    their own default event stream.
+    """
+    from app.models import Workspace
+    from app.tenancy import DEFAULT_WORKSPACE_ID
+    public_id = str((data or {}).get('workspace_id') or '').strip()
+    ws = Workspace.query.filter_by(public_id=public_id).first() if public_id else None
+    if ws is None or ws.id == DEFAULT_WORKSPACE_ID:
+        emit('error', {'message': 'Workspace not found'})
+        return None
+    return ws
+
+
+@socketio.on('watch_workspace')
+def handle_watch_workspace(data):
+    """Platform operator drills into one workspace's realtime stream.
+
+    Phase 5 operator view (closes Phase 3 deviation 24's deferral): joins
+    this socket to ``ws:{id}`` so every workspace-scoped emit — queue
+    updates, call lifecycle, config changes, verification — reaches the
+    operator live. The sid also lands in ``ws_clients:{id}`` so the 5s
+    wallboard treats the workspace as watched; disconnect cleanup already
+    sweeps every ws_clients set, so nothing leaks on a dropped socket.
+    """
+    user = _platform_user_from(data)
+    if user is None:
+        return
+    ws = _watched_workspace(data)
+    if ws is None:
+        return
+    join_room(workspace_room(ws.id))
+    add_to_set(ws_clients_key(ws.id), request.sid)
+    logger.info("watch_workspace: operator %s watching ws %s", user.id, ws.public_id)
+    emit('watching_workspace', {'workspace_id': ws.public_id})
+
+
+@socketio.on('unwatch_workspace')
+def handle_unwatch_workspace(data):
+    """Leave a watched workspace's realtime stream (Phase 5 operator view)."""
+    user = _platform_user_from(data)
+    if user is None:
+        return
+    ws = _watched_workspace(data)
+    if ws is None:
+        return
+    leave_room(workspace_room(ws.id))
+    remove_from_set(ws_clients_key(ws.id), request.sid)
+    logger.info("watch_workspace: operator %s stopped watching ws %s", user.id, ws.public_id)
+    emit('unwatched_workspace', {'workspace_id': ws.public_id})
+
+
 @socketio.on('join_call')
 def handle_join_call(data):
     """Join a call room to receive real-time updates.

@@ -231,6 +231,12 @@ def reap_workspace(ws: Workspace) -> dict[str, Any]:
     counts['redis_keys'] = _delete_workspace_redis_keys(ws_id)
 
     try:
+        from app.services.demo_telemetry import bump_daily
+        bump_daily('ws_reaped')
+    except Exception:
+        pass
+
+    try:
         socketio.emit('demo:reset', {
             'message': 'This workspace has expired — please start a new one.',
         }, room=workspace_room(ws_id))

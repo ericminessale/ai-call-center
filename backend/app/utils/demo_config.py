@@ -97,9 +97,20 @@ def runtime_config() -> dict:
     except Exception:
         branding = None
 
+    ttl_days = None
+    if is_demo_mode():
+        try:
+            from app.services.workspace_session import workspace_ttl_seconds
+            ttl_days = max(1, round(workspace_ttl_seconds() / 86400))
+        except Exception:
+            ttl_days = 7
+
     return {
         'demo_mode': is_demo_mode(),
         'demo_phone_numbers': demo_phone_numbers() if is_demo_mode() else [],
+        # Workspace lifetime for landing/banner copy — the operator can
+        # tune WORKSPACE_TTL_DAYS, so the UI must not hardcode "7 days".
+        'workspace_ttl_days': ttl_days,
         # White-label branding (IMP-02) — public by design: the login page
         # must render the brand before any auth exists. Name/logo/colors
         # only, never secrets.

@@ -200,6 +200,19 @@ PAIR_INVALID = 'INVALID_CODE'
 PAIR_NUMBER_TAKEN = 'NUMBER_TAKEN'
 PAIR_NO_NUMBER = 'NO_NUMBER'
 
+# NOTE (Phase 5, security): an SMS "re-claim" flow was prototyped here —
+# texting a fresh workspace's code from a number already bound to a
+# different live workspace would move that older workspace onto the new
+# browser's cookie. It was REVERTED before shipping: the pairing code is a
+# bearer secret shown on-screen, so an attacker could create a workspace,
+# read its code, and social-engineer a victim into texting it — handing the
+# attacker the victim's workspace (KB, contacts, call history, verified
+# number). A single inbound SMS cannot prove the code's browser and the
+# sender's phone belong to the same person, so cross-browser transfer is
+# fundamentally unsafe. A number already bound to a live workspace stays
+# NUMBER_TAKEN; the 7-day session cookie remains the lost-session recovery
+# path. See MULTI_TENANCY_DESIGN.md "Phase 5 deviations".
+
 
 def pair_number(code: str, number: str) -> dict:
     """Bind a verified phone number to the workspace that owns ``code``.
@@ -236,7 +249,10 @@ def pair_number(code: str, number: str) -> dict:
 
     # One number ↔ one live workspace. If this number is already bound to a
     # DIFFERENT workspace that is still live, refuse — otherwise the binding
-    # is stale (workspace gone) and we take it over.
+    # is stale (workspace gone) and we take it over. We deliberately do NOT
+    # transfer the existing workspace to this code's browser: the code is a
+    # bearer secret and the SMS can't prove the two belong to one person
+    # (see the reverted re-claim note above).
     existing = _unpack(redis_client.get(_number_key(norm)))
     if existing is not None:
         existing_ws, _existing_uid = existing
@@ -261,6 +277,12 @@ def pair_number(code: str, number: str) -> dict:
             db.session.commit()
     except Exception as exc:  # noqa: BLE001
         logger.warning("demo_verify: verified_number mirror write failed: %s", exc)
+
+    try:
+        from app.services.demo_telemetry import bump_daily
+        bump_daily('ws_verified')
+    except Exception:
+        pass
 
     logger.info(
         "demo_verify: paired number %s → workspace %s (user %s)",
@@ -452,6 +474,11 @@ def note_rejected_inbound(from_number: Optional[str], entry_point: str) -> None:
         redis_client = get_redis_client()
         if redis_client is not None:
             redis_client.incr(REJECTED_COUNTER_KEY)
+    except Exception:
+        pass
+    try:
+        from app.services.demo_telemetry import bump_daily
+        bump_daily('inbound_rejected')
     except Exception:
         pass
     try:

@@ -1,6 +1,6 @@
 import axios from 'axios';
 import io, { Socket } from 'socket.io-client';
-import { AuthResponse, Call, CallsListResponse, Transcription } from '../types';
+import { AuthResponse, Call, CallsListResponse, DemoWorkspace, Transcription } from '../types';
 import { Contact, ContactMinimal, ContactsListResponse, Interaction, InteractionsListResponse } from '../types/callcenter';
 
 // CRITICAL: Set axios defaults to prevent it from using window.location.origin
@@ -128,6 +128,9 @@ import type { Branding } from '../lib/branding';
 export interface RuntimeConfig {
   demo_mode: boolean;
   demo_phone_numbers: DemoPhoneNumber[];
+  // Workspace lifetime in days (hosted demo only) — feeds landing/banner
+  // copy so it tracks the operator's WORKSPACE_TTL_DAYS.
+  workspace_ttl_days?: number | null;
   // White-label branding (IMP-02); null/absent means stock SignalWire.
   branding?: Branding | null;
 }
@@ -145,10 +148,15 @@ export const runtimeApi = {
 // for the cookie to roundtrip — verified in the api client config.
 export const demoApi = {
   start: () => api.post<AuthResponse>('/api/demo/start'),
-  heartbeat: () => api.post<{ ok: boolean }>('/api/demo/heartbeat'),
+  heartbeat: () =>
+    api.post<{ ok: boolean; seat_held: boolean; workspace: DemoWorkspace | null }>(
+      '/api/demo/heartbeat'
+    ),
   end: () => api.post<{ ok: boolean; released: boolean }>('/api/demo/end'),
   status: () =>
-    api.get<{ leased: boolean; persona: any | null }>('/api/demo/status'),
+    api.get<{ leased: boolean; persona: any | null; workspace: DemoWorkspace | null }>(
+      '/api/demo/status'
+    ),
   // Phone verification (pairing-code flow).
   pairingCode: () =>
     api.post<{ code: string }>('/api/demo/verify/pairing-code'),
@@ -411,11 +419,57 @@ export const contactsApi = {
     api.get<{ contacts: ContactMinimal[] }>('/api/contacts/active'),
 };
 
+// Platform operator's workspace roster row (Phase 5 operator view).
+export interface WorkspaceRosterRow {
+  id: string;
+  name: string;
+  status: string;
+  is_template: boolean;
+  created_at: string | null;
+  last_active_at: string | null;
+  expires_at: string | null;
+  verified_number: string | null; // masked
+  connected_clients: number;
+  users: number;
+  queues: number;
+  calls: number;
+  contacts: number;
+}
+
+export interface DemoStats {
+  demo_mode: boolean;
+  pool_size: number;
+  provisioned: number;
+  active_leases: number;
+  workspaces: {
+    active: number;
+    verified: number;
+    verified_pct: number;
+    created_by_day: { date: string; count: number }[];
+    reaped_by_day: { date: string; count: number }[];
+  };
+  inbound_rejected: {
+    total: number;
+    by_day: { date: string; count: number }[];
+  };
+}
+
 // Admin API
 export const adminApi = {
   // Agent routing config
   getAgentConfig: () =>
     api.get('/api/admin/agent-config'),
+
+  // Platform operator view (Phase 5) — platform admins only (403
+  // `platform_only` for workspace-bound admins).
+  listWorkspaces: () =>
+    api.get<{ workspaces: WorkspaceRosterRow[]; total: number }>('/api/admin/workspaces'),
+  reapWorkspace: (publicId: string) =>
+    api.post<{ ok: boolean; summary: Record<string, unknown> }>(
+      `/api/admin/workspaces/${publicId}/reap`
+    ),
+  demoStats: () =>
+    api.get<DemoStats>('/api/admin/demo/stats'),
   updateAgentConfig: (config: Record<string, string>) =>
     api.put('/api/admin/agent-config', config),
 

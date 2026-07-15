@@ -633,7 +633,28 @@ def broadcast_queue_updates():
         active_socket_workspace_ids, workspace_room, ws_key,
     )
 
-    for ws_id in active_socket_workspace_ids(redis_client):
+    from app.models import Workspace
+
+    active_ids = list(active_socket_workspace_ids(redis_client))
+    # Public id rides along in each queue dict (additive — the agent desktop
+    # ignores it) so a platform operator watching a foreign workspace room
+    # can attribute wallboard ticks. Batch the id→public_id map in ONE query
+    # per tick instead of a SELECT per active workspace (this loop runs every
+    # 5s from the monitor thread).
+    public_ids = {}
+    if active_ids:
+        public_ids = {
+            w.id: w.public_id
+            for w in Workspace.query.filter(Workspace.id.in_(active_ids)).all()
+        }
+
+    for ws_id in active_ids:
+        # Skip a workspace whose row was deleted (reaped) between the
+        # ws_clients read and now — emitting workspace:null would defeat the
+        # operator watch-feed's attribution filter.
+        ws_public = public_ids.get(ws_id)
+        if ws_public is None:
+            continue
         queues_data = []
         slugs = [
             q.slug
@@ -662,6 +683,7 @@ def broadcast_queue_updates():
             queues_data.append({
                 'id': queue_id,
                 'name': queue_id.capitalize(),
+                'workspace': ws_public,
                 'waiting': queue_depth,
                 'avgWait': int(avg_wait),
                 'longest': int(longest_wait),

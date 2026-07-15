@@ -21,20 +21,34 @@ def get_redis_client():
         except Exception as exc:
             logger.debug("Cached Redis client failed ping (%s); trying fresh connection", exc)
 
-    # Try to create a new connection with IP fallback
+    # Try to create a new connection with IP fallback. Honor REDIS_URL so
+    # the fallback carries the same credentials/db as the primary client —
+    # prod Redis runs with `requirepass`, and hardcoding a password-less
+    # `redis://redis:6379/0` here made this path fail auth (NOAUTH) and
+    # return None whenever the cached global client was unavailable.
+    import os
     import redis
+    from urllib.parse import urlsplit, urlunsplit
+    redis_url = os.getenv('REDIS_URL', 'redis://redis:6379/0')
     try:
-        # Try hostname first
-        client = redis.from_url('redis://redis:6379/0', decode_responses=True)
+        # Try the configured host first.
+        client = redis.from_url(redis_url, decode_responses=True)
         client.ping()
         return client
-    except:
+    except Exception:
         try:
-            # Fallback to IP
-            client = redis.from_url('redis://172.18.0.3:6379/0', decode_responses=True)
+            # IP fallback — swap only the host, preserving any userinfo
+            # (password), port, and db path from REDIS_URL.
+            parts = urlsplit(redis_url)
+            userinfo = ''
+            if parts.username or parts.password:
+                userinfo = f"{parts.username or ''}:{parts.password or ''}@"
+            netloc = f"{userinfo}172.18.0.3:{parts.port or 6379}"
+            ip_url = urlunsplit((parts.scheme, netloc, parts.path or '/0', '', ''))
+            client = redis.from_url(ip_url, decode_responses=True)
             client.ping()
             return client
-        except:
+        except Exception:
             return None
 
 

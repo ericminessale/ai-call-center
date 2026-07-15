@@ -120,11 +120,29 @@ services:
       FLASK_APP: app
       FLASK_ENV: production
 
+      # TENANCY_MODE gates the hosted multi-workspace demo (per-visitor
+      # workspaces, verify-first inbound, workspace reaper). DEMO_MODE is
+      # the legacy alias — either flag works, both default off so a
+      # clone-and-own prod deploy is single-workspace with zero behavior
+      # change (§12).
+      TENANCY_MODE: ${TENANCY_MODE:-false}
       DEMO_MODE: ${DEMO_MODE:-false}
       DEMO_PHONE_NUMBERS: ${DEMO_PHONE_NUMBERS:-}
+      SEAT_POOL_SIZE: ${SEAT_POOL_SIZE:-20}
       DEMO_POOL_SIZE: ${DEMO_POOL_SIZE:-20}
+      SEAT_LEASE_TTL_SECONDS: ${SEAT_LEASE_TTL_SECONDS:-300}
       DEMO_LEASE_TTL_SECONDS: ${DEMO_LEASE_TTL_SECONDS:-300}
+      WORKSPACE_TTL_DAYS: ${WORKSPACE_TTL_DAYS:-7}
+      MAX_WORKSPACES: ${MAX_WORKSPACES:-200}
       DEMO_INBOUND_CAP_PER_HOUR: ${DEMO_INBOUND_CAP_PER_HOUR:-10}
+      # Per-workspace resource caps (§4.3). Only enforced in TENANCY_MODE;
+      # empty = module defaults.
+      WORKSPACE_CAP_QUEUES: ${WORKSPACE_CAP_QUEUES:-}
+      WORKSPACE_CAP_COLLECTIONS: ${WORKSPACE_CAP_COLLECTIONS:-}
+      WORKSPACE_CAP_DOCUMENTS: ${WORKSPACE_CAP_DOCUMENTS:-}
+      WORKSPACE_CAP_CONTACTS: ${WORKSPACE_CAP_CONTACTS:-}
+      WORKSPACE_CAP_USERS: ${WORKSPACE_CAP_USERS:-}
+      WORKSPACE_CAP_CALLBACKS: ${WORKSPACE_CAP_CALLBACKS:-}
       # nginx (this stack) + optionally Cloudflare in front. Default 2 assumes
       # Cloudflare→nginx; set 1 if nginx is directly internet-facing.
       TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-2}

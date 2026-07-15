@@ -25,6 +25,7 @@ import {
   Activity,
   RotateCcw,
   Palette,
+  Building2,
 } from 'lucide-react';
 import { adminApi } from '../../services/api';
 import { useAuthStore } from '../../stores/authStore';
@@ -33,6 +34,7 @@ import { ConfirmModal } from '../shared/ConfirmModal';
 import { Chip, Checkbox } from '../restraint';
 import { ExternalToolsTab } from './ExternalToolsTab';
 import { WebhookLogTab } from './WebhookLogTab';
+import { WorkspacesTab } from './WorkspacesTab';
 
 // =============================================================================
 // Shared Types
@@ -195,7 +197,7 @@ interface QueueAgentAssignment {
   skill_level: number;
 }
 
-type SettingsTabId = 'phone-numbers' | 'queues' | 'agents' | 'knowledge' | 'external-tools' | 'branding' | 'users' | 'webhooks';
+type SettingsTabId = 'phone-numbers' | 'queues' | 'agents' | 'knowledge' | 'external-tools' | 'branding' | 'users' | 'webhooks' | 'workspaces';
 
 
 // =============================================================================
@@ -206,6 +208,13 @@ export function SettingsPanel() {
   const [activeTab, setActiveTab] = useState<SettingsTabId>('phone-numbers');
   // Cross-tab navigation: AgentsTab can request opening a collection in KnowledgeBaseTab
   const [focusCollectionId, setFocusCollectionId] = useState<number | null>(null);
+  // Platform operator's workspace roster (Phase 5): only meaningful on a
+  // hosted multi-workspace install, and only for platform-level admins
+  // (workspace_id null). Clone-and-own admins are platform-level too, but
+  // demo_mode is off there, so the tab stays hidden.
+  const { user, runtimeConfig } = useAuthStore();
+  const showWorkspacesTab =
+    !!runtimeConfig?.demo_mode && user != null && user.workspace_id == null;
 
   const handleNavigateToCollection = (collectionId: number) => {
     setFocusCollectionId(collectionId);
@@ -286,6 +295,15 @@ export function SettingsPanel() {
             active={activeTab === 'webhooks'}
             onClick={() => handleTabChange('webhooks')}
           />
+          {showWorkspacesTab && (
+            <TabButton
+              id="workspaces"
+              icon={<Building2 className="w-3.5 h-3.5" />}
+              label="Workspaces"
+              active={activeTab === 'workspaces'}
+              onClick={() => handleTabChange('workspaces')}
+            />
+          )}
         </nav>
       </div>
 
@@ -299,6 +317,7 @@ export function SettingsPanel() {
         {activeTab === 'branding' && <BrandingTab />}
         {activeTab === 'users' && <UserManagementTab />}
         {activeTab === 'webhooks' && <WebhookLogTab />}
+        {activeTab === 'workspaces' && showWorkspacesTab && <WorkspacesTab />}
       </div>
     </div>
   );

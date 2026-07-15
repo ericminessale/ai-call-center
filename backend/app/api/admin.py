@@ -1792,6 +1792,26 @@ def demo_stats():
             .filter(Workspace.id != DEFAULT_WORKSPACE_ID)
             .count()
         )
+        verified_workspaces = (
+            Workspace.query
+            .filter(Workspace.status == Workspace.STATUS_ACTIVE)
+            .filter(Workspace.id != DEFAULT_WORKSPACE_ID)
+            .filter(Workspace.verified_number.isnot(None))
+            .count()
+        )
+
+    # Daily event counters (Phase 5 telemetry). Redis-backed because reaped
+    # workspaces delete their DB rows — created/day can't be reconstructed.
+    from app.services.demo_telemetry import read_daily_series
+    from app.services.demo_verify import REJECTED_COUNTER_KEY
+    from app.services.redis_service import get_redis_client
+    rejected_total = 0
+    try:
+        _r = get_redis_client()
+        raw = _r.get(REJECTED_COUNTER_KEY) if _r is not None else None
+        rejected_total = int(raw) if raw is not None else 0
+    except Exception:
+        rejected_total = 0
 
     return jsonify({
         'demo_mode': is_demo_mode(),
@@ -1800,5 +1820,120 @@ def demo_stats():
         'active_leases': leased,
         'workspaces': {
             'active': active_workspaces,
+            'verified': verified_workspaces,
+            'verified_pct': (
+                round(100.0 * verified_workspaces / active_workspaces, 1)
+                if active_workspaces else 0.0
+            ),
+            'created_by_day': read_daily_series('ws_created'),
+            'reaped_by_day': read_daily_series('ws_reaped'),
+        },
+        'inbound_rejected': {
+            'total': rejected_total,
+            'by_day': read_daily_series('inbound_rejected'),
         },
     }), 200
+
+
+@admin_bp.route('/workspaces', methods=['GET'])
+def list_workspaces():
+    """Platform operator's workspace roster (Phase 5 operator view).
+
+    One row per workspace with lifecycle timestamps, verification state
+    (masked — operators don't need the full number), connected-socket
+    count, and per-workspace row counts. Bounded by MAX_WORKSPACES (~200),
+    so a single unpaginated response with grouped count queries is fine.
+    """
+    platform_only = _require_platform_admin()
+    if platform_only:
+        return jsonify(platform_only[0]), platform_only[1]
+
+    from sqlalchemy import func
+
+    from app.models import Call, Contact, Queue, User, Workspace
+    from app.services.demo_verify import mask_number
+    from app.services.redis_service import get_redis_client
+    from app.services.ws_rooms import ws_clients_key
+    from app.tenancy import DEFAULT_WORKSPACE_ID, workspace_context
+
+    def _counts_by_ws(model):
+        rows = (
+            db.session.query(model.workspace_id, func.count(model.id))
+            .group_by(model.workspace_id)
+            .all()
+        )
+        return {ws_id: count for ws_id, count in rows}
+
+    with workspace_context(None):
+        workspaces = Workspace.query.order_by(
+            Workspace.last_active_at.desc().nullslast()
+        ).all()
+        users_by_ws = _counts_by_ws(User)
+        queues_by_ws = _counts_by_ws(Queue)
+        calls_by_ws = _counts_by_ws(Call)
+        contacts_by_ws = _counts_by_ws(Contact)
+
+    redis_client = None
+    try:
+        redis_client = get_redis_client()
+    except Exception:
+        pass
+
+    def _connected(ws_id: int) -> int:
+        if redis_client is None:
+            return 0
+        try:
+            return int(redis_client.scard(ws_clients_key(ws_id)))
+        except Exception:
+            return 0
+
+    rows = []
+    for ws in workspaces:
+        rows.append({
+            'id': ws.public_id,
+            'name': ws.name,
+            'status': ws.status,
+            'is_template': ws.id == DEFAULT_WORKSPACE_ID,
+            'created_at': ws.created_at.isoformat() if ws.created_at else None,
+            'last_active_at': ws.last_active_at.isoformat() if ws.last_active_at else None,
+            'expires_at': ws.expires_at.isoformat() if ws.expires_at else None,
+            'verified_number': mask_number(ws.verified_number),
+            'connected_clients': _connected(ws.id),
+            'users': users_by_ws.get(ws.id, 0),
+            'queues': queues_by_ws.get(ws.id, 0),
+            'calls': calls_by_ws.get(ws.id, 0),
+            'contacts': contacts_by_ws.get(ws.id, 0),
+        })
+    return jsonify({'workspaces': rows, 'total': len(rows)}), 200
+
+
+@admin_bp.route('/workspaces/<public_id>/reap', methods=['POST'])
+def reap_workspace_now(public_id):
+    """Manually reap one workspace (Phase 5 operator view).
+
+    Same code path the hourly GC runs — rows in dependency order, Redis
+    ``ws:{id}:*`` keys, verify bindings, seat release, epoch bump — so an
+    operator can retire an abusive or stuck workspace without waiting for
+    its TTL. The template workspace is never reapable.
+    """
+    platform_only = _require_platform_admin()
+    if platform_only:
+        return jsonify(platform_only[0]), platform_only[1]
+
+    from app.models import Workspace
+    from app.tenancy import DEFAULT_WORKSPACE_ID, workspace_context
+
+    with workspace_context(None):
+        ws = Workspace.query.filter_by(public_id=public_id).first()
+        if ws is None:
+            return jsonify({'error': 'Workspace not found'}), 404
+        if ws.id == DEFAULT_WORKSPACE_ID:
+            return jsonify({'error': 'The template workspace cannot be reaped'}), 400
+        from app.services.demo_reset import reap_workspace
+        counts = reap_workspace(ws)
+
+    if counts.get('error'):
+        return jsonify({'error': 'Reap failed', 'detail': counts['error']}), 500
+    logger.warning("admin: workspace %s manually reaped by %s",
+                   public_id, getattr(request.current_user, 'email', '?'))
+    return jsonify({'ok': True, 'summary': counts}), 200

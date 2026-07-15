@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
 import { AlertCircle, Eye, EyeOff, Loader2 } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -13,11 +13,14 @@ export default function Login() {
   const { login, isLoading, error, runtimeConfig } = useAuthStore();
   const { productName, isWhiteLabeled } = useBrand();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
 
   // Hosted-demo deployment: render the no-signup landing card instead
   // of the login form. Production-shape deployments fall through to
-  // the normal login flow below.
-  if (runtimeConfig?.demo_mode) {
+  // the normal login flow below. ``?operator=1`` (linked discreetly from
+  // the landing card) reaches the real form on a hosted install — the
+  // platform operator's password login is not demo-blocked server-side.
+  if (runtimeConfig?.demo_mode && !searchParams.get('operator')) {
     return <DemoLanding />;
   }
 
@@ -26,7 +29,17 @@ export default function Login() {
     try {
       await login(email, password);
       toast.success('Welcome back');
-      navigate('/');
+      // Operator sign-in on a hosted demo install: the page may have already
+      // connected its sockets as a demo VISITOR (checkAuth's demo-flag
+      // restore on load). A soft navigate leaves those sockets authenticated
+      // as the visitor, so the operator's realtime UI (incl. the workspace
+      // watch feed) would show visitor-workspace events. Force a full reload
+      // so every socket re-auths as the operator.
+      if (runtimeConfig?.demo_mode) {
+        window.location.assign('/');
+      } else {
+        navigate('/');
+      }
     } catch {
       toast.error('Login failed. Check your credentials.');
     }

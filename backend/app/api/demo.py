@@ -236,7 +236,10 @@ def heartbeat_demo_session():
         refresh_bindings(user.workspace_id)
     except Exception:
         pass
-    return jsonify({'ok': True, 'seat_held': seat_held})
+    # Workspace lifetime rides the heartbeat (Phase 5 expiry UX): the touch
+    # above may have just extended expires_at, so the banner's countdown
+    # stays honest without another request.
+    return jsonify({'ok': True, 'seat_held': seat_held, 'workspace': workspace.to_dict()})
 
 
 @demo_bp.route('/demo/end', methods=['POST'])
@@ -325,9 +328,10 @@ def get_demo_session_status():
         return _refuse_when_demo_off()
     session_token = _request_session_token()
     if not session_token:
-        return jsonify({'leased': False, 'persona': None})
+        return jsonify({'leased': False, 'persona': None, 'workspace': None})
     result = resume_workspace(session_token)
     return jsonify({
         'leased': result is not None,
         'persona': result[1].to_dict() if result else None,
+        'workspace': result[0].to_dict() if result else None,
     })

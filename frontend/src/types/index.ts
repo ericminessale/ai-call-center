@@ -15,6 +15,10 @@ export interface User {
   role?: string; // 'agent' | 'supervisor' | 'admin'
   is_active: boolean;
   created_at: string;
+  // Tenancy: null = platform-level user (hosted operator / clone-and-own
+  // admin), number = workspace-bound (hosted demo visitor + colleagues).
+  // Gates the platform-only Workspaces view.
+  workspace_id?: number | null;
   languages?: string[]; // BCP-47 codes (e.g. ["en-US", "es-ES"])
   // Resolved flag map after role defaults merge with per-user overrides.
   // UI gates observer controls off this. Shipped on every /auth/me response.
@@ -36,6 +40,18 @@ export interface AuthResponse {
   expires_in: number;
   user: User;
   message: string;
+  // Hosted demo only (/api/demo/start): the visitor's workspace, including
+  // its expiry — feeds the banner's lifetime display.
+  workspace?: DemoWorkspace;
+}
+
+// Hosted-demo workspace lifecycle info (id = public id).
+export interface DemoWorkspace {
+  id: string;
+  name: string;
+  status: string;
+  created_at: string | null;
+  expires_at: string | null;
 }
 
 export interface Call {

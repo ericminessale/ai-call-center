@@ -7,14 +7,14 @@ from flask import Blueprint, jsonify, request, current_app
 from app.services.queue_service import QueueService
 from app.services.redis_service import get_redis_client
 from app.services.callcenter_socketio import emit_call_update
-from app.utils.decorators import require_auth
+from app.utils.decorators import require_auth, require_role
 from app.utils.demo_config import block_in_demo_mode, is_demo_mode
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.utils.webhook_auth import require_webhook_auth
 from app import db
 from app.models import Call, User, Conference, ConferenceParticipant, CallLeg, Contact
 from app.models.queue import Queue, QueueAgentAssignment
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import json
 import os
@@ -770,6 +770,79 @@ def update_agent_status():
     except Exception as e:
         logger.error(f"Error updating agent status: {str(e)}")
         return jsonify({"error": "Failed to update status"}), 500
+
+
+@queues_bp.route('/agents/scorecards', methods=['GET'])
+@require_auth
+@require_role('supervisor', 'admin')
+def get_agent_scorecards():
+    """Per-agent performance over a window — the supervisor scorecard feed.
+
+    Same Call-table basis as get_agent_metrics (the self-serve variant
+    below), but grouped across every active user and joined with live
+    queue-service presence. One grouped query; agents with no handled
+    calls in the window still appear with zeroes.
+    """
+    from sqlalchemy import func
+
+    period_hours = request.args.get('period_hours', 24, type=int)
+    if not period_hours or period_hours < 1 or period_hours > 24 * 90:
+        period_hours = 24
+    since = datetime.utcnow() - timedelta(hours=period_hours)
+
+    try:
+        handle_secs = (
+            func.extract('epoch', Call.ended_at)
+            - func.extract('epoch', Call.answered_at)
+        )
+        rows = (
+            db.session.query(
+                Call.assigned_agent_id.label('agent_id'),
+                func.count(Call.id).label('calls_handled'),
+                func.avg(handle_secs).label('aht'),
+                func.sum(handle_secs).label('talk'),
+                func.avg(Call.sentiment_score).label('avg_sentiment'),
+                func.sum(Call.return_count).label('returns'),
+            )
+            .filter(
+                Call.assigned_agent_id.isnot(None),
+                Call.created_at >= since,
+                Call.answered_at.isnot(None),
+                Call.ended_at.isnot(None),
+            )
+            .group_by(Call.assigned_agent_id)
+            .all()
+        )
+        by_agent = {row.agent_id: row for row in rows}
+
+        service = get_queue_service(workspace_id=request.current_user.workspace_id)
+        users = User.query.filter(User.is_active == True).order_by(User.name, User.email).all()  # noqa: E712
+
+        scorecards = []
+        for u in users:
+            row = by_agent.get(u.id)
+            presence = service.get_agent_status(str(u.id)) or {}
+            scorecards.append({
+                'user_id': u.id,
+                'name': u.name or u.email,
+                'email': u.email,
+                'role': u.role,
+                'status': presence.get('status', 'offline'),
+                'calls_handled': int(row.calls_handled) if row else 0,
+                'average_handle_time': round(float(row.aht or 0), 1) if row else 0.0,
+                'total_talk_time': int(row.talk or 0) if row else 0,
+                'average_sentiment': (
+                    round(float(row.avg_sentiment), 2)
+                    if row and row.avg_sentiment is not None else None
+                ),
+                'returned_to_queue': int(row.returns or 0) if row else 0,
+            })
+
+        return jsonify({'period_hours': period_hours, 'agents': scorecards})
+
+    except Exception as e:
+        logger.error(f"Error building agent scorecards: {str(e)}")
+        return jsonify({"error": "Failed to get scorecards"}), 500
 
 
 @queues_bp.route('/agent/metrics', methods=['GET'])

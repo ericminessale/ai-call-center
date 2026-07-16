@@ -107,6 +107,7 @@ Five AI agents ship out-of-box; all are Python-defined using the SignalWire Agen
 - Upload documents via the admin UI; trigger reindex to regenerate embeddings.
 - AI agents query their bound collection at runtime via SWAIG function calls.
 - Assignments are dynamic — reindex a collection and agents pick up new content on the next conversation, no restart needed.
+- The human-agent **Factbook** search (manual, from-transcript, auto, and coach lookups) derives its collection from the call's queue — queue → AI agent route → collection assignment — so a support call searches the support KB, not a hardcoded default.
 
 ### Context preservation
 
@@ -129,6 +130,8 @@ AI agents report sentiment events (score, reason, timestamp) during the call. Th
 ### Online presence
 
 Agents toggle between Available / Busy / After-Call / Break / Offline. The Call Fabric SDK initializes on Available; queue routing only considers agents in the Available state.
+
+When a call ends, the agent drops into After-Call automatically with a **60-second ACW countdown** shown in the status pill — it auto-returns them to Available at zero. Manually selecting After-Call is deliberate and never expires.
 
 ### Queue opt-in
 
@@ -188,8 +191,8 @@ All of the following operate on calls the agent is *on*:
 Observer controls surface in the **Supervisor** tab and in the **Active Calls** list for calls the viewer isn't participating in. They are permission-gated separately from role.
 
 - **Listen** — silent monitoring. For AI calls, uses SignalWire's `tap` to stream audio to a WebSocket-backed AudioMonitor component in the viewer's browser. For human calls, does a silent conference join.
-- **Whisper** — *planned as an observer action.* The `can_whisper` permission, capability plumbing, and UI scaffolding exist, but the supervisor-initiated endpoint and button are hidden until wired. (Agent-initiated whisper is live today via "Escalate to Supervisor".)
-- **Barge** — *planned as an observer action.* Same status: `can_barge` permission and capability scaffolding exist; a full-audio join is currently reachable only through the agent-initiated escalation path.
+- **Whisper** — coach an agent mid-call with one-way audio. Joins the conference with SignalWire's `coach` member shape: the supervisor hears the whole room but is heard only by the agent's leg. Gated on `can_whisper`. (Agent-initiated whisper also exists via "Escalate to Supervisor".)
+- **Barge** — insert yourself into the call with full audio. Silent-entry full-participant conference join; leaving never tears the call down. Gated on `can_barge`.
 
 ### Transfer to AI specialist
 
@@ -244,6 +247,7 @@ When the call ends, the call detail view becomes the review workspace:
 - Live list of every active call with visual indicators for AI-vs-human handling, sentiment, VIP status, and "needs attention" flags (sentiment-negative or duration-long).
 - Queue depth bar chart and call distribution donut, rendered in real time.
 - **SLA wallboard** — per-queue service level vs. threshold, abandon rate, offered/answered counts (24h), and longest current wait, pushed live over Socket.IO.
+- **Agent scorecards** — per-agent table over a 24h/7d window: live presence, calls handled, average handle time, total talk time, average sentiment, and returns-to-queue. Supervisor/admin only.
 - Per-call monitoring entry — click to drill in and observe.
 
 ### Multi-agent conferencing modes
@@ -412,11 +416,8 @@ Every inbound SignalWire webhook is logged as a `WebhookEvent` row and browsable
 The items below are on the roadmap but not yet live. Listed here for completeness so this document stays honest about scope. (Audited against the code 2026-07-16.)
 
 - **Warm transfer with briefing** — agent-to-agent handoff with spoken context. The previous transfer endpoint was removed after an audit found it desynced DB state from the actual SignalWire call (LIFE-02); the replacement path via conference `move_participant` plus a consult-then-handoff flow is designed but not wired. Return-to-Queue and Request-Backup cover the interim.
-- **After-call work (ACW) timer** — the After-Call presence state exists and auto-engages on call end, but there's no countdown or auto-return-to-available. (Disposition codes shipped with the wrap-up panel.)
 - **IVR callback opt-in** — "press 1 for a callback" while waiting. The agent-facing callback queue (schedule / claim / dial / outcomes) is live; the caller-initiated IVR entry path is not.
-- **Agent analytics / scorecards UI** — the per-agent metrics endpoint (service level, handle times over a period) exists on the backend; no frontend consumes it yet beyond the live header counters.
 - **Transcript-synced recording scrubbing** — the inline player and download shipped; click-a-transcript-line-to-seek has not.
-- **Supervisor-initiated Whisper / Barge** — permissions and capability plumbing shipped; the observer-surface endpoints and buttons stay hidden until wired (see "Observer actions").
 - **Named routing profiles** — per-number routing modes (AI triage / AI specialist / direct-to-queue) shipped; reusable named profiles beyond that have not.
 - **Per-agent prompt editor** — KB bindings and external tools are already UI-editable; prompts intentionally stay in code (see "Architecture principle"), so this remains an open design question rather than a commitment.
 - **Post-call survey** via the SDK's survey prefab.

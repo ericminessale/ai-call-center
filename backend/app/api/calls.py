@@ -339,10 +339,12 @@ def get_call(call_id):
 def kb_search(call_id):
     """KB Factbook: pgvector retrieval over a single collection.
 
-    Body: {query: str, collection_name: str, top_k?: int (1-20, default 5)}
-    Auto-derivation of collection_name from queue/agent assignment lands later.
+    Body: {query: str, collection_name?: str, top_k?: int (1-20, default 5)}
+    When collection_name is omitted it's derived from the call's queue →
+    AI-agent → collection assignment (kb_collection_for_queue).
     """
     import requests as http_requests
+    from app.services.knowledge import kb_collection_for_queue
 
     call = None
     if call_id.isdigit():
@@ -355,12 +357,11 @@ def kb_search(call_id):
     data = request.get_json(silent=True) or {}
     query = (data.get('query') or '').strip()
     top_k = data.get('top_k', 5)
-    collection_name = (data.get('collection_name') or '').strip()
+    collection_name = (data.get('collection_name') or '').strip() or \
+        kb_collection_for_queue(call.queue_id, call.workspace_id)
 
     if not query:
         return jsonify({'error': 'query is required'}), 400
-    if not collection_name:
-        return jsonify({'error': 'collection_name is required'}), 400
     if not isinstance(top_k, int) or top_k < 1 or top_k > 20:
         top_k = 5
 
@@ -390,12 +391,15 @@ def kb_search(call_id):
 def kb_search_from_transcript(call_id):
     """KB Factbook: search KB using the last N final caller utterances as the query.
 
-    Body: {collection_name: str, n_utterances?: int (1-20, default 5), top_k?: int (1-20, default 5)}
+    Body: {collection_name?: str, n_utterances?: int (1-20, default 5), top_k?: int (1-20, default 5)}
+    When collection_name is omitted it's derived from the call's queue →
+    AI-agent → collection assignment (kb_collection_for_queue).
     Returns {success, collection_name, query, results, [note]}. ``note`` is set
     when there were no caller utterances to derive a query from — in that case
     results is empty but it's not a hard error.
     """
     import requests as http_requests
+    from app.services.knowledge import kb_collection_for_queue
 
     call = None
     if call_id.isdigit():
@@ -408,10 +412,9 @@ def kb_search_from_transcript(call_id):
     data = request.get_json(silent=True) or {}
     n_utterances = data.get('n_utterances', 5)
     top_k = data.get('top_k', 5)
-    collection_name = (data.get('collection_name') or '').strip()
+    collection_name = (data.get('collection_name') or '').strip() or \
+        kb_collection_for_queue(call.queue_id, call.workspace_id)
 
-    if not collection_name:
-        return jsonify({'error': 'collection_name is required'}), 400
     if not isinstance(n_utterances, int) or n_utterances < 1 or n_utterances > 20:
         n_utterances = 5
     if not isinstance(top_k, int) or top_k < 1 or top_k > 20:

@@ -324,10 +324,10 @@ export function LiveCallTab({
     setFactbookNote(null);
     setFactbookSearched(true);
     try {
-      // TODO: auto-derive collection_name from user's queue → AgentCollectionAssignment (M3-final / M5)
+      // collection_name is derived server-side from the call's queue →
+      // agent → collection assignment; omit it to get the right KB.
       const resp = await api.post(`/api/calls/${callSid}/kb-search`, {
         query: factbookQuery.trim(),
-        collection_name: 'sales_knowledge',
         top_k: 5,
       });
       setFactbookResults(resp.data.results || []);
@@ -348,7 +348,6 @@ export function LiveCallTab({
     setFactbookSearched(true);
     try {
       const resp = await api.post(`/api/calls/${callSid}/kb-search-from-transcript`, {
-        collection_name: 'sales_knowledge',
         n_utterances: 3,
         top_k: 5,
       });

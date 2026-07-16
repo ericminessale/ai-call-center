@@ -3,6 +3,7 @@ from app import db, socketio
 from app.api import webhooks_bp
 from app.models import Call, CallLeg, Transcription, WebhookEvent
 from app.models.user import User
+from app.services.knowledge import DEFAULT_KB_COLLECTION, kb_collection_for_queue
 from app.services.redis_service import publish_event
 from app.utils.webhook_auth import require_webhook_auth
 from datetime import datetime
@@ -125,7 +126,8 @@ def _trigger_kb_auto_search_if_enabled(call, call_sid_str):
         resp = http_requests.post(
             f"{ai_agents_url}/search",
             json={
-                'collection_name': 'sales_knowledge',  # TODO: derive from queue / agent assignment
+                'collection_name': kb_collection_for_queue(
+                    call.queue_id, call.workspace_id),
                 'query': query,
                 'top_k': 3,
             },
@@ -1225,12 +1227,19 @@ def coach_lookup_kb():
                 'response': 'No query provided — ask the agent for clarification.',
             }), 200
 
-        # Choose the collection. For now, defaults to sales_knowledge — same
-        # placeholder as the Factbook auto-search. Once per-queue collection
-        # assignments land (roadmap), derive from global_data.queue_slug.
+        # Choose the collection from the call's queue (same derivation as the
+        # Factbook auto-search). global_data carries call_db_id + queue_slug
+        # from coach.py; the Call row is the trusted workspace anchor — this
+        # is a public webhook, so nothing else in the payload picks a tenant.
         global_data = data.get('global_data') or {}
-        queue_slug = global_data.get('queue_slug')  # noqa: F841 — TODO use this
-        collection_name = 'sales_knowledge'
+        collection_name = DEFAULT_KB_COLLECTION
+        call_db_id = global_data.get('call_db_id')
+        if isinstance(call_db_id, int) or (isinstance(call_db_id, str) and call_db_id.isdigit()):
+            kb_call = db.session.get(Call, int(call_db_id))
+            if kb_call is not None:
+                queue_slug = global_data.get('queue_slug') or kb_call.queue_id
+                collection_name = kb_collection_for_queue(
+                    queue_slug, kb_call.workspace_id)
 
         ai_agents_url = os.getenv('AI_AGENTS_ADMIN_URL', 'http://ai-agents:8081')
         try:

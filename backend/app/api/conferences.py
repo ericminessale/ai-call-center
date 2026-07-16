@@ -516,6 +516,24 @@ def agent_conference_webhook():
             join_params["end_on_exit"] = False
             logger.info(f"Escalation whisper/coach mode: supervisor {agent_id} coaching agent SID {agent_call_sid}")
 
+        elif join_type == 'whisper' and agent_call_sid:
+            # Supervisor-INITIATED whisper (observer surface) — same coach
+            # shape as escalation whisper, but the supervisor started it from
+            # a call they're not on (call_control observe/whisper).
+            join_params["coach"] = agent_call_sid
+            join_params["beep"] = "false"
+            join_params["start_on_enter"] = False
+            join_params["end_on_exit"] = False
+            logger.info(f"Observer whisper mode: supervisor {agent_id} coaching agent SID {agent_call_sid}")
+
+        elif join_type == 'barge':
+            # Supervisor-INITIATED barge (observer surface) — full
+            # participant with silent entry; leaving never ends the call.
+            join_params["beep"] = "false"
+            join_params["start_on_enter"] = False
+            join_params["end_on_exit"] = False
+            logger.info(f"Observer barge mode: supervisor {agent_id} joining as full participant")
+
         elif join_type in ('backup', 'escalation'):
             # Backup agent or supervisor (non-whisper) — full participant, silent entry
             join_params["beep"] = "false"

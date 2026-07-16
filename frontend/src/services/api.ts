@@ -693,6 +693,14 @@ export const callControlApi = {
   stopMonitor: (callId: number | string) =>
     api.post<{ success: boolean; monitor_type: string }>(`/api/call-control/${callId}/monitor/stop`),
 
+  // Observer whisper/barge (supervisor-initiated, permission-gated). Both
+  // return a dial_address the browser dials via Call Fabric
+  // (startObserverCall); hanging up that call is the stop action.
+  observeWhisper: (callId: number | string) =>
+    api.post<{ success: boolean; mode: 'whisper'; token: string; dial_address: string; conference_name: string }>(`/api/call-control/${callId}/observe/whisper`),
+  observeBarge: (callId: number | string) =>
+    api.post<{ success: boolean; mode: 'barge'; token: string; dial_address: string; conference_name: string }>(`/api/call-control/${callId}/observe/barge`),
+
   // Return-to-Queue (Tier 2p) — drop the agent off the call, send the caller
   // back to queue routing with the original AI context preserved. Reason is
   // mandatory + must be one of the codes the backend recognises. Soft cap at
@@ -745,7 +753,27 @@ export const queueApi = {
   // SLA wallboard aggregate (IMP-18)
   getWallboard: () =>
     api.get('/api/queues/wallboard'),
+  // Per-agent scorecards (supervisor/admin only)
+  getAgentScorecards: (periodHours?: number) =>
+    api.get<{ period_hours: number; agents: AgentScorecard[] }>(
+      '/api/queues/agents/scorecards',
+      { params: periodHours ? { period_hours: periodHours } : undefined },
+    ),
 };
+
+// Row shape from GET /api/queues/agents/scorecards
+export interface AgentScorecard {
+  user_id: number;
+  name: string;
+  email: string;
+  role: string;
+  status: string;
+  calls_handled: number;
+  average_handle_time: number;
+  total_talk_time: number;
+  average_sentiment: number | null;
+  returned_to_queue: number;
+}
 
 // WebSocket service - now uses a shared socket from SocketContext
 // This is a legacy compatibility layer. Prefer using useSocketContext() in components.

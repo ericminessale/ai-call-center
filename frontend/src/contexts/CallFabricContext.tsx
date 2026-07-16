@@ -106,6 +106,12 @@ interface CallFabricContextType {
   setOnCustomerConnected: (callback: ((customer: ConnectedCustomer) => void) | undefined) => void;
   clearConnectedCustomer: () => void;
 
+  // ACW countdown — seconds left in the after-call window when the agent
+  // was auto-dropped into 'after-call' by a call ending; null otherwise.
+  // Expires back to 'available' automatically. Manual After-Call is
+  // deliberate and never auto-expires.
+  acwSecondsLeft: number | null;
+
   // Actions
   setAgentStatus: (status: AgentStatusType) => Promise<void>;
   initializeClient: () => Promise<void>;
@@ -132,6 +138,13 @@ interface CallFabricContextType {
 
   // Takeover calls (connect to existing call via SWML)
   makeCallToSwml: (swmlUrl: string, context?: any) => Promise<any>;
+
+  // Observer dial (supervisor whisper/barge on a call you're NOT on).
+  // Deliberately separate from the participant state machine — an observer
+  // join must not flip isInConference/activeCall or the participant UI.
+  observerCallState: 'idle' | 'connecting' | 'active';
+  startObserverCall: (dialAddress: string) => Promise<void>;
+  stopObserverCall: () => Promise<void>;
 
   // Pending call assignment (when customer routed but agent hasn't joined yet)
   pendingCallAssignment: CallAssignment | null;
@@ -342,6 +355,22 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
   const rootElementRef = useRef<HTMLDivElement | null>(null);
   const inviteRef = useRef<any>(null);
   const takeoverCallSidRef = useRef<string | null>(null);
+
+  // Observer dial (supervisor whisper/barge) — kept off the participant
+  // state machine so observing never reads as "on a call" to the rest of
+  // the UI. One observer call at a time.
+  const observerCallRef = useRef<any>(null);
+  const [observerCallState, setObserverCallState] = useState<'idle' | 'connecting' | 'active'>('idle');
+
+  // ACW (after-call work) countdown. Only runs when the busy→after-call
+  // auto-transition set acwAutoEnteredRef — a manually chosen After-Call
+  // never expires. The pre-existing setAgentStatusRef (above) breaks the
+  // countdown effect's dependency on the setAgentStatus callback identity
+  // (which changes with client state and would otherwise reset the
+  // countdown mid-window).
+  const ACW_SECONDS = 60;
+  const [acwSecondsLeft, setAcwSecondsLeft] = useState<number | null>(null);
+  const acwAutoEnteredRef = useRef(false);
   const initializingRef = useRef(false);
 
   // Get subscriber token from backend
@@ -1300,6 +1329,70 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     }
   }, [client, user]);
 
+  // Observer dial — join a conference-join dial address (from the backend's
+  // observe/whisper or observe/barge endpoints) WITHOUT touching the
+  // participant state machine. Hanging up (stopObserverCall) is the only
+  // teardown; the conference status callback handles the member-leave event.
+  const startObserverCall = useCallback(async (dialAddress: string) => {
+    if (!client || !user) {
+      throw new Error('Client or user not ready');
+    }
+    if (observerCallRef.current) {
+      throw new Error('Already observing a call');
+    }
+    try {
+      logger.debug('👂 [CallFabric] Observer dialing:', dialAddress);
+      setObserverCallState('connecting');
+      const call = await client.dial({
+        to: dialAddress,
+        rootElement: rootElementRef.current,
+        audio: true,
+        video: false,
+        userVariables: {
+          agent_id: Number(user.id),
+          call_type: 'observer',
+        },
+      });
+
+      call.on('call.state', (state: any) => {
+        logger.debug('👂 [CallFabric] Observer call state:', state);
+        if (state === 'active' || state === 'answered') {
+          setObserverCallState('active');
+        } else if (state === 'ending' || state === 'ended') {
+          setObserverCallState('idle');
+          observerCallRef.current = null;
+        }
+      });
+      call.on('destroy', () => {
+        logger.debug('👂 [CallFabric] Observer call destroyed');
+        setObserverCallState('idle');
+        observerCallRef.current = null;
+      });
+
+      observerCallRef.current = call;
+      await call.start();
+      logger.debug('✅ [CallFabric] Observer call started');
+    } catch (error) {
+      logger.error('❌ [CallFabric] Observer dial failed:', error);
+      setObserverCallState('idle');
+      observerCallRef.current = null;
+      throw error;
+    }
+  }, [client, user]);
+
+  const stopObserverCall = useCallback(async () => {
+    const call = observerCallRef.current;
+    if (!call) return;
+    try {
+      await call.hangup();
+    } catch (error) {
+      logger.error('❌ [CallFabric] Observer hangup failed:', error);
+    } finally {
+      observerCallRef.current = null;
+      setObserverCallState('idle');
+    }
+  }, []);
+
   // Leave current conference (works for both agent and interaction conferences)
   const leaveConference = useCallback(async () => {
     if (!isInConference || !conferenceCallRef.current) {
@@ -1893,9 +1986,37 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       setAgentStatus('busy');
     } else if (callState === 'idle' && agentStatus === 'busy') {
       logger.debug('🔄 [CallFabric] Auto-transition: busy → after-call (call ended)');
+      acwAutoEnteredRef.current = true;
       setAgentStatus('after-call');
     }
   }, [callState, agentStatus]);
+
+  // ACW timer — only for the auto-entered after-call state above. Counts
+  // down ACW_SECONDS then returns the agent to 'available'. Any manual
+  // status change cancels it (the status leaves 'after-call', which both
+  // clears the interval via cleanup and resets the auto-entered flag).
+  useEffect(() => {
+    if (agentStatus !== 'after-call' || !acwAutoEnteredRef.current) {
+      if (agentStatus !== 'after-call') acwAutoEnteredRef.current = false;
+      setAcwSecondsLeft(null);
+      return;
+    }
+    setAcwSecondsLeft(ACW_SECONDS);
+    const startedAt = Date.now();
+    const id = setInterval(() => {
+      const left = ACW_SECONDS - Math.floor((Date.now() - startedAt) / 1000);
+      if (left <= 0) {
+        clearInterval(id);
+        acwAutoEnteredRef.current = false;
+        setAcwSecondsLeft(null);
+        logger.debug('⏲️ [CallFabric] ACW window expired — auto-returning to available');
+        setAgentStatusRef.current('available').catch(() => {});
+      } else {
+        setAcwSecondsLeft(left);
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [agentStatus]);
 
   // Handle auto-restore when client is initialized
   // This handles page refresh: if agent was 'available', restore their online status
@@ -2461,6 +2582,12 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     resetCallFabricState,
     // Takeover calls
     makeCallToSwml,
+    // Observer dial (whisper/barge)
+    observerCallState,
+    startObserverCall,
+    stopObserverCall,
+    // ACW countdown
+    acwSecondsLeft,
     // Pending call assignment
     pendingCallAssignment,
     acceptCallAssignment,

@@ -1101,3 +1101,114 @@ def escalate_to_supervisor(call_id):
     except Exception as e:
         logger.error(f"Failed to escalate call {call_id}: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+
+# ==================== Observer actions (whisper / barge) ====================
+#
+# Supervisor-INITIATED joins to a call the supervisor is NOT on — the
+# other half of the observer surface next to monitor/start (Listen).
+# Unlike escalate (agent asks, supervisor gets an assignment), here the
+# observer acts directly: we mint the same Redis conference_join token
+# prepare_conference_join uses, and the observer's browser dials the
+# returned resource address via Call Fabric. The agent-conference SWML
+# webhook (conferences.py) shapes the join from token['type']:
+#   whisper → join_conference with coach=<agent leg SID>: the supervisor
+#             hears the room but is heard ONLY by the agent.
+#   barge   → full-participant join, silent entry (no beep).
+# Conference-based (human-handled) calls only; AI calls have takeover.
+
+def _mint_observer_join(call, user, mode, agent_call_sid=None):
+    """Store observer-join params in Redis and return the dial payload."""
+    import uuid
+    token = str(uuid.uuid4())
+    token_data = {
+        'agent_id': str(user.id),
+        'conf': call.conference_name,
+        'call_id': str(call.id),
+        'type': mode,
+    }
+    if agent_call_sid:
+        token_data['agent_call_sid'] = agent_call_sid
+    redis_client = get_redis_client()
+    redis_client.setex(f'conference_join:{token}', 300, json.dumps(token_data))
+
+    resource_address = os.getenv('AGENT_CONFERENCE_RESOURCE', '/public/agent-conference-swml')
+    return {
+        'success': True,
+        'mode': mode,
+        'token': token,
+        'dial_address': f"{resource_address}?token={token}",
+        'conference_name': call.conference_name,
+    }
+
+
+@call_control_bp.route('/<call_id>/observe/whisper', methods=['POST'])
+@require_auth
+@require_permission('can_whisper')
+def observe_whisper(call_id):
+    """Supervisor-initiated whisper: coach the agent on a call you're not on.
+
+    Joins the call's conference with SignalWire's ``coach`` member shape —
+    the supervisor hears everything, but their audio reaches only the
+    agent's leg. Returns a ``dial_address`` the caller's browser dials via
+    Call Fabric; hanging that call up ends the whisper.
+    """
+    call = find_call(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+    if not call.conference_name:
+        return jsonify({'error': 'Whisper requires a conference-based call'}), 400
+
+    # Coach targeting needs the agent's live leg SID. Prefer the primary
+    # human agent leg; a backup agent's leg is an acceptable stand-in.
+    target_leg = (
+        CallLeg.query.filter_by(call_id=call.id, status='active')
+        .filter(CallLeg.leg_type.in_(['human_agent', 'backup']))
+        .filter(CallLeg.signalwire_sid.isnot(None))
+        .order_by(CallLeg.leg_number.asc())
+        .first()
+    )
+    if not target_leg:
+        return jsonify({
+            'error': 'No active human agent leg to whisper to',
+        }), 409
+
+    try:
+        payload = _mint_observer_join(
+            call, request.current_user, 'whisper', target_leg.signalwire_sid)
+        emit_call_event(call.id, 'conference', {
+            'action': 'whisper_started',
+            'supervisor': request.current_user.email,
+        }, call.signalwire_call_sid)
+        return jsonify(payload), 200
+    except Exception as e:
+        logger.error(f"Failed to prepare whisper for call {call_id}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@call_control_bp.route('/<call_id>/observe/barge', methods=['POST'])
+@require_auth
+@require_permission('can_barge')
+def observe_barge(call_id):
+    """Supervisor-initiated barge: join a call you're not on with full audio.
+
+    Full-participant conference join with silent entry (no beep). Returns a
+    ``dial_address`` the caller's browser dials via Call Fabric; hanging
+    that call up leaves the conference.
+    """
+    call = find_call(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+    if not call.conference_name:
+        return jsonify({'error': 'Barge requires a conference-based call'}), 400
+
+    try:
+        payload = _mint_observer_join(call, request.current_user, 'barge')
+        emit_call_event(call.id, 'conference', {
+            'action': 'barge_started',
+            'supervisor': request.current_user.email,
+        }, call.signalwire_call_sid)
+        return jsonify(payload), 200
+    except Exception as e:
+        logger.error(f"Failed to prepare barge for call {call_id}: {str(e)}")
+        return jsonify({'error': str(e)}), 500

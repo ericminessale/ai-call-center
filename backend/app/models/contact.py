@@ -161,9 +161,15 @@ class Contact(WorkspaceScoped, db.Model):
         if last_call:
             self.last_interaction_at = last_call.created_at
 
-        # TODO: average Call.sentiment_score into self.average_sentiment —
-        # the data exists now (calls carry sentiment_score); this rollup is
-        # the only missing piece. average_sentiment is already serialized.
+        # Average sentiment across calls that carry a score (stays None
+        # until at least one call has one)
+        from app.models.call import Call
+        avg = (
+            self.calls.filter(Call.sentiment_score.isnot(None))
+            .with_entities(func.avg(Call.sentiment_score))
+            .scalar()
+        )
+        self.average_sentiment = float(avg) if avg is not None else None
 
     @classmethod
     def find_by_phone(cls, phone):

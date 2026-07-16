@@ -21,6 +21,7 @@ import { queueApi } from '../../services/api';
 import toast from 'react-hot-toast';
 import { DemoTip, useDemoTip } from '../shared/DemoTip';
 import { useSocketContext } from '../../contexts/SocketContext';
+import { useCallFabricContext } from '../../contexts/CallFabricContext';
 import { Checkbox, Chip } from '../restraint';
 
 interface UnifiedHeaderProps {
@@ -146,6 +147,9 @@ export function UnifiedHeader({
   };
 
   const current = statusMeta[agentStatus];
+  // ACW countdown — shown inside the status pill while the auto-entered
+  // after-call window ticks down (auto-returns to Available at zero).
+  const { acwSecondsLeft } = useCallFabricContext();
   const activeQueueCount = availableQueues.filter(q => q.is_activated).length;
   const formatMMSS = (secs: number) =>
     `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
@@ -310,6 +314,14 @@ export function UnifiedHeader({
             >
               <span className={current.dotClass} />
               <span className={`text-[13px] font-medium ${current.textClass}`}>{current.label}</span>
+              {agentStatus === 'after-call' && acwSecondsLeft != null && (
+                <span
+                  className="mono text-[10px] px-1.5 py-0.5 rounded-sm text-wait-soft border border-rule-strong leading-none tabular-nums"
+                  title="After-call work — auto-returns to Available when the timer ends"
+                >
+                  {formatMMSS(acwSecondsLeft)}
+                </span>
+              )}
               {activeQueueCount > 0 && agentStatus !== 'offline' && (
                 <span className="mono text-[10px] px-1.5 py-0.5 rounded-sm bg-transparent text-ink-muted border border-rule-strong leading-none">
                   {activeQueueCount}

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Call } from '../../types/callcenter';
-import { callsApi, queueApi } from '../../services/api';
+import { callsApi, queueApi, AgentScorecard } from '../../services/api';
 import ObserverControls from '../shared/ObserverControls';
 import { FloorStatGrid, StatusDot, QueueDepthRow, AttentionBar, Button, AI_GLYPH } from '../restraint';
 import type { FloorStatTileProps, RestraintStatus } from '../restraint';
@@ -72,6 +72,23 @@ export function DashboardCharts({ activeCalls, queuedCalls, onSelectCall }: Dash
     const id = setInterval(load, 60000);
     return () => { cancelled = true; clearInterval(id); };
   }, []);
+
+  // Agent scorecards — per-agent performance over a selectable window.
+  // Supervisor/admin-only endpoint; errors are swallowed like the wallboard
+  // (this view only renders for those roles anyway).
+  const [scorecards, setScorecards] = useState<AgentScorecard[]>([]);
+  const [scorecardHours, setScorecardHours] = useState<24 | 168>(24);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      queueApi.getAgentScorecards(scorecardHours)
+        .then((res) => { if (!cancelled) setScorecards(res.data.agents || []); })
+        .catch(() => {});
+    };
+    load();
+    const id = setInterval(load, 30000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [scorecardHours]);
 
   const queueDepthMap: Record<string, number> = {};
   queuedCalls.forEach(c => {
@@ -186,6 +203,53 @@ export function DashboardCharts({ activeCalls, queuedCalls, onSelectCall }: Dash
         </div>
       )}
 
+      {/* Agent scorecards — per-agent performance table over 24h / 7d */}
+      {scorecards.length > 0 && (
+        <div className="px-7 pt-7">
+          <div className="flex items-baseline justify-between mb-3">
+            <span className="text-[11px] font-medium text-ink-dim">
+              Agent scorecards — last {scorecardHours === 24 ? '24h' : '7 days'}
+            </span>
+            <div className="flex items-center gap-1">
+              {([24, 168] as const).map((h) => (
+                <button
+                  key={h}
+                  type="button"
+                  onClick={() => setScorecardHours(h)}
+                  className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors ${
+                    scorecardHours === h
+                      ? 'bg-canvas-hover text-ink border border-rule-strong'
+                      : 'text-ink-dim hover:text-ink border border-transparent'
+                  }`}
+                >
+                  {h === 24 ? '24h' : '7d'}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="border border-rule rounded-lg bg-canvas-raised overflow-x-auto">
+            <table className="w-full text-left">
+              <thead>
+                <tr className="border-b border-rule">
+                  <th className="px-4 py-2.5 text-[10.5px] font-medium text-ink-dim uppercase tracking-wider">Agent</th>
+                  <th className="px-4 py-2.5 text-[10.5px] font-medium text-ink-dim uppercase tracking-wider">Status</th>
+                  <th className="px-4 py-2.5 text-[10.5px] font-medium text-ink-dim uppercase tracking-wider text-right">Calls</th>
+                  <th className="px-4 py-2.5 text-[10.5px] font-medium text-ink-dim uppercase tracking-wider text-right">Avg handle</th>
+                  <th className="px-4 py-2.5 text-[10.5px] font-medium text-ink-dim uppercase tracking-wider text-right">Talk time</th>
+                  <th className="px-4 py-2.5 text-[10.5px] font-medium text-ink-dim uppercase tracking-wider text-right">Sentiment</th>
+                  <th className="px-4 py-2.5 text-[10.5px] font-medium text-ink-dim uppercase tracking-wider text-right">Returns</th>
+                </tr>
+              </thead>
+              <tbody>
+                {scorecards.map((a) => (
+                  <ScorecardRow key={a.user_id} agent={a} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Cards row — Queue depth bars | Call distribution split (rs-cards 1.25fr 1fr) */}
       <div className="px-7 pt-3 grid grid-cols-[1.25fr_1fr] gap-2.5">
         {/* Queue depth — lightweight bars (rs-qrow), not a chart */}
@@ -271,6 +335,47 @@ export function DashboardCharts({ activeCalls, queuedCalls, onSelectCall }: Dash
         </div>
       )}
     </div>
+  );
+}
+
+function ScorecardRow({ agent }: { agent: AgentScorecard }) {
+  // Presence dot: green when takeable, amber when actively on calls,
+  // neutral for everything else (break / after-call / offline).
+  const presence: RestraintStatus =
+    agent.status === 'available' ? 'success' :
+    agent.status === 'busy'      ? 'warning' :
+    'neutral';
+  const sentiment = agent.average_sentiment;
+  return (
+    <tr className="border-b border-rule last:border-b-0">
+      <td className="px-4 py-2.5">
+        <div className="text-[12.5px] font-medium text-ink leading-tight">{agent.name}</div>
+        <div className="text-[10.5px] text-ink-dim">{agent.role}</div>
+      </td>
+      <td className="px-4 py-2.5">
+        <span className="inline-flex items-center gap-1.5 text-[11.5px] text-ink-muted capitalize">
+          <StatusDot status={presence} />
+          {agent.status.replace(/[-_]/g, ' ')}
+        </span>
+      </td>
+      <td className="px-4 py-2.5 text-right mono text-[12px] tabular-nums text-ink">
+        {agent.calls_handled}
+      </td>
+      <td className="px-4 py-2.5 text-right mono text-[12px] tabular-nums text-ink-muted">
+        {agent.calls_handled > 0 ? formatWaitShort(agent.average_handle_time) : '—'}
+      </td>
+      <td className="px-4 py-2.5 text-right mono text-[12px] tabular-nums text-ink-muted">
+        {agent.total_talk_time > 0 ? formatWaitShort(agent.total_talk_time) : '—'}
+      </td>
+      <td className={`px-4 py-2.5 text-right mono text-[12px] tabular-nums ${
+        sentiment != null && sentiment < -0.3 ? 'text-status-error' : 'text-ink-muted'
+      }`}>
+        {sentiment == null ? '—' : `${sentiment > 0 ? '+' : ''}${sentiment.toFixed(1)}`}
+      </td>
+      <td className="px-4 py-2.5 text-right mono text-[12px] tabular-nums text-ink-muted">
+        {agent.returned_to_queue || '—'}
+      </td>
+    </tr>
   );
 }
 

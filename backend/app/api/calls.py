@@ -682,7 +682,7 @@ def list_calls():
 
         # Get status filters (can be multiple)
         status_filters = request.args.getlist('status')  # e.g., ?status=waiting&status=ai_active
-        agent_id = request.args.get('agent_id')  # Filter by assigned agent
+        agent_id = request.args.get('agent_id', type=int)  # Filter by assigned agent
 
         # Query calls for the user
         from app import db
@@ -733,11 +733,9 @@ def list_calls():
             if internal_statuses:
                 query = query.filter(Call.status.in_(internal_statuses))
 
-        # Filter by agent if provided
+        # Filter by assigned agent if provided
         if agent_id:
-            # TODO: Add agent_id column to Call model
-            # query = query.filter(Call.agent_id == agent_id)
-            pass
+            query = query.filter(Call.assigned_agent_id == agent_id)
 
         # Add search functionality
         if search:
@@ -805,7 +803,11 @@ def map_to_dashboard_status(internal_status):
         'created': 'waiting',
         'ringing': 'waiting',
         'initiated': 'waiting',
-        'answered': 'ai_active',  # TODO: Distinguish AI vs human based on call routing
+        # 'answered' mislabels human-answered calls as ai_active here; AI
+        # handoffs set ai_active explicitly (swml.py, ai_control.py), and
+        # Call.handler_type is the real AI-vs-human source of truth. Kept
+        # until the dashboard status vocabulary grows a human_active state.
+        'answered': 'ai_active',
         'ended': 'completed',
         'completed': 'completed'
     }

@@ -74,7 +74,11 @@ def map_to_dashboard_status(internal_status):
         'created': 'waiting',
         'ringing': 'waiting',
         'initiated': 'waiting',
-        'answered': 'ai_active',  # TODO: Distinguish AI vs human based on call routing
+        # 'answered' mislabels human-answered calls as ai_active here; AI
+        # handoffs set ai_active explicitly (swml.py, ai_control.py), and
+        # Call.handler_type is the real AI-vs-human source of truth. Kept
+        # until the dashboard status vocabulary grows a human_active state.
+        'answered': 'ai_active',
         'ended': 'completed',
         'completed': 'completed'
     }

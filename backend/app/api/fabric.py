@@ -411,26 +411,6 @@ def list_subscribers():
         return jsonify({'error': str(e)}), 500
 
 
-@fabric_bp.route('/call/transfer', methods=['POST'])
-@jwt_required()
-def transfer_call():
-    """
-    Transfer an active call to another agent or queue.
-    TODO: Implement using conference-based transfers.
-    """
-    return jsonify({'error': 'Transfer not yet implemented. Use conference-based routing instead.'}), 501
-
-
-@fabric_bp.route('/call/record', methods=['POST'])
-@jwt_required()
-def toggle_recording():
-    """
-    Start or stop recording for an active call.
-    TODO: Implement using SignalWire REST API.
-    """
-    return jsonify({'error': 'Recording control not yet implemented.'}), 501
-
-
 @fabric_bp.route('/resources', methods=['GET'])
 @jwt_required()
 def list_resources():

@@ -161,7 +161,9 @@ class Contact(WorkspaceScoped, db.Model):
         if last_call:
             self.last_interaction_at = last_call.created_at
 
-        # TODO: Calculate average sentiment when we have sentiment data on calls
+        # TODO: average Call.sentiment_score into self.average_sentiment —
+        # the data exists now (calls carry sentiment_score); this rollup is
+        # the only missing piece. average_sentiment is already serialized.
 
     @classmethod
     def find_by_phone(cls, phone):

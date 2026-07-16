@@ -59,6 +59,17 @@ Additional per-queue knobs:
 
 Phone numbers can bypass the AI triage entirely and land callers directly in a specific queue's routing flow. Useful for published VIP lines or department-specific direct dials.
 
+### Callback queue
+
+Agent-facing callback management for callers who'd rather not wait:
+
+- Schedule a callback for a contact (agent-initiated or programmatic via API).
+- Pending callbacks are a shared pool — agents claim one, release it back, or dial it with one click.
+- Outcome tracking per attempt (success, no-answer, etc.) with real-time Socket.IO updates to everyone watching the pool.
+- Callback dials run answering-machine detection — voicemail gets a short message, not a stranded AI pitch.
+
+The caller-initiated IVR path ("press 1 for a callback and keep your place in line") is planned but not yet wired.
+
 ### Conference-based bridging
 
 Human agents join calls via **Call Fabric conferences**, not direct phone-to-phone bridges. This means:
@@ -139,6 +150,7 @@ When a call is active, the contact detail pane becomes the call workspace. Surfa
 - **Transcription feed** — AI-agent utterances streamed live via WebSocket.
 - **Sentiment indicator** — current emotional tone, updated as the AI observes shifts.
 - **Conference participants** — live list of everyone in the conference with type badges (caller / agent / AI / supervisor).
+- **Coach panel** — real-time AI assist for the human agent (see "Real-time agent assist" below).
 
 ### Active Calls / Queue / Supervisor tabs
 
@@ -169,14 +181,15 @@ All of the following operate on calls the agent is *on*:
 - **Live Translate toggle** — start or stop bidirectional real-time speech translation mid-call. Language picker lets the agent change the source or target pair without tearing down the session (stop + restart internally, since `live_translate` has no `update` action).
 - **Request Backup** — queues another agent into the current conference. Uses the queue routing system to find an available agent.
 - **Escalate to Supervisor** — adds a supervisor to the conference with optional whisper (coach-only audio).
+- **Return to Queue** — bounce the call back to a queue (same or different) with a reason code. Return count is tracked per call for analytics; the SLA clock is *not* reset (the caller's wait is their wait), and a soft cap of 2 returns forces escalation instead of infinite hot-potato.
 
 ### Observer actions (for calls you're NOT on)
 
 Observer controls surface in the **Supervisor** tab and in the **Active Calls** list for calls the viewer isn't participating in. They are permission-gated separately from role.
 
 - **Listen** — silent monitoring. For AI calls, uses SignalWire's `tap` to stream audio to a WebSocket-backed AudioMonitor component in the viewer's browser. For human calls, does a silent conference join.
-- **Whisper** — *planned.* Coach an agent mid-call with one-way audio.
-- **Barge** — *planned.* Insert yourself into the call with full audio.
+- **Whisper** — *planned as an observer action.* The `can_whisper` permission, capability plumbing, and UI scaffolding exist, but the supervisor-initiated endpoint and button are hidden until wired. (Agent-initiated whisper is live today via "Escalate to Supervisor".)
+- **Barge** — *planned as an observer action.* Same status: `can_barge` permission and capability scaffolding exist; a full-audio join is currently reachable only through the agent-initiated escalation path.
 
 ### Transfer to AI specialist
 
@@ -198,12 +211,39 @@ Ten languages configured by default: English (US), Spanish, French, German, Ital
 
 ---
 
+## Real-time agent assist (Coach)
+
+A per-call AI copilot for the human agent, built on SignalWire's `ai_sidecar` — the coach hears the live call audio and pushes help into the agent's UI without ever speaking on the call.
+
+- **Modes**: off / on-request / auto, selectable per agent. Auto mode volunteers suggestions as the conversation develops; on-request answers only when asked.
+- **Coaching suggestions** stream into the Coach panel in real time as the sidecar observes the call.
+- **Ask Coach** — the agent types a question mid-call and gets an answer grounded in the live conversation context.
+- **KB Factbook** — knowledge-base lookups surfaced alongside the conversation; in auto mode, the caller's latest utterances trigger a debounced KB search so relevant facts appear before the agent asks.
+- Permission-gated via `can_use_coach`; coach tone/behavior preset configurable by admins.
+
+Full design notes in `AGENT_ASSIST.md`.
+
+---
+
+## Post-call review & wrap-up
+
+When the call ends, the call detail view becomes the review workspace:
+
+- **Wrap-up panel** — disposition code + free-text agent notes. The AI's post-prompt report auto-fills both as a starting point, marked with a "Captured by AI" badge (`wrap_up_source`); the agent's edits take over from there.
+- **Recording playback** — inline audio player plus one-click download, straight from the call record.
+- **Sentiment arc** — a per-call timeline of sentiment segments showing how the caller's tone moved across the conversation, alongside the overall score.
+- **End-reason classification** — every call gets a deterministic technical ending (abandoned-in-queue, missed, caller-hangup, agent-hangup, premature-disconnect, failed, completed) distinct from the agent's business disposition. Drives the status chips in call history.
+- **Full transcript + event timeline** — the complete record of what was said and what happened, in one place.
+
+---
+
 ## Supervisor & observer surfaces
 
 ### Supervisor tab
 
 - Live list of every active call with visual indicators for AI-vs-human handling, sentiment, VIP status, and "needs attention" flags (sentiment-negative or duration-long).
 - Queue depth bar chart and call distribution donut, rendered in real time.
+- **SLA wallboard** — per-queue service level vs. threshold, abandon rate, offered/answered counts (24h), and longest current wait, pushed live over Socket.IO.
 - Per-call monitoring entry — click to drill in and observe.
 
 ### Multi-agent conferencing modes
@@ -259,6 +299,10 @@ Bridge customer-owned MCP (Model Context Protocol) servers into agents. Each row
 
 The pitch: every CCaaS says "we integrate with Salesforce." That took them 18 months and breaks when Salesforce changes. We say: paste your gateway URL. Your AI has whatever tools you exposed, in production, today.
 
+### Webhook Event Log
+
+Every inbound SignalWire webhook is logged as a `WebhookEvent` row and browsable from a dedicated Settings tab — filterable by event type, paginated, with expandable raw payloads. When a call misbehaves, the answer to "what did SignalWire actually send us?" is one click away instead of a grep through container logs.
+
 ### User Management
 
 - List every user account with role, languages, subscriber link status, creation date.
@@ -304,7 +348,7 @@ The pitch: every CCaaS says "we integrate with Salesforce." That took them 18 mo
 
 - AI calls auto-record via SWML.
 - Human calls support on-demand recording start/stop.
-- Recording URL stored on the Call record; accessible for download once the call ends.
+- Recording URL stored on the Call record; inline playback + download in the post-call review view.
 - Status endpoint lets the UI hydrate the button on mount so it reflects the real recording state.
 
 ### Transcription
@@ -318,6 +362,7 @@ The pitch: every CCaaS says "we integrate with Salesforce." That took them 18 mo
 - AI agents report sentiment events (score, reason, timestamp) during calls.
 - Live sentiment indicator on the agent UI.
 - Persisted for historical review and for supervisor "needs attention" flags.
+- Post-call **sentiment arc** — per-call timeline of sentiment segments in the review view.
 
 ---
 
@@ -364,21 +409,19 @@ The pitch: every CCaaS says "we integrate with Salesforce." That took them 18 mo
 
 ## What's planned but not yet shipped
 
-The items below are on the roadmap but not yet live. Listed here for completeness so this document stays honest about scope.
+The items below are on the roadmap but not yet live. Listed here for completeness so this document stays honest about scope. (Audited against the code 2026-07-16.)
 
-- **Post-call wrap-up UI** — AI summary, disposition codes, auto-CRM notes.
-- **Recording playback UI** — inline audio player with transcript-synced scrubbing.
-- **Sentiment arc visualization** — per-call sentiment timeline.
-- **Warm transfer with briefing** — agent-to-agent handoff with spoken context.
-- **After-call work (ACW) timer + disposition codes.**
-- **Callback queue** — "press 1 for callback" when wait is long.
-- **Agent analytics / scorecards**, **SLA dashboard**, **webhook event log viewer**, **video escalation**, **real-time agent assist.**
-- **Return caller to queue** — agent-initiated mid-call re-route to a different queue with reason code tracking.
+- **Warm transfer with briefing** — agent-to-agent handoff with spoken context. The previous transfer endpoint was removed after an audit found it desynced DB state from the actual SignalWire call (LIFE-02); the replacement path via conference `move_participant` plus a consult-then-handoff flow is designed but not wired. Return-to-Queue and Request-Backup cover the interim.
+- **After-call work (ACW) timer** — the After-Call presence state exists and auto-engages on call end, but there's no countdown or auto-return-to-available. (Disposition codes shipped with the wrap-up panel.)
+- **IVR callback opt-in** — "press 1 for a callback" while waiting. The agent-facing callback queue (schedule / claim / dial / outcomes) is live; the caller-initiated IVR entry path is not.
+- **Agent analytics / scorecards UI** — the per-agent metrics endpoint (service level, handle times over a period) exists on the backend; no frontend consumes it yet beyond the live header counters.
+- **Transcript-synced recording scrubbing** — the inline player and download shipped; click-a-transcript-line-to-seek has not.
+- **Supervisor-initiated Whisper / Barge** — permissions and capability plumbing shipped; the observer-surface endpoints and buttons stay hidden until wired (see "Observer actions").
+- **Named routing profiles** — per-number routing modes (AI triage / AI specialist / direct-to-queue) shipped; reusable named profiles beyond that have not.
+- **Per-agent prompt editor** — KB bindings and external tools are already UI-editable; prompts intentionally stay in code (see "Architecture principle"), so this remains an open design question rather than a commitment.
 - **Post-call survey** via the SDK's survey prefab.
-- **Routing Profiles** — named entry-point flows per phone number (beyond the single default).
-- **Admin AI workflow editor** — in-UI prompt/tool/KB editor per agent.
 - **Outbound campaigns** — list upload, power dialer. (Answering-machine detection itself shipped 2026-06-09: outbound AI calls and callback dials run `detect_machine` — voicemail gets a short message after the beep and a clean hangup instead of the AI pitch.)
-- **Whisper** and **Barge** observer actions.
+- **Video escalation.**
 - **Visual SWML Builder** — drag-and-drop IVR flow editor. Deferred until the Tier 2 CCaaS gaps close.
 
 Each item has a design note in the internal roadmap. Ship order and prioritization are intentional — the architecture has to stay coherent as we extend it.

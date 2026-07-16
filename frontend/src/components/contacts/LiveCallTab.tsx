@@ -96,7 +96,6 @@ export function LiveCallTab({
   transcription,
   isAICall,
   callSid,
-  callDuration,
   callState,
   isOutboundCallInProgress,
   aiContext,

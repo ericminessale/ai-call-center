@@ -44,12 +44,13 @@ export function IncomingCallBanner({
     const lookupContact = async () => {
       try {
         const response = await contactsApi.lookup(phoneNumber);
-        if (response.data) {
+        const data = response.data;
+        if (data && 'displayName' in data) {
           setContactInfo({
-            displayName: response.data.displayName,
-            company: response.data.company,
-            isVip: response.data.isVip,
-            accountTier: response.data.accountTier,
+            displayName: data.displayName,
+            company: data.company,
+            isVip: data.isVip,
+            accountTier: data.accountTier,
           });
         }
       } catch {

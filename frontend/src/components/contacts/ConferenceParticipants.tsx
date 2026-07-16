@@ -50,9 +50,9 @@ export function ConferenceParticipants({ participants, className = '' }: Confere
                   <span className="text-[10px] text-yellow-400 animate-pulse">Joining...</span>
                 )}
                 {p.isMuted ? (
-                  <MicOff className="w-3.5 h-3.5 text-red-400" title="Muted" />
+                  <span title="Muted"><MicOff className="w-3.5 h-3.5 text-red-400" /></span>
                 ) : (
-                  <Mic className="w-3.5 h-3.5 text-green-400" title="Unmuted" />
+                  <span title="Unmuted"><Mic className="w-3.5 h-3.5 text-green-400" /></span>
                 )}
               </div>
             </div>

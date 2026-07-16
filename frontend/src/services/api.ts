@@ -1,7 +1,7 @@
 import axios from 'axios';
-import io, { Socket } from 'socket.io-client';
-import { AuthResponse, Call, CallsListResponse, DemoWorkspace, Transcription } from '../types';
-import { Contact, ContactMinimal, ContactsListResponse, Interaction, InteractionsListResponse } from '../types/callcenter';
+import { Socket } from 'socket.io-client';
+import { AuthResponse, Call, DemoWorkspace, Transcription } from '../types';
+import { Contact, ContactMinimal, ContactsListResponse, InteractionsListResponse } from '../types/callcenter';
 
 // CRITICAL: Set axios defaults to prevent it from using window.location.origin
 // DO NOT set a default baseURL - let axios handle relative URLs naturally
@@ -258,6 +258,7 @@ export const callsApi = {
         disposition_code: string | null;
         agent_notes: string | null;
         wrapped_up_at: string | null;
+        wrap_up_source: 'ai' | 'agent' | null;
       };
     }>(`/api/calls/${call_id}/wrap-up`, payload),
 };
@@ -533,7 +534,15 @@ export const adminApi = {
   // local credentials so the next /api/fabric/token call mints a fresh
   // one. See CALL_TRANSPORT.md.
   resetUserSubscriber: (id: number) =>
-    api.post<{ success: boolean; message: string; sw_warning?: string }>(
+    api.post<{
+      success: boolean;
+      message: string;
+      deleted_subscriber_id?: string | null;
+      new_subscriber_id?: string | null;
+      user?: Record<string, unknown>;
+      sw_warning?: string;
+      recreate_error?: string;
+    }>(
       `/api/admin/users/${id}/reset-subscriber`,
     ),
 

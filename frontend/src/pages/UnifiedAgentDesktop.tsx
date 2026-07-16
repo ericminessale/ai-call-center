@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
 import { useCallFabricContext, ConnectedCustomer } from '../contexts/CallFabricContext';
@@ -149,9 +149,6 @@ export function UnifiedAgentDesktop() {
 
   // Socket connection (proper authentication and reconnection handling)
   const socket = useSocket();
-
-  // Ref to track if we've loaded initial data
-  const initialLoadDone = useRef(false);
 
   // WebSocket subscriptions
   useEffect(() => {
@@ -376,7 +373,7 @@ export function UnifiedAgentDesktop() {
       // Fallback to old endpoint if new one doesn't exist
       try {
         const response = await callsApi.list({ status: 'waiting,assigned' });
-        setQueuedCalls(response.data.calls || []);
+        setQueuedCalls(mapCalls(response.data.calls || []));
       } catch (fallbackError) {
         logger.error('Fallback also failed:', fallbackError);
       }
@@ -395,7 +392,7 @@ export function UnifiedAgentDesktop() {
       setCallCounts({
         active: activeRes.data.total || 0,
         queue: queueRes.data.total || 0,
-        aiActive: activeRes.data.calls?.filter((c: Call) => c.status === 'ai_active').length || 0,
+        aiActive: activeRes.data.calls?.filter((c) => c.status === 'ai_active').length || 0,
       });
     } catch (error) {
       logger.error('Failed to update call counts:', error);
@@ -624,7 +621,7 @@ export function UnifiedAgentDesktop() {
             displayName: phoneNumber,
           });
 
-          const contactId = response.data.contact?.id || response.data.id;
+          const contactId = response.data.contact?.id;
           if (contactId) {
             loadContacts();
             navigate(`/contacts/${contactId}`);
@@ -688,7 +685,9 @@ export function UnifiedAgentDesktop() {
         displayName: phoneNumber,
       });
       await callFabric.answerCall();
-      navigate(`/contacts/${response.data.id}`);
+      if (response.data.contact?.id) {
+        navigate(`/contacts/${response.data.contact.id}`);
+      }
       setViewMode('contacts');
     } catch (error) {
       logger.error('Failed to handle incoming call:', error);
@@ -710,7 +709,7 @@ export function UnifiedAgentDesktop() {
         displayName: phoneNumber,
       });
 
-      const contactId = response.data.contact?.id || response.data.id;
+      const contactId = response.data.contact?.id;
       if (contactId) {
         loadContacts();
         navigate(`/contacts/${contactId}`);
@@ -736,8 +735,7 @@ export function UnifiedAgentDesktop() {
           }
         }
         await callFabric.acceptCallAssignment();
-        const contactId = callFabric.pendingCallAssignment.customerInfo?.contact_id ||
-                         callFabric.pendingCallAssignment.customerInfo?.contactId;
+        const contactId = callFabric.pendingCallAssignment.customerInfo?.contactId;
         if (contactId) {
           navigate(`/contacts/${contactId}`);
           setViewMode('contacts');
@@ -827,7 +825,7 @@ export function UnifiedAgentDesktop() {
                 onSelectCall={handleCallSelect}
                 onTakeCall={handleTakeCall}
                 onSelectQueuedCall={handleQueueCallSelect}
-                selectedQueuedCallId={selectedQueuedCall?.id ?? null}
+                selectedQueuedCallId={selectedQueuedCall ? Number(selectedQueuedCall.id) : null}
                 isLoadingCalls={isLoadingCalls}
                 isLoadingQueue={isLoadingQueue}
                 queueConfigs={queueConfigs}
@@ -930,7 +928,7 @@ export function UnifiedAgentDesktop() {
                       onContactUpdate={handleContactUpdate}
                       onContactDelete={handleContactDelete}
                       activeCallForContact={activeCallForContact}
-                      liveSentiment={activeCallForContact?.id ? liveSentimentMap[activeCallForContact.id] || null : null}
+                      liveSentiment={activeCallForContact?.id ? liveSentimentMap[Number(activeCallForContact.id)] || null : null}
                     />
                   );
                 })()

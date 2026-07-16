@@ -65,7 +65,7 @@ export default function CallDetails() {
       // Only set transcribing if call is active AND transcription is active
       const isCallActive = ['created', 'ringing', 'answered'].includes(response.data.call.status.toLowerCase());
       setIsTranscribing(response.data.call.transcription_active && isCallActive);
-      setSummary(response.data.call.summary);
+      setSummary(response.data.call.summary ?? null);
     } catch (error) {
       logger.error('Failed to load call details:', error);
     } finally {
@@ -362,9 +362,11 @@ export default function CallDetails() {
                 <div key={trans.id || index} className="border-l-4 border-blue-500 pl-4 py-2">
                   <p className="text-gray-900">{trans.transcript}</p>
                   <div className="flex items-center space-x-4 mt-1">
-                    <span className="text-xs text-gray-500">
-                      Confidence: {(trans.confidence * 100).toFixed(1)}%
-                    </span>
+                    {trans.confidence != null && (
+                      <span className="text-xs text-gray-500">
+                        Confidence: {(trans.confidence * 100).toFixed(1)}%
+                      </span>
+                    )}
                     <span className="text-xs text-gray-500">
                       {format(new Date(trans.created_at), 'h:mm:ss a')}
                     </span>

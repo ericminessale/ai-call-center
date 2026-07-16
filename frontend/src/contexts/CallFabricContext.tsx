@@ -373,7 +373,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
   // Load WebRTC adapter for cross-browser compatibility (like SDK example does)
   const loadWebRTCAdapter = () => {
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve) => {
       // Check if adapter is already loaded
       if ((window as any).adapter) {
         logger.debug('✅ WebRTC adapter already loaded');
@@ -892,7 +892,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
 
           // Prepare the conference join (stores params in Redis, returns dial address)
           const prepareResponse = await conferencesApi.prepareJoin({
-            agent_id: user?.id,
+            agent_id: Number(user?.id),
             conference_name: confName
           });
           const dialAddress = prepareResponse.data.dial_address;
@@ -1005,7 +1005,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
             id: 0,
             conferenceName: confName,
             conferenceType: 'interaction',
-            ownerUserId: user?.id || 0,
+            ownerUserId: Number(user?.id) || 0,
             status: 'active',
             createdAt: new Date().toISOString()
           };
@@ -1118,7 +1118,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           id: 0,
           conferenceName: assignment.conferenceName,
           conferenceType: 'interaction',
-          ownerUserId: user?.id || 0,
+          ownerUserId: Number(user?.id) || 0,
           status: 'active',
           createdAt: new Date().toISOString()
         };
@@ -1163,7 +1163,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         logLevel: 'debug',
         debug: { logWsTraffic: true },
         userVariables: {
-          agent_id: user.id,
+          agent_id: Number(user.id),
           call_type: 'interaction',
           conference_name: conferenceName
         }
@@ -1174,7 +1174,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         id: 0, // Will be updated by status callback
         conferenceName: conferenceName,
         conferenceType: 'interaction',
-        ownerUserId: user.id,
+        ownerUserId: Number(user.id),
         status: 'active',
         createdAt: new Date().toISOString()
       };
@@ -1335,9 +1335,6 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     }
   }, [isInConference, socket, agentConference]);
 
-  // Alias for backward compatibility
-  const leaveAgentConference = leaveConference;
-
   // Accept a call assignment - dial OUT to join the conference
   // The backend sends a socket notification (not a call) when a customer is routed.
   // Agent clicks Accept, and we dial OUT to join the conference.
@@ -1432,7 +1429,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       // Step 1: Prepare the join by storing params in Redis (more reliable than query params)
       logger.debug('📞 [CallFabric] Preparing conference join via API...');
       const prepareParams: Parameters<typeof conferencesApi.prepareJoin>[0] = {
-        agent_id: user.id,
+        agent_id: Number(user.id),
         conference_name: conferenceName,
         call_id: callDbId,
       };
@@ -1471,7 +1468,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         logLevel: 'debug',
         debug: { logWsTraffic: true },
         userVariables: {
-          agent_id: user.id,
+          agent_id: Number(user.id),
           call_type: 'interaction',
           conference_name: conferenceName,
           token: prepareResponse.data.token
@@ -1564,7 +1561,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         id: 0,
         conferenceName: conferenceName,
         conferenceType: 'interaction',
-        ownerUserId: user.id,
+        ownerUserId: Number(user.id),
         status: 'active',
         createdAt: new Date().toISOString()
       };
@@ -1600,8 +1597,9 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           queueId: pendingCallAssignment.queueId || '',
           conferenceName: conferenceName,
           customerInfo: {
+            phone: pendingCallAssignment.customerInfo.phone,
             name: pendingCallAssignment.customerInfo.name,
-            contact_id: pendingCallAssignment.customerInfo.contact_id || (pendingCallAssignment.customerInfo as any).contactId,
+            contact_id: pendingCallAssignment.customerInfo.contactId,
           },
           aiContext: pendingCallAssignment.context || {},
           connectedAt: new Date()
@@ -1644,7 +1642,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       // Step 1: Prepare the join by storing params in Redis (more reliable than query params)
       logger.debug('📞 [CallFabric] Preparing conference join via API...');
       const prepareResponse = await conferencesApi.prepareJoin({
-        agent_id: user.id,
+        agent_id: Number(user.id),
         conference_name: conferenceName,
         call_id: assignment.callDbId
       });
@@ -1664,7 +1662,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         logLevel: 'debug',
         debug: { logWsTraffic: true },
         userVariables: {
-          agent_id: user.id,
+          agent_id: Number(user.id),
           call_type: 'interaction',
           conference_name: conferenceName,
           token: prepareResponse.data.token
@@ -1757,7 +1755,7 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
         id: 0,
         conferenceName: conferenceName,
         conferenceType: 'interaction',
-        ownerUserId: user.id,
+        ownerUserId: Number(user.id),
         status: 'active',
         createdAt: new Date().toISOString()
       };
@@ -1793,8 +1791,9 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
           queueId: assignment.queueId || '',
           conferenceName: conferenceName,
           customerInfo: {
+            phone: assignment.customerInfo.phone,
             name: assignment.customerInfo.name,
-            contact_id: assignment.customerInfo.contact_id || assignment.customerInfo.contactId,
+            contact_id: assignment.customerInfo.contactId,
           },
           aiContext: assignment.context || {},
           connectedAt: new Date()

@@ -155,9 +155,9 @@ export function UnifiedHeader({
   // pill and read as stuck (socket state ≠ agent presence). We still show the
   // transient "Reconnecting" spinner, which is a distinct, useful signal.
   const { connectionStatus } = useSocketContext();
-  const socketBanner = (() => {
+  const socketBanner: { label: string; tone: 'wait' | 'urgent'; spin: boolean } | null = (() => {
     if (connectionStatus === 'reconnecting') {
-      return { label: 'Reconnecting', tone: 'wait' as const, spin: true };
+      return { label: 'Reconnecting', tone: 'wait', spin: true };
     }
     return null;
   })();

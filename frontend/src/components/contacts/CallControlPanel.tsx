@@ -11,10 +11,8 @@
  * discussion in the call-controls refactor.
  */
 
-import React, { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import {
-  Pause,
-  Play,
   Circle,
   Volume2,
   Hash,
@@ -68,8 +66,8 @@ interface CallControlPanelProps {
 
 export default function CallControlPanel({
   callId,
-  callSid,
-  isAICall,
+  // callSid, isAICall — accepted by callers (see props interface) but not used
+  // by this panel's current control set.
   isHumanCall,
   isInConference,
   isOnHold,
@@ -161,6 +159,10 @@ export default function CallControlPanel({
       setIsLoading(null);
     }
   }, [callId, isOnHold, onHoldChange, cf, user?.id]);
+  // Intentionally retained while the Hold/Resume button is deferred (RE-AUDIT-01,
+  // see the button-site comment below). Referenced here so noUnusedLocals doesn't
+  // flag the orchestration callback we're deliberately keeping around.
+  void handleHold;
 
   const handleRecord = useCallback(async () => {
     setIsLoading('record');

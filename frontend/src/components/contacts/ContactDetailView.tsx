@@ -7,17 +7,12 @@ import {
   Edit2,
   Star,
   Clock,
-  ChevronDown,
-  ChevronUp,
   Tag,
   Ban,
   MoreHorizontal,
   Trash2,
   Mic,
   MicOff,
-  Pause,
-  Play,
-  Send,
   AlertCircle,
   X,
   PhoneCall,
@@ -30,7 +25,6 @@ import api from '../../services/api';
 import { useCallFabric } from '../../hooks/useCallFabric';
 import { useCallFabricContext } from '../../contexts/CallFabricContext';
 import { useSocketContext } from '../../contexts/SocketContext';
-import { CallTimeline } from './CallTimeline';
 import { LiveCallTab, SentimentData } from './LiveCallTab';
 import { CallDetailTab } from './CallDetailTab';
 import CallControlPanel from './CallControlPanel';
@@ -109,7 +103,6 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   const interactionsPageRef = useRef(1);
   const contactIdRef = useRef(contact.id);
   const INTERACTIONS_PER_PAGE = 20;
-  const [showAllNotes, setShowAllNotes] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [activeTab, setActiveTab] = useState<'history' | 'notes' | 'details' | 'live' | 'callDetail'>('history');
   const [showMoreMenu, setShowMoreMenu] = useState(false);
@@ -155,7 +148,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
   } = useCallFabric();
 
   // Call Fabric context for taking queued calls
-  const { acceptCallAssignmentWithData, isClientReady, isInConference, conferenceParticipants, joinInteractionConference, makeCallToSwml } = useCallFabricContext();
+  const { acceptCallAssignmentWithData, isClientReady, isInConference, conferenceParticipants, makeCallToSwml } = useCallFabricContext();
 
   // State for taking queued calls
   const [isTakingCall, setIsTakingCall] = useState(false);
@@ -256,7 +249,7 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
         customerInfo: {
           phone: activeCallForContact.from_number || activeCallForContact.phoneNumber || '',
           name: activeCallForContact.customerName || contact.displayName,
-          contact_id: contact.id,
+          contactId: contact.id,
         },
         context: aiContext,
       });

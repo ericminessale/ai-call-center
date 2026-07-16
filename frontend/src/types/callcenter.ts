@@ -61,7 +61,7 @@ export interface CallLeg {
 }
 
 // Conference types for conference-based routing
-export type ConferenceType = 'agent' | 'ai' | 'hold';
+export type ConferenceType = 'agent' | 'ai' | 'hold' | 'interaction';
 export type ParticipantType = 'customer' | 'agent' | 'ai' | 'supervisor';
 export type ParticipantStatus = 'joining' | 'active' | 'left' | 'muted';
 
@@ -195,7 +195,8 @@ export interface Call {
   startTime?: string | Date;  // ISO string or Date object
   created_at?: string;  // Backend timestamp
   duration?: number;
-  status: 'waiting' | 'assigned' | 'connecting' | 'active' | 'ai_active' | 'on_hold' | 'ended' | 'completed';
+  status: 'waiting' | 'assigned' | 'connecting' | 'ringing' | 'active' | 'ai_active' | 'on_hold' | 'ended' | 'completed' | 'failed';
+  direction?: 'inbound' | 'outbound';  // Populated by mapCall from backend
   isOnHold?: boolean;
   queueId?: string;
   queue_id?: string;  // Backend snake_case

@@ -1,7 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
-  Settings,
-  Database,
   BookOpen,
   Save,
   Plus,
@@ -127,14 +125,6 @@ const PERMISSION_LABELS: Record<PermissionKey, { label: string; hint: string }> 
   },
 };
 
-const PERMISSION_ORDER: PermissionKey[] = [
-  'can_listen_ai_calls',
-  'can_listen_human_calls',
-  'can_whisper',
-  'can_barge',
-  'can_control_recording',
-  'can_use_coach',
-];
 
 // BCP-47 language menu shown to admins. Keep small — these are the
 // languages SignalWire's live_translate supports out of the box.
@@ -188,13 +178,6 @@ interface QueueConfig {
   sla_threshold_seconds: number;
   max_wait_before_ai_fallback: number;
   agent_count?: number;
-}
-
-interface QueueAgentAssignment {
-  user_id: number;
-  user_name: string | null;
-  user_email: string;
-  skill_level: number;
 }
 
 type SettingsTabId = 'phone-numbers' | 'queues' | 'agents' | 'knowledge' | 'external-tools' | 'branding' | 'users' | 'webhooks' | 'workspaces';
@@ -404,7 +387,10 @@ function BrandingTab() {
   const save = async (next: BrandingForm) => {
     setSaving(true);
     try {
-      await adminApi.updateBranding(next);
+      // BrandingForm is structurally a record of string fields; the double
+      // cast is TS's prescribed path (an interface without an index signature
+      // isn't directly assignable to Record<string, string>).
+      await adminApi.updateBranding(next as unknown as Record<string, string>);
       // Re-fetching runtime config re-applies the CSS variables app-wide
       // (App.tsx effect) — the rebrand lands live, no rebuild.
       await fetchRuntimeConfig();

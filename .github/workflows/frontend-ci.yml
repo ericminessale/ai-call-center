@@ -34,14 +34,17 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '18' # matches frontend/Dockerfile.prod
+          node-version: '24' # matches frontend/Dockerfile.prod (current LTS)
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      # Mirrors the Dockerfile.prod install line: prefer the lockfile, fall
-      # back to a plain install if it has drifted (see project CLAUDE.md).
+      # Lockfile drift is a build failure. Silently falling back to
+      # `npm install` made local, CI, and production dependency trees differ.
       - name: Install dependencies
-        run: npm ci || npm install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
 
       - name: Typecheck (tsc --noEmit)
         run: npm run typecheck

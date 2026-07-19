@@ -97,10 +97,11 @@ function getEventDescription(event: CallEvent): string {
       return `Conference event: ${data.action || 'update'}`;
     case 'ai_tool_call':
       return `AI called: ${data.function_name || data.tool || 'function'}`;
-    case 'sentiment':
+    case 'sentiment': {
       const score = data.score || data.sentiment_score;
       const label = score > 0.3 ? 'positive' : score < -0.3 ? 'negative' : 'neutral';
       return `Sentiment: ${label} (${typeof score === 'number' ? score.toFixed(2) : score})${data.reason ? ` - ${data.reason}` : ''}`;
+    }
     case 'transfer':
       return `Transfer to ${data.destination || data.target || 'agent'}`;
     case 'ended':

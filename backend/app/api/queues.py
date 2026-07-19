@@ -9,6 +9,7 @@ from app.services.redis_service import get_redis_client
 from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth, require_role
 from app.utils.demo_config import block_in_demo_mode, is_demo_mode
+from app.utils.request_logging import payload_keys, request_summary
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.utils.webhook_auth import require_webhook_auth
 from app import db
@@ -51,7 +52,7 @@ def route_call_to_queue(queue_id):
     try:
         logger.info(f"Queue route hit: /api/queues/{queue_id}/route")
         data = request.json or {}
-        logger.info(f"Queue route received data: {json.dumps(data, default=str)[:1000]}")
+        logger.info("Queue route request: %s", request_summary(request, data))
 
         # Extract call information from SignalWire webhook
         # SignalWire sends call info nested under 'call' key
@@ -67,7 +68,10 @@ def route_call_to_queue(queue_id):
             try:
                 ctx_json = base64.urlsafe_b64decode(ctx_param.encode()).decode()
                 url_context = json.loads(ctx_json)
-                logger.info(f"Decoded URL context: {json.dumps(url_context)}")
+                logger.debug(
+                    "Decoded URL context fields: %s",
+                    payload_keys(url_context),
+                )
             except Exception as e:
                 logger.warning(f"Failed to decode ctx param: {e}")
 
@@ -314,8 +318,8 @@ def route_call_to_queue(queue_id):
         # same lifecycle: enqueue in Redis, emit queue_update, immediate-
         # dispatch if an agent is available, start announcement loop otherwise,
         # return SWML. Transport choice (conference vs bridge) is hidden
-        # behind call_transport.build_ingress_swml. Today M0 always picks
-        # conference; M1 lets admins opt queues into bridge mode.
+        # behind call_transport.build_ingress_swml; admins can select either
+        # conference or native bridge mode per queue.
         from app.services.call_transport import build_ingress_swml
         base_url = get_base_url()
         swml_response = build_ingress_swml(
@@ -578,8 +582,7 @@ def direct_inbound_queue(queue_slug):
         # confirmed.
 
         # Unified queue onboarding — call_transport.build_ingress_swml
-        # dispatches on the queue's routing_transport (conference today;
-        # M1 lets admins opt into bridge). Handles Conference DB row,
+        # dispatches on the queue's routing_transport. Handles Conference DB row,
         # Redis enqueue, queue_update emit, immediate dispatch + agent
         # notification, announcement loop, and SWML build.
         from app.services.call_transport import build_ingress_swml
@@ -684,12 +687,11 @@ def get_wallboard():
 
     One call instead of N per-queue /status fetches: live depth/waits from
     Redis, 24h service level against each queue's own SLA threshold, and
-    24h offered/answered/abandoned counts from the Call table (end_reason
-    'abandoned_in_queue' is stamped deterministically at call end).
+    measured queue attempts, with a non-overlapping fallback for legacy calls.
     """
     try:
         from datetime import timedelta
-        from sqlalchemy import func, case
+        from app.services.interaction_timeline import get_queue_volume
 
         service = get_queue_service(workspace_id=request.current_user.workspace_id)
         since = datetime.utcnow() - timedelta(hours=24)
@@ -699,17 +701,12 @@ def get_wallboard():
             metrics = service.get_queue_metrics(queue.slug)
             metrics.pop('calls', None)  # wallboard doesn't need per-call previews
 
-            counts = db.session.query(
-                func.count(Call.id),
-                func.sum(case((Call.answered_at.isnot(None), 1), else_=0)),
-                func.sum(case((Call.end_reason == 'abandoned_in_queue', 1), else_=0)),
-            ).filter(
-                Call.queue_id == queue.slug,
-                Call.created_at >= since,
-            ).one()
-            offered = int(counts[0] or 0)
-            answered = int(counts[1] or 0)
-            abandoned = int(counts[2] or 0)
+            volume = get_queue_volume(
+                queue.slug, since, workspace_id=queue.workspace_id,
+            )
+            offered = volume['offered']
+            answered = volume['answered']
+            abandoned = volume['abandoned']
 
             rows.append({
                 **metrics,
@@ -778,12 +775,10 @@ def update_agent_status():
 def get_agent_scorecards():
     """Per-agent performance over a window — the supervisor scorecard feed.
 
-    Same Call-table basis as get_agent_metrics (the self-serve variant
-    below), but grouped across every active user and joined with live
-    queue-service presence. One grouped query; agents with no handled
-    calls in the window still appear with zeroes.
+    Uses measured human handling segments, with a non-overlapping legacy
+    fallback for calls created before the timeline migration. Agents with no
+    handled calls in the window still appear with zeroes.
     """
-    from sqlalchemy import func
 
     period_hours = request.args.get('period_hours', 24, type=int)
     if not period_hours or period_hours < 1 or period_hours > 24 * 90:
@@ -791,29 +786,10 @@ def get_agent_scorecards():
     since = datetime.utcnow() - timedelta(hours=period_hours)
 
     try:
-        handle_secs = (
-            func.extract('epoch', Call.ended_at)
-            - func.extract('epoch', Call.answered_at)
+        from app.services.interaction_timeline import get_agent_performance
+        by_agent = get_agent_performance(
+            since, workspace_id=request.current_user.workspace_id,
         )
-        rows = (
-            db.session.query(
-                Call.assigned_agent_id.label('agent_id'),
-                func.count(Call.id).label('calls_handled'),
-                func.avg(handle_secs).label('aht'),
-                func.sum(handle_secs).label('talk'),
-                func.avg(Call.sentiment_score).label('avg_sentiment'),
-                func.sum(Call.return_count).label('returns'),
-            )
-            .filter(
-                Call.assigned_agent_id.isnot(None),
-                Call.created_at >= since,
-                Call.answered_at.isnot(None),
-                Call.ended_at.isnot(None),
-            )
-            .group_by(Call.assigned_agent_id)
-            .all()
-        )
-        by_agent = {row.agent_id: row for row in rows}
 
         service = get_queue_service(workspace_id=request.current_user.workspace_id)
         users = User.query.filter(User.is_active == True).order_by(User.name, User.email).all()  # noqa: E712
@@ -828,14 +804,11 @@ def get_agent_scorecards():
                 'email': u.email,
                 'role': u.role,
                 'status': presence.get('status', 'offline'),
-                'calls_handled': int(row.calls_handled) if row else 0,
-                'average_handle_time': round(float(row.aht or 0), 1) if row else 0.0,
-                'total_talk_time': int(row.talk or 0) if row else 0,
-                'average_sentiment': (
-                    round(float(row.avg_sentiment), 2)
-                    if row and row.avg_sentiment is not None else None
-                ),
-                'returned_to_queue': int(row.returns or 0) if row else 0,
+                'calls_handled': row['calls_handled'] if row else 0,
+                'average_handle_time': row['average_handle_time'] if row else 0.0,
+                'total_talk_time': row['total_talk_time'] if row else 0,
+                'average_sentiment': row['average_sentiment'] if row else None,
+                'returned_to_queue': row['returned_to_queue'] if row else 0,
             })
 
         return jsonify({'period_hours': period_hours, 'agents': scorecards})

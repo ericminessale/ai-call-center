@@ -2181,11 +2181,8 @@ if __name__ == '__main__':
     server.register(outbound_sales, '/outbound-sales')
     server.register(outbound_support, '/outbound-support')
 
-    username, password = triage.get_basic_auth_credentials()
-
     print('\nAuthentication:')
-    print(f'  Username: {username}')
-    print(f'  Password: {password}')
+    print('  Basic Auth: configured')
     print('\nRoutes (Inbound):')
     print('  /receptionist : Triage agent (NO problem solving)')
     print('  /sales-ai     : Sales specialist (helps with sales + RAG)')
@@ -2196,7 +2193,7 @@ if __name__ == '__main__':
     print('\nAdmin API:')
     print('  POST /reindex : Reindex documents into pgvector (port 8081)')
     print('  POST /search  : Vector similarity search (port 8081)')
-    print(f'\nDatabase: {DATABASE_URL[:50]}...' if DATABASE_URL else '\nDatabase: NOT CONFIGURED')
+    print('\nDatabase: configured' if DATABASE_URL else '\nDatabase: NOT CONFIGURED')
     print('\nStarting agent server on port 8080...\n')
 
     server.run()

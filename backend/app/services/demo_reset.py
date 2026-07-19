@@ -44,8 +44,10 @@ from app.models import (
     Contact,
     Document,
     DocumentCollection,
+    HandlingSegment,
     McpGatewayConfig,
     Queue,
+    QueueAttempt,
     QueueAgentAssignment,
     SystemConfig,
     Transcription,
@@ -80,6 +82,8 @@ def max_workspaces() -> int:
 _REAP_MODELS_IN_ORDER = (
     Transcription,
     CallLeg,
+    HandlingSegment,
+    QueueAttempt,
     ConferenceParticipant,
     Conference,
     WebhookEvent,
@@ -99,6 +103,8 @@ _REAP_MODELS_IN_ORDER = (
 _TEMPLATE_INTERACTION_MODELS = (
     Transcription,
     CallLeg,
+    HandlingSegment,
+    QueueAttempt,
     ConferenceParticipant,
     Conference,
     WebhookEvent,

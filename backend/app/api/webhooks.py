@@ -5,6 +5,7 @@ from app.models import Call, CallLeg, Transcription, WebhookEvent
 from app.models.user import User
 from app.services.knowledge import DEFAULT_KB_COLLECTION, kb_collection_for_queue
 from app.services.redis_service import publish_event
+from app.utils.request_logging import mask_phone, request_summary
 from app.utils.webhook_auth import require_webhook_auth
 from datetime import datetime
 from typing import Optional
@@ -162,7 +163,7 @@ def call_status():
         # Log the complete JSON received
         logger.info("="*50)
         logger.info("WEBHOOK: /api/webhooks/call-status")
-        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("Payload shape: %s", request_summary(request, data))
         logger.info("="*50)
 
         # Check if this is a call state event with the new format
@@ -175,7 +176,12 @@ def call_status():
             from_number = params.get('from', params.get('from_number'))
 
             # Log for debugging
-            logger.info(f"Extracted (params format) - Call ID: {call_id}, Status: {status}, From: {from_number}")
+            logger.info(
+                "Extracted params-format call=%s status=%s from=%s",
+                call_id,
+                status,
+                mask_phone(from_number),
+            )
         elif 'call' in data:
             # Alternative SignalWire format with call object
             call_data = data.get('call', {})
@@ -184,14 +190,24 @@ def call_status():
             from_number = call_data.get('from', call_data.get('from_number'))
 
             # Log for debugging
-            logger.info(f"Extracted (call format) - Call ID: {call_id}, Status: {status}, From: {from_number}")
+            logger.info(
+                "Extracted call-format call=%s status=%s from=%s",
+                call_id,
+                status,
+                mask_phone(from_number),
+            )
         else:
             # Old format or Twilio SDK format
             call_id = data.get('CallSid') or data.get('call_sid') or data.get('call_id')
             status = data.get('CallStatus') or data.get('CallState') or data.get('status') or data.get('state')
             from_number = data.get('From') or data.get('from') or data.get('from_number')
 
-        logger.info(f"Call status webhook: {call_id} - {status} - From: {from_number}")
+        logger.info(
+            "Call status webhook: %s - %s - from=%s",
+            call_id,
+            status,
+            mask_phone(from_number),
+        )
 
         # Update call in database FIRST (to get the database ID)
         call = Call.find_by_sid(call_id)
@@ -268,7 +284,11 @@ def call_status():
             # Update from_number if provided and not already set
             if from_number and not call.from_number:
                 call.from_number = from_number
-                logger.info(f"Updated call {call_id} with from_number: {from_number}")
+                logger.info(
+                    "Updated call %s with from_number=%s",
+                    call_id,
+                    mask_phone(from_number),
+                )
 
             db.session.commit()
 
@@ -709,7 +729,7 @@ def transcription():
         # Log the complete JSON received
         logger.info("="*50)
         logger.info("WEBHOOK: /api/webhooks/transcription")
-        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("Payload shape: %s", request_summary(request, data))
         logger.info("="*50)
 
         # End-of-session AI summary (live_transcribe ai_summary:true) arrives here
@@ -740,7 +760,7 @@ def summary():
         # Log the complete JSON received
         logger.info("="*50)
         logger.info("WEBHOOK: /api/webhooks/summary")
-        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("Payload shape: %s", request_summary(request, data))
         logger.info("="*50)
 
         # Extract call_id from various possible locations
@@ -858,7 +878,7 @@ def queue_status():
 
         logger.info("=" * 50)
         logger.info("WEBHOOK: /api/webhooks/queue-status")
-        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("Payload shape: %s", request_summary(request, data))
         logger.info("=" * 50)
 
         # Defensive parsing — SignalWire's exact key naming hasn't been
@@ -902,6 +922,11 @@ def queue_status():
                     # Bridge succeeded: agent picked up. Status owned by the
                     # call-state flow from here on (will become 'active').
                     call.status = 'assigned'
+                    from app.services.interaction_timeline import best_effort, record_human_started
+                    # Native queue callbacks identify the customer leg but do
+                    # not reliably include our User id. Preserve that truth as
+                    # an unattributed human segment instead of guessing.
+                    best_effort(record_human_started, call, call.assigned_agent_id)
                 elif result in ('timeout', 'hangup', 'failed'):
                     # Caller never bridged to an agent — verb ended without
                     # success. Mark the row ended if no agent has taken it.
@@ -989,7 +1014,7 @@ def sidecar_events():
 
         logger.info("=" * 50)
         logger.info("WEBHOOK: /api/webhooks/sidecar/events")
-        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("Payload shape: %s", request_summary(request, data))
         logger.info("=" * 50)
 
         # Coach events are WRAPPED (verified call 5a1def2d, 2026-06-08):
@@ -1199,7 +1224,7 @@ def coach_lookup_kb():
         data = request.get_json(silent=True) or {}
         logger.info("=" * 50)
         logger.info("WEBHOOK: /api/webhooks/coach/lookup_kb")
-        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("Payload shape: %s", request_summary(request, data))
         logger.info("=" * 50)
 
         # SWAIG payload shape isn't 100% stable across SignalWire releases.
@@ -1310,7 +1335,7 @@ def post_prompt():
         # Log the complete JSON received
         logger.info("="*50)
         logger.info("WEBHOOK: /api/webhooks/post-prompt")
-        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("Payload shape: %s", request_summary(request, data))
         logger.info("="*50)
 
         # Persist the raw payload for offline debugging (most-recent + history).
@@ -1542,7 +1567,7 @@ def recording():
         # Log the complete JSON received
         logger.info("="*50)
         logger.info("WEBHOOK: /api/webhooks/recording")
-        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("Payload shape: %s", request_summary(request, data))
         logger.info("="*50)
 
         # Extract from nested params if present (SWML format)
@@ -1626,7 +1651,7 @@ def recording_status():
         # Log the complete JSON received
         logger.info("="*50)
         logger.info("WEBHOOK: /api/webhooks/recording-status")
-        logger.info(f"RAW JSON: {json.dumps(data, indent=2)}")
+        logger.info("Payload shape: %s", request_summary(request, data))
         logger.info("="*50)
 
         call_sid = data.get('CallSid') or data.get('call_sid')

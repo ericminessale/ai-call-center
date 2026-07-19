@@ -25,7 +25,7 @@ This is a reference implementation built on **SignalWire's Programmable Unified 
 4. The receptionist determines the caller's intent (sales, support, billing) and offers a choice between an AI specialist or a human agent.
 5. Depending on the choice:
    - **AI specialist**: transferred to a department-specific agent (Sales AI / Support AI) with preserved context.
-   - **Human**: transferred into a queue, routed to the best-matched available agent, and bridged via a Call Fabric conference.
+   - **Human**: transferred into a queue and routed to an available agent using either a multi-party conference or SignalWire's native `enter_queue` + two-leg bridge transport, selected per queue.
 
 ### Phone number management
 
@@ -248,6 +248,8 @@ When the call ends, the call detail view becomes the review workspace:
 - Queue depth bar chart and call distribution donut, rendered in real time.
 - **SLA wallboard** — per-queue service level vs. threshold, abandon rate, offered/answered counts (24h), and longest current wait, pushed live over Socket.IO.
 - **Agent scorecards** — per-agent table over a 24h/7d window: live presence, calls handled, average handle time, total talk time, average sentiment, and returns-to-queue. Supervisor/admin only.
+- **Measured interaction history** — each continuous queue stay records entry, offers, declines, acceptance, exit reason, transport, and the original SLA clock across returns. AI, human, hold, and future consultation time have separate handling-segment types, so scorecards no longer infer human talk time from one overloaded call timestamp.
+- **Legacy-safe rollout** — timeline-backed calls are measured from queue attempts and handling segments; older calls continue through a non-overlapping compatibility calculation, avoiding both blank dashboards and double-counting.
 - Per-call monitoring entry — click to drill in and observe.
 
 ### Multi-agent conferencing modes

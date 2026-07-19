@@ -343,3 +343,58 @@ export interface QueueAgentAssignmentType {
   skill_level: number;
   is_activated: boolean;
 }
+
+export interface QueueAttemptTimeline {
+  id: number;
+  callId: number;
+  queueId?: number | null;
+  queueSlug: string;
+  queueDisplayName?: string | null;
+  attemptNumber: number;
+  priority?: number | null;
+  routingStrategy?: string | null;
+  transport?: 'conference' | 'bridge' | null;
+  enteredAt: string;
+  serviceStartedAt: string;
+  firstOfferedAt?: string | null;
+  lastOfferedAt?: string | null;
+  lastOfferedAgentId?: number | null;
+  lastOfferedAgentName?: string | null;
+  offerCount: number;
+  declinedOfferCount: number;
+  lastDeclinedAt?: string | null;
+  lastDeclinedAgentId?: number | null;
+  lastDeclinedAgentName?: string | null;
+  acceptedAt?: string | null;
+  acceptedAgentId?: number | null;
+  acceptedAgentName?: string | null;
+  exitedAt?: string | null;
+  exitReason?: string | null;
+  waitSeconds?: number | null;
+}
+
+export type HandlingSegmentType = 'ai' | 'human' | 'hold' | 'consultation';
+
+export interface HandlingSegmentTimeline {
+  id: number;
+  callId: number;
+  queueAttemptId?: number | null;
+  type: HandlingSegmentType;
+  agentId?: number | null;
+  agentName?: string | null;
+  aiAgentName?: string | null;
+  transport?: 'conference' | 'bridge' | null;
+  startedAt: string;
+  endedAt?: string | null;
+  endReason?: string | null;
+  durationSeconds?: number | null;
+  details: Record<string, unknown>;
+}
+
+export interface CallTimelineResponse {
+  callId: number;
+  signalwireCallId: string;
+  transport?: 'conference' | 'bridge' | null;
+  queueAttempts: QueueAttemptTimeline[];
+  handlingSegments: HandlingSegmentTimeline[];
+}

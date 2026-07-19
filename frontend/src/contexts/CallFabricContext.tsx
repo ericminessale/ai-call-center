@@ -1989,6 +1989,9 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       acwAutoEnteredRef.current = true;
       setAgentStatus('after-call');
     }
+    // Status transitions are driven only by callState/agentStatus. The setter
+    // is mirrored through a ref for timer callbacks and is not an effect trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callState, agentStatus]);
 
   // ACW timer — only for the auto-entered after-call state above. Counts
@@ -2061,7 +2064,10 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
     };
 
     doRestore();
-  }, [client, isClientReady]); // Minimal dependencies - only trigger on client ready
+    // Restoration runs once when the SDK client becomes ready. Including live
+    // status/function identities can redial or repeat Redis writes mid-session.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client, isClientReady]);
 
   // Listen for socket status updates
   useEffect(() => {
@@ -2473,6 +2479,9 @@ export function CallFabricProvider({ children }: CallFabricProviderProps) {
       // Reset initialization ref so re-mount can initialize again
       initializingRef.current = false;
     };
+    // This is a user-session mount/unmount boundary. Client changes are read
+    // through clientRef so cleanup always targets the latest SDK instance.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
   // Helper functions for connected customer

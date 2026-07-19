@@ -17,7 +17,7 @@ function decodePCMU(data: Uint8Array): Float32Array {
   const output = new Float32Array(data.length);
 
   for (let i = 0; i < data.length; i++) {
-    let mulaw = ~data[i] & 0xff;
+    const mulaw = ~data[i] & 0xff;
     const sign = (mulaw & 0x80) ? -1 : 1;
     const exponent = (mulaw >> 4) & 0x07;
     const mantissa = mulaw & 0x0f;

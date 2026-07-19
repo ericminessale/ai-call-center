@@ -10,9 +10,10 @@ interface CallTimelineProps {
    *  marked 'active'/'connecting' as Completed (legacy rows the backend didn't
    *  fully close). The real fix is CallLeg.end_all_open() on the backend. */
   callEnded?: boolean;
+  showHeading?: boolean;
 }
 
-export function CallTimeline({ legs, callEnded }: CallTimelineProps) {
+export function CallTimeline({ legs, callEnded, showHeading = true }: CallTimelineProps) {
   if (!legs || legs.length === 0) {
     return null;
   }
@@ -46,7 +47,7 @@ export function CallTimeline({ legs, callEnded }: CallTimelineProps) {
 
   return (
     <div className="mt-4 space-y-1">
-      <h4 className="text-sm font-semibold text-gray-300 mb-3">Call Journey</h4>
+      {showHeading && <h4 className="text-sm font-semibold text-gray-300 mb-3">Call Journey</h4>}
       <div className="relative">
         {/* Vertical line */}
         <div className="absolute left-4 top-4 bottom-4 w-0.5 bg-gray-700" />

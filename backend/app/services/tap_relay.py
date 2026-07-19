@@ -24,6 +24,8 @@ Audio routing (RT-01, 2026-06-02 audit follow-up):
 
 from flask_sock import Sock
 from app import socketio
+from app.utils.url_utils import verify_tap_stream_signature
+from flask import request
 import logging
 import base64
 import json
@@ -49,12 +51,28 @@ def _tap_room(call_id: str) -> str:
 
 @sock.route('/ws/tap-stream/<call_id>')
 def tap_stream(ws, call_id):
+    return _handle_tap_stream(ws, call_id)
+
+
+def _handle_tap_stream(ws, call_id):
     """WebSocket endpoint that receives tap audio from SignalWire.
 
     SignalWire sends raw audio frames (PCMU 8kHz by default) over this connection.
     We base64-encode each frame and relay it via Socket.IO to authorized
     monitoring clients (those who passed permission check via ``join_tap``).
     """
+    if not verify_tap_stream_signature(
+        call_id,
+        request.args.get('expires'),
+        request.args.get('signature'),
+    ):
+        logger.warning('Rejected unauthorized tap stream for call %s', call_id)
+        # Flask-Sock has already completed the WebSocket handshake before the
+        # handler runs. Close immediately, before emitting status or reading a
+        # single caller-controlled frame.
+        ws.close()
+        return
+
     logger.info(f"Tap stream connected for call {call_id}")
     room = _tap_room(call_id)
 

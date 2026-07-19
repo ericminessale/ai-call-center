@@ -1,7 +1,11 @@
 from datetime import datetime
+import logging
 from app import db
 from app.tenancy import WorkspaceScoped
 import json
+
+
+logger = logging.getLogger(__name__)
 
 
 def _call_capabilities(call) -> list:
@@ -120,6 +124,12 @@ class Call(WorkspaceScoped, db.Model):
     # Relationships
     transcriptions = db.relationship('Transcription', backref='call', lazy='dynamic', cascade='all, delete-orphan')
     webhook_events = db.relationship('WebhookEvent', backref='call', lazy='dynamic', cascade='all, delete-orphan')
+    queue_attempts = db.relationship(
+        'QueueAttempt', backref='call', lazy='dynamic', cascade='all, delete-orphan',
+    )
+    handling_segments = db.relationship(
+        'HandlingSegment', backref='call', lazy='dynamic', cascade='all, delete-orphan',
+    )
 
     def __repr__(self):
         return f'<Call {self.signalwire_call_sid}>'
@@ -286,6 +296,7 @@ class Call(WorkspaceScoped, db.Model):
         the enter_queue status webhook seeing a 'timeout' — can pass it in;
         otherwise it's computed from the call's fields.
         """
+        previous_status = self.status
         self.status = status
         if status == 'answered' and not self.answered_at:
             self.answered_at = datetime.utcnow()
@@ -296,3 +307,16 @@ class Call(WorkspaceScoped, db.Model):
                 self.duration = int(delta.total_seconds())
         if status in self.TERMINAL_STATUSES and not self.end_reason:
             self.end_reason = end_reason or self.compute_end_reason()
+
+        # A savepoint keeps analytics failures from blocking live call control
+        # while successful writes still commit atomically with the outer state
+        # change. This also makes a rolling app/schema deployment survivable.
+        try:
+            from app.services.interaction_timeline import record_status_transition
+            with db.session.begin_nested():
+                record_status_transition(self, previous_status, status)
+        except Exception as exc:
+            logger.warning(
+                "Could not record call %s status timeline (%s -> %s): %s",
+                self.id, previous_status, status, exc,
+            )

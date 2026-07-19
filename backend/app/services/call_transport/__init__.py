@@ -13,14 +13,18 @@ Two transports today:
                    Per-leg REST verbs operate directly. No multi-party
                    without promotion to conference (not implemented in MVP).
 
-M0 (this commit): only the conference impl exists. Dispatch always lands in
-conference.py — bit-identical to pre-refactor behavior. M1 adds bridge.py
-and starts using `Queue.routing_transport` to pick a path at ingress.
+Ingress resolves the queue's ``routing_transport`` preference and persists the
+actual transport on the Call. Every later call-control operation dispatches
+from that per-call value.
 """
 
+import logging
 from typing import Any, Dict, Optional
 
 from .base import Capability  # re-export for callers
+
+
+logger = logging.getLogger(__name__)
 
 # Lazy imports inside functions to avoid circular-import problems with
 # models/services at app startup. The conference impl pulls in Conference,
@@ -50,17 +54,13 @@ def build_ingress_swml(
     position-announcement loop if no agent is immediately available, dispatch
     via Socket.IO call_assignment when an agent comes up.
 
-    Bridge (M1+): play greeting + connect to selected agent's Fabric address.
-    Falls back to conference if no agent is available at ingress.
-
-    M0: always dispatches to conference.
+    Bridge: park the caller with SignalWire's native ``enter_queue`` verb and
+    connect the selected agent through a regular two-leg bridge.
     """
     from app.models import Queue
 
-    # Decide transport based on queue preference. Bridge can still fall back
-    # to conference inside bridge.build_ingress_swml when no agent is
-    # available (Risk 1 recommendation a) — that fallback updates
-    # call.transport to match what actually happened.
+    # Decide transport from the queue preference. Both implementations can
+    # park a waiting caller, so the selected mode remains stable for the call.
     transport = _resolve_transport(call, queue_slug)
 
     if transport == 'bridge':
@@ -69,9 +69,7 @@ def build_ingress_swml(
         from . import conference as _impl
 
     # Persist the transport choice on the Call row so every later operation
-    # routes through the right impl. Bridge fallback inside the bridge
-    # implementation will overwrite this if it ends up parking the caller
-    # in a conference instead.
+    # routes through the right implementation.
     if call.transport != transport:
         call.transport = transport
         from app import db
@@ -79,6 +77,26 @@ def build_ingress_swml(
             db.session.commit()
         except Exception:
             db.session.rollback()
+
+    # Both transports write the same operational queue timeline. Keep this
+    # above the implementation fork so bridge and conference analytics have
+    # identical semantics even though their SignalWire primitives differ.
+    try:
+        from app import db
+        from app.services.interaction_timeline import record_queue_entered
+        record_queue_entered(
+            call,
+            queue_slug,
+            priority=priority,
+            routing_strategy=routing_strategy,
+        )
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        logger.warning(
+            "Queue timeline entry failed for call %s: %s",
+            call.id, exc,
+        )
 
     return _impl.build_ingress_swml(
         call=call,

@@ -72,6 +72,9 @@ export function WrapUpPanel({ interaction, onUpdate }: WrapUpPanelProps) {
     setErrorMsg(null);
     setHumanTouched(false);
     initialNotes.current = interaction.agentNotes ?? '';
+    // The interaction ID is the reset boundary. Autosave updates to notes or
+    // disposition on the same interaction must not reset local edit state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interaction.id]);
 
   // Pull the disposition list once. Cheap enough to lazy-load on mount.

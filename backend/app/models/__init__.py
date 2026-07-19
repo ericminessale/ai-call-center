@@ -2,6 +2,8 @@ from .workspace import Workspace
 from .subscriber_seat import SubscriberSeat
 from .user import User
 from .call import Call
+from .queue_attempt import QueueAttempt
+from .handling_segment import HandlingSegment
 from .call_leg import CallLeg
 from .contact import Contact
 from .transcription import Transcription
@@ -19,6 +21,8 @@ __all__ = [
     'SubscriberSeat',
     'User',
     'Call',
+    'QueueAttempt',
+    'HandlingSegment',
     'CallLeg',
     'Contact',
     'Transcription',

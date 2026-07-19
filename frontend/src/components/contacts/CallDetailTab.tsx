@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { PhoneIncoming, PhoneOutgoing, Mic, Play, Download, User } from 'lucide-react';
 import { Interaction, CallLeg } from '../../types/callcenter';
-import api from '../../services/api';
+import type { CallTimelineResponse } from '../../types/callcenter';
+import api, { callsApi } from '../../services/api';
 import { logger } from '../../lib/logger';
 import { CallTimeline } from './CallTimeline';
+import { CallJourney } from './CallJourney';
 import { AISummaryDisplay } from './ContactDetailView';
 import { SentimentArc, SentimentSegment } from './SentimentArc';
 import { WrapUpPanel } from './WrapUpPanel';
@@ -33,12 +35,17 @@ export function CallDetailTab({
   const [transcriptions, setTranscriptions] = useState<{ speaker: string; text: string; timestamp: string; sentiment?: string | null }[]>([]);
   const [legs, setLegs] = useState<CallLeg[]>([]);
   const [isLoadingTranscriptions, setIsLoadingTranscriptions] = useState(true);
+  const [timeline, setTimeline] = useState<CallTimelineResponse | null>(null);
+  const [isLoadingTimeline, setIsLoadingTimeline] = useState(true);
+  const [timelineError, setTimelineError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Fetch transcriptions and legs for this call
   useEffect(() => {
     const fetchCallDetails = async () => {
       setIsLoadingTranscriptions(true);
+      setIsLoadingTimeline(true);
+      setTimelineError(null);
       try {
         const response = await api.get(`/api/calls/${interaction.signalwireCallSid}`);
         const data = response.data.transcriptions || [];
@@ -56,12 +63,22 @@ export function CallDetailTab({
           logger.debug('No legs data available for this call');
           setLegs([]);
         }
+
+        try {
+          const timelineResponse = await callsApi.getTimeline(interaction.signalwireCallSid);
+          setTimeline(timelineResponse.data);
+        } catch (timelineLoadError) {
+          logger.debug('No measured journey data available for this call');
+          setTimeline(null);
+          setTimelineError('unavailable');
+        }
       } catch (error) {
         logger.error('Failed to load call details:', error);
         setTranscriptions([]);
         setLegs([]);
       } finally {
         setIsLoadingTranscriptions(false);
+        setIsLoadingTimeline(false);
       }
     };
 
@@ -76,6 +93,9 @@ export function CallDetailTab({
     'neutral';
 
   const directionLabel = interaction.direction === 'inbound' ? 'Inbound call' : 'Outbound call';
+  const hasMeasuredJourney = !!timeline && (
+    timeline.queueAttempts.length > 0 || timeline.handlingSegments.length > 0
+  );
 
   return (
     /* Flows naturally; the parent tab pane (overflow-y-auto) does the scrolling
@@ -236,12 +256,20 @@ export function CallDetailTab({
             ]}
           />
 
-          {/* Timeline — only if legs exist */}
-          {legs.length > 0 && (
+          {/* Measured journey; pre-migration calls fall back to legacy legs. */}
+          {(isLoadingTimeline || hasMeasuredJourney || legs.length === 0) && (
+            <CallJourney
+              timeline={timeline}
+              isLoading={isLoadingTimeline}
+              error={timelineError}
+            />
+          )}
+          {!isLoadingTimeline && !hasMeasuredJourney && legs.length > 0 && (
             <div className="border border-rule rounded-lg bg-canvas-raised p-3">
-              <div className="text-[12.5px] font-semibold text-ink mb-2">Call timeline</div>
+              <div className="text-[12.5px] font-semibold text-ink mb-2">Legacy handler journey</div>
               <CallTimeline
                 legs={legs}
+                showHeading={false}
                 callEnded={!!interaction.endedAt || ['completed', 'ended', 'failed', 'abandoned', 'no_answer', 'missed', 'canceled'].includes(interaction.status || '')}
               />
             </div>

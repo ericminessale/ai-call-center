@@ -342,8 +342,9 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
     if (activeTab === 'callDetail') {
       setActiveTab('history');
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- activeTab read for
-    // conditional reset only; we don't want to re-fire on tab changes.
+    // activeTab is sampled for a one-time conditional reset; tab changes must
+    // not reload the interaction or clear the selected call.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contact.id]);
 
   // Track call duration
@@ -391,6 +392,9 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
       socket.off('call_update', handleCallUpdate);
       socket.off('call_ended', handleCallEnded);
     };
+    // loadInteractions is intentionally sampled by the event handlers; it is
+    // declared later in this large component and is not an event trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [socket, currentCallSid]);
 
   // Listen for transcription updates via WebSocket

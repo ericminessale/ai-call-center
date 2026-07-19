@@ -1,7 +1,13 @@
 import axios from 'axios';
 import { Socket } from 'socket.io-client';
 import { AuthResponse, Call, DemoWorkspace, Transcription } from '../types';
-import { Contact, ContactMinimal, ContactsListResponse, InteractionsListResponse } from '../types/callcenter';
+import {
+  CallTimelineResponse,
+  Contact,
+  ContactMinimal,
+  ContactsListResponse,
+  InteractionsListResponse,
+} from '../types/callcenter';
 
 // CRITICAL: Set axios defaults to prevent it from using window.location.origin
 // DO NOT set a default baseURL - let axios handle relative URLs naturally
@@ -204,6 +210,9 @@ export const callsApi = {
 
   get: (call_sid: string) =>
     api.get<{ call: Call; transcriptions: Transcription[] }>(`/api/calls/${call_sid}`),
+
+  getTimeline: (call_id: number | string) =>
+    api.get<CallTimelineResponse>(`/api/calls/${call_id}/timeline`),
 
   // Cost transparency (IMP-01) — estimates at published list rates
   costRates: () =>

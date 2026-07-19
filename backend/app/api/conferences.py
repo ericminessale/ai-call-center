@@ -3,6 +3,7 @@ from app import db, redis_client
 from app.models import Conference, ConferenceParticipant, Call, CallLeg, User
 from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth
+from app.utils.request_logging import mask_phone, payload_keys, request_summary
 from app.utils.url_utils import get_base_url, signed_webhook_url
 import logging
 import json
@@ -230,26 +231,13 @@ def agent_conference_webhook():
     - Per-interaction: dial('/public/agent-conference?conf=interaction-abc123&agent_id=4')
     - Per-agent (legacy): dial('/public/agent-conference?agent_id=4')
     """
-    logger.info(f"Agent conference webhook called")
-    logger.info(f"Request method: {request.method}")
-    logger.info(f"Request URL: {request.url}")
-    logger.info(f"Request headers: {dict(request.headers)}")
-    logger.info(f"Request args: {dict(request.args)}")
-    logger.info(f"Request form: {dict(request.form)}")
-    logger.info(f"Request content type: {request.content_type}")
-
-    # Log raw data for debugging
-    try:
-        raw_data = request.get_data(as_text=True)
-        logger.info(f"Request raw data: {raw_data[:2000] if raw_data else 'empty'}")
-    except Exception as e:
-        logger.info(f"Could not get raw data: {e}")
+    logger.info("Agent conference webhook called: %s", request_summary(request))
 
     # Try to get JSON body if present
     json_data = {}
     if request.is_json:
         json_data = request.get_json() or {}
-        logger.info(f"Request JSON: {json_data}")
+        logger.debug("Agent conference JSON fields: %s", payload_keys(json_data))
 
     # Parse query params from multiple sources
     parsed_params = {}
@@ -261,12 +249,12 @@ def agent_conference_webhook():
     if '?' in to_param:
         query_string = to_param.split('?', 1)[1]
         parsed_params = {k: v[0] for k, v in parse_qs(query_string).items()}
-        logger.info(f"Parsed params from To: {parsed_params}")
+        logger.debug("Parsed parameter fields from To: %s", payload_keys(parsed_params))
 
     # Source 3: JSON body 'call' object (SignalWire Call Fabric format)
     if 'call' in json_data:
         call_data = json_data.get('call', {})
-        logger.info(f"Call data from JSON: {call_data}")
+        logger.debug("Agent conference call fields: %s", payload_keys(call_data))
         # Check for user_variables or params in call data
         if 'user_variables' in call_data:
             parsed_params.update(call_data['user_variables'])
@@ -277,14 +265,20 @@ def agent_conference_webhook():
         if '?' in json_to:
             query_string = json_to.split('?', 1)[1]
             parsed_params.update({k: v[0] for k, v in parse_qs(query_string).items()})
-            logger.info(f"Parsed params from JSON to field: {parsed_params}")
+            logger.debug(
+                "Parsed parameter fields from JSON To: %s",
+                payload_keys(parsed_params),
+            )
 
     # Also check top-level JSON for 'to', 'To', 'destination'
     json_to_toplevel = json_data.get('to', '') or json_data.get('To', '') or json_data.get('destination', '') or json_data.get('Destination', '')
     if json_to_toplevel and '?' in json_to_toplevel:
         query_string = json_to_toplevel.split('?', 1)[1]
         parsed_params.update({k: v[0] for k, v in parse_qs(query_string).items()})
-        logger.info(f"Parsed params from top-level to field: {parsed_params}")
+        logger.debug(
+            "Parsed parameter fields from top-level To: %s",
+            payload_keys(parsed_params),
+        )
 
     # Source 4: JSON body 'vars' or 'variables' (another common format)
     if 'vars' in json_data:
@@ -323,7 +317,7 @@ def agent_conference_webhook():
         if key in json_data and isinstance(json_data[key], dict):
             parsed_params.update(json_data[key])
 
-    logger.info(f"All parsed params: {parsed_params}")
+    logger.debug("Agent conference parsed parameter fields: %s", payload_keys(parsed_params))
 
     # Source 10: Redis lookup by join_token (most reliable method)
     # The frontend calls /api/conferences/prepare-join first, which stores params in Redis
@@ -335,7 +329,10 @@ def agent_conference_webhook():
         if redis_data:
             try:
                 token_params = json.loads(redis_data)
-                logger.info(f"Found params from Redis: {token_params}")
+                logger.debug(
+                    "Found Redis join-token parameter fields: %s",
+                    payload_keys(token_params),
+                )
                 parsed_params.update(token_params)
                 # DO NOT delete the token here. SignalWire fetches this
                 # SWML URL multiple times per dial (e.g. PSTN-leg node and
@@ -448,7 +445,7 @@ def agent_conference_webhook():
             }
         }
 
-        logger.info(f"TAKEOVER SWML: {json.dumps(swml, indent=2)}")
+        logger.debug("Returning takeover conference SWML")
         return jsonify(swml)
 
     # Get conference name - if provided, use per-interaction mode
@@ -568,7 +565,7 @@ def agent_conference_webhook():
                 "main": swml_main
             }
         }
-        logger.info(f"Returning SWML: {json.dumps(swml)}")
+        logger.debug("Returning agent conference SWML")
         return jsonify(swml)
 
     # Mode 2: Per-agent conference (LEGACY - for backward compatibility)
@@ -597,7 +594,7 @@ def agent_conference_webhook():
     }
 
     logger.info(f"Agent {agent_id} joining conference {conference.conference_name}")
-    logger.info(f"Returning SWML: {json.dumps(swml)}")
+    logger.debug("Returning agent conference SWML")
 
     return jsonify(swml)
 
@@ -616,9 +613,7 @@ def join_conference_webhook():
     Can use the same CXML/SWML Script resource as agent-conference, just pass conf param:
         /public/agent-conference?conf=interaction-abc123&agent_id=4
     """
-    logger.info(f"Join conference webhook called")
-    logger.info(f"Request args: {dict(request.args)}")
-    logger.info(f"Request form: {dict(request.form)}")
+    logger.info("Join conference webhook called: %s", request_summary(request))
 
     # Get conference name - try multiple sources
     conference_name = request.args.get('conf') or request.args.get('conference')
@@ -626,13 +621,13 @@ def join_conference_webhook():
     # If not in query params, parse from the 'To' parameter
     if not conference_name:
         to_param = request.form.get('To', '') or request.form.get('Called', '')
-        logger.info(f"Parsing conf from To parameter: {to_param}")
+        logger.debug("Parsing conference from the To parameter")
 
         if '?' in to_param:
             query_string = to_param.split('?', 1)[1]
             parsed_qs = parse_qs(query_string)
             conference_name = parsed_qs.get('conf', parsed_qs.get('conference', [None]))[0]
-            logger.info(f"Extracted conf from To: {conference_name}")
+            logger.debug("Conference name extracted from the To parameter")
 
     if not conference_name:
         logger.error("No conference name provided")
@@ -678,7 +673,7 @@ def join_conference_webhook():
     }
 
     logger.info(f"Agent {agent_id} joining interaction conference {conference_name}")
-    logger.info(f"Returning SWML: {json.dumps(swml)}")
+    logger.debug("Returning join-conference SWML")
 
     return jsonify(swml)
 
@@ -697,9 +692,7 @@ def agent_join_swml():
     This is the SERVER-INITIATED pattern - no SignalWire Dashboard resource needed.
     Backend calls agent -> agent answers -> this SWML runs -> agent joins conference.
     """
-    logger.info(f"Agent join SWML endpoint called")
-    logger.info(f"Request args: {dict(request.args)}")
-    logger.info(f"Request form: {dict(request.form)}")
+    logger.info("Agent join SWML endpoint called: %s", request_summary(request))
 
     # Get conference name from query params
     conference_name = request.args.get('conf') or request.args.get('conference')
@@ -740,8 +733,7 @@ def agent_join_swml():
         }
     }
 
-    logger.info(f"Returning SWML for agent {agent_id} to join {conference_name}")
-    logger.info(f"SWML: {json.dumps(swml)}")
+    logger.debug("Returning agent-join SWML for agent %s", agent_id)
 
     return jsonify(swml)
 
@@ -758,7 +750,7 @@ def agent_call_state_webhook(conference_name):
     data = request.get_json() if request.is_json else request.form.to_dict()
 
     logger.info(f"Agent call state webhook for conference {conference_name}")
-    logger.info(f"Data: {json.dumps(data, indent=2) if isinstance(data, dict) else data}")
+    logger.info("Agent call state request: %s", request_summary(request, data))
 
     # Handle nested params structure from SignalWire
     params = data.get('params', data)
@@ -1015,8 +1007,7 @@ def handle_call_conference_status(conference_name, event_type, participant_call_
 
         # Update call status
         if call.status not in ['ended', 'completed']:
-            call.status = 'ended'
-            call.ended_at = datetime.utcnow()
+            call.update_status('ended')
             db.session.commit()
 
             # Emit call update
@@ -1039,7 +1030,11 @@ def conference_status_callback(conference_name):
     """
     data = request.get_json() if request.is_json else request.form.to_dict()
 
-    logger.info(f"Conference status callback for {conference_name}: {json.dumps(data, indent=2)}")
+    logger.info(
+        "Conference status callback for %s: %s",
+        conference_name,
+        request_summary(request, data),
+    )
 
     event_type = data.get('event_type', data.get('StatusCallbackEvent'))
     participant_call_sid = data.get('call_id', data.get('CallSid'))
@@ -1127,8 +1122,11 @@ def conference_status_callback(conference_name):
                 }
                 if call.status in NON_TERMINAL_PRE_ACTIVE:
                     prev_status = call.status
-                    call.status = 'active'
                     call.handler_type = 'human'
+                    call.assigned_agent_id = call.assigned_agent_id or conference.owner_user_id
+                    if not call.answered_at:
+                        call.answered_at = datetime.utcnow()
+                    call.update_status('active')
                     logger.info(
                         f"Conference join: call {call.id} status "
                         f"{prev_status!r} → 'active', handler_type → 'human'"
@@ -1190,8 +1188,7 @@ def conference_status_callback(conference_name):
 
                     # Update call status to completed
                     if call.status not in ['completed', 'ended']:
-                        call.status = 'completed'
-                        call.ended_at = datetime.utcnow()
+                        call.update_status('completed')
                         logger.info(f"Updated call {call.id} status to 'completed'")
 
                     db.session.commit()
@@ -1513,7 +1510,7 @@ def dial_out_to_conference(conference_name):
         call_state_url = f"{base_url}/api/conferences/{conference_name}/call-state"
 
         logger.info(f"Dial-out: {phone_number} -> conference {conference_name}")
-        logger.info(f"Answer URL (SWML): {answer_url}")
+        logger.debug("Outbound answer URL prepared: %s", urlparse(answer_url).path)
         logger.info(f"Call State URL: {call_state_url}")
 
         # Create the outbound call
@@ -1577,15 +1574,19 @@ def outbound_answer_webhook(conference_name):
     No auth required - this is called by SignalWire.
     """
     logger.info(f"Outbound call answered, joining conference: {conference_name}")
-    logger.info(f"Request args: {dict(request.args)}")
-    logger.info(f"Request form: {dict(request.form)}")
+    logger.info("Outbound-answer webhook request: %s", request_summary(request))
 
     # Get call info from SignalWire
     call_sid = request.form.get('CallSid') or request.form.get('call_id')
     from_number = request.form.get('From')
     to_number = request.form.get('To')
 
-    logger.info(f"Call SID: {call_sid}, From: {from_number}, To: {to_number}")
+    logger.info(
+        "Outbound answer call=%s from=%s to=%s",
+        call_sid,
+        mask_phone(from_number),
+        mask_phone(to_number),
+    )
 
     base_url = get_base_url()
     status_callback = f"{base_url}/api/conferences/{conference_name}/status"
@@ -1610,8 +1611,7 @@ def outbound_answer_webhook(conference_name):
         }
     }
 
-    logger.info(f"Returning SWML to join conference {conference_name}")
-    logger.info(f"SWML: {json.dumps(swml, indent=2)}")
+    logger.debug("Returning outbound-answer conference SWML")
 
     return jsonify(swml)
 
@@ -1626,7 +1626,7 @@ def call_state_webhook(conference_name):
     data = request.get_json() if request.is_json else request.form.to_dict()
 
     logger.info(f"Call state webhook for conference {conference_name}")
-    logger.info(f"Data: {json.dumps(data, indent=2) if isinstance(data, dict) else data}")
+    logger.info("Call state request: %s", request_summary(request, data))
 
     call_sid = data.get('call_id') or data.get('CallSid')
     call_state = data.get('call_state') or data.get('CallStatus')
@@ -1656,13 +1656,12 @@ def call_state_webhook(conference_name):
     old_status = call.status
 
     if new_status and new_status != old_status:
-        call.status = new_status
-        logger.info(f"Call {call.id} status: {old_status} -> {new_status}")
-
         if new_status == 'active':
-            call.answered_at = datetime.utcnow()
-        elif new_status in ['ended', 'failed']:
-            call.ended_at = datetime.utcnow()
+            call.handler_type = 'human'
+            call.assigned_agent_id = call.assigned_agent_id or call.user_id
+            call.answered_at = call.answered_at or datetime.utcnow()
+        call.update_status(new_status)
+        logger.info(f"Call {call.id} status: {old_status} -> {new_status}")
 
         db.session.commit()
 

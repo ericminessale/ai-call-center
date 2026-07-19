@@ -558,6 +558,7 @@ class QueueService:
             # bails before the banner fires. No more phantom assignments.
             try:
                 from sqlalchemy import text
+                claim_at = datetime.utcnow()
                 claim = db.session.execute(
                     text(
                         "UPDATE calls "
@@ -567,7 +568,7 @@ class QueueService:
                     ),
                     {
                         'uid': agent_user.id,
-                        'ts': datetime.utcnow(),
+                        'ts': claim_at,
                         'id': call.id,
                     },
                 )
@@ -582,6 +583,8 @@ class QueueService:
                         f"{agent_id} stays available."
                     )
                     return
+                from app.services.interaction_timeline import best_effort, record_queue_offered
+                best_effort(record_queue_offered, call, agent_user.id, claim_at)
                 db.session.commit()
                 # Refresh the in-memory call object so downstream emit reads
                 # the latest assigned_agent_id / status fields.
@@ -1035,13 +1038,11 @@ class QueueService:
     def get_agent_metrics(self, agent_id: str, period_hours: int = 24) -> Dict[str, Any]:
         """Get performance metrics for an agent over a window.
 
-        Pulls from the ``calls`` table. ``calls_handled`` counts Call rows
-        assigned to this agent within the window; ``average_handle_time``
-        is mean ``ended_at - answered_at`` in seconds for those rows.
+        Handling segments are authoritative for new interactions. Calls that
+        predate the timeline migration retain a non-overlapping legacy
+        fallback, so the dashboard stays useful during rollout.
         """
-        from sqlalchemy import func
-        from app import db
-        from app.models import Call
+        from app.services.interaction_timeline import get_agent_performance
 
         since = datetime.utcnow() - timedelta(hours=period_hours)
         try:
@@ -1049,29 +1050,14 @@ class QueueService:
         except (TypeError, ValueError):
             agent_id_int = None
 
-        calls_handled = 0
-        avg_handle_time = 0.0
-        if agent_id_int is not None:
-            row = db.session.query(
-                func.count(Call.id),
-                func.avg(
-                    func.extract('epoch', Call.ended_at) -
-                    func.extract('epoch', Call.answered_at)
-                ),
-            ).filter(
-                Call.assigned_agent_id == agent_id_int,
-                Call.created_at >= since,
-                Call.answered_at.isnot(None),
-                Call.ended_at.isnot(None),
-            ).one()
-            calls_handled = int(row[0] or 0)
-            avg_handle_time = float(row[1] or 0.0)
+        performance = get_agent_performance(since, self.workspace_id)
+        row = performance.get(agent_id_int, {}) if agent_id_int is not None else {}
 
         return {
             "agent_id": agent_id,
             "period_hours": period_hours,
-            "calls_handled": calls_handled,
-            "average_handle_time": round(avg_handle_time, 1),
+            "calls_handled": row.get('calls_handled', 0),
+            "average_handle_time": row.get('average_handle_time', 0.0),
             "current_status": self.get_agent_status(agent_id),
         }
 
@@ -1115,25 +1101,11 @@ class QueueService:
         there's no data in the window — callers should treat that as
         "not enough data" rather than coerce to 0.
         """
-        from sqlalchemy import func, case
-        from app import db
-        from app.models import Call
-
         since = datetime.utcnow() - timedelta(hours=window_hours)
-        wait_seconds = (
-            func.extract('epoch', Call.answered_at)
-            - func.extract('epoch', Call.created_at)
+        from app.services.interaction_timeline import calculate_service_level
+        return calculate_service_level(
+            queue_id,
+            since,
+            threshold_seconds,
+            workspace_id=self.workspace_id,
         )
-        row = db.session.query(
-            func.count(Call.id),
-            func.sum(case((wait_seconds <= threshold_seconds, 1), else_=0)),
-        ).filter(
-            Call.queue_id == queue_id,
-            Call.created_at >= since,
-            Call.answered_at.isnot(None),
-        ).one()
-
-        total, within = int(row[0] or 0), int(row[1] or 0)
-        if total == 0:
-            return None
-        return round(100.0 * within / total, 1)

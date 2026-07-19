@@ -3,9 +3,11 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { callsApi, transcriptionApi } from '../services/api';
 import { useSocketContext } from '../contexts/SocketContext';
 import { Call, Transcription } from '../types';
+import type { CallTimelineResponse } from '../types/callcenter';
 import { ArrowLeft, Phone, Clock, Calendar, Mic, MicOff, FileText, Loader2, Play, Download, AlertCircle } from 'lucide-react';
 import { format } from 'date-fns';
 import { logger } from '../lib/logger';
+import { CallJourney } from './contacts/CallJourney';
 
 interface TranscriptionEvent {
   call_sid: string;
@@ -27,11 +29,17 @@ export default function CallDetails() {
   const [isLoading, setIsLoading] = useState(true);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [summary, setSummary] = useState<string | null>(null);
+  const [timeline, setTimeline] = useState<CallTimelineResponse | null>(null);
+  const [isLoadingTimeline, setIsLoadingTimeline] = useState(true);
+  const [timelineError, setTimelineError] = useState<string | null>(null);
 
   // Load call details
   useEffect(() => {
     if (!callSid) return;
     loadCallDetails();
+    loadCallTimeline();
+    // callSid is the trigger; the loader is recreated with the same callSid.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callSid]);
 
   // Socket event listeners
@@ -52,6 +60,9 @@ export default function CallDetails() {
       socket.off('summary', handleSummary);
       socket.emit('leave_call', { call_sid: callSid });
     };
+    // Handlers read callSid, which is already a dependency. Re-subscribing for
+    // each render-created handler would churn the live socket subscription.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callSid, socket]);
 
   const loadCallDetails = async () => {
@@ -64,12 +75,27 @@ export default function CallDetails() {
       setTranscriptions(response.data.transcriptions || []);
       // Only set transcribing if call is active AND transcription is active
       const isCallActive = ['created', 'ringing', 'answered'].includes(response.data.call.status.toLowerCase());
-      setIsTranscribing(response.data.call.transcription_active && isCallActive);
+      setIsTranscribing(response.data.call.transcriptionActive && isCallActive);
       setSummary(response.data.call.summary ?? null);
     } catch (error) {
       logger.error('Failed to load call details:', error);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const loadCallTimeline = async () => {
+    if (!callSid) return;
+    setIsLoadingTimeline(true);
+    setTimelineError(null);
+    try {
+      const response = await callsApi.getTimeline(callSid);
+      setTimeline(response.data);
+    } catch (error) {
+      logger.error('Failed to load call journey:', error);
+      setTimelineError('unavailable');
+    } finally {
+      setIsLoadingTimeline(false);
     }
   };
 
@@ -103,6 +129,7 @@ export default function CallDetails() {
       if (data.status === 'ended') {
         setIsTranscribing(false);
       }
+      void loadCallTimeline();
     }
   };
 
@@ -123,7 +150,7 @@ export default function CallDetails() {
       const action = isTranscribing ? 'stop' : 'start';
       await transcriptionApi.control(callSid, action);
       setIsTranscribing(!isTranscribing);
-      setCall({ ...call, transcription_active: !isTranscribing });
+      setCall({ ...call, transcriptionActive: !isTranscribing });
     } catch (error) {
       logger.error('Failed to toggle transcription:', error);
     }
@@ -146,12 +173,13 @@ export default function CallDetails() {
       await callsApi.end(callSid);
       setCall({ ...call, status: 'ended' });
       setIsTranscribing(false);
+      await loadCallTimeline();
     } catch (error) {
       logger.error('Failed to end call:', error);
     }
   };
 
-  const formatDuration = (seconds?: number) => {
+  const formatDuration = (seconds?: number | null) => {
     if (!seconds) return '-';
     const minutes = Math.floor(seconds / 60);
     const secs = seconds % 60;
@@ -224,7 +252,7 @@ export default function CallDetails() {
                   <div className="flex items-center space-x-4 text-sm text-gray-500 mt-1">
                     <span className="flex items-center">
                       <Calendar className="h-3 w-3 mr-1" />
-                      {format(new Date(call.created_at), 'MMM d, yyyy h:mm a')}
+                      {format(new Date(call.createdAt), 'MMM d, yyyy h:mm a')}
                     </span>
                     <span className="flex items-center">
                       <Clock className="h-3 w-3 mr-1" />
@@ -287,6 +315,15 @@ export default function CallDetails() {
           )}
         </div>
 
+        <div className="mb-6">
+          <CallJourney
+            timeline={timeline}
+            isLoading={isLoadingTimeline}
+            error={timelineError}
+            variant="light"
+          />
+        </div>
+
         {/* Live Transcript */}
         {isActive && (isTranscribing || liveTranscript) && (
           <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
@@ -303,7 +340,7 @@ export default function CallDetails() {
         )}
 
         {/* Recording Player */}
-        {call.recording_url && (
+        {call.recordingUrl && (
           <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
             <h2 className="text-xl font-bold mb-4 flex items-center">
               <Play className="h-5 w-5 mr-2" />
@@ -311,7 +348,7 @@ export default function CallDetails() {
             </h2>
             <div className="bg-gray-50 rounded-lg p-4">
               <audio controls className="w-full">
-                <source src={call.recording_url} type="audio/mpeg" />
+                <source src={call.recordingUrl} type="audio/mpeg" />
                 Your browser does not support the audio element.
               </audio>
               <div className="mt-3 flex justify-between items-center">
@@ -319,7 +356,7 @@ export default function CallDetails() {
                   Duration: {formatDuration(call.duration)}
                 </span>
                 <a
-                  href={call.recording_url}
+                  href={call.recordingUrl}
                   download
                   className="flex items-center text-blue-600 hover:text-blue-800 text-sm"
                 >

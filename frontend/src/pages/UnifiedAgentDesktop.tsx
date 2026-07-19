@@ -138,7 +138,6 @@ export function UnifiedAgentDesktop() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.state]);
 
   // Live sentiment from AI agents, keyed by call ID
@@ -319,6 +318,9 @@ export function UnifiedAgentDesktop() {
       socket.off('queue_config_changed');
       socket.off('sentiment_update');
     };
+    // Load helpers are sampled by stable socket callbacks. Rebinding every
+    // time search/contact state changes would duplicate live subscriptions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [socket]);
 
   // Load contacts
@@ -429,6 +431,9 @@ export function UnifiedAgentDesktop() {
     updateCallCounts();
     loadQueueConfigs();
     loadStats();
+    // Mount-only bootstrap. Search changes have their own debounced contact
+    // loader below and must not reload every dashboard data source.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Poll stats every 30 seconds
@@ -516,6 +521,9 @@ export function UnifiedAgentDesktop() {
   // Update view mode when URL changes
   useEffect(() => {
     setViewMode(getInitialViewMode());
+    // pathname is the route state that determines the view; the local helper
+    // is recreated on render but should not itself retrigger navigation state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname]);
 
   // Tabs permitted per role. Agents have no supervisor/settings access;

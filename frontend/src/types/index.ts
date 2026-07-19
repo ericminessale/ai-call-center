@@ -55,20 +55,28 @@ export interface DemoWorkspace {
 }
 
 export interface Call {
-  id: string;
-  user_id: string;
-  signalwire_call_sid: string;
+  id: number;
+  userId: number;
+  contactId?: number | null;
+  signalwireCallSid: string;
+  fromNumber?: string | null;
   destination: string;
-  destination_type: 'phone' | 'sip';
+  destinationType: 'phone' | 'sip';
+  direction: 'inbound' | 'outbound';
+  handlerType: 'human' | 'ai';
+  aiAgentName?: string | null;
   status: string;
-  transcription_active: boolean;
-  recording_url?: string;
-  summary?: string;
-  duration?: number;
-  created_at: string;
-  answered_at?: string;
-  ended_at?: string;
-  full_transcript?: string;
+  transcriptionActive: boolean;
+  recordingUrl?: string | null;
+  summary?: string | null;
+  duration?: number | null;
+  sentimentScore?: number | null;
+  createdAt: string;
+  answeredAt?: string | null;
+  endedAt?: string | null;
+  queue_id?: string | null;
+  assigned_agent_id?: number | null;
+  transport?: 'conference' | 'bridge';
 }
 
 export interface Transcription {

@@ -1299,6 +1299,7 @@ def take_queued_call(call_id):
         # double-clicking won't 409 them.
         from sqlalchemy import text
         user_id = request.current_user.id
+        claim_at = datetime.utcnow()
         claim = db.session.execute(
             text(
                 "UPDATE calls SET "
@@ -1314,7 +1315,7 @@ def take_queued_call(call_id):
             ),
             {
                 'uid': user_id,
-                'ts': datetime.utcnow(),
+                'ts': claim_at,
                 'id': call.id,
                 'conf': f"interaction-{call.signalwire_call_sid}",
             },
@@ -1330,6 +1331,8 @@ def take_queued_call(call_id):
             )
             return jsonify({'error': 'Call is assigned to another agent'}), 409
 
+        from app.services.interaction_timeline import best_effort, record_queue_offered
+        best_effort(record_queue_offered, call, user_id, claim_at)
         db.session.commit()
         # Refresh so downstream code (emit, response payload) reads the
         # claimed state, not the pre-claim snapshot.
@@ -1447,19 +1450,15 @@ def update_call_status(call_id):
 
         old_status = call.status
 
-        # Update status
-        call.status = new_status
+        # Update status through the model so the durable handling timeline is
+        # written in the same transaction as the compatibility Call fields.
         call.handler_type = 'human'  # Agent is now handling
 
         # If becoming active, mark answered time
         if new_status == 'active' and not call.answered_at:
             call.answered_at = datetime.utcnow()
 
-        # If ended, mark ended time
-        if new_status == 'ended' and not call.ended_at:
-            call.ended_at = datetime.utcnow()
-            if call.answered_at:
-                call.duration = int((call.ended_at - call.answered_at).total_seconds())
+        call.update_status(new_status)
 
         db.session.commit()
         logger.info(f"Call {call_id} status updated: {old_status} -> {new_status}")
@@ -1482,6 +1481,80 @@ def update_call_status(call_id):
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({'error': f'Failed to update call status: {str(e)}'}), 500
+
+
+@calls_bp.route('/<call_id>/timeline', methods=['GET'])
+@require_auth
+def get_call_timeline(call_id):
+    """Return the measured queue and handling history for one interaction."""
+    call = None
+    if str(call_id).isdigit():
+        call = db.session.query(Call).filter_by(id=int(call_id)).first()
+    if not call:
+        call = Call.find_by_sid(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+
+    owner_check = _require_call_ownership(call, request.current_user)
+    if owner_check is not None:
+        return owner_check
+
+    from app.models import HandlingSegment, Queue, QueueAttempt, User
+    attempts = (
+        QueueAttempt.query.filter_by(call_id=call.id)
+        .order_by(QueueAttempt.attempt_number.asc())
+        .all()
+    )
+    segments = (
+        HandlingSegment.query.filter_by(call_id=call.id)
+        .order_by(HandlingSegment.started_at.asc())
+        .all()
+    )
+    agent_ids = {
+        agent_id
+        for attempt in attempts
+        for agent_id in (
+            attempt.last_offered_agent_id,
+            attempt.last_declined_agent_id,
+            attempt.accepted_agent_id,
+        )
+        if agent_id is not None
+    } | {
+        segment.agent_id for segment in segments if segment.agent_id is not None
+    }
+    agents = {
+        user.id: (user.name or user.email)
+        for user in User.query.filter(User.id.in_(agent_ids)).all()
+    } if agent_ids else {}
+    queue_ids = {attempt.queue_id for attempt in attempts if attempt.queue_id is not None}
+    queues = {
+        queue.id: queue.display_name
+        for queue in Queue.query.filter(Queue.id.in_(queue_ids)).all()
+    } if queue_ids else {}
+
+    attempt_rows = []
+    for attempt in attempts:
+        row = attempt.to_dict()
+        row.update({
+            'queueDisplayName': queues.get(attempt.queue_id),
+            'lastOfferedAgentName': agents.get(attempt.last_offered_agent_id),
+            'lastDeclinedAgentName': agents.get(attempt.last_declined_agent_id),
+            'acceptedAgentName': agents.get(attempt.accepted_agent_id),
+        })
+        attempt_rows.append(row)
+    segment_rows = []
+    for segment in segments:
+        row = segment.to_dict()
+        row['agentName'] = agents.get(segment.agent_id)
+        segment_rows.append(row)
+
+    return jsonify({
+        'callId': call.id,
+        'signalwireCallId': call.signalwire_call_sid,
+        'transport': call.transport,
+        'queueAttempts': attempt_rows,
+        'handlingSegments': segment_rows,
+    })
 
 
 @calls_bp.route('/<call_id>/legs', methods=['GET'])
@@ -1699,8 +1772,7 @@ def cleanup_stale_calls():
         cleaned_count = 0
         for call in stale_calls:
             logger.info(f"Cleaning up stale call {call.id}: status={call.status}, created={call.created_at}")
-            call.status = 'ended'
-            call.ended_at = datetime.utcnow()
+            call.update_status('ended')
             cleaned_count += 1
 
         db.session.commit()
@@ -1735,19 +1807,12 @@ def get_my_stats():
         user_id = request.current_user.id
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # Calls handled today (where this agent was assigned or initiated)
-        calls_today = db.session.query(func.count(Call.id)).filter(
-            ((Call.assigned_agent_id == user_id) | (Call.user_id == user_id)),
-            Call.created_at >= today_start,
-            Call.status.in_(['ended', 'completed', 'answered', 'active'])
-        ).scalar() or 0
-
-        # Average handle time today (seconds) for completed calls
-        avg_handle_time = db.session.query(func.avg(Call.duration)).filter(
-            ((Call.assigned_agent_id == user_id) | (Call.user_id == user_id)),
-            Call.created_at >= today_start,
-            Call.duration.isnot(None)
-        ).scalar() or 0
+        from app.services.interaction_timeline import get_agent_performance
+        performance = get_agent_performance(
+            today_start, workspace_id=request.current_user.workspace_id,
+        ).get(user_id, {})
+        calls_today = performance.get('calls_handled', 0)
+        avg_handle_time = performance.get('average_handle_time', 0)
 
         # Queue depth across all queues
         total_queue_depth = 0

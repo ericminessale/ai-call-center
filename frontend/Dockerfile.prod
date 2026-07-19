@@ -12,10 +12,10 @@
 # which becomes https/wss automatically behind TLS (DEPLOY-M5).
 
 # ---- build stage ----
-FROM node:18-alpine AS build
+FROM node:24-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci 2>/dev/null || npm install
+RUN npm ci
 COPY . .
 # Optional build-time public config. Safe to leave empty for same-origin.
 ARG VITE_SIGNALWIRE_HOST

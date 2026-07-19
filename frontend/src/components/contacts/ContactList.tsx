@@ -208,6 +208,9 @@ function NewContactModal({
         setFormData(prev => ({ ...prev, displayName: name }));
       }
     }
+    // displayName is deliberately sampled: once a user edits it, name changes
+    // must not overwrite their explicit value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formData.firstName, formData.lastName]);
 
   const handleSubmit = async (e: React.FormEvent) => {

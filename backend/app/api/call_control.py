@@ -11,6 +11,7 @@ from app.models import User
 from app.utils.decorators import require_auth, require_permission, require_role
 from app.services.signalwire_api import get_signalwire_api
 from app.services.redis_service import get_redis_client
+from app.utils.url_utils import get_base_url, signed_tap_stream_url
 from datetime import datetime
 import logging
 import json
@@ -287,6 +288,18 @@ def return_call_to_queue(call_id):
         # IMPORTANT: ai_context stays — the next agent sees the same
         # collected context, no re-triage. answered_at also stays —
         # SLA clock is original-to-now per the 2p spec.
+        try:
+            context = json.loads(call.ai_context) if call.ai_context else {}
+        except Exception:
+            context = {}
+        from app.services.interaction_timeline import best_effort, record_return_to_queue
+        best_effort(
+            record_return_to_queue,
+            call, target_queue_slug,
+            reason=reason,
+            priority=context.get('priority', 5),
+        )
+
         call.status = 'waiting'
         call.assigned_agent_id = None
         call.assigned_at = None
@@ -307,10 +320,6 @@ def return_call_to_queue(call_id):
                 qs.set_agent_status(str(user.id), 'available')
             # 6. Re-enqueue. Preserves AI-collected priority + context for
             # the next agent.
-            try:
-                context = json.loads(call.ai_context) if call.ai_context else {}
-            except Exception:
-                context = {}
             qs.enqueue_call(
                 call_id=call.signalwire_call_sid,
                 queue_id=target_queue_slug,
@@ -759,7 +768,7 @@ def start_monitor(call_id):
             }
             redis_client.set(f'conference_join:{token}', json.dumps(redis_data), ex=300)
 
-            base_url = os.environ.get('EXTERNAL_URL', 'http://localhost:5000')
+            base_url = get_base_url()
             dial_address = f"{base_url}/api/conferences/agent-conference?token={token}"
 
             emit_call_event(call.id, 'monitor', {
@@ -777,7 +786,7 @@ def start_monitor(call_id):
             }), 200
         else:
             # AI call or non-conference: use tap
-            base_url = os.environ.get('EXTERNAL_URL', 'http://localhost:5000')
+            base_url = get_base_url()
             ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
             # RE-AUDIT-03 fix (2026-06-03): the tap URL used to embed
             # ``call.id`` (DB int), so tap_relay's per-frame Socket.IO
@@ -788,7 +797,7 @@ def start_monitor(call_id):
             # because no socket was ever in ``tap:{db_id}``. Listen was
             # silently dead for everyone. Use the sid in the URL so the
             # producer's emit room matches what join_tap joins.
-            tap_uri = f"{ws_url}/ws/tap-stream/{call.signalwire_call_sid}"
+            tap_uri = signed_tap_stream_url(ws_url, call.signalwire_call_sid)
 
             sw_api = get_signalwire_api()
             result = sw_api.tap_call(call.signalwire_call_sid, tap_uri, direction='both')

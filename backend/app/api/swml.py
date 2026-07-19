@@ -5,6 +5,7 @@ from app import db, redis_client
 from app.api import swml_bp
 from app.models import Call, CallLeg, WebhookEvent, User, Conference, ConferenceParticipant
 from app.models.system_config import SystemConfig
+from app.utils.request_logging import mask_phone, request_summary
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.utils.demo_config import is_demo_mode
 import logging
@@ -21,10 +22,9 @@ def initial_call():
     # Handle JSON data from SignalWire
     data = request.get_json() if request.is_json else request.form.to_dict()
 
-    # Log the complete JSON received
     logger.info("SWML REQUEST: /api/swml/initial-call call_id=%s",
                 data.get('call', {}).get('call_id'))
-    logger.debug("RAW JSON: %s", json.dumps(data, indent=2))
+    logger.debug("Payload shape: %s", request_summary(request, data))
 
     # Extract call information from the JSON structure
     call_data = data.get('call', {})
@@ -36,7 +36,13 @@ def initial_call():
     call_state = call_data.get('call_state')
     direction = call_data.get('direction')
 
-    logger.info(f"Extracted - Call ID: {call_id}, From: {from_number}, To: {to_number}, State: {call_state}")
+    logger.info(
+        "Extracted call=%s from=%s to=%s state=%s",
+        call_id,
+        mask_phone(from_number),
+        mask_phone(to_number),
+        call_state,
+    )
 
     # Hosted demo only: per-caller-ID inbound ratelimit. If this
     # number has hit its hourly cap, return a polite "try later" SWML
@@ -47,7 +53,8 @@ def initial_call():
     )
     if should_reject_inbound(from_number):
         logger.info(
-            "Inbound call from %s rejected by demo ratelimit", from_number,
+            "Inbound call from %s rejected by demo ratelimit",
+            mask_phone(from_number),
         )
         return jsonify(demo_reject_swml())
 
@@ -137,7 +144,11 @@ def initial_call():
                 )
                 db.session.add(contact)
                 db.session.flush()  # Get the ID
-                logger.info(f"Created new contact for {from_number}: ID {contact.id}")
+                logger.info(
+                    "Created new contact for %s: ID %s",
+                    mask_phone(from_number),
+                    contact.id,
+                )
             contact_id = contact.id
             # Update last interaction timestamp
             contact.last_interaction_at = datetime.utcnow()
@@ -160,14 +171,23 @@ def initial_call():
             workspace_id=ws_id,  # None → flush stamper derives/defaults
         )
         db.session.add(call)
-        logger.info(f"Created new call {call_id} with from_number: {from_number}, contact_id: {contact_id}")
+        logger.info(
+            "Created new call %s with from_number=%s contact_id=%s",
+            call_id,
+            mask_phone(from_number),
+            contact_id,
+        )
     else:
         # Update existing call
         call.update_status(call_state)
         # Update from_number if not already set
         if from_number and not call.from_number:
             call.from_number = from_number
-            logger.info(f"Updated call {call_id} with from_number: {from_number}")
+            logger.info(
+                "Updated call %s with from_number=%s",
+                call_id,
+                mask_phone(from_number),
+            )
 
     db.session.commit()
 
@@ -373,11 +393,7 @@ def initial_call():
         "sections": {"main": main_section},
     }
 
-    # Log the SWML response
-    logger.info("="*50)
-    logger.info("SWML RESPONSE: /api/swml/initial-call")
-    logger.info(f"JSON: {json.dumps(swml_response, indent=2)}")
-    logger.info("="*50)
+    logger.debug("SWML response prepared for /api/swml/initial-call")
 
     return jsonify(swml_response)
 

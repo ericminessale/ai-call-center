@@ -87,9 +87,7 @@ def _reap_call(call) -> None:
     # the pre-end status to decide abandoned_in_queue vs missed etc).
     if not call.end_reason:
         call.end_reason = call.compute_end_reason()
-    call.status = 'ended'
-    if not call.ended_at:
-        call.ended_at = datetime.utcnow()
+    call.update_status('ended', end_reason=call.end_reason)
 
     redis_client = get_redis_client()
     if redis_client:

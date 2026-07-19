@@ -6,7 +6,6 @@
 
 const isDev = import.meta.env.DEV;
 
-/* eslint-disable no-console */
 export const logger = {
   debug: (...args: unknown[]) => {
     if (isDev) console.log(...args);

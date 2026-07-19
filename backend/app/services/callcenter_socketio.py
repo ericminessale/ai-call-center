@@ -291,6 +291,17 @@ def handle_reject_call_assignment(data):
         emit('error', {'message': 'Not authorized for this call'})
         return
 
+    # A delayed/retried decline from a previous banner must not clear a newer
+    # agent's assignment. The dispatch claim is committed before the banner is
+    # emitted, so the rejecting agent must still be the durable owner here.
+    if call.assigned_agent_id != int(user_id):
+        logger.info(
+            f"Reject ignored for call {call.id}: agent {user_id} no longer "
+            f"owns assignment {call.assigned_agent_id}"
+        )
+        emit('error', {'message': 'This assignment is no longer active'})
+        return
+
     queue_id = call.queue_id
     declining_agent = str(user_id)
 
@@ -307,6 +318,8 @@ def handle_reject_call_assignment(data):
         qs.mark_decline(declining_agent, call.signalwire_call_sid)
 
         # Reset assignment so another agent can take it.
+        from app.services.interaction_timeline import best_effort, record_queue_offer_declined
+        best_effort(record_queue_offer_declined, call, int(declining_agent))
         call.assigned_agent_id = None
         call.status = 'waiting'
         db.session.commit()
@@ -519,8 +532,7 @@ def handle_end_call(data):
                     )
                     emit('error', {'message': 'Not authorized for this call'})
                     return
-                call.status = 'ended'
-                call.ended_at = datetime.utcnow()
+                call.update_status('ended')
                 db.session.commit()
         except Exception as e:
             logger.error(f"Error ending call: {e}")

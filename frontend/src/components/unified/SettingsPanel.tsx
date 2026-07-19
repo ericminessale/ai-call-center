@@ -1696,6 +1696,9 @@ function KnowledgeBaseTab({ focusCollectionId }: { focusCollectionId?: number | 
       const target = collections.find(c => c.id === focusCollectionId);
       if (target) handleSelectCollection(target);
     }
+    // Navigation focus and collection loading are the only triggers. The
+    // selection helper is recreated by this component but has no stateful identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusCollectionId, collections]);
 
   const loadDocuments = useCallback(async (collectionId: number) => {

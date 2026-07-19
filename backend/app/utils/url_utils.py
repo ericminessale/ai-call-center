@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import os
+import time
 from urllib.parse import quote, urlparse, urlunparse
 
 from flask import request
@@ -9,6 +10,11 @@ from flask import request
 # External URL for SignalWire callbacks (e.g., ngrok URL)
 # Set this in .env when developing locally so SignalWire can reach your server
 EXTERNAL_URL = os.getenv('EXTERNAL_URL')
+
+# A monitor tap can legitimately remain active for a long call, but the URL
+# should not be a permanent bearer credential. This matches the two-hour
+# Redis lifetime used for tap control IDs in call_control.py.
+TAP_STREAM_URL_TTL_SECONDS = 2 * 60 * 60
 
 
 def call_context_token(call_db_id) -> str:
@@ -41,6 +47,75 @@ def verify_call_context_token(call_db_id, token) -> bool:
     if not token:
         return False
     return hmac.compare_digest(call_context_token(call_db_id), str(token))
+
+
+def _tap_stream_signing_key() -> bytes:
+    """Return the server-only key used for tap-ingest URLs.
+
+    WEBHOOK_AUTH_PASSWORD is the normal SignalWire-facing trust anchor. The
+    JWT secret keeps explicitly configured webhook soft-mode usable without
+    ever falling back to an empty/public key.
+    """
+    secret = os.getenv('WEBHOOK_AUTH_PASSWORD') or os.getenv('JWT_SECRET_KEY')
+    if not secret:
+        raise RuntimeError(
+            'Tap stream signing requires WEBHOOK_AUTH_PASSWORD or JWT_SECRET_KEY'
+        )
+    return secret.encode()
+
+
+def tap_stream_signature(call_id: str, expires_at: int) -> str:
+    """Sign one SignalWire tap-ingest URL for a specific call and expiry."""
+    message = f'tap-stream:{call_id}:{int(expires_at)}'.encode()
+    return hmac.new(
+        _tap_stream_signing_key(), message, hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_tap_stream_signature(
+    call_id: str,
+    expires_at,
+    signature,
+    *,
+    now: int | None = None,
+) -> bool:
+    """Validate a call-bound tap URL in constant time and fail closed."""
+    if not signature:
+        return False
+    try:
+        expiry = int(expires_at)
+    except (TypeError, ValueError):
+        return False
+
+    current = int(time.time()) if now is None else int(now)
+    if expiry < current:
+        return False
+    # Reject unexpectedly long-lived URLs even if a future call site signs
+    # one by mistake. Sixty seconds allows harmless clock/rounding skew.
+    if expiry > current + TAP_STREAM_URL_TTL_SECONDS + 60:
+        return False
+    try:
+        expected = tap_stream_signature(str(call_id), expiry)
+    except RuntimeError:
+        return False
+    return hmac.compare_digest(expected, str(signature))
+
+
+def signed_tap_stream_url(
+    base_ws_url: str,
+    call_id: str,
+    *,
+    now: int | None = None,
+) -> str:
+    """Build the short-lived WebSocket URL handed to SignalWire calling.tap."""
+    issued_at = int(time.time()) if now is None else int(now)
+    expires_at = issued_at + TAP_STREAM_URL_TTL_SECONDS
+    call_path = quote(str(call_id), safe='')
+    signature = tap_stream_signature(str(call_id), expires_at)
+    return (
+        f"{base_ws_url.rstrip('/')}/ws/tap-stream/{call_path}"
+        f"?expires={expires_at}&signature={signature}"
+    )
 
 
 def get_base_url():

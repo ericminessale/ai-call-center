@@ -263,6 +263,7 @@ def enqueue_and_build_swml(
                     # write to assigned_agent_id and one of the banner
                     # recipients would later get rejected on Take.
                     from sqlalchemy import text
+                    claim_at = datetime.utcnow()
                     claim = db.session.execute(
                         text(
                             "UPDATE calls "
@@ -270,12 +271,14 @@ def enqueue_and_build_swml(
                             "WHERE id = :id AND assigned_agent_id IS NULL "
                             "RETURNING id"
                         ),
-                        {'uid': selected_user.id, 'ts': datetime.utcnow(), 'id': call.id},
+                        {'uid': selected_user.id, 'ts': claim_at, 'id': call.id},
                     )
                     if claim.fetchone():
                         if conf:
                             conf.owner_user_id = selected_user.id
                         try:
+                            from app.services.interaction_timeline import best_effort, record_queue_offered
+                            best_effort(record_queue_offered, call, selected_user.id, claim_at)
                             db.session.commit()
                             db.session.refresh(call)
                         except Exception:

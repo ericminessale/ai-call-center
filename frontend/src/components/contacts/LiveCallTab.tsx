@@ -124,7 +124,15 @@ export function LiveCallTab({
   // local state and resets between calls. See AGENT_ASSIST.md.
   type CoachMode = 'off' | 'on_request' | 'auto';
   const { can } = usePermissions();
-  const coachAllowed = can('can_use_coach');
+  const coachPermitted = can('can_use_coach');
+  // Feature-flagged (COACH_ENABLED, off by default; also off in the hosted demo
+  // — the sidecar bills per minute and targets a pre-release platform verb).
+  // runtimeConfig.coach_enabled folds in the demo block, so when it's false we
+  // render a non-interactive "coming soon" teaser instead of the live panel.
+  // Backend coach endpoints are gated the same way (@require_coach_enabled +
+  // @block_in_demo_mode).
+  const coachEnabled = useAuthStore((s) => !!s.runtimeConfig?.coach_enabled);
+  const coachAllowed = coachPermitted && coachEnabled;
 
   const [coachMode, setCoachMode] = useState<CoachMode>('off');
   // Tracks whether a sidecar is actually attached on the backend. Distinct
@@ -550,6 +558,26 @@ export function LiveCallTab({
               )}
             </div>
           )}
+        </div>
+      )}
+
+      {/* AI Coach — "coming soon" teaser when the feature is flagged off
+          (COACH_ENABLED unset, or the hosted demo). Non-interactive: it
+          advertises the capability without exposing the unfinished path. */}
+      {callSid && coachPermitted && !coachEnabled && !isAICall && callState === 'active' && (
+        <div
+          className="mx-5 mt-2.5 border border-rule rounded-lg bg-canvas-raised overflow-hidden opacity-60"
+          title="Real-time AI coaching — coming soon."
+        >
+          <div className="w-full flex items-center justify-between px-3.5 py-2.5">
+            <div className="flex items-center gap-2">
+              <span aria-hidden className="text-ink-dim">{AI_GLYPH}</span>
+              <span className="text-[12.5px] font-semibold text-ink-dim">AI coach</span>
+            </div>
+            <span className="text-[10px] uppercase tracking-wide text-ink-dim border border-rule rounded px-1.5 py-0.5">
+              Coming soon
+            </span>
+          </div>
         </div>
       )}
 

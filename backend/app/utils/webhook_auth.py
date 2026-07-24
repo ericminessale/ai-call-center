@@ -14,6 +14,15 @@ Configuration via env (in ``.env``):
     WEBHOOK_AUTH_REQUIRED=false  # OPTIONAL escape hatch. Default (unset)
                                  # ENFORCES; only 'false' downgrades to
                                  # soft-logging.
+    INTERNAL_AUTH_USER=<username>      # OPTIONAL but recommended for public
+    INTERNAL_AUTH_PASSWORD=<random>    # hosts. Segregated secret for the
+                                       # private /api/internal/* API + ctk /
+                                       # tap-stream HMACs. Falls back to
+                                       # WEBHOOK_AUTH_* when unset. Set it to a
+                                       # DISTINCT value so a WEBHOOK_AUTH leak
+                                       # from a rendered SWML can't reach the
+                                       # internal surface. See
+                                       # _expected_internal_credentials().
 
 Producers (the AI agents and any backend code that hands SignalWire a URL
 to call back) must inject these credentials into the URL — see
@@ -48,6 +57,27 @@ def _expected_credentials() -> tuple[str | None, str | None]:
     return os.getenv('WEBHOOK_AUTH_USER'), os.getenv('WEBHOOK_AUTH_PASSWORD')
 
 
+def _expected_internal_credentials() -> tuple[str | None, str | None]:
+    """Credentials for the private backend⇄agent API (:func:`require_internal_auth`).
+
+    SEGREGATED from the SignalWire-facing WEBHOOK_AUTH creds. By SignalWire's
+    own webhook-auth design those creds ride in the ``user:pass@host`` of
+    callback URLs that get rendered into SWML the platform fetches from PUBLIC
+    agent routes — so they must be treated as semi-public and can leak. The
+    internal routes expose decrypted MCP-gateway credentials and a destructive
+    demo reset, and the same secret keys the ctk / tap-stream HMACs, so they get
+    their OWN credential that never appears in any rendered document.
+
+    Falls back to WEBHOOK_AUTH_* when INTERNAL_AUTH_* is unset, so an existing
+    deployment keeps working unchanged until the operator rotates to a distinct
+    internal secret (strongly recommended for any public host — without it, a
+    WEBHOOK_AUTH leak from a rendered SWML also unlocks /api/internal/*).
+    """
+    user = os.getenv('INTERNAL_AUTH_USER') or os.getenv('WEBHOOK_AUTH_USER')
+    pw = os.getenv('INTERNAL_AUTH_PASSWORD') or os.getenv('WEBHOOK_AUTH_PASSWORD')
+    return user, pw
+
+
 def _enforce_mode() -> bool:
     """Whether failed webhook auth REJECTS (vs soft-logs).
 
@@ -74,14 +104,12 @@ def _parse_basic_auth(header_value: str) -> tuple[str, str] | None:
     return user, password
 
 
-def _validate_request_auth() -> tuple[bool, bool]:
-    """Validate the inbound HTTP Basic header against configured creds.
-
-    Returns ``(configured, authorized)``:
-      - ``configured`` is False when WEBHOOK_AUTH_USER/PASSWORD aren't set.
-      - ``authorized`` is True only when the header matches (constant-time).
-    """
-    expected_user, expected_pw = _expected_credentials()
+def _validate_against(
+    expected_user: str | None, expected_pw: str | None
+) -> tuple[bool, bool]:
+    """Constant-time check of the inbound HTTP Basic header against one
+    credential pair. Returns ``(configured, authorized)`` — ``configured`` is
+    False when the expected pair isn't set."""
     if not expected_user or not expected_pw:
         return False, False
     provided = _parse_basic_auth(request.headers.get('Authorization', ''))
@@ -90,6 +118,23 @@ def _validate_request_auth() -> tuple[bool, bool]:
         and hmac.compare_digest(provided[1], expected_pw)
     )
     return True, authorized
+
+
+def _validate_request_auth() -> tuple[bool, bool]:
+    """Validate the inbound HTTP Basic header against the SignalWire-facing
+    WEBHOOK_AUTH creds.
+
+    Returns ``(configured, authorized)``:
+      - ``configured`` is False when WEBHOOK_AUTH_USER/PASSWORD aren't set.
+      - ``authorized`` is True only when the header matches (constant-time).
+    """
+    return _validate_against(*_expected_credentials())
+
+
+def _validate_internal_request_auth() -> tuple[bool, bool]:
+    """Validate the inbound HTTP Basic header against the segregated
+    INTERNAL_AUTH creds (see :func:`_expected_internal_credentials`)."""
+    return _validate_against(*_expected_internal_credentials())
 
 
 def require_webhook_auth(f: Callable) -> Callable:
@@ -149,11 +194,12 @@ def require_internal_auth(f: Callable) -> Callable:
 
     @wraps(f)
     def wrapper(*args, **kwargs):
-        configured, authorized = _validate_request_auth()
+        configured, authorized = _validate_internal_request_auth()
         if not configured:
             logger.error(
-                "%s: internal auth required but WEBHOOK_AUTH_USER/PASSWORD "
-                "are not configured — refusing request",
+                "%s: internal auth required but INTERNAL_AUTH_USER/PASSWORD "
+                "(or the WEBHOOK_AUTH_* fallback) are not configured — "
+                "refusing request",
                 request.path,
             )
             return jsonify({'error': 'Internal auth not configured'}), 500

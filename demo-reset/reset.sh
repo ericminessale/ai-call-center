@@ -12,15 +12,19 @@
 #                       same GC + MAX_WORKSPACES cap enforcement +
 #                       template-workspace interaction hygiene
 #
-# Auth: HTTP Basic via WEBHOOK_AUTH_USER / WEBHOOK_AUTH_PASSWORD —
-# the same shared secret all our internal endpoints use.
+# Auth: HTTP Basic via INTERNAL_AUTH_USER / INTERNAL_AUTH_PASSWORD — the
+# segregated secret for the private /api/internal/* API — falling back to
+# WEBHOOK_AUTH_USER / WEBHOOK_AUTH_PASSWORD when unset. Must mirror the
+# backend's require_internal_auth exactly (shared docker-compose env), so if
+# the operator rotates to a distinct INTERNAL_AUTH secret this cron picks it
+# up too.
 
 set -e
 
 MODE="${1:-hourly}"
 BACKEND_URL="${BACKEND_URL:-http://backend:5000}"
-USER="${WEBHOOK_AUTH_USER:-}"
-PASS="${WEBHOOK_AUTH_PASSWORD:-}"
+USER="${INTERNAL_AUTH_USER:-${WEBHOOK_AUTH_USER:-}}"
+PASS="${INTERNAL_AUTH_PASSWORD:-${WEBHOOK_AUTH_PASSWORD:-}}"
 
 case "$MODE" in
     nightly) ENDPOINT="/api/internal/demo-reset" ;;
@@ -39,7 +43,7 @@ AUTH_ARGS=""
 if [ -n "$USER" ] && [ -n "$PASS" ]; then
     AUTH_ARGS="-u ${USER}:${PASS}"
 else
-    echo "[demo-reset] ERROR: WEBHOOK_AUTH_USER / WEBHOOK_AUTH_PASSWORD not set — ${ENDPOINT} will 401. Wire creds in docker-compose env." >&2
+    echo "[demo-reset] ERROR: INTERNAL_AUTH_USER/PASSWORD (or the WEBHOOK_AUTH_* fallback) not set — ${ENDPOINT} will 401. Wire creds in docker-compose env." >&2
     exit 2
 fi
 

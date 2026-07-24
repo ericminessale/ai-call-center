@@ -140,10 +140,16 @@ def provision_workspace(session_token: str):
             # workspace row below re-claims this exact unique value.
             db.session.flush()
 
+        # Count only workspaces that are BOTH active AND not past their TTL.
+        # A workspace's status stays ACTIVE until the reaper deletes it, so
+        # without the expires_at filter expired-but-unreaped rows count toward
+        # the cap and 503 new visitors between reaper runs (or forever if the
+        # reaper isn't wired). Expired rows aren't live capacity — exclude them.
         live_count = (
             Workspace.query
             .filter(Workspace.status == Workspace.STATUS_ACTIVE)
             .filter(Workspace.id != DEFAULT_WORKSPACE_ID)
+            .filter(Workspace.expires_at > datetime.utcnow())
             .count()
         )
     if live_count >= max_workspaces():

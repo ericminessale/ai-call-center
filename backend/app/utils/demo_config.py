@@ -105,9 +105,14 @@ def runtime_config() -> dict:
         except Exception:
             ttl_days = 7
 
+    from app.utils.feature_flags import coach_enabled
     return {
         'demo_mode': is_demo_mode(),
         'demo_phone_numbers': demo_phone_numbers() if is_demo_mode() else [],
+        # AI Coach visibility. Off by default (COACH_ENABLED) and never in the
+        # demo (per-minute billing / pre-release verb); folds both in so the
+        # frontend reads one boolean — true → live panel, false → "coming soon".
+        'coach_enabled': coach_enabled() and not is_demo_mode(),
         # Workspace lifetime for landing/banner copy — the operator can
         # tune WORKSPACE_TTL_DAYS, so the UI must not hardcode "7 days".
         'workspace_ttl_days': ttl_days,

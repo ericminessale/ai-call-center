@@ -10,7 +10,9 @@ REM window to kill the tunnel.
 
 setlocal
 
-cd /d "%~dp0"
+REM Operate from the repo root (this script lives in scripts/dev/), so .env
+REM and the compose files resolve correctly regardless of launch directory.
+cd /d "%~dp0..\.."
 
 REM === 1. Launch ngrok in a persistent window ==============================
 echo Launching ngrok on port 80...
@@ -52,8 +54,12 @@ findstr /b "EXTERNAL_URL= AGENT_BASE_URL=" .env
 REM === 5. Recreate containers so the new env takes effect ==================
 REM `restart` does NOT re-read env from .env; `up -d` will recreate changed ones.
 echo.
-echo Recreating backend + ai-agents with new URL...
-docker-compose up -d backend ai-agents
+REM nginx is the tunnel target (ngrok -> :80 -> nginx -> /api backend), so
+REM make sure it's up alongside the services that read the new URL. If a
+REM local COMPOSE_FILE overlay is set in .env (e.g. the hosted-demo override),
+REM docker-compose picks it up automatically — no flags needed here.
+echo Recreating nginx + backend + ai-agents with new URL...
+docker-compose up -d nginx backend ai-agents
 
 echo.
 echo Done. App at http://localhost/ ^| Webhooks at %NGROK_URL%

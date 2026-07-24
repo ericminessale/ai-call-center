@@ -134,6 +134,9 @@ import type { Branding } from '../lib/branding';
 export interface RuntimeConfig {
   demo_mode: boolean;
   demo_phone_numbers: DemoPhoneNumber[];
+  // AI Coach gate (COACH_ENABLED, off by default and never in the demo). When
+  // false the UI shows a \"coming soon\" teaser instead of the live coach panel.
+  coach_enabled?: boolean;
   // Workspace lifetime in days (hosted demo only) — feeds landing/banner
   // copy so it tracks the operator's WORKSPACE_TTL_DAYS.
   workspace_ttl_days?: number | null;

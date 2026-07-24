@@ -17,6 +17,21 @@ EXTERNAL_URL = os.getenv('EXTERNAL_URL')
 TAP_STREAM_URL_TTL_SECONDS = 2 * 60 * 60
 
 
+def _internal_signing_secret() -> str | None:
+    """Secret for backend-minted HMAC tokens (ctk, tap-stream).
+
+    Keyed on the segregated INTERNAL_AUTH secret so a leak of the
+    SignalWire-facing WEBHOOK_AUTH creds — which travel semi-publicly in the
+    ``user:pass@host`` of SWML callback URLs — can't forge these tokens. Falls
+    back to WEBHOOK_AUTH_PASSWORD, then JWT_SECRET_KEY, so an unconfigured
+    deployment behaves exactly as before. Mirrors
+    ``webhook_auth._expected_internal_credentials``.
+    """
+    return (os.getenv('INTERNAL_AUTH_PASSWORD')
+            or os.getenv('WEBHOOK_AUTH_PASSWORD')
+            or os.getenv('JWT_SECRET_KEY'))
+
+
 def call_context_token(call_db_id) -> str:
     """Unforgeable per-call token binding a ``call_db_id`` to backend intent.
 
@@ -31,12 +46,12 @@ def call_context_token(call_db_id) -> str:
     never mints one — so a caller who can't produce a valid token for a
     call_db_id gets the inert template config instead of a tenant's.
 
-    HMAC over the shared WEBHOOK_AUTH secret (already the backend↔agent
-    trust anchor). Truncated to 32 hex chars — ample against online
-    guessing given call-context also sits behind internal Basic auth.
+    HMAC over the segregated INTERNAL_AUTH secret (see
+    :func:`_internal_signing_secret`) — NOT the semi-public WEBHOOK_AUTH creds
+    that ride in rendered SWML. Truncated to 32 hex chars — ample against
+    online guessing given call-context also sits behind internal Basic auth.
     """
-    key = (os.getenv('WEBHOOK_AUTH_PASSWORD')
-           or os.getenv('JWT_SECRET_KEY') or '').encode()
+    key = (_internal_signing_secret() or '').encode()
     msg = f'call-context:{call_db_id}'.encode()
     return hmac.new(key, msg, hashlib.sha256).hexdigest()[:32]
 
@@ -52,14 +67,17 @@ def verify_call_context_token(call_db_id, token) -> bool:
 def _tap_stream_signing_key() -> bytes:
     """Return the server-only key used for tap-ingest URLs.
 
-    WEBHOOK_AUTH_PASSWORD is the normal SignalWire-facing trust anchor. The
-    JWT secret keeps explicitly configured webhook soft-mode usable without
-    ever falling back to an empty/public key.
+    Keyed on the segregated INTERNAL_AUTH secret (see
+    :func:`_internal_signing_secret`), falling back to WEBHOOK_AUTH_PASSWORD
+    then JWT_SECRET_KEY — never an empty/public key. The tap URL grants live
+    call-audio access, so its signing key must not be the semi-public
+    WEBHOOK_AUTH cred embedded in rendered SWML.
     """
-    secret = os.getenv('WEBHOOK_AUTH_PASSWORD') or os.getenv('JWT_SECRET_KEY')
+    secret = _internal_signing_secret()
     if not secret:
         raise RuntimeError(
-            'Tap stream signing requires WEBHOOK_AUTH_PASSWORD or JWT_SECRET_KEY'
+            'Tap stream signing requires INTERNAL_AUTH_PASSWORD, '
+            'WEBHOOK_AUTH_PASSWORD or JWT_SECRET_KEY'
         )
     return secret.encode()
 

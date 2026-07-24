@@ -115,6 +115,12 @@ services:
       WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
       WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
       WEBHOOK_AUTH_REQUIRED: ${WEBHOOK_AUTH_REQUIRED:-true}
+      # Segregated internal-API secret (falls back to WEBHOOK_AUTH_* when unset).
+      # Set to a DISTINCT value for public hosting — see .env.example.
+      INTERNAL_AUTH_USER: ${INTERNAL_AUTH_USER:-}
+      INTERNAL_AUTH_PASSWORD: ${INTERNAL_AUTH_PASSWORD:-}
+      # Feature flags — off by default; operator opts in. See .env.example.
+      COACH_ENABLED: ${COACH_ENABLED:-false}
 
       EXTERNAL_URL: ${EXTERNAL_URL}
       FLASK_APP: app
@@ -189,6 +195,10 @@ services:
       SWML_BASIC_AUTH_PASSWORD: ${SWML_BASIC_AUTH_PASSWORD}
       WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
       WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
+      # Segregated internal-API secret for _internal_auth() (falls back to
+      # WEBHOOK_AUTH_* when unset).
+      INTERNAL_AUTH_USER: ${INTERNAL_AUTH_USER:-}
+      INTERNAL_AUTH_PASSWORD: ${INTERNAL_AUTH_PASSWORD:-}
       SWML_ALLOW_PRIVATE_URLS: ${SWML_ALLOW_PRIVATE_URLS:-true}
       DEBUG_WEBHOOK_ENABLED: ${DEBUG_WEBHOOK_ENABLED:-false}
       DEBUG_WEBHOOK_LEVEL: ${DEBUG_WEBHOOK_LEVEL:-2}

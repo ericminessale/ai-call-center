@@ -198,6 +198,11 @@ export function SettingsPanel() {
   const { user, runtimeConfig } = useAuthStore();
   const showWorkspacesTab =
     !!runtimeConfig?.demo_mode && user != null && user.workspace_id == null;
+  // External Tools (MCP gateways) is hidden in the hosted demo: the probe is a
+  // server-side fetch of an admin-supplied URL (SSRF surface, now also blocked
+  // backend-side via @block_in_demo_mode), and gateway management isn't part of
+  // the public demo. Clone-and-own operators keep it.
+  const showExternalToolsTab = !runtimeConfig?.demo_mode;
 
   const handleNavigateToCollection = (collectionId: number) => {
     setFocusCollectionId(collectionId);
@@ -250,13 +255,15 @@ export function SettingsPanel() {
             active={activeTab === 'knowledge'}
             onClick={() => handleTabChange('knowledge')}
           />
-          <TabButton
-            id="external-tools"
-            icon={<Plug className="w-3.5 h-3.5" />}
-            label="External Tools"
-            active={activeTab === 'external-tools'}
-            onClick={() => handleTabChange('external-tools')}
-          />
+          {showExternalToolsTab && (
+            <TabButton
+              id="external-tools"
+              icon={<Plug className="w-3.5 h-3.5" />}
+              label="External Tools"
+              active={activeTab === 'external-tools'}
+              onClick={() => handleTabChange('external-tools')}
+            />
+          )}
           <TabButton
             id="branding"
             icon={<Palette className="w-3.5 h-3.5" />}
@@ -296,7 +303,7 @@ export function SettingsPanel() {
         {activeTab === 'queues' && <QueuesTab />}
         {activeTab === 'agents' && <AgentsTab onNavigateToCollection={handleNavigateToCollection} />}
         {activeTab === 'knowledge' && <KnowledgeBaseTab focusCollectionId={focusCollectionId} />}
-        {activeTab === 'external-tools' && <ExternalToolsTab />}
+        {activeTab === 'external-tools' && showExternalToolsTab && <ExternalToolsTab />}
         {activeTab === 'branding' && <BrandingTab />}
         {activeTab === 'users' && <UserManagementTab />}
         {activeTab === 'webhooks' && <WebhookLogTab />}
@@ -1054,6 +1061,9 @@ const ROUTING_STRATEGIES = [
 ];
 
 function QueuesTab() {
+  // Bridge transport is rejected by the backend in hosted mode (native queues
+  // are shared across workspaces), so don't offer it as a pick in the demo.
+  const demoMode = useAuthStore((s) => !!s.runtimeConfig?.demo_mode);
   const [queues, setQueues] = useState<QueueConfig[]>([]);
   const [selectedQueue, setSelectedQueue] = useState<QueueConfig | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -1357,7 +1367,9 @@ function QueuesTab() {
                   className="input"
                 >
                   <option value="conference">Conference — multi-party (supervisor monitor, whisper, barge)</option>
-                  <option value="bridge">Bridge — direct dial (native hold + DTMF, no multi-party)</option>
+                  {!demoMode && (
+                    <option value="bridge">Bridge — direct dial (native hold + DTMF, no multi-party)</option>
+                  )}
                 </select>
                 <p className="text-[11px] text-ink-dim mt-1">
                   {editForm.routing_transport === 'bridge'
@@ -2307,6 +2319,10 @@ function UserEditModal({
   onUpdated: (next: AdminUser) => void;
   onDeleted: () => void;
 }) {
+  // Reset/Create subscriber is a platform-only operation (workspace_id null);
+  // demo visitors are workspace-scoped admins, so it always 403s for them.
+  // Hide the control in the hosted demo rather than surface a dead-end.
+  const demoMode = useAuthStore((s) => !!s.runtimeConfig?.demo_mode);
   // Draft state for batched save. Initialized from the passed-in user.
   const [draftRole, setDraftRole] = useState<UserRole>(user.role as UserRole);
   const [draftLanguages, setDraftLanguages] = useState<string[]>(user.languages || ['en-US']);
@@ -2731,6 +2747,7 @@ function UserEditModal({
                     active session, urgent palette)
                   - no subscriber:  "Create" (constructive setup, info
                     palette, no session to drop) */}
+            {!demoMode && (
             <section>
               <div className="kicker mb-2">SignalWire subscriber</div>
               {user.has_subscriber ? (
@@ -2789,6 +2806,7 @@ function UserEditModal({
                 </>
               )}
             </section>
+            )}
           </div>
 
           {/* Footer */}

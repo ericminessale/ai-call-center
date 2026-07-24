@@ -42,11 +42,19 @@ def _signed_webhook_url(url: str) -> str:
 
 def _internal_auth():
     """HTTP Basic tuple for the backend's private ``@require_internal_auth``
-    routes (register-ai-leg, sentiment). Returns None when creds aren't set
-    so ``requests`` sends no Authorization header (backend fail-loud handles
-    the misconfig). ISO-9 (2026-07-07 pre-deploy)."""
-    user = os.getenv('WEBHOOK_AUTH_USER')
-    pw = os.getenv('WEBHOOK_AUTH_PASSWORD')
+    routes (call-context, agent-assignments, mcp-gateways, register-ai-leg,
+    sentiment). Returns None when creds aren't set so ``requests`` sends no
+    Authorization header (backend fail-loud handles the misconfig). ISO-9
+    (2026-07-07 pre-deploy).
+
+    Reads the segregated INTERNAL_AUTH_* secret first, falling back to
+    WEBHOOK_AUTH_* — must mirror the backend's
+    ``webhook_auth._expected_internal_credentials`` exactly, since backend and
+    agents share one docker-compose env: if the operator rotates to a distinct
+    INTERNAL_AUTH secret, both sides pick it up together and internal calls
+    keep authenticating."""
+    user = os.getenv('INTERNAL_AUTH_USER') or os.getenv('WEBHOOK_AUTH_USER')
+    pw = os.getenv('INTERNAL_AUTH_PASSWORD') or os.getenv('WEBHOOK_AUTH_PASSWORD')
     return (user, pw) if (user and pw) else None
 
 
@@ -269,15 +277,13 @@ _kb_last_logged = {}
 def _fetch_kb_assignments():
     """GET the full agent→collection map from the backend's internal API.
 
-    Uses the same WEBHOOK_AUTH service credentials as the MCP gateway fetch
-    (the old admin-surface endpoint required a user JWT, so the agents' boot
-    fetch always 401'd and fell back). Returns None on any failure so callers
-    keep the previous map instead of blanking a working one.
+    Uses the same segregated internal service credentials as the MCP gateway
+    fetch (the old admin-surface endpoint required a user JWT, so the agents'
+    boot fetch always 401'd and fell back). Returns None on any failure so
+    callers keep the previous map instead of blanking a working one.
     """
     import requests
-    auth_user = os.getenv('WEBHOOK_AUTH_USER')
-    auth_password = os.getenv('WEBHOOK_AUTH_PASSWORD')
-    auth = (auth_user, auth_password) if (auth_user and auth_password) else None
+    auth = _internal_auth()
     try:
         resp = requests.get(
             f"{BACKEND_URL}/api/internal/agent-assignments",

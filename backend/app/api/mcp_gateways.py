@@ -14,8 +14,12 @@ SWAIG functions the AI can call mid-conversation.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import os
+import socket
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from flask import jsonify, request
@@ -25,8 +29,62 @@ from app import db
 from app.api import admin_bp
 from app.models import McpGatewayConfig
 from app.models.mcp_gateway_config import AUTH_TYPES
+from app.utils.demo_config import block_in_demo_mode
 
 logger = logging.getLogger(__name__)
+
+
+def _url_host_is_safe(url: str) -> tuple[bool, str]:
+    """SSRF guard: resolve the URL's host and reject internal targets.
+
+    The gateway URL is admin-supplied and the backend fetches it server-side
+    (:func:`_probe_gateway`), so without this an admin — and, in hosted-demo
+    mode, any visitor who is provisioned as a workspace admin — could point it
+    at internal services or the cloud-metadata endpoint and read the reflected
+    response (classic SSRF).
+
+    ALWAYS blocks loopback, link-local (incl. the 169.254.169.254 cloud-metadata
+    IP), multicast, reserved, site-local, and unspecified addresses. Private
+    RFC1918 / unique-local ranges are additionally blocked unless
+    ``SWML_ALLOW_PRIVATE_URLS`` is truthy — the bundled demo-mcp-gateway lives on
+    the docker network at an RFC1918 address, so the demo keeps that flag on
+    while the metadata endpoint stays blocked regardless.
+
+    Checks EVERY address the host resolves to (rejects a name that resolves to
+    any internal IP) and fails closed on a resolution error. Returns
+    ``(ok, reason)``.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return False, 'gateway_url has no host'
+
+    allow_private = os.getenv('SWML_ALLOW_PRIVATE_URLS', '').strip().lower() == 'true'
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        return False, f'could not resolve host {host!r}: {exc}'
+
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False, f'unparseable resolved address {info[4][0]!r}'
+        # Unwrap IPv4-mapped IPv6 (::ffff:a.b.c.d) so a mapped internal is caught.
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if (ip.is_loopback or ip.is_link_local or ip.is_multicast
+                or ip.is_reserved or ip.is_unspecified
+                or getattr(ip, 'is_site_local', False)):
+            return False, f'host {host!r} resolves to a blocked address ({ip})'
+        if ip.is_private and not allow_private:
+            return False, (
+                f'host {host!r} resolves to a private address ({ip}); '
+                'set SWML_ALLOW_PRIVATE_URLS=true to allow'
+            )
+    return True, ''
 
 
 def _validate_payload(payload: dict[str, Any]) -> tuple[dict, int] | None:
@@ -41,6 +99,9 @@ def _validate_payload(payload: dict[str, Any]) -> tuple[dict, int] | None:
         return {'error': 'gateway_url is required'}, 400
     if not gateway_url.startswith(('http://', 'https://')):
         return {'error': 'gateway_url must start with http:// or https://'}, 400
+    safe, reason = _url_host_is_safe(gateway_url)
+    if not safe:
+        return {'error': f'gateway_url is not allowed: {reason}'}, 400
 
     auth_type = payload.get('auth_type', 'basic')
     if auth_type not in AUTH_TYPES:
@@ -107,6 +168,7 @@ def get_mcp_gateway(config_id: int):
 
 
 @admin_bp.route('/mcp-gateways', methods=['POST'])
+@block_in_demo_mode
 def create_mcp_gateway():
     payload = request.get_json() or {}
     invalid = _validate_payload(payload)
@@ -125,6 +187,7 @@ def create_mcp_gateway():
 
 
 @admin_bp.route('/mcp-gateways/<int:config_id>', methods=['PUT'])
+@block_in_demo_mode
 def update_mcp_gateway(config_id: int):
     config = db.session.get(McpGatewayConfig, config_id)
     if not config:
@@ -142,6 +205,7 @@ def update_mcp_gateway(config_id: int):
 
 
 @admin_bp.route('/mcp-gateways/<int:config_id>', methods=['DELETE'])
+@block_in_demo_mode
 def delete_mcp_gateway(config_id: int):
     config = db.session.get(McpGatewayConfig, config_id)
     if not config:
@@ -159,6 +223,7 @@ def delete_mcp_gateway(config_id: int):
 
 
 @admin_bp.route('/mcp-gateways/<int:config_id>/test', methods=['POST'])
+@block_in_demo_mode
 def test_mcp_gateway(config_id: int):
     """Probe the configured gateway and return the services it exposes.
 
@@ -198,6 +263,12 @@ def _probe_gateway(config: McpGatewayConfig, *, timeout: float = 8.0) -> list[di
         auth = HTTPBasicAuth(config.auth_user, password)
 
     services_url = f"{config.gateway_url.rstrip('/')}/services"
+    # Re-validate at fetch time: a row may predate the create-time guard, or the
+    # host may now resolve to an internal address (DNS rebinding). _probe_service_tools
+    # reuses this same (now-validated) host, so one check here covers both fetches.
+    safe, reason = _url_host_is_safe(services_url)
+    if not safe:
+        raise _GatewayProbeError(f"Refusing to probe unsafe gateway URL: {reason}")
     try:
         resp = requests.get(services_url, headers=headers, auth=auth, timeout=timeout)
     except requests.exceptions.RequestException as exc:

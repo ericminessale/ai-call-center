@@ -4,7 +4,9 @@ from app.api import calls_bp
 from app.models import Call, CallLeg, Transcription
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth, require_permission, require_role, validate_json
-from app.utils.demo_config import is_demo_mode, DEMO_BLOCKED_RESPONSE
+from app.utils.demo_config import is_demo_mode, block_in_demo_mode, DEMO_BLOCKED_RESPONSE
+from app.utils.rate_limit import rate_limit
+from app.utils.feature_flags import require_coach_enabled
 from app.utils.webhook_auth import require_internal_auth
 from app.utils.moderation import is_text_acceptable
 from app.utils.url_utils import get_base_url, signed_webhook_url
@@ -336,11 +338,12 @@ def get_call(call_id):
 
 @calls_bp.route('/<call_id>/kb-search', methods=['POST'])
 @require_auth
+@rate_limit('kb-search', 60, 60)
 def kb_search(call_id):
     """KB Factbook: pgvector retrieval over a single collection.
 
-    Body: {query: str, collection_name?: str, top_k?: int (1-20, default 5)}
-    When collection_name is omitted it's derived from the call's queue →
+    Body: {query: str, top_k?: int (1-20, default 5)}
+    The collection is ALWAYS derived server-side from the call's queue →
     AI-agent → collection assignment (kb_collection_for_queue).
     """
     import requests as http_requests
@@ -357,8 +360,7 @@ def kb_search(call_id):
     data = request.get_json(silent=True) or {}
     query = (data.get('query') or '').strip()
     top_k = data.get('top_k', 5)
-    collection_name = (data.get('collection_name') or '').strip() or \
-        kb_collection_for_queue(call.queue_id, call.workspace_id)
+    collection_name = kb_collection_for_queue(call.queue_id, call.workspace_id)
 
     if not query:
         return jsonify({'error': 'query is required'}), 400
@@ -388,11 +390,12 @@ def kb_search(call_id):
 
 @calls_bp.route('/<call_id>/kb-search-from-transcript', methods=['POST'])
 @require_auth
+@rate_limit('kb-search-transcript', 60, 60)
 def kb_search_from_transcript(call_id):
     """KB Factbook: search KB using the last N final caller utterances as the query.
 
-    Body: {collection_name?: str, n_utterances?: int (1-20, default 5), top_k?: int (1-20, default 5)}
-    When collection_name is omitted it's derived from the call's queue →
+    Body: {n_utterances?: int (1-20, default 5), top_k?: int (1-20, default 5)}
+    The collection is ALWAYS derived server-side from the call's queue →
     AI-agent → collection assignment (kb_collection_for_queue).
     Returns {success, collection_name, query, results, [note]}. ``note`` is set
     when there were no caller utterances to derive a query from — in that case
@@ -412,8 +415,7 @@ def kb_search_from_transcript(call_id):
     data = request.get_json(silent=True) or {}
     n_utterances = data.get('n_utterances', 5)
     top_k = data.get('top_k', 5)
-    collection_name = (data.get('collection_name') or '').strip() or \
-        kb_collection_for_queue(call.queue_id, call.workspace_id)
+    collection_name = kb_collection_for_queue(call.queue_id, call.workspace_id)
 
     if not isinstance(n_utterances, int) or n_utterances < 1 or n_utterances > 20:
         n_utterances = 5
@@ -485,6 +487,8 @@ def _coach_call_lookup(call_id):
 
 
 @calls_bp.route('/<call_id>/coach/attach', methods=['POST'])
+@block_in_demo_mode
+@require_coach_enabled
 @require_auth
 @require_permission('can_use_coach')
 def coach_attach(call_id):
@@ -560,6 +564,8 @@ def coach_attach(call_id):
 
 
 @calls_bp.route('/<call_id>/coach/detach', methods=['POST'])
+@block_in_demo_mode
+@require_coach_enabled
 @require_auth
 @require_permission('can_use_coach')
 def coach_detach(call_id):
@@ -589,6 +595,8 @@ def coach_detach(call_id):
 
 
 @calls_bp.route('/<call_id>/coach/ask', methods=['POST'])
+@block_in_demo_mode
+@require_coach_enabled
 @require_auth
 @require_permission('can_use_coach')
 def coach_ask(call_id):

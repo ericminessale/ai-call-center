@@ -86,6 +86,11 @@ services:
       WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
       WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
       WEBHOOK_AUTH_REQUIRED: ${WEBHOOK_AUTH_REQUIRED:-true}
+      # Segregated internal-API secret (falls back to WEBHOOK_AUTH_* when unset).
+      INTERNAL_AUTH_USER: ${INTERNAL_AUTH_USER:-}
+      INTERNAL_AUTH_PASSWORD: ${INTERNAL_AUTH_PASSWORD:-}
+      # Feature flags — off by default; operator opts in. See .env.example.
+      COACH_ENABLED: ${COACH_ENABLED:-false}
 
       # External URL (for SignalWire callbacks when using ngrok)
       # Set this to your ngrok URL so SignalWire can reach your local server
@@ -185,6 +190,10 @@ services:
       # and to authenticate the /api/internal/mcp-gateways fetch at boot.
       WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
       WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
+      # Segregated internal-API secret used by _internal_auth() for the
+      # /api/internal/* fetches (falls back to WEBHOOK_AUTH_* when unset).
+      INTERNAL_AUTH_USER: ${INTERNAL_AUTH_USER:-}
+      INTERNAL_AUTH_PASSWORD: ${INTERNAL_AUTH_PASSWORD:-}
 
       # The mcp_gateway skill's SSRF protection blocks RFC1918 hosts by
       # default. The bundled demo-mcp-gateway is reachable via its

@@ -1636,8 +1636,9 @@ def update_phone_number(number_sid):
 
             from app.utils.url_utils import signed_webhook_url
             from app.services.fabric_sync import update_swml_webhook_for_phone
+            # Stored on the number itself (see fabric_sync) — no expiry.
             status_callback_url = signed_webhook_url(
-                f"{base_url}/api/webhooks/call-status"
+                f"{base_url}/api/webhooks/call-status", persistent=True,
             )
             updated = client.phone_numbers.update(
                 number_sid,
@@ -1687,8 +1688,9 @@ def update_phone_number(number_sid):
         oos_url = f"{base_url}/api/swml/out-of-service"
         from app.utils.url_utils import signed_webhook_url
         from app.services.fabric_sync import update_swml_webhook_for_phone
+        # Stored on the number itself (see fabric_sync) — no expiry.
         status_callback_url = signed_webhook_url(
-            f"{base_url}/api/webhooks/call-status"
+            f"{base_url}/api/webhooks/call-status", persistent=True,
         )
         updated = client.phone_numbers.update(
             number_sid,

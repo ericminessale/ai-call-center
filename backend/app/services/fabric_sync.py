@@ -239,8 +239,10 @@ def sync_phone_number_webhooks(external_url: str) -> dict:
     # events delivered to /api/webhooks/call-status. The handler there
     # cleans up Redis + Conference rows + emits `queue_update action='ended'`.
     from app.utils.url_utils import signed_webhook_url
+    # persistent=True: this is written ONTO the phone number and reused
+    # for every inbound leg indefinitely, so it must not carry an expiry.
     desired_status_callback = signed_webhook_url(
-        f"{target_host}/api/webhooks/call-status"
+        f"{target_host}/api/webhooks/call-status", persistent=True,
     )
 
     try:

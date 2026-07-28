@@ -85,6 +85,11 @@ services:
       # enforces regardless of the flag.
       WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
       WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
+      # Callback URL auth scheme — 'token' stops embedding WEBHOOK_AUTH in
+      # the URLs rendered into SWML (CRITICAL-1 Phase 2 / HIGH-4). Requires
+      # INTERNAL_AUTH_PASSWORD; the inbound side accepts both schemes either
+      # way, so flipping this is non-breaking and reversible.
+      WEBHOOK_URL_AUTH: ${WEBHOOK_URL_AUTH:-basic}
       WEBHOOK_AUTH_REQUIRED: ${WEBHOOK_AUTH_REQUIRED:-true}
       # Segregated internal-API secret (falls back to WEBHOOK_AUTH_* when unset).
       INTERNAL_AUTH_USER: ${INTERNAL_AUTH_USER:-}
@@ -195,6 +200,11 @@ services:
       # and to authenticate the /api/internal/mcp-gateways fetch at boot.
       WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
       WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
+      # Callback URL auth scheme — 'token' stops embedding WEBHOOK_AUTH in
+      # the URLs rendered into SWML (CRITICAL-1 Phase 2 / HIGH-4). Requires
+      # INTERNAL_AUTH_PASSWORD; the inbound side accepts both schemes either
+      # way, so flipping this is non-breaking and reversible.
+      WEBHOOK_URL_AUTH: ${WEBHOOK_URL_AUTH:-basic}
       # Segregated internal-API secret used by _internal_auth() for the
       # /api/internal/* fetches (falls back to WEBHOOK_AUTH_* when unset).
       INTERNAL_AUTH_USER: ${INTERNAL_AUTH_USER:-}

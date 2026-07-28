@@ -11,23 +11,45 @@ from signalwire.core.function_result import FunctionResult
 import os
 import json
 import base64
+import hashlib
+import hmac
 import re
 import threading
+import time
 from urllib.parse import quote, urlparse, urlunparse
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-def _signed_webhook_url(url: str) -> str:
-    """Embed WEBHOOK_AUTH credentials into a URL the platform will call back.
+# CRITICAL-1 Phase 2 / HIGH-4. These agent routes are PUBLIC — nginx's
+# auth_basic is commented out and the SDK's own check is disabled — so whatever
+# a rendered SWML contains is readable by anyone who GETs /receptionist. Putting
+# WEBHOOK_AUTH in the callback URLs therefore published the install's webhook
+# password. This is the leak, and this helper is where it happened.
+#
+# Token mode replaces the credential with an HMAC bound to the callback's own
+# PATH, signed with INTERNAL_AUTH_PASSWORD — which never appears in any
+# rendered document. Must stay byte-compatible with the backend's
+# app/utils/url_utils.py: the backend VERIFIES what we mint here, so the
+# message format, truncation and parameter names are a shared contract.
+WEBHOOK_TOKEN_PARAM = '_wt'
+WEBHOOK_TOKEN_EXPIRY_PARAM = '_wexp'
+WEBHOOK_URL_TOKEN_TTL_SECONDS = 12 * 60 * 60
 
-    The backend webhook endpoints accept HTTP Basic Auth from
-    WEBHOOK_AUTH_USER/WEBHOOK_AUTH_PASSWORD. SignalWire pulls those out of
-    the URL we hand it (``user:pass@host`` form) and replays them on the
-    callback. If the env vars aren't set, the URL is unchanged — backend
-    runs in soft mode and logs a warning instead of rejecting.
+
+def _webhook_token_signing_secret():
+    """INTERNAL_AUTH_PASSWORD only — no fallback, matching the backend.
+
+    Falling back to WEBHOOK_AUTH_PASSWORD would sign the token with the exact
+    credential this change removes from the URL, so a leaked SWML would let
+    anyone forge tokens. No secret → no token mode.
     """
+    return os.getenv('INTERNAL_AUTH_PASSWORD') or None
+
+
+def _basic_auth_webhook_url(url: str) -> str:
+    """Legacy scheme: WEBHOOK_AUTH creds in the ``user:pass@host``."""
     user = os.getenv('WEBHOOK_AUTH_USER')
     pw = os.getenv('WEBHOOK_AUTH_PASSWORD')
     if not user or not pw:
@@ -39,6 +61,45 @@ def _signed_webhook_url(url: str) -> str:
     netloc = f"{quote(user, safe='')}:{quote(pw, safe='')}@{host}"
     return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params,
                        parsed.query, parsed.fragment))
+
+
+def _signed_webhook_url(url: str) -> str:
+    """Authenticate a URL the platform will call back into the backend.
+
+    ``WEBHOOK_URL_AUTH=token`` switches to the path-bound HMAC; anything else
+    keeps today's credentials-in-URL. Default is unchanged on purpose — the
+    backend accepts BOTH schemes, so this flips (and rolls back) without a
+    flag-day, but only a live PSTN call proves the callbacks still land.
+
+    If the env isn't set for whichever scheme is selected, the URL is returned
+    unchanged / degraded to Basic — the backend's soft mode logs rather than
+    rejects.
+    """
+    if os.getenv('WEBHOOK_URL_AUTH', '').strip().lower() != 'token':
+        return _basic_auth_webhook_url(url)
+
+    secret = _webhook_token_signing_secret()
+    if not secret:
+        print(
+            '[agent] WEBHOOK_URL_AUTH=token ignored: INTERNAL_AUTH_PASSWORD is '
+            'not set, so there is no secret safe to sign callback tokens with. '
+            'Falling back to credentials-in-URL.',
+            flush=True,
+        )
+        return _basic_auth_webhook_url(url)
+
+    parsed = urlparse(url)
+    expires_at = int(time.time()) + WEBHOOK_URL_TOKEN_TTL_SECONDS
+    # Path only, and the same message string the backend signs — see
+    # url_utils._webhook_token_path / webhook_url_token.
+    message = f'webhook-url:{parsed.path or "/"}:{expires_at}'.encode()
+    token = hmac.new(
+        secret.encode(), message, hashlib.sha256,
+    ).hexdigest()[:32]
+    extra = f'{WEBHOOK_TOKEN_EXPIRY_PARAM}={expires_at}&{WEBHOOK_TOKEN_PARAM}={token}'
+    query = f'{parsed.query}&{extra}' if parsed.query else extra
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path,
+                       parsed.params, query, parsed.fragment))
 
 def _internal_auth():
     """HTTP Basic tuple for the backend's private ``@require_internal_auth``

@@ -24,9 +24,17 @@ Configuration via env (in ``.env``):
                                        # internal surface. See
                                        # _expected_internal_credentials().
 
+    WEBHOOK_URL_AUTH=token       # OPTIONAL. Switches PRODUCERS from putting
+                                 # WEBHOOK_AUTH creds in the callback URL to a
+                                 # path-bound HMAC token (CRITICAL-1 Phase 2 /
+                                 # HIGH-4). Default 'basic' = unchanged. The
+                                 # inbound side below accepts BOTH either way,
+                                 # so the flip is non-breaking and reversible.
+                                 # Requires INTERNAL_AUTH_PASSWORD to be set.
+
 Producers (the AI agents and any backend code that hands SignalWire a URL
-to call back) must inject these credentials into the URL — see
-``app.utils.url_utils.signed_webhook_url`` for the helper.
+to call back) go through ``app.utils.url_utils.signed_webhook_url``, which
+applies whichever scheme ``WEBHOOK_URL_AUTH`` selects.
 
 Secure-by-default: :func:`require_webhook_auth` ENFORCES (rejects with 401)
 unless ``WEBHOOK_AUTH_REQUIRED=false`` is explicitly set. Soft mode logs a
@@ -120,14 +128,54 @@ def _validate_against(
     return True, authorized
 
 
+def _validate_url_token() -> tuple[bool, bool]:
+    """Validate a path-bound callback token on the request (CRITICAL-1 Phase 2).
+
+    The Phase 2 scheme replaces ``user:pass@host`` in callback URLs with an
+    HMAC bound to the URL's own path, signed with the segregated INTERNAL_AUTH
+    secret — so a token lifted out of a rendered SWML grants "POST this one
+    endpoint until it expires", not the install's webhook password.
+
+    Returns ``(present, authorized)``. ``present`` is False when the request
+    carries no token at all, which is the normal case while producers are still
+    on the Basic scheme — the caller then falls through to the Basic check.
+    """
+    from app.utils.url_utils import (
+        WEBHOOK_TOKEN_EXPIRY_PARAM,
+        WEBHOOK_TOKEN_PARAM,
+        verify_webhook_url_token,
+    )
+
+    token = request.args.get(WEBHOOK_TOKEN_PARAM)
+    if not token:
+        return False, False
+    return True, verify_webhook_url_token(
+        request.path,
+        token,
+        request.args.get(WEBHOOK_TOKEN_EXPIRY_PARAM),
+    )
+
+
 def _validate_request_auth() -> tuple[bool, bool]:
-    """Validate the inbound HTTP Basic header against the SignalWire-facing
-    WEBHOOK_AUTH creds.
+    """Validate an inbound SignalWire callback by EITHER supported scheme.
+
+    Accepts both on purpose: producers are switched by ``WEBHOOK_URL_AUTH`` (see
+    :func:`app.utils.url_utils.webhook_url_auth_mode`), and callback URLs that
+    SignalWire already stored keep arriving with the old scheme long after the
+    flag flips. Accepting both makes the rollout non-breaking and the rollback
+    instant.
 
     Returns ``(configured, authorized)``:
-      - ``configured`` is False when WEBHOOK_AUTH_USER/PASSWORD aren't set.
-      - ``authorized`` is True only when the header matches (constant-time).
+      - ``configured`` is False only when NEITHER scheme can be checked —
+        no WEBHOOK_AUTH pair and no token on the request.
+      - ``authorized`` is True when either scheme validates (constant-time).
     """
+    token_present, token_ok = _validate_url_token()
+    if token_present:
+        # A request that brought a token is asserting the Phase 2 scheme; judge
+        # it on that alone. Falling back to Basic on a BAD token would let a
+        # caller with stale creds bypass a token check that just failed.
+        return True, token_ok
     return _validate_against(*_expected_credentials())
 
 

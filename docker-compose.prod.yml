@@ -114,6 +114,11 @@ services:
 
       WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
       WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
+      # Callback URL auth scheme — 'token' stops embedding WEBHOOK_AUTH in
+      # the URLs rendered into SWML (CRITICAL-1 Phase 2 / HIGH-4). Requires
+      # INTERNAL_AUTH_PASSWORD; the inbound side accepts both schemes either
+      # way, so flipping this is non-breaking and reversible.
+      WEBHOOK_URL_AUTH: ${WEBHOOK_URL_AUTH:-basic}
       WEBHOOK_AUTH_REQUIRED: ${WEBHOOK_AUTH_REQUIRED:-true}
       # Segregated internal-API secret (falls back to WEBHOOK_AUTH_* when unset).
       # Set to a DISTINCT value for public hosting — see .env.example.
@@ -200,6 +205,11 @@ services:
       SWML_BASIC_AUTH_PASSWORD: ${SWML_BASIC_AUTH_PASSWORD}
       WEBHOOK_AUTH_USER: ${WEBHOOK_AUTH_USER}
       WEBHOOK_AUTH_PASSWORD: ${WEBHOOK_AUTH_PASSWORD}
+      # Callback URL auth scheme — 'token' stops embedding WEBHOOK_AUTH in
+      # the URLs rendered into SWML (CRITICAL-1 Phase 2 / HIGH-4). Requires
+      # INTERNAL_AUTH_PASSWORD; the inbound side accepts both schemes either
+      # way, so flipping this is non-breaking and reversible.
+      WEBHOOK_URL_AUTH: ${WEBHOOK_URL_AUTH:-basic}
       # Segregated internal-API secret for _internal_auth() (falls back to
       # WEBHOOK_AUTH_* when unset).
       INTERNAL_AUTH_USER: ${INTERNAL_AUTH_USER:-}

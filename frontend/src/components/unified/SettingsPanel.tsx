@@ -204,15 +204,15 @@ export function SettingsPanel() {
   // backend-side via @block_in_demo_mode), and gateway management isn't part of
   // the public demo. Clone-and-own operators keep it.
   const showExternalToolsTab = !runtimeConfig?.demo_mode;
-  // User Management is full-admin only (HIGH-3). Every write behind it —
-  // change role, edit capability overrides, delete a user (which also deletes
-  // a SignalWire subscriber), reset a subscriber — is @require_full_admin or
-  // platform-only backend-side, so a hosted 'visitor' would meet a wall of
-  // 403s. A demo workspace also has exactly one member (theirs; no simulated
-  // colleagues are seeded), so there's nothing here for them to manage. The
-  // roster itself stays readable via GET /api/admin/users, which the Queues
-  // tab needs for agent assignment.
-  const showUserManagementTab = isFullAdmin(user?.role);
+  // User Management stays visible to hosted 'visitor's (HIGH-3). GET
+  // /api/admin/users is auto-scoped by tenancy, so the roster they see is
+  // themselves, and the settings on their own row that they legitimately own —
+  // languages, Factbook mode, coach style — are all writable for them. The two
+  // things they can't do (assign roles, grant capability overrides) are the
+  // escalation surfaces and render read-only; delete/reset-subscriber were
+  // already self-disabled / demo-hidden. `canManageUsers` below is the single
+  // predicate those surfaces gate on.
+  const canManageUsers = isFullAdmin(user?.role);
 
   const handleNavigateToCollection = (collectionId: number) => {
     setFocusCollectionId(collectionId);
@@ -281,15 +281,13 @@ export function SettingsPanel() {
             active={activeTab === 'branding'}
             onClick={() => handleTabChange('branding')}
           />
-          {showUserManagementTab && (
-            <TabButton
-              id="users"
-              icon={<Users className="w-3.5 h-3.5" />}
-              label="User Management"
-              active={activeTab === 'users'}
-              onClick={() => handleTabChange('users')}
-            />
-          )}
+          <TabButton
+            id="users"
+            icon={<Users className="w-3.5 h-3.5" />}
+            label="User Management"
+            active={activeTab === 'users'}
+            onClick={() => handleTabChange('users')}
+          />
           <TabButton
             id="webhooks"
             icon={<Activity className="w-3.5 h-3.5" />}
@@ -317,7 +315,7 @@ export function SettingsPanel() {
         {activeTab === 'knowledge' && <KnowledgeBaseTab focusCollectionId={focusCollectionId} />}
         {activeTab === 'external-tools' && showExternalToolsTab && <ExternalToolsTab />}
         {activeTab === 'branding' && <BrandingTab />}
-        {activeTab === 'users' && showUserManagementTab && <UserManagementTab />}
+        {activeTab === 'users' && <UserManagementTab canManageUsers={canManageUsers} />}
         {activeTab === 'webhooks' && <WebhookLogTab />}
         {activeTab === 'workspaces' && showWorkspacesTab && <WorkspacesTab />}
       </div>
@@ -2159,11 +2157,19 @@ function KnowledgeBaseTab({ focusCollectionId }: { focusCollectionId?: number | 
 // Tab: User Management
 // =============================================================================
 
-type UserRole = 'admin' | 'supervisor' | 'agent';
+// Roles an admin may hand out. Mirrors VALID_USER_ROLES in api/admin.py.
+type AssignableUserRole = 'admin' | 'supervisor' | 'agent';
+// Roles a user row can DISPLAY. 'visitor' is minted only by hosted-demo
+// provisioning (HIGH-3) and is deliberately not assignable, so it's in the
+// display union but out of ROLE_OPTIONS.
+type UserRole = AssignableUserRole | 'visitor';
 
-const ROLE_OPTIONS: UserRole[] = ['admin', 'supervisor', 'agent'];
+const ROLE_OPTIONS: AssignableUserRole[] = ['admin', 'supervisor', 'agent'];
 
-function UserManagementTab() {
+const isAssignableRole = (role: UserRole): role is AssignableUserRole =>
+  (ROLE_OPTIONS as UserRole[]).includes(role);
+
+function UserManagementTab({ canManageUsers }: { canManageUsers: boolean }) {
   const currentUser = useAuthStore((s) => s.user);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -2183,7 +2189,7 @@ function UserManagementTab() {
 
   useEffect(() => { loadUsers(); }, [loadUsers]);
 
-  const changeUserRole = async (user: AdminUser, nextRole: UserRole) => {
+  const changeUserRole = async (user: AdminUser, nextRole: AssignableUserRole) => {
     if (user.role === nextRole) return;
     setSavingRoleFor(user.id);
     // Optimistic update — revert on error.
@@ -2214,7 +2220,9 @@ function UserManagementTab() {
         <div className="kicker mb-1">Team</div>
         <h2 className="font-display text-[24px] text-ink leading-none mb-2">User management</h2>
         <p className="text-[13px] text-ink-muted">
-          Deleting a user removes their account, their calls, and their SignalWire subscriber.
+          {canManageUsers
+            ? 'Deleting a user removes their account, their calls, and their SignalWire subscriber.'
+            : 'Your own settings. Role and permissions are fixed for this workspace.'}
         </p>
       </div>
 
@@ -2242,13 +2250,16 @@ function UserManagementTab() {
                     value={user.role as UserRole}
                     onChange={(next) => changeUserRole(user, next)}
                     disabled={
+                      !canManageUsers ||
                       savingRoleFor === user.id ||
                       (currentUser?.id !== undefined && String(currentUser.id) === String(user.id))
                     }
                     title={
-                      currentUser?.id !== undefined && String(currentUser.id) === String(user.id)
-                        ? "You can't change your own role"
-                        : undefined
+                      !canManageUsers
+                        ? 'Roles are fixed for this workspace'
+                        : currentUser?.id !== undefined && String(currentUser.id) === String(user.id)
+                          ? "You can't change your own role"
+                          : undefined
                     }
                   />
                 </td>
@@ -2291,6 +2302,7 @@ function UserManagementTab() {
       {editingUser && (
         <UserEditModal
           user={editingUser}
+          canManageUsers={canManageUsers}
           isSelf={currentUser?.id !== undefined && String(currentUser.id) === String(editingUser.id)}
           onClose={() => setEditingUser(null)}
           onUpdated={(next) => {
@@ -2320,12 +2332,14 @@ function UserManagementTab() {
 
 function UserEditModal({
   user,
+  canManageUsers,
   isSelf,
   onClose,
   onUpdated,
   onDeleted,
 }: {
   user: AdminUser;
+  canManageUsers: boolean;
   isSelf: boolean;
   onClose: () => void;
   onUpdated: (next: AdminUser) => void;
@@ -2378,7 +2392,10 @@ function UserEditModal({
         can_use_coach: true,
       };
     }
-    if (draftRole === 'supervisor') {
+    // 'visitor' carries the supervisor capability set (HIGH-3) — keep this
+    // branch in step with ROLE_PERMISSION_DEFAULTS or the rows below will
+    // advertise the wrong "role default" to a hosted visitor.
+    if (draftRole === 'supervisor' || draftRole === 'visitor') {
       return {
         can_listen_ai_calls: true,
         can_listen_human_calls: true,
@@ -2461,6 +2478,12 @@ function UserEditModal({
       if (dirty.role) {
         if (isSelf && draftRole !== 'admin') {
           throw new Error('You cannot change your own role away from admin');
+        }
+        // Unreachable through the UI (the select can't produce a non-assignable
+        // value and is disabled without canManageUsers) — belt-and-braces so a
+        // hosted 'visitor' can never be sent to a route that would 403.
+        if (!canManageUsers || !isAssignableRole(draftRole)) {
+          throw new Error('Roles are fixed for this workspace');
         }
         const resp = await adminApi.updateUserRole(user.id, draftRole);
         next = resp.data.user;
@@ -2609,10 +2632,14 @@ function UserEditModal({
             {/* Role */}
             <section>
               <div className="kicker mb-2">Role</div>
-              {isSelf ? (
+              {isSelf || !canManageUsers ? (
                 <div className="flex items-center gap-2 text-[13px] text-ink-muted">
                   <RoleSelect value={draftRole} onChange={() => {}} disabled />
-                  <span className="text-[11.5px]">You can\u2019t change your own role.</span>
+                  <span className="text-[11.5px]">
+                    {isSelf
+                      ? 'You can\u2019t change your own role.'
+                      : 'Roles are fixed for this workspace.'}
+                  </span>
                 </div>
               ) : (
                 <RoleSelect value={draftRole} onChange={setDraftRole} />
@@ -2685,13 +2712,23 @@ function UserEditModal({
             <section>
               <div className="flex items-baseline justify-between mb-2">
                 <div className="kicker">Permissions</div>
-                {Object.keys(draftOverrides).length > 0 && (
-                  <button
-                    onClick={resetAllOverrides}
-                    className="text-[11px] text-ink-dim hover:text-ink-muted underline-offset-2 hover:underline"
-                  >
-                    Reset all to {draftRole} defaults
-                  </button>
+                {/* Capability grants are an escalation surface, so
+                    PUT /users/<id>/permissions is @require_full_admin (HIGH-3).
+                    Show a hosted visitor what they hold, read-only, rather than
+                    interactive toggles that would 403 on save. */}
+                {!canManageUsers ? (
+                  <span className="text-[11px] text-ink-dim">
+                    Read-only — set by your {draftRole} role
+                  </span>
+                ) : (
+                  Object.keys(draftOverrides).length > 0 && (
+                    <button
+                      onClick={resetAllOverrides}
+                      className="text-[11px] text-ink-dim hover:text-ink-muted underline-offset-2 hover:underline"
+                    >
+                      Reset all to {draftRole} defaults
+                    </button>
+                  )
                 )}
               </div>
               <div className="rounded-md border border-rule divide-y divide-rule/60">
@@ -2709,6 +2746,7 @@ function UserEditModal({
                   roleDefaults={roleDefaults}
                   draftRole={draftRole}
                   setDraftOverrides={setDraftOverrides}
+                  readOnly={!canManageUsers}
                 />
 
                 {/* Standalone actions. No parent grouping because each is a
@@ -2721,6 +2759,7 @@ function UserEditModal({
                   reset={() => resetFlag('can_whisper')}
                   roleDefault={roleDefaults.can_whisper}
                   draftRole={draftRole}
+                  readOnly={!canManageUsers}
                 />
                 <PermissionRow
                   flag="can_barge"
@@ -2730,6 +2769,7 @@ function UserEditModal({
                   reset={() => resetFlag('can_barge')}
                   roleDefault={roleDefaults.can_barge}
                   draftRole={draftRole}
+                  readOnly={!canManageUsers}
                 />
                 <PermissionRow
                   flag="can_control_recording"
@@ -2739,6 +2779,7 @@ function UserEditModal({
                   reset={() => resetFlag('can_control_recording')}
                   roleDefault={roleDefaults.can_control_recording}
                   draftRole={draftRole}
+                  readOnly={!canManageUsers}
                 />
                 <PermissionRow
                   flag="can_use_coach"
@@ -2748,6 +2789,7 @@ function UserEditModal({
                   reset={() => resetFlag('can_use_coach')}
                   roleDefault={roleDefaults.can_use_coach}
                   draftRole={draftRole}
+                  readOnly={!canManageUsers}
                 />
               </div>
             </section>
@@ -2825,9 +2867,15 @@ function UserEditModal({
           <div className="px-6 py-4 border-t border-rule flex items-center gap-2">
             <button
               onClick={() => setShowDeleteConfirm(true)}
-              disabled={isSelf || saving}
+              disabled={!canManageUsers || isSelf || saving}
               className="btn-danger"
-              title={isSelf ? 'You cannot delete yourself' : 'Permanently delete this user'}
+              title={
+                !canManageUsers
+                  ? 'Deleting users is not available in this workspace'
+                  : isSelf
+                    ? 'You cannot delete yourself'
+                    : 'Permanently delete this user'
+              }
             >
               <Trash2 className="w-3.5 h-3.5" />
               Delete user
@@ -2886,16 +2934,19 @@ function PermissionToggle({
   on,
   onClick,
   label,
+  disabled,
 }: {
   on: boolean;
   onClick: () => void;
   label: string;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className={`mt-0.5 w-8 h-5 rounded-full flex-shrink-0 relative transition-colors ${
+      disabled={disabled}
+      className={`mt-0.5 w-8 h-5 rounded-full flex-shrink-0 relative transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
         on ? 'bg-sw-fuchsia' : 'bg-canvas-sunken border border-rule'
       }`}
       aria-label={`${label} ${on ? 'on' : 'off'}`}
@@ -2918,6 +2969,7 @@ function PermissionRow({
   roleDefault,
   draftRole,
   indent = false,
+  readOnly = false,
 }: {
   flag: PermissionKey;
   resolved: boolean;
@@ -2927,11 +2979,12 @@ function PermissionRow({
   roleDefault: boolean;
   draftRole: UserRole;
   indent?: boolean;
+  readOnly?: boolean;
 }) {
   const meta = PERMISSION_LABELS[flag];
   return (
     <div className={`flex items-start gap-3 px-3 py-2.5 ${indent ? 'pl-10' : ''}`}>
-      <PermissionToggle on={resolved} onClick={toggle} label={meta.label} />
+      <PermissionToggle on={resolved} onClick={toggle} label={meta.label} disabled={readOnly} />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <span className="text-[13px] text-ink">{meta.label}</span>
@@ -2945,7 +2998,7 @@ function PermissionRow({
           {meta.hint}
         </div>
       </div>
-      {overridden && (
+      {overridden && !readOnly && (
         <button
           onClick={reset}
           className="text-[11px] text-ink-dim hover:text-ink-muted underline-offset-2 hover:underline flex-shrink-0"
@@ -2973,6 +3026,7 @@ function PermissionGroup({
   roleDefaults,
   draftRole,
   setDraftOverrides,
+  readOnly = false,
 }: {
   label: string;
   hint: string;
@@ -2986,6 +3040,7 @@ function PermissionGroup({
   setDraftOverrides: React.Dispatch<
     React.SetStateAction<Partial<Record<PermissionKey, boolean>>>
   >;
+  readOnly?: boolean;
 }) {
   const parentOn = childFlags.some((f) => resolvedFor(f));
   const anyChildOverridden = childFlags.some((f) => isOverridden(f));
@@ -3020,7 +3075,7 @@ function PermissionGroup({
     <div className="px-3 py-2.5">
       {/* Parent row */}
       <div className="flex items-start gap-3">
-        <PermissionToggle on={parentOn} onClick={toggleParent} label={label} />
+        <PermissionToggle on={parentOn} onClick={toggleParent} label={label} disabled={readOnly} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <span className="text-[13px] text-ink font-medium">{label}</span>
@@ -3052,6 +3107,7 @@ function PermissionGroup({
                 roleDefault={roleDefaults[flag]}
                 draftRole={draftRole}
                 indent
+                readOnly={readOnly}
               />
             ))}
           </div>
@@ -3097,26 +3153,41 @@ function RoleSelect({
   title,
 }: {
   value: UserRole;
-  onChange: (next: UserRole) => void;
+  onChange: (next: AssignableUserRole) => void;
   disabled?: boolean;
   title?: string;
 }) {
   const style =
     value === 'admin'
       ? 'bg-canvas-elevated text-ink border-rule-strong'
-      : value === 'supervisor'
+      : value === 'supervisor' || value === 'visitor'
         ? 'bg-ai/10 text-ai-soft border-ai/30'
         : 'bg-info/10 text-info-soft border-info/30';
+  // A role that isn't assignable (hosted 'visitor') still has to render as the
+  // selected value — a <select> whose value matches no <option> silently shows
+  // the first one instead, which would mislabel the viewer as an admin.
+  const options: UserRole[] = isAssignableRole(value)
+    ? ROLE_OPTIONS
+    : [value, ...ROLE_OPTIONS];
   return (
     <select
       value={value}
       disabled={disabled}
       title={title}
-      onChange={(e) => onChange(e.target.value as UserRole)}
+      onChange={(e) => {
+        const next = e.target.value as UserRole;
+        // The display-only option for an unassignable role is inert.
+        if (isAssignableRole(next)) onChange(next);
+      }}
       className={`px-2 py-1 text-[11.5px] font-medium rounded border capitalize cursor-pointer disabled:cursor-not-allowed disabled:opacity-60 mono uppercase tracking-wider ${style}`}
     >
-      {ROLE_OPTIONS.map((r) => (
-        <option key={r} value={r} className="bg-canvas text-ink">
+      {options.map((r) => (
+        <option
+          key={r}
+          value={r}
+          disabled={!isAssignableRole(r)}
+          className="bg-canvas text-ink"
+        >
           {r}
         </option>
       ))}

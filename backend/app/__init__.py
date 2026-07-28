@@ -321,4 +321,18 @@ def create_app():
             # Don't crash the app for a seed failure — log loudly so it gets fixed.
             app.logger.error(f"[seat_pool] startup failed (non-fatal): {e}")
 
+        # In-process workspace GC (HIGH-7). The hourly/nightly reaper used to be
+        # reachable only over HTTP from the `demo-reset` cron container, which is
+        # defined solely in the operator's gitignored docker-compose.demo.yml —
+        # so without that overlay expired workspaces accumulated until
+        # MAX_WORKSPACES 503'd every new visitor. This starts the same GC on a
+        # timer. Self-gates on hosted-demo mode (no-op for clone-and-own). Every
+        # worker gets a loop; a Redis lock re-elected each tick decides which one
+        # actually sweeps (see demo_scheduler for why election is per-tick).
+        try:
+            from app.services.demo_scheduler import start as start_workspace_gc
+            start_workspace_gc(app)
+        except Exception as e:
+            app.logger.error(f"[workspace_gc] start failed (non-fatal): {e}")
+
     return app

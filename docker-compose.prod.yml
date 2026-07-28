@@ -121,6 +121,11 @@ services:
       INTERNAL_AUTH_PASSWORD: ${INTERNAL_AUTH_PASSWORD:-}
       # Feature flags — off by default; operator opts in. See .env.example.
       COACH_ENABLED: ${COACH_ENABLED:-false}
+      # In-process workspace GC (HIGH-7). Default-on in hosted-demo mode so the
+      # reaper no longer depends on the demo-reset cron container; 'false' hands
+      # GC back to an external scheduler. No-op for clone-and-own.
+      WORKSPACE_GC_IN_PROCESS: ${WORKSPACE_GC_IN_PROCESS:-true}
+      WORKSPACE_GC_INTERVAL_SECONDS: ${WORKSPACE_GC_INTERVAL_SECONDS:-3600}
 
       EXTERNAL_URL: ${EXTERNAL_URL}
       FLASK_APP: app

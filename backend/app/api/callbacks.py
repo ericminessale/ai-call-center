@@ -22,6 +22,7 @@ from flask import Blueprint, jsonify, request
 from app import db, socketio
 from app.models import Call, Callback, Contact, User
 from app.models.callback import CALLBACK_OUTCOMES
+from app.models.user import SUPERVISORY_ROLES
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth
 from app.utils.demo_config import is_demo_mode
@@ -367,7 +368,7 @@ def record_outcome(callback_id):
         # the requester to be the claiming agent (or a supervisor/admin),
         # mirroring release_callback.
         role = request.current_user.role or ''
-        if role not in ('admin', 'supervisor') and cb.claimed_by_agent_id != request.current_user.id:
+        if role not in SUPERVISORY_ROLES and cb.claimed_by_agent_id != request.current_user.id:
             return jsonify({
                 'error': "You don't own this callback",
                 'detail': 'Claim it first, or ask a supervisor to record the outcome.',

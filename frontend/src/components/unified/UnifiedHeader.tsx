@@ -23,6 +23,7 @@ import { DemoTip, useDemoTip } from '../shared/DemoTip';
 import { useSocketContext } from '../../contexts/SocketContext';
 import { useCallFabricContext } from '../../contexts/CallFabricContext';
 import { Checkbox, Chip } from '../restraint';
+import { isAdminSurface, isSupervisory } from '../../lib/roles';
 
 interface UnifiedHeaderProps {
   user: { email: string; role?: string } | null;
@@ -213,7 +214,7 @@ export function UnifiedHeader({
             active={viewMode === 'callbacks'}
             onClick={() => onViewModeChange('callbacks')}
           />
-          {(user?.role === 'admin' || user?.role === 'supervisor') && (
+          {isSupervisory(user?.role) && (
             <ViewTab
               icon={<Eye className="w-3.5 h-3.5" />}
               label="Supervisor"
@@ -221,7 +222,7 @@ export function UnifiedHeader({
               onClick={() => onViewModeChange('supervisor')}
             />
           )}
-          {user?.role === 'admin' && (
+          {isAdminSurface(user?.role) && (
             <ViewTab
               icon={<Settings className="w-3.5 h-3.5" />}
               label="Settings"

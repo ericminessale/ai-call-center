@@ -23,6 +23,7 @@ import { DashboardCharts } from '../components/unified/DashboardCharts';
 import { QueueDetailPanel } from '../components/unified/QueueDetailPanel';
 import toast from 'react-hot-toast';
 import { logger } from '../lib/logger';
+import { isAdminSurface, isSupervisory } from '../lib/roles';
 import { mapCall, mapCalls } from '../lib/mapCall';
 
 // View modes for the unified interface
@@ -527,11 +528,12 @@ export function UnifiedAgentDesktop() {
   }, [location.pathname]);
 
   // Tabs permitted per role. Agents have no supervisor/settings access;
-  // supervisors can monitor but not configure the system.
+  // supervisors can monitor but not configure the system. Hosted 'visitor's
+  // get both — the demo is theirs to run and configure (HIGH-3).
   const canAccessView = useCallback(
     (mode: ViewMode): boolean => {
-      if (mode === 'settings') return user?.role === 'admin';
-      if (mode === 'supervisor') return user?.role === 'admin' || user?.role === 'supervisor';
+      if (mode === 'settings') return isAdminSurface(user?.role);
+      if (mode === 'supervisor') return isSupervisory(user?.role);
       return true;
     },
     [user?.role],

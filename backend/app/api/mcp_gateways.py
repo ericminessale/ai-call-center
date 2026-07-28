@@ -1,10 +1,15 @@
 """
 Admin endpoints for managing MCP Gateway integrations.
 
-Routes are registered on ``admin_bp`` so the blueprint-level admin role
-gate (see ``app/api/admin.py``) covers auth automatically. Importing
-this module is enough to wire the routes in — the import happens
-indirectly via ``app/__init__.py`` registering ``admin_bp``.
+Routes are registered on ``admin_bp`` so the blueprint-level role gate
+(see ``app/api/admin.py``) covers auth automatically. Importing this
+module is enough to wire the routes in — the import happens indirectly
+via ``app/__init__.py`` registering ``admin_bp``.
+
+That blueprint gate admits hosted-demo visitors too (HIGH-3), so every
+mutating route here — and the ``/test`` probe, which is the CRITICAL-2
+SSRF surface — additionally carries ``@require_full_admin`` on top of
+``@block_in_demo_mode``. Reads stay open: ``to_dict`` strips secrets.
 
 Each :class:`McpGatewayConfig` row tells the AI agents to load the
 SignalWire SDK's ``mcp_gateway`` skill against that gateway at boot.
@@ -29,6 +34,7 @@ from app import db
 from app.api import admin_bp
 from app.models import McpGatewayConfig
 from app.models.mcp_gateway_config import AUTH_TYPES
+from app.utils.decorators import require_full_admin
 from app.utils.demo_config import block_in_demo_mode
 
 logger = logging.getLogger(__name__)
@@ -38,10 +44,12 @@ def _url_host_is_safe(url: str) -> tuple[bool, str]:
     """SSRF guard: resolve the URL's host and reject internal targets.
 
     The gateway URL is admin-supplied and the backend fetches it server-side
-    (:func:`_probe_gateway`), so without this an admin — and, in hosted-demo
-    mode, any visitor who is provisioned as a workspace admin — could point it
-    at internal services or the cloud-metadata endpoint and read the reflected
-    response (classic SSRF).
+    (:func:`_probe_gateway`), so without this an admin could point it at
+    internal services or the cloud-metadata endpoint and read the reflected
+    response (classic SSRF). It was reachable by any hosted-demo visitor when
+    visitors were provisioned as workspace admins; they no longer are (HIGH-3)
+    and the routes are role-gated, but this guard is the one that has to hold
+    for a clone-and-own admin too.
 
     ALWAYS blocks loopback, link-local (incl. the 169.254.169.254 cloud-metadata
     IP), multicast, reserved, site-local, and unspecified addresses. Private
@@ -169,6 +177,7 @@ def get_mcp_gateway(config_id: int):
 
 @admin_bp.route('/mcp-gateways', methods=['POST'])
 @block_in_demo_mode
+@require_full_admin
 def create_mcp_gateway():
     payload = request.get_json() or {}
     invalid = _validate_payload(payload)
@@ -188,6 +197,7 @@ def create_mcp_gateway():
 
 @admin_bp.route('/mcp-gateways/<int:config_id>', methods=['PUT'])
 @block_in_demo_mode
+@require_full_admin
 def update_mcp_gateway(config_id: int):
     config = db.session.get(McpGatewayConfig, config_id)
     if not config:
@@ -206,6 +216,7 @@ def update_mcp_gateway(config_id: int):
 
 @admin_bp.route('/mcp-gateways/<int:config_id>', methods=['DELETE'])
 @block_in_demo_mode
+@require_full_admin
 def delete_mcp_gateway(config_id: int):
     config = db.session.get(McpGatewayConfig, config_id)
     if not config:
@@ -224,6 +235,7 @@ def delete_mcp_gateway(config_id: int):
 
 @admin_bp.route('/mcp-gateways/<int:config_id>/test', methods=['POST'])
 @block_in_demo_mode
+@require_full_admin
 def test_mcp_gateway(config_id: int):
     """Probe the configured gateway and return the services it exposes.
 

@@ -68,6 +68,43 @@ def require_role(*allowed_roles):
     return decorator
 
 
+def require_full_admin(f):
+    """Refuse hosted-demo visitors on admin-MANAGEMENT routes (HIGH-3).
+
+    The /api/admin/* blueprint gate admits both 'admin' and 'visitor' (see
+    ``ADMIN_SURFACE_ROLES``) because a hosted visitor genuinely needs most of
+    that surface to drive the demo — queues, knowledge base, agent routing,
+    the webhook log. This decorator marks the subset they must NOT reach:
+    anything that manages *users or credentials*, fires a server-side fetch at
+    an operator-supplied URL, or bulk-deletes rows.
+
+    Stack it under the route decorator on those handlers. Works with or without
+    ``@require_auth`` — the blueprint's ``before_request`` has already
+    populated ``request.current_user`` by the time this runs.
+
+    Deliberately a separate check from ``_require_platform_admin``: that one
+    protects install-wide SignalWire state from *any* workspace-bound admin
+    (clone-and-own included), this one protects a single workspace from its own
+    anonymous owner.
+    """
+    from app.models.user import FULL_ADMIN_ROLES
+
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = getattr(request, 'current_user', None)
+        if user is None:
+            return jsonify({'error': 'Authentication required'}), 401
+        if (user.role or '') not in FULL_ADMIN_ROLES:
+            return jsonify({
+                'error': 'This action is not available in the hosted demo.',
+                'code': 'admin_only',
+                'current_role': user.role,
+            }), 403
+        return f(*args, **kwargs)
+
+    return decorated_function
+
+
 def require_permission(*required_flags):
     """Decorator requiring one or more capability flags. Must be used AFTER @require_auth.
 

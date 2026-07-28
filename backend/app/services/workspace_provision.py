@@ -12,8 +12,13 @@ WITH their documents (editable copies are the demo — "change what the AI
 knows"), agent→collection assignments, MCP gateway bindings, and the
 route.* config keys from the global (workspace 0) layer. Deliberately NO
 simulated colleagues and NO fake history (§10.3) — the seed is structural
-only. The visitor's own User row is the one user: role='admin', generated
+only. The visitor's own User row is the one user: role='visitor', generated
 email, unusable password (JWTs come from /api/demo/start, never login).
+
+The owner used to be minted as role='admin', which handed every anonymous
+visitor the whole /api/admin/* surface (HIGH-3). 'visitor' keeps the
+operational reach they need — see SUPERVISORY_ROLES in models/user.py — while
+the admin-management routes now refuse them.
 
 Provisioning cost is a handful of DB rows — no SignalWire API calls
 (subscriber seats are leased separately when the browser needs WebRTC) —
@@ -42,6 +47,7 @@ from app.models import (
     User,
     Workspace,
 )
+from app.models.user import ROLE_VISITOR, WORKSPACE_OWNER_ROLES
 from app.services.workspace_session import (
     bump_workspace_epoch,
     end_session,
@@ -70,11 +76,22 @@ def _hash_token(session_token: str) -> str:
 
 
 def _workspace_owner(workspace):
-    """The visitor's admin user for a workspace (oldest admin row)."""
+    """The visitor's own user row for a workspace (oldest owner-role row).
+
+    Accepts either owner role: 'visitor' is what provisioning mints now, and
+    'admin' still appears on workspaces created before HIGH-3 (or after the
+    migration is downgraded). A too-narrow filter here doesn't fail loudly —
+    it makes resume_workspace return None, so every F5 would hand the visitor
+    a brand-new workspace instead of their own.
+    """
     with workspace_context(None):
         return (
             User.query
-            .filter_by(workspace_id=workspace.id, role='admin', is_active=True)
+            .filter(
+                User.workspace_id == workspace.id,
+                User.role.in_(WORKSPACE_OWNER_ROLES),
+                User.is_active.is_(True),
+            )
             .order_by(User.id.asc())
             .first()
         )
@@ -179,7 +196,7 @@ def provision_workspace(session_token: str):
             workspace_id=ws.id,
             email=f'owner@ws-{ws.public_id[:8]}.demo.invalid',
             name='Demo Admin',
-            role='admin',
+            role=ROLE_VISITOR,
             is_active=True,
             languages=['en-US'],
             permissions={},

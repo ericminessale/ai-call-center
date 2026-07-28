@@ -33,6 +33,7 @@ import { Chip, Checkbox } from '../restraint';
 import { ExternalToolsTab } from './ExternalToolsTab';
 import { WebhookLogTab } from './WebhookLogTab';
 import { WorkspacesTab } from './WorkspacesTab';
+import { isFullAdmin } from '../../lib/roles';
 
 // =============================================================================
 // Shared Types
@@ -203,6 +204,15 @@ export function SettingsPanel() {
   // backend-side via @block_in_demo_mode), and gateway management isn't part of
   // the public demo. Clone-and-own operators keep it.
   const showExternalToolsTab = !runtimeConfig?.demo_mode;
+  // User Management is full-admin only (HIGH-3). Every write behind it —
+  // change role, edit capability overrides, delete a user (which also deletes
+  // a SignalWire subscriber), reset a subscriber — is @require_full_admin or
+  // platform-only backend-side, so a hosted 'visitor' would meet a wall of
+  // 403s. A demo workspace also has exactly one member (theirs; no simulated
+  // colleagues are seeded), so there's nothing here for them to manage. The
+  // roster itself stays readable via GET /api/admin/users, which the Queues
+  // tab needs for agent assignment.
+  const showUserManagementTab = isFullAdmin(user?.role);
 
   const handleNavigateToCollection = (collectionId: number) => {
     setFocusCollectionId(collectionId);
@@ -271,13 +281,15 @@ export function SettingsPanel() {
             active={activeTab === 'branding'}
             onClick={() => handleTabChange('branding')}
           />
-          <TabButton
-            id="users"
-            icon={<Users className="w-3.5 h-3.5" />}
-            label="User Management"
-            active={activeTab === 'users'}
-            onClick={() => handleTabChange('users')}
-          />
+          {showUserManagementTab && (
+            <TabButton
+              id="users"
+              icon={<Users className="w-3.5 h-3.5" />}
+              label="User Management"
+              active={activeTab === 'users'}
+              onClick={() => handleTabChange('users')}
+            />
+          )}
           <TabButton
             id="webhooks"
             icon={<Activity className="w-3.5 h-3.5" />}
@@ -305,7 +317,7 @@ export function SettingsPanel() {
         {activeTab === 'knowledge' && <KnowledgeBaseTab focusCollectionId={focusCollectionId} />}
         {activeTab === 'external-tools' && showExternalToolsTab && <ExternalToolsTab />}
         {activeTab === 'branding' && <BrandingTab />}
-        {activeTab === 'users' && <UserManagementTab />}
+        {activeTab === 'users' && showUserManagementTab && <UserManagementTab />}
         {activeTab === 'webhooks' && <WebhookLogTab />}
         {activeTab === 'workspaces' && showWorkspacesTab && <WorkspacesTab />}
       </div>

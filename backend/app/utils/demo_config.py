@@ -51,9 +51,12 @@ def is_demo_mode() -> bool:
 
 # (The persona self-scope layer — DEMO_AGENT_ROLE, call_is_persona_owned,
 # demo_persona_self_scoped/owns_call/call_guard — was deleted in Phase 2 of
-# the tenancy refactor, §9: hosted visitors are ordinary workspace-scoped
-# admins; isolation is the tenancy auto-filter plus explicit workspace
-# predicates at the socket auth points, not a decorator sprawl.)
+# the tenancy refactor, §9. Isolation is the tenancy auto-filter plus explicit
+# workspace predicates at the socket auth points, not a decorator sprawl.
+# Hosted visitors are workspace-scoped users with their OWN role — 'visitor',
+# see models/user.py — not workspace admins; that split (HIGH-3) is what bounds
+# which /api/admin/* actions they can perform, since the data filter alone says
+# nothing about side effects.)
 
 
 def demo_phone_numbers() -> list[dict]:

@@ -12,7 +12,7 @@ per-visitor WORKSPACES instead of the old shared persona pool:
   - ``POST /api/demo/start``     — gated 404 in production. In tenancy
     mode: resumes the cookie's workspace or provisions a fresh one
     (queues/KB/config cloned from the template workspace), mints a JWT
-    for the workspace's admin user, sets the session cookie, returns
+    for the workspace's owner user, sets the session cookie, returns
     ``{access_token, refresh_token, user}``.
   - ``POST /api/demo/heartbeat`` — refreshes workspace liveness + the
     WebRTC seat lease while a visitor's tab is open.
@@ -165,7 +165,7 @@ def start_demo_session():
       - sets the demo session cookie if not present
       - resumes the cookie's live workspace, or creates + template-seeds a
         fresh one (own queues, own editable KB, own config — no colleagues)
-      - mints a JWT for the workspace's admin ``User`` row
+      - mints a JWT for the workspace's owner ``User`` row (role='visitor')
       - returns the same shape ``authApi.login`` does, so the frontend
         can hand the response straight to the existing auth handlers
     """

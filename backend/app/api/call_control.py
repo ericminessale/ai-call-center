@@ -8,6 +8,7 @@ from app import db, socketio
 from app.models.call import Call
 from app.models.call_leg import CallLeg
 from app.models import User
+from app.models.user import SUPERVISORY_ROLES
 from app.utils.decorators import require_auth, require_permission, require_role
 from app.services.signalwire_api import get_signalwire_api
 from app.services.redis_service import get_redis_client
@@ -84,7 +85,7 @@ def _require_call_ownership(call, user):
     if not call:
         return jsonify({'error': 'Call not found'}), 404
     role = getattr(user, 'role', '') or ''
-    if role in ('admin', 'supervisor'):
+    if role in SUPERVISORY_ROLES:
         return None
     if call.assigned_agent_id == user.id:
         return None
@@ -1026,7 +1027,10 @@ def escalate_to_supervisor(call_id):
         }), 403
 
     try:
-        # Find available supervisors and admins
+        # Find available supervisors and admins. Not widened to
+        # SUPERVISORY_ROLES: this looks for someone OTHER than the caller
+        # (User.id != current_user.id below), and a hosted workspace's only
+        # 'visitor' is always the caller — adding the role would change nothing.
         candidates = User.query.filter(
             User.role.in_(['supervisor', 'admin']),
             User.is_active == True,

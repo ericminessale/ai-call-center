@@ -5,14 +5,18 @@ from app.models import Call, Transcription, User, WebhookEvent
 from app.models.system_config import SystemConfig
 from app.models.document import DocumentCollection, Document, AgentCollectionAssignment
 from app.models.queue import Queue, QueueAgentAssignment
-from app.utils.decorators import require_auth, require_role
+from app.models.user import ADMIN_SURFACE_ROLES
+from app.utils.decorators import require_auth, require_full_admin, require_role
 from app.utils.jwt_utils import verify_token
+from app.utils.rate_limit import rate_limit
 from app.utils.url_utils import get_base_url
 from app.services import signalwire_client as sw_client
 
 # Roles an admin is allowed to assign via the User Management UI.
 # (The old reserved ``demo_agent`` persona role is gone with the shared
-# floor — hosted visitors are ordinary workspace-scoped admins now.)
+# floor.) ``visitor`` is deliberately absent: it's minted only by hosted-demo
+# provisioning, so it can neither be handed out nor escalated away from here —
+# and the routes that write this field are @require_full_admin anyway.
 VALID_USER_ROLES = ('admin', 'supervisor', 'agent')
 
 
@@ -36,10 +40,19 @@ def _require_platform_admin():
 
 @admin_bp.before_request
 def _enforce_admin_role():
-    """Require admin role for every /api/admin/* route.
+    """Admit only the admin surface's roles on every /api/admin/* route.
 
     Replaces per-route @require_auth; populates request.current_user so existing
     handlers can read it without changes.
+
+    HIGH-3: this used to require ``role == 'admin'`` and hosted-demo visitors
+    were provisioned AS admins, which put the entire surface (minus the six
+    platform-gated routes) in reach of an anonymous member of the public,
+    scoped only by the tenancy *data* filter — which does nothing about
+    side-effecting endpoints. Visitors are now their own role and the routes
+    they must not perform carry ``@require_full_admin``. The gate here stays
+    coarse on purpose: a role that isn't on the admin surface at all
+    (supervisor, agent) should never see these paths.
     """
     auth_header = request.headers.get('Authorization')
     if not auth_header:
@@ -57,7 +70,7 @@ def _enforce_admin_role():
     if not user or not user.is_active:
         return jsonify({'error': 'User not found or inactive'}), 401
 
-    if user.role != 'admin':
+    if user.role not in ADMIN_SURFACE_ROLES:
         return jsonify({
             'error': 'Admin role required',
             'current_role': user.role,
@@ -110,8 +123,15 @@ def sync_fabric_webhooks():
 
 @admin_bp.route('/clear-calls', methods=['POST'])
 @require_auth
+@require_full_admin
 def clear_calls():
-    """Clear all stale calls from the database."""
+    """Clear all stale calls from the database.
+
+    Full-admin only: an unattended bulk delete of Call + Transcription rows is
+    a maintenance hammer, not a demo action, and nothing in the frontend calls
+    it. (It IS workspace-scoped by the auto-filter, so the ceiling on a visitor
+    would only be their own data — but there's no reason to hand it out.)
+    """
     logger.info(f"CLEAR CALLS REQUEST from user: {request.current_user.id}")
 
     try:
@@ -694,8 +714,16 @@ def delete_document(doc_id):
 
 @admin_bp.route('/collections/<int:collection_id>/reindex', methods=['POST'])
 @require_auth
+@rate_limit('admin_reindex', limit=10, window_seconds=60)
 def reindex_collection(collection_id):
-    """Trigger reindexing of a collection's documents into pgvector."""
+    """Trigger reindexing of a collection's documents into pgvector.
+
+    Stays open to hosted visitors on purpose: "change what the AI knows" is a
+    headline demo beat and KB edits don't reach pgvector without this. The
+    outbound POST goes to a fixed internal URL (AI_AGENTS_ADMIN_URL, env — not
+    request data), so there's no SSRF here; the abuse angle is embedding
+    compute, which the per-IP rate limit above bounds (HIGH-3 / HIGH-5).
+    """
     try:
         collection = DocumentCollection.query.get(collection_id)
         if not collection:
@@ -844,8 +872,13 @@ def update_agent_assignments():
 
 @admin_bp.route('/users', methods=['POST'])
 @require_auth
+@require_full_admin
 def create_user():
     """Create a team member (Phase 2 — the invite-a-colleague demo).
+
+    Full-admin only (HIGH-3): minting accounts — and choosing their role — is
+    user management, not something an anonymous visitor performs. No frontend
+    surface calls this today, so gating it costs the demo nothing.
 
     A workspace admin creates users INSIDE their workspace (the flush
     stamper takes g.workspace_id, so the row lands scoped); a platform
@@ -929,8 +962,14 @@ def list_users():
 
 @admin_bp.route('/users/<int:user_id>', methods=['PUT'])
 @require_auth
+@require_full_admin
 def update_user(user_id):
-    """Update a user's role. Admin-only (enforced at blueprint level)."""
+    """Update a user's role. Full-admin only.
+
+    HIGH-3: role assignment is the privilege-escalation surface — a visitor
+    with this route could mint an 'admin' inside their workspace and reach
+    everything @require_full_admin protects.
+    """
     data = request.get_json() or {}
     new_role = data.get('role')
 
@@ -1223,8 +1262,12 @@ def reset_user_subscriber(user_id):
 
 @admin_bp.route('/users/<int:user_id>/permissions', methods=['PUT'])
 @require_auth
+@require_full_admin
 def update_user_permissions(user_id):
-    """Replace a user's per-user permission overrides. Admin-only.
+    """Replace a user's per-user permission overrides. Full-admin only.
+
+    HIGH-3: capability grants are the other escalation surface — a visitor
+    could raise their own ceiling past their role defaults (or a colleague's).
 
     Body: { "permissions": { "can_listen_ai_calls": true, ... } }
 
@@ -1276,8 +1319,15 @@ def update_user_permissions(user_id):
 
 @admin_bp.route('/users/<int:user_id>', methods=['DELETE'])
 @require_auth
+@require_full_admin
 def delete_user(user_id):
-    """Delete a user, their SignalWire subscriber, and clean up FK references."""
+    """Delete a user, their SignalWire subscriber, and clean up FK references.
+
+    Full-admin only (HIGH-3). Step 1 issues a real DELETE against the
+    operator's SignalWire Fabric account — an external, irreversible side
+    effect on install-wide state — and the local half cascades a user's calls
+    away. Not a visitor action.
+    """
     try:
         # Prevent self-deletion
         if request.current_user.id == user_id:

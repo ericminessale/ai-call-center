@@ -8,6 +8,7 @@ from flask import request
 from app import socketio, db
 from app.utils.jwt_utils import verify_token
 from app.models import User, Call
+from app.models.user import SUPERVISORY_ROLES
 from app.services.redis_service import get_redis_client
 import json
 import logging
@@ -526,7 +527,7 @@ def handle_end_call(data):
                 is_owner = user and (
                     call.user_id == user.id or call.assigned_agent_id == user.id
                 )
-                if not (is_owner or role in ('admin', 'supervisor')):
+                if not (is_owner or role in SUPERVISORY_ROLES):
                     logger.warning(
                         f"end_call socket: user {user_id} denied ending call {call.id}"
                     )

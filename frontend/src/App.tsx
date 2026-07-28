@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { Toaster } from 'react-hot-toast';
 import { useAuthStore } from './stores/authStore';
 import { applyBranding } from './lib/branding';
+import { ADMIN_SURFACE_ROLES, FULL_ADMIN_ROLES, SUPERVISORY_ROLES } from './lib/roles';
 import { SocketProvider } from './contexts/SocketContext';
 import { CallFabricProvider } from './contexts/CallFabricContext';
 import { UnifiedAgentDesktop } from './pages/UnifiedAgentDesktop';
@@ -132,36 +133,38 @@ function App() {
             }
           />
 
-          {/* Supervisor View (integrated) — supervisor or admin only. FE-01
+          {/* Supervisor View (integrated) — supervisory roles only. FE-01
               audit followup (2026-06-02): previously rendered for any logged-in
               user; backend RBAC still gates the supervisor APIs but the screen
               itself shouldn't show its buttons to agents. */}
           <Route
             path="/supervisor"
             element={
-              <ProtectedRoute requireRole={['supervisor', 'admin']}>
+              <ProtectedRoute requireRole={[...SUPERVISORY_ROLES]}>
                 <UnifiedAgentDesktop />
               </ProtectedRoute>
             }
           />
 
-          {/* Settings View — admin only. The Settings panel exposes RBAC
-              editing, queue config, phone-number routing, etc. — same
-              risk class as /admin. */}
+          {/* Settings View — the admin surface. Hosted 'visitor's belong here:
+              queues, knowledge base and branding are their demo to configure.
+              The admin-MANAGEMENT parts of the panel gate on isFullAdmin
+              separately (HIGH-3), so a visitor sees no control they can't use. */}
           <Route
             path="/settings"
             element={
-              <ProtectedRoute requireRole="admin">
+              <ProtectedRoute requireRole={[...ADMIN_SURFACE_ROLES]}>
                 <UnifiedAgentDesktop />
               </ProtectedRoute>
             }
           />
 
-          {/* Admin Settings (standalone fallback) — admin role only */}
+          {/* Admin Settings (standalone fallback) — full admins only. Unlike
+              /settings this legacy screen has no visitor-safe subset. */}
           <Route
             path="/admin"
             element={
-              <ProtectedRoute requireRole="admin">
+              <ProtectedRoute requireRole={[...FULL_ADMIN_ROLES]}>
                 <Admin />
               </ProtectedRoute>
             }

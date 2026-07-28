@@ -15,6 +15,7 @@ from app.utils.webhook_auth import require_webhook_auth
 from app import db
 from app.models import Call, User, Conference, ConferenceParticipant, CallLeg, Contact
 from app.models.queue import Queue, QueueAgentAssignment
+from app.models.user import SUPERVISORY_ROLES
 from datetime import datetime, timedelta
 import logging
 import json
@@ -771,7 +772,7 @@ def update_agent_status():
 
 @queues_bp.route('/agents/scorecards', methods=['GET'])
 @require_auth
-@require_role('supervisor', 'admin')
+@require_role(*SUPERVISORY_ROLES)
 def get_agent_scorecards():
     """Per-agent performance over a window — the supervisor scorecard feed.
 

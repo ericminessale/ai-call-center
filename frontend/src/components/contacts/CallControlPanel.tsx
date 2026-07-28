@@ -29,6 +29,7 @@ import { useCallCapabilities } from '../../hooks/useCallCapabilities';
 import { useCallFabricContext } from '../../contexts/CallFabricContext';
 import { useAuthStore } from '../../stores/authStore';
 import { logger } from '../../lib/logger';
+import { isSupervisory } from '../../lib/roles';
 import type { Call } from '../../types/callcenter';
 
 // Same BCP-47 menu as the admin user editor so caller/agent vocabularies match.
@@ -94,7 +95,8 @@ export default function CallControlPanel({
   const [translateFromLang, setTranslateFromLang] = useState<string>('es-ES');
   const [translateToLang, setTranslateToLang] = useState<string>('en-US');
 
-  const isSupervisor = userRole === 'supervisor' || userRole === 'admin';
+  // Hosted 'visitor's are included: they run their own floor (HIGH-3).
+  const isSupervisor = isSupervisory(userRole);
 
   // SDK handles for the leave-conference Hold pattern. Backend's hold endpoint
   // marks state + announces to caller; this side issues the actual WebRTC

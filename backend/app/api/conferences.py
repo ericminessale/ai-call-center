@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify, Response, make_response
 from app import db, redis_client
 from app.models import Conference, ConferenceParticipant, Call, CallLeg, User
+from app.models.user import SUPERVISORY_ROLES
 from app.services.callcenter_socketio import emit_call_update
 from app.utils.decorators import require_auth
 from app.utils.request_logging import mask_phone, payload_keys, request_summary
@@ -1237,7 +1238,7 @@ def _require_conference_control(conference, user):
     active participant in this conference.
     """
     role = getattr(user, 'role', '') or ''
-    if role in ('admin', 'supervisor'):
+    if role in SUPERVISORY_ROLES:
         return None
     part = ConferenceParticipant.query.filter_by(
         conference_id=conference.id,

@@ -19,6 +19,47 @@ PERMISSION_FLAGS = (
     'can_return_to_queue',     # bounce an accepted call back to queue routing (Tier 2p)
 )
 
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+# 'admin'      — full workspace administrator: clone-and-own owners and the
+#                platform operator (workspace_id NULL).
+# 'supervisor' — monitors/coaches the floor; no configuration surface.
+# 'agent'      — handles calls.
+# 'visitor'    — HOSTED-DEMO workspace owner (HIGH-3). Operationally the same
+#                as a supervisor *inside their own workspace* — they have to be
+#                able to drive the whole demo (take calls, listen/whisper/barge,
+#                edit their own queues and knowledge base) — but deliberately
+#                NOT an 'admin', so the admin-MANAGEMENT routes (user CRUD,
+#                permission grants, MCP-gateway CRUD/probe, bulk deletes) stay
+#                closed to an anonymous member of the public. Provisioning is
+#                the only thing that mints it; it is intentionally absent from
+#                VALID_USER_ROLES (api/admin.py) so it can't be assigned — or
+#                escalated away from — through the User Management UI.
+ROLE_ADMIN = 'admin'
+ROLE_SUPERVISOR = 'supervisor'
+ROLE_AGENT = 'agent'
+ROLE_VISITOR = 'visitor'
+
+# Roles with supervisory reach across their whole workspace: they may see and
+# act on calls they don't personally own. Replaces the ('admin', 'supervisor')
+# literal that used to be spelled out at a dozen call sites — 'visitor' MUST be
+# in this set or a hosted visitor loses control of their own demo floor.
+SUPERVISORY_ROLES = (ROLE_ADMIN, ROLE_SUPERVISOR, ROLE_VISITOR)
+
+# Roles allowed onto /api/admin/* at all (the blueprint-level gate).
+ADMIN_SURFACE_ROLES = (ROLE_ADMIN, ROLE_VISITOR)
+
+# Roles allowed to perform admin MANAGEMENT actions on that surface. Visitors
+# are excluded on purpose — see require_full_admin in app/utils/decorators.py.
+FULL_ADMIN_ROLES = (ROLE_ADMIN,)
+
+# Roles a hosted workspace's owner row can carry: 'visitor' since HIGH-3,
+# 'admin' for workspaces provisioned before it (and after a migration
+# downgrade). Keep the lookup in workspace_provision tolerant of both.
+WORKSPACE_OWNER_ROLES = (ROLE_VISITOR, ROLE_ADMIN)
+
+
 ROLE_PERMISSION_DEFAULTS = {
     'admin': {k: True for k in PERMISSION_FLAGS},
     'supervisor': {
@@ -39,10 +80,30 @@ ROLE_PERMISSION_DEFAULTS = {
         'can_use_coach':          True,   # opt-in via in-call toggle; defaults to off per-call
         'can_return_to_queue':    True,   # default-on, revokable for abuse cases per 2p spec
     },
-    # (The old 'demo_agent' persona role is gone with the shared floor —
-    # hosted visitors are ordinary workspace-scoped 'admin' users whose
-    # isolation is structural: tenancy auto-filtering plus the workspace
-    # predicates at the socket auth points.)
+    # Hosted-demo visitor: the *capability* set of a supervisor, because the
+    # visitor is the only human on their floor and every one of these flags is
+    # a demo beat (Listen on the AI call, whisper/barge into a human one,
+    # pause recording, bounce a call back to the queue). What a visitor can't
+    # do isn't expressed here — it's the admin-management gate (HIGH-3).
+    #
+    # can_use_coach stays True even though the Coach is unfinished: the
+    # COACH_ENABLED flag (utils/feature_flags.py) is the real gate and it is
+    # off everywhere by default plus @block_in_demo_mode on the endpoints.
+    # Flipping this flag off instead would also hide the deliberate
+    # "AI coach — coming soon" teaser from the demo.
+    'visitor': {
+        'can_listen_ai_calls':    True,
+        'can_listen_human_calls': True,
+        'can_whisper':            True,
+        'can_barge':              True,
+        'can_control_recording':  True,
+        'can_use_coach':          True,
+        'can_return_to_queue':    True,
+    },
+    # (The old 'demo_agent' persona role is gone with the shared floor. Hosted
+    # visitors are workspace-scoped 'visitor' users; their isolation is
+    # structural — tenancy auto-filtering plus the workspace predicates at the
+    # socket auth points — and their privilege ceiling is the role split above.)
 }
 
 
@@ -62,6 +123,9 @@ class User(WorkspaceScoped, db.Model):
     email = db.Column(db.String(255), nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
     name = db.Column(db.String(255), nullable=True)
+    # Free-text VARCHAR, not a Postgres ENUM — adding 'visitor' needed no
+    # schema change (see the role constants above for the valid values). The
+    # w3x4y5z6a7b8 migration only re-labels existing rows.
     role = db.Column(db.String(50), default='agent', nullable=False)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)

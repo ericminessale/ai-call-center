@@ -12,7 +12,10 @@ export interface User {
   id: string;
   email: string;
   name?: string;
-  role?: string; // 'agent' | 'supervisor' | 'admin'
+  // 'agent' | 'supervisor' | 'admin' | 'visitor' (hosted-demo workspace owner).
+  // Gate UI on the helpers in lib/roles.ts, not on string equality — 'visitor'
+  // has a supervisor's reach but not admin-management powers (HIGH-3).
+  role?: string;
   is_active: boolean;
   created_at: string;
   // Tenancy: null = platform-level user (hosted operator / clone-and-own

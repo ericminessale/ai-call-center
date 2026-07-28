@@ -2,6 +2,7 @@ from flask_socketio import emit, join_room, leave_room
 from flask import request
 from app import socketio
 from app.models import Call, User
+from app.models.user import SUPERVISORY_ROLES
 from app.utils.jwt_utils import verify_token
 from app.services.redis_service import add_to_set, remove_from_set
 from app.services.ws_rooms import WS_CLIENTS_PREFIX, workspace_room, ws_clients_key
@@ -323,13 +324,13 @@ def handle_join_call(data):
 
     role = user.role or ''
     is_owner = (call.user_id == user.id) or (call.assigned_agent_id == user.id)
-    is_privileged = role in ('admin', 'supervisor')
+    is_privileged = role in SUPERVISORY_ROLES
     is_human_call = bool(call.conference_name and call.handler_type == 'human')
     listen_flag = 'can_listen_human_calls' if is_human_call else 'can_listen_ai_calls'
     # The old persona self-scope layer and shared-floor allowance are gone
-    # with the shared floor itself (§10.4): a hosted visitor is the admin
-    # of their own workspace, so within the workspace plain flag/role
-    # semantics apply — identical to clone-and-own.
+    # with the shared floor itself (§10.4): a hosted visitor holds a
+    # supervisory role over their own workspace, so within the workspace
+    # plain flag/role semantics apply — identical to clone-and-own.
     flag_grants = user.has_permission(listen_flag)
     authorized = is_owner or is_privileged or flag_grants
 
@@ -588,7 +589,7 @@ def handle_agent_answered(data):
         emit('error', {'message': 'Not authorized for this conference'})
         return
     role = user.role or ''
-    authorized = role in ('admin', 'supervisor') or (
+    authorized = role in SUPERVISORY_ROLES or (
         conf_call is not None
         and (conf_call.assigned_agent_id == user.id or conf_call.user_id == user.id)
     )

@@ -335,13 +335,15 @@ def list_subscribers():
     rather than emitting the bogus fabricated form.
     """
     from app.models import User
+    from app.models.user import SUPERVISORY_ROLES
     # ISO-18 (2026-07-07 pre-deploy): this returns every subscriber's email,
-    # Fabric address and metadata. Restrict to supervisors/admins — a leased
-    # demo persona (or any plain agent) has no reason to enumerate the roster,
-    # and on the shared instance it leaked all personas' details.
+    # Fabric address and metadata. Restrict to the supervisory roles — a plain
+    # agent has no reason to enumerate the roster, and on the shared instance it
+    # leaked all personas' details. (SUPERVISORY_ROLES includes the hosted
+    # 'visitor' role, which used to reach this as an 'admin'.)
     from flask_jwt_extended import get_jwt_identity
     _requester = User.find_by_id(get_jwt_identity())
-    if not _requester or (_requester.role or '') not in ('admin', 'supervisor'):
+    if not _requester or (_requester.role or '') not in SUPERVISORY_ROLES:
         return jsonify({'error': 'Insufficient permissions'}), 403
     try:
         try:

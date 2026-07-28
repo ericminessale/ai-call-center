@@ -2,6 +2,7 @@ from flask import request, jsonify
 from app import db, socketio, redis_client
 from app.api import calls_bp
 from app.models import Call, CallLeg, Transcription
+from app.models.user import SUPERVISORY_ROLES
 from app.services.signalwire_api import get_signalwire_api
 from app.utils.decorators import require_auth, require_permission, require_role, validate_json
 from app.utils.demo_config import is_demo_mode, block_in_demo_mode, DEMO_BLOCKED_RESPONSE
@@ -36,20 +37,21 @@ def _require_call_ownership(call, user, allow_demo_ai_view=False):
 
     ``allow_demo_ai_view``: retained for signature compatibility; the
     shared-floor read allowance it used to enable is gone with the shared
-    floor (hosted visitors are admins of their own workspace and pass the
-    role check; tenancy auto-filtering stops cross-workspace lookups).
+    floor (a hosted visitor holds a supervisory role over their own
+    workspace and passes the role check; tenancy auto-filtering stops
+    cross-workspace lookups).
     """
     if not call:
         return jsonify({'error': 'Call not found'}), 404
     role = getattr(user, 'role', '') or ''
-    if role in ('admin', 'supervisor'):
+    if role in SUPERVISORY_ROLES:
         return None
     if call.assigned_agent_id == user.id or call.user_id == user.id:
         return None
     # (The old shared-floor read allowance for demo personas is gone with
-    # the shared floor itself — hosted visitors are admins of their own
-    # workspace and pass the role check above; the tenancy auto-filter
-    # already stops cross-workspace call lookups from resolving at all.)
+    # the shared floor itself — a hosted 'visitor' is in SUPERVISORY_ROLES
+    # and passes the role check above; the tenancy auto-filter already
+    # stops cross-workspace call lookups from resolving at all.)
     return jsonify({
         'error': "You don't have access to this call",
         'detail': (
@@ -478,6 +480,11 @@ def _coach_call_lookup(call_id):
         return None, None, (jsonify({'error': 'Call not found'}), 404)
 
     user = request.current_user
+    # Left as a strict 'admin' check, NOT widened to SUPERVISORY_ROLES: the
+    # intent is "only the agent on this call", with an admin bypass. Hosted
+    # 'visitor's don't need it (in the demo they ARE the assigned agent) and
+    # the coach endpoints are @block_in_demo_mode + @require_coach_enabled
+    # anyway, so keeping this narrow costs nothing.
     is_admin = getattr(user, 'role', None) == 'admin'
     if not is_admin and call.assigned_agent_id != user.id:
         return None, None, (jsonify({
@@ -719,14 +726,14 @@ def list_calls():
         # supervisors/admins and fall back to own-calls for regular agents.
         role = request.current_user.role or ''
         show_all_ai = status_filters and 'ai_active' in status_filters and (
-            role in ('admin', 'supervisor')
+            role in SUPERVISORY_ROLES
         )
         if show_all_ai:
-            # Unfiltered within the caller's scope: hosted visitors are the
-            # admin of their own workspace, so the tenancy auto-filter keeps
-            # this to their rows; clone-and-own admins/supervisors see all,
-            # same as baseline. (The old demo-persona floor filter is gone
-            # with the shared floor.)
+            # Unfiltered within the caller's scope: a hosted 'visitor' has
+            # supervisory reach over their own workspace only, so the
+            # tenancy auto-filter keeps this to their rows; clone-and-own
+            # admins/supervisors see all, same as baseline. (The old
+            # demo-persona floor filter is gone with the shared floor.)
             query = db.session.query(Call)
         else:
             # User's own calls only
@@ -1728,6 +1735,9 @@ def update_wrap_up(call_id):
 
 @calls_bp.route('/cleanup-stale', methods=['POST'])
 @require_auth
+# Deliberately NOT widened to SUPERVISORY_ROLES: a bulk status sweep is
+# maintenance, no frontend surface calls it, and hosted 'visitor's have no
+# reason to reach it. Same call as @require_full_admin on /api/admin/clear-calls.
 @require_role('supervisor', 'admin')
 def cleanup_stale_calls():
     """Clean up stale calls that are stuck in ringing/active status.

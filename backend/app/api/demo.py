@@ -42,7 +42,7 @@ from app.services.workspace_provision import (
     release_workspace,
     resume_workspace,
 )
-from app.services.workspace_session import get_workspace_epoch
+from app.services.workspace_session import get_workspace_epoch, workspace_ttl_seconds
 from app.utils.demo_config import is_demo_mode, runtime_config
 from app.utils.decorators import require_auth
 from app.utils.jwt_utils import generate_tokens
@@ -57,10 +57,23 @@ demo_bp = Blueprint('demo', __name__)
 # URL-safe secret. HttpOnly so JS can't read it; SameSite=Lax so
 # cross-site embeds can't provision on someone's behalf. The cookie is
 # the workspace-resume credential, so its lifetime tracks the workspace
-# idle TTL (7 days) rather than the old 24h/5-min lease asymmetry —
-# only its sha256 ever touches the database.
+# idle TTL rather than the old 24h/5-min lease asymmetry — only its sha256
+# ever touches the database.
 _SESSION_COOKIE = 'demo_session'
-_SESSION_COOKIE_MAX_AGE = 7 * 24 * 60 * 60
+
+
+def _session_cookie_max_age() -> int:
+    """Cookie lifetime == workspace idle TTL, read at response time.
+
+    Was hardcoded to 7 days, which only matched the DEFAULT
+    ``WORKSPACE_TTL_DAYS``. The TTL is configurable from 1 hour to 30 days
+    (:func:`workspace_ttl_seconds`), so any value above 7 days orphaned still-
+    live workspaces: the browser dropped the only resume credential while the
+    row stayed active, holding a MAX_WORKSPACES slot until the reaper caught
+    it. Reading the TTL here keeps the cookie, the Redis session key and
+    ``workspaces.expires_at`` on one clock.
+    """
+    return workspace_ttl_seconds()
 
 
 def _request_session_token() -> str | None:
@@ -82,7 +95,7 @@ def _set_session_cookie(response, token: str) -> None:
     response.set_cookie(
         _SESSION_COOKIE,
         value=token,
-        max_age=_SESSION_COOKIE_MAX_AGE,
+        max_age=_session_cookie_max_age(),
         secure=request.is_secure,
         httponly=True,
         samesite='Lax',

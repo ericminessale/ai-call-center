@@ -313,11 +313,28 @@ def nightly_safety_pass() -> dict[str, Any]:
     expired = reap_expired_workspaces()
 
     # Cap enforcement: reap oldest-idle live workspaces beyond the cap.
+    #
+    # "live" has to mean the same thing here as in Workspace.is_live() and in
+    # provision_workspace's cap count — active AND not past its TTL. Counting
+    # every non-template row instead meant a workspace whose reap failed a few
+    # lines up (expired but still present, or already status='reaped') kept
+    # occupying a cap slot, which pushed a genuinely active workspace past the
+    # cap boundary and got it deleted out from under a live visitor. Dead rows
+    # aren't capacity; the next reap_expired_workspaces pass retries them.
+    #
+    # nullslast: last_active_at is NOT NULL today, but Postgres sorts NULLs
+    # first under DESC, so a NULL would read as "most recently active" and
+    # shield a dead row while reaping a live one. Cheap to not depend on it.
     cap = max_workspaces()
+    now = datetime.utcnow()
     live = (
         Workspace.query
         .filter(Workspace.id != DEFAULT_WORKSPACE_ID)
-        .order_by(Workspace.last_active_at.desc())
+        .filter(Workspace.status == Workspace.STATUS_ACTIVE)
+        .filter(
+            (Workspace.expires_at.is_(None)) | (Workspace.expires_at > now)
+        )
+        .order_by(Workspace.last_active_at.desc().nullslast())
         .all()
     )
     over_cap = live[cap:]

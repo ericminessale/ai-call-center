@@ -34,6 +34,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta
 
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from app import db
@@ -58,6 +59,41 @@ from app.services.workspace_session import (
 from app.tenancy import DEFAULT_WORKSPACE_ID, workspace_context
 
 logger = logging.getLogger(__name__)
+
+# Arbitrary but fixed advisory-lock key for workspace admission. Any int64 is
+# fine as long as nothing else in the schema picks the same one.
+_ADMISSION_LOCK_KEY = 0x577C4C00
+
+
+def _serialize_admission() -> None:
+    """Serialize the MAX_WORKSPACES check against the INSERT that consumes a slot.
+
+    The cap was raceable: every concurrent /demo/start ran its own ``live_count``
+    query, all of them saw the same under-cap number, and all of them then
+    created a workspace — so N simultaneous visitors could overshoot
+    MAX_WORKSPACES by N-1. Counting and inserting inside one advisory lock makes
+    admission strictly one-at-a-time, which is the only thing that makes the
+    count meaningful; the lock is transaction-scoped, so it releases on the
+    commit (or rollback) at the end of provisioning without any unlock call.
+
+    It is held across ``_clone_templates`` too, so simultaneous first-time
+    visitors provision in series rather than in parallel. That's a few hundred
+    ms of DB inserts each, and correctness of a hard cap is worth more than
+    concurrent cold starts on a demo box.
+
+    No-ops on non-PostgreSQL binds (the SQLite test setup is single-writer, and
+    pg_advisory_xact_lock doesn't exist there).
+    """
+    try:
+        if db.session.get_bind().dialect.name != 'postgresql':
+            return
+        db.session.execute(
+            text('SELECT pg_advisory_xact_lock(:key)'), {'key': _ADMISSION_LOCK_KEY}
+        )
+    except Exception as exc:
+        # Fail OPEN: losing serialization degrades the cap to its previous
+        # best-effort behaviour, which beats refusing to provision at all.
+        logger.warning("workspace admission lock unavailable (%s) — cap is best-effort", exc)
 
 
 def max_workspaces() -> int:
@@ -149,6 +185,9 @@ def provision_workspace(session_token: str):
     # A dead workspace may still hold this cookie's hash (expired while the
     # cookie lived on) — free the unique binding before re-claiming it.
     with workspace_context(None):
+        # Must come before the cap count below — see _serialize_admission.
+        _serialize_admission()
+
         stale = Workspace.query.filter_by(session_token_hash=token_hash).first()
         if stale is not None:
             stale.session_token_hash = None
@@ -171,6 +210,10 @@ def provision_workspace(session_token: str):
         )
     if live_count >= max_workspaces():
         logger.warning("provision_workspace: MAX_WORKSPACES (%d) reached", max_workspaces())
+        # Release the admission lock (and drop the uncommitted hash-freeing
+        # UPDATE, which we have no business keeping when we admit nobody)
+        # instead of holding both until request teardown.
+        db.session.rollback()
         return None
 
     now = datetime.utcnow()

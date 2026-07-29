@@ -364,7 +364,10 @@ export const conferencesApi = {
     agent_id: number;
     conference_name: string;
     call_id?: number | string;
-    type?: 'monitor' | 'backup' | 'escalation';
+    // Assignment-driven joins only. Observer shapes (monitor/whisper/barge)
+    // come from their own permission-gated endpoints — the backend rejects
+    // them here with a 400.
+    type?: 'backup' | 'escalation';
     context?: Record<string, any>;
     whisper_mode?: boolean;
     agent_call_sid?: string;

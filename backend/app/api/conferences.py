@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 conferences_bp = Blueprint('conferences', __name__)
 
+# Join types /prepare-join is allowed to mint — see the block comment in
+# prepare_conference_join for why the observer/takeover shapes are excluded.
+_PREPARE_JOIN_TYPES = ('backup', 'escalation')
+
 
 # ============================================================================
 # Helpers
@@ -158,18 +162,41 @@ def prepare_conference_join():
     """
     data = request.get_json() or {}
 
-    agent_id = data.get('agent_id')
+    # The join is always for the CALLER. A body-supplied agent_id used to be
+    # trusted verbatim, which let any authenticated user mint a conference-join
+    # token naming someone else — including a whisper token whose `coach`
+    # target is another agent's leg. Every frontend caller already sends
+    # `user.id` here, so pinning it changes no legitimate flow.
+    body_agent_id = data.get('agent_id')
+    agent_id = request.current_user.id
+    if body_agent_id is not None and str(body_agent_id) != str(agent_id):
+        logger.warning(
+            "prepare-join: ignoring body agent_id=%s; minting for caller %s",
+            body_agent_id, agent_id,
+        )
+
     conference_name = data.get('conference_name')
     call_id = data.get('call_id')
-
-    if not agent_id:
-        return jsonify({'error': 'agent_id is required'}), 400
 
     if not conference_name:
         return jsonify({'error': 'conference_name is required'}), 400
 
-    # Optional fields for multi-agent conference modes
-    join_type = data.get('type')              # 'monitor', 'backup', 'escalation', or None (normal)
+    # Optional fields for multi-agent conference modes.
+    #
+    # This endpoint is @require_auth only — it's the "I was assigned this call,
+    # let me in" path an ordinary agent uses. It may therefore only mint the
+    # assignment-driven join types, whose authorization already happened when
+    # the assignment was created (/request-backup, /escalate — the latter gates
+    # `whisper` on can_whisper). The observer shapes (monitor / whisper / barge)
+    # and takeover are minted ONLY by their own permission-gated endpoints
+    # (call_control._mint_observer_join, /monitor/start, /calls/<sid>/takeover);
+    # accepting them here would hand any logged-in agent silent-listen and
+    # coach-audio into any conference whose name they know.
+    join_type = data.get('type')              # 'backup', 'escalation', or None (normal)
+    if join_type is not None and join_type not in _PREPARE_JOIN_TYPES:
+        return jsonify({
+            'error': f'type must be one of {list(_PREPARE_JOIN_TYPES)} (or omitted)',
+        }), 400
     context = data.get('context')             # AI-collected context for whisper
     whisper_mode = data.get('whisper_mode')   # True for supervisor coach mode
     agent_call_sid = data.get('agent_call_sid')  # Agent's SID for coach targeting
@@ -213,6 +240,44 @@ def prepare_conference_join():
 # ============================================================================
 # CXML/SWML Webhook Endpoints (called by SignalWire, no auth required)
 # ============================================================================
+
+# Params that grant a PRIVILEGED conference member shape and must therefore
+# never be honoured from an untrusted source.
+#
+# agent-conference is an unauthenticated webhook (SignalWire calls it) that
+# scrapes params out of ~10 request locations, including the raw query string
+# of the dialled address. Every privileged mode is minted server-side into a
+# `conference_join:<token>` Redis entry by an endpoint that has already run
+# the authorization:
+#
+#   monitor    → /monitor/start        (can_listen_human_calls / _ai_calls)
+#   whisper    → /observe/whisper      (can_whisper)
+#   barge      → /observe/barge        (can_barge)
+#   escalation → /escalate            (can_whisper, when whisper_mode)
+#   backup     → /request-backup
+#   takeover   → /calls/<sid>/takeover
+#
+# Without this stripping, a caller who could dial the public SWML resource
+# with their own query string could ask for `type=whisper&agent_call_sid=…`
+# (coach-audio into a live call) or `type=takeover&call_sid=…` (kill the AI
+# leg and bridge themselves to the customer) and skip those gates entirely.
+# `context` is here too: it's AI-collected caller PII played as pre-join TTS.
+#
+# Raw params may still carry `conf`/`agent_id` — that's the documented
+# legacy normal-participant join and is unchanged.
+_TOKEN_ONLY_JOIN_PARAMS = (
+    'type',
+    'whisper_mode',
+    'agent_call_sid',
+    'context',
+    'call_sid',
+    'call_id',
+    'leg_id',
+    'user_id',
+    'muted',
+    'beep',
+)
+
 
 @conferences_bp.route('/agent-conference', methods=['POST', 'GET'])
 def agent_conference_webhook():
@@ -319,6 +384,21 @@ def agent_conference_webhook():
             parsed_params.update(json_data[key])
 
     logger.debug("Agent conference parsed parameter fields: %s", payload_keys(parsed_params))
+
+    # Everything gathered above came from an unauthenticated request. Drop the
+    # privileged join fields BEFORE the token merge below, so the only way to
+    # get a monitor/whisper/barge/escalation/backup/takeover shape is a Redis
+    # token minted by the permission-gated endpoint for that mode. See
+    # _TOKEN_ONLY_JOIN_PARAMS.
+    untrusted_privileged = [k for k in _TOKEN_ONLY_JOIN_PARAMS if k in parsed_params]
+    if untrusted_privileged:
+        logger.warning(
+            "Agent conference: ignoring untrusted privileged join params %s "
+            "(no join token supplies them) — %s",
+            untrusted_privileged, request_summary(request),
+        )
+        for key in untrusted_privileged:
+            parsed_params.pop(key, None)
 
     # Source 10: Redis lookup by join_token (most reliable method)
     # The frontend calls /api/conferences/prepare-join first, which stores params in Redis
@@ -449,11 +529,16 @@ def agent_conference_webhook():
         logger.debug("Returning takeover conference SWML")
         return jsonify(swml)
 
-    # Get conference name - if provided, use per-interaction mode
-    conference_name = request.args.get('conf') or parsed_params.get('conf')
+    # Get conference name - if provided, use per-interaction mode.
+    # parsed_params FIRST so a join token's conference wins: the query string
+    # is attacker-controlled, and args-first let a valid token minted for one
+    # conference (e.g. a monitor token for your own call) be re-pointed at a
+    # different conference with `?token=<valid>&conf=<other>`. The bare
+    # `?conf=` legacy join still works — parsed_params is simply empty then.
+    conference_name = parsed_params.get('conf') or request.args.get('conf')
 
-    # Get agent_id from multiple sources
-    agent_id = request.args.get('agent_id') or parsed_params.get('agent_id') or request.form.get('agent_id')
+    # Get agent_id from multiple sources (token first, same reasoning)
+    agent_id = parsed_params.get('agent_id') or request.args.get('agent_id') or request.form.get('agent_id')
 
     if not agent_id:
         logger.error("No agent_id provided - all sources checked")

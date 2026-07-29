@@ -245,6 +245,17 @@ services:
       DEMO_MCP_USER: ${DEMO_MCP_USER:-mcpservice}
       DEMO_MCP_PASSWORD: ${DEMO_MCP_PASSWORD:?set DEMO_MCP_PASSWORD}
       SHOP_DB_PATH: /data/shop.db
+      # Hosted-demo gate for the shop-reset listener on 8101
+      # (demo-mcp/shop_admin.py). The shop DB is shared by every visitor
+      # and start_return writes to it, so the demo-reset cron restores it
+      # nightly. Unset — i.e. every clone-and-own install — means the
+      # listener never binds and nothing can wipe this shop's data.
+      TENANCY_MODE: ${TENANCY_MODE:-}
+      DEMO_MODE: ${DEMO_MODE:-}
+      # Basic-auth for that listener; falls back to the DEMO_MCP_* pair
+      # above when unset, so the demo needs no additional secret.
+      SHOP_RESET_USER: ${SHOP_RESET_USER:-}
+      SHOP_RESET_PASSWORD: ${SHOP_RESET_PASSWORD:-}
       PYTHONUNBUFFERED: 1
     volumes:
       - demo_mcp_data:/data

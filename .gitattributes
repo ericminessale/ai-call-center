@@ -1,2 +1,6 @@
 # Shell scripts execute inside Linux containers — CRLF breaks them.
 *.sh text eol=lf
+# Same reasoning, different consumer: busybox crond keeps the trailing CR
+# as part of the command, so a CRLF crontab checked out on Windows and
+# COPYied into the demo-reset image makes every scheduled run fail.
+demo-reset/crontab text eol=lf

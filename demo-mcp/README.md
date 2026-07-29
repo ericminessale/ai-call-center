@@ -81,8 +81,9 @@ example.
 demo-mcp/
 ├── Dockerfile             # python:3.11-slim + mcp + signalwire[mcp-gateway]
 ├── requirements.txt
-├── shop_seed.py           # creates + populates shop.db (idempotent)
+├── shop_seed.py           # creates + populates shop.db (idempotent, or --force)
 ├── shop_mcp_server.py     # the MCP server (six @mcp.tool() functions)
+├── shop_admin.py          # hosted-demo-only reset listener (:8101)
 ├── gateway-config.json    # config for the SDK's mcp-gateway CLI
 ├── entrypoint.sh          # seed-then-launch
 └── README.md
@@ -90,5 +91,30 @@ demo-mcp/
 
 DB lives at `/data/shop.db` inside the container, backed by the
 `demo_mcp_data` named volume so seeded edits survive container
-restarts. To reset, `docker-compose down -v` (drops all volumes) or
-`docker volume rm signalwire-call-center_demo_mcp_data`.
+restarts.
+
+## Resetting the shop data
+
+`start_return` writes — it inserts an RMA row and flips the order to
+`returned` — so a shop that's been demoed a few times drifts from its
+seed state. Three ways back:
+
+```bash
+# In place, keeping the container up (safe mid-call: one transaction):
+docker-compose exec demo-mcp-gateway python3 /app/shop_seed.py --force
+
+# Or drop the volume and let first-boot seeding rerun:
+docker-compose down -v      # drops ALL volumes, including Postgres
+docker volume rm signalwire-call-center_demo_mcp_data
+```
+
+A `--force` reseed also refreshes the relative order dates ("shipped 3
+days ago" stays 3 days ago instead of aging with the volume).
+
+**On the hosted demo this is automatic.** Because every visitor shares
+this one shop DB, `demo-reset/reset.sh nightly` POSTs
+`/internal/shop-reset` to `shop_admin.py` on port 8101 after the
+workspace GC, so each day starts from seed state. That listener binds
+**only** when `TENANCY_MODE`/`DEMO_MODE=true`; on a clone-and-own
+install it never opens a socket, and your shop data is yours to keep.
+`demo-reset.sh shop` runs just that step by hand.

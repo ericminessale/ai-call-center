@@ -97,6 +97,10 @@ class Call(WorkspaceScoped, db.Model):
     # disposition_code (the agent's BUSINESS outcome). Computed deterministically
     # on call end (see compute_end_reason). Drives the call-history status chip.
     #   abandoned_in_queue   — caller hung up before reaching anyone
+    #   callback_scheduled   — hold timeout: we took the caller off hold and put
+    #                          them on the callback list (queue_dispatch.py).
+    #                          Set BEFORE the call ends, so it doubles as the
+    #                          teardown claim; compute_end_reason never yields it.
     #   missed               — agent was assigned but the call never connected
     #   premature_disconnect — connected but dropped almost immediately (<10s)
     #   caller_hangup        — connected, caller ended the call (per hangup_direction)

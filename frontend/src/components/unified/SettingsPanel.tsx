@@ -1347,8 +1347,11 @@ function QueuesTab() {
                   className="input mono"
                 />
               </div>
+              {/* Field name is legacy (`max_wait_before_ai_fallback`, part of
+                  the admin API contract); the label describes what the backend
+                  actually does with it. See services/queue_dispatch.py. */}
               <div>
-                <label className="block kicker mb-1">Max Wait Before AI Fallback (seconds)</label>
+                <label className="block kicker mb-1">Max Hold Before Callback (seconds)</label>
                 <input
                   type="number" min={0}
                   value={editForm.max_wait_before_ai_fallback ?? 120}
@@ -1356,7 +1359,8 @@ function QueuesTab() {
                   className="input mono"
                 />
                 <p className="text-[11px] text-ink-dim mt-1">
-                  Waiting callers are offered the <span className="text-ai">✦</span> AI specialist after this delay.
+                  A caller waiting longer than this is added to the callback queue,
+                  told an agent will call back, and released. 0 disables the cap.
                 </p>
               </div>
 

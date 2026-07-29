@@ -11,6 +11,9 @@ const END_REASON_CHIP: Record<string, { label: string; className: string }> = {
   agent_hangup:         { label: 'Agent wrapped',  className: 'bg-gray-500/20 text-gray-300' },
   premature_disconnect: { label: 'Dropped early',  className: 'bg-amber-500/20 text-amber-400' },
   abandoned_in_queue:   { label: 'Abandoned',      className: 'bg-amber-500/20 text-amber-400' },
+  // Hold timeout took them off hold — they didn't abandon us, so this reads
+  // as a queued follow-up rather than a failure. See queue_dispatch.py.
+  callback_scheduled:   { label: 'Callback queued', className: 'bg-blue-500/20 text-blue-400' },
   missed:               { label: 'Missed',         className: 'bg-red-500/20 text-red-400' },
   failed:               { label: 'Failed',         className: 'bg-red-500/20 text-red-400' },
 };

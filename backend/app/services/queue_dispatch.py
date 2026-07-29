@@ -12,8 +12,9 @@ already in the same conference (placed there by /direct-inbound's SWML), so
 both end up bridged with no additional plumbing.
 
 Also hosts the per-caller in-conference announcement loop — periodic position
-updates while the caller waits, and pre-join "agent joining" TTS the moment a
-dispatch fires.
+updates while the caller waits, pre-join "agent joining" TTS the moment a
+dispatch fires, and the hold timeout that bounds the wait (see
+``_offer_callback_and_release``).
 
 This file exists to avoid duplicating the emit code in multiple callers and
 to sidestep circular imports between queue_service.py and queues.py.
@@ -24,6 +25,38 @@ import logging
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Hold-timeout tunables
+# ---------------------------------------------------------------------------
+
+# end_reason stamped on a call we released into the callback queue. Distinct
+# from 'abandoned_in_queue' on purpose — the caller did not give up on us, we
+# took them off hold — so wallboards and the call-history chip can tell the
+# two apart. Also becomes the QueueAttempt.exit_reason, because
+# Call.update_status feeds end_reason to close_open_queue_attempt.
+END_REASON_CALLBACK_SCHEDULED = 'callback_scheduled'
+
+# Seconds to let the closing announcement play before we drop the caller's
+# leg. calling.play returns when SignalWire ACCEPTS the command, not when the
+# audio finishes, so ending the call immediately would cut the caller off
+# mid-sentence — they'd hear a syllable and a hangup instead of the promise
+# we just made them.
+CALLBACK_ANNOUNCE_SETTLE_SECONDS = 9
+
+# Consecutive play_tts failures that end the loop. A leg that has gone away
+# without us being told (carrier drop, stale zset entry) fails every single
+# announcement; previously those failures were logged and ignored forever.
+MAX_CONSECUTIVE_TTS_FAILURES = 3
+
+# Absolute ceiling on one caller's announcement loop, however the queue is
+# configured. Only reachable when an admin has disabled the per-queue cap
+# (set it to 0) — it exists so a disabled cap can still never mean "this
+# greenlet runs until the process restarts". Matches
+# call_watchdog.STALE_MAX_AGE['waiting']: past that point the watchdog has
+# reaped the Call row, so announcing into it is provably pointless.
+HOLD_LOOP_CEILING_SECONDS = 2100
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +101,306 @@ def start_position_announcement_loop(
     )
 
 
+def _queue_hold_cap_seconds(queue_slug: str, workspace_id) -> Optional[int]:
+    """The queue's ``max_wait_before_ai_fallback``, or None when unbounded.
+
+    Read fresh on every announcement rather than captured once, so an admin
+    editing the queue in Settings takes effect on callers who are ALREADY
+    holding — that is the whole point of the setting being live config.
+
+    Returns None when the cap is disabled (admin set it to 0 or NULL) or the
+    queue row has gone away; in both cases only HOLD_LOOP_CEILING_SECONDS
+    bounds the loop.
+
+    Filters ``workspace_id`` explicitly instead of leaning on the ORM
+    auto-scope: this runs in a background greenlet with no request context,
+    so ``current_workspace_id()`` is None and nothing would be filtered —
+    and queue slugs repeat across workspaces (§8.2), so an unfiltered
+    ``filter_by(slug=...)`` would read some other tenant's setting.
+    """
+    from app.models import Queue
+
+    try:
+        queue = Queue.query.filter_by(
+            slug=queue_slug, workspace_id=workspace_id,
+        ).first()
+    except Exception as e:
+        logger.warning(
+            f"Hold cap lookup failed for queue '{queue_slug}' "
+            f"(workspace {workspace_id}): {e}"
+        )
+        return None
+
+    if queue is None:
+        return None
+    cap = queue.max_wait_before_ai_fallback
+    if cap is None or int(cap) <= 0:
+        return None
+    return int(cap)
+
+
+def _waited_seconds(entry: Optional[Dict[str, Any]]) -> Optional[int]:
+    """How long this caller has been waiting, per their queue entry.
+
+    Keys off the entry's ``enqueued_at``, which despite the name is the
+    call's ORIGINAL arrival time, preserved across re-enqueues and
+    returns-to-queue (LIFE-06 in ``queue_service.enqueue_call``). So this is
+    the same clock the SLA math and the agent desktop's countdown already
+    use — "their wait is their wait, regardless of how many agents touched
+    the call" — and the hold timeout can't be reset by bouncing a caller
+    between agents.
+
+    None when the entry has no parseable timestamp; callers treat that as
+    "wait unknown" and leave the caller holding rather than guess.
+    """
+    from datetime import datetime
+
+    if not entry:
+        return None
+    raw = entry.get('enqueued_at')
+    if not raw:
+        return None
+    try:
+        enqueued_at = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(0, int((datetime.utcnow() - enqueued_at).total_seconds()))
+
+
+def _offer_callback_and_release(
+    call_sid: str, queue_slug: str, workspace_id, waited_seconds: int,
+    cap_seconds: int,
+) -> None:
+    """Hold timeout: put the caller on the callback list and free the line.
+
+    Runs when a waiting caller passes their queue's
+    ``max_wait_before_ai_fallback``. Enrolling them in the callback queue
+    (``models/callback.py`` + ``api/callbacks.py``, already agent-facing)
+    turns an unbounded hold into a promise somebody can actually keep: the
+    row lands on the callback board, an agent claims and dials it, and the
+    outcome vocabulary already covers "caller said no thanks" (`declined`).
+
+    Deliberately NOT an AI hand-back, despite the column name. Sending the
+    caller's leg back to ``queue.ai_agent_route`` means re-pointing a leg
+    that is mid-``join_conference`` at new SWML, and the only primitive here
+    for that (``signalwire_api.update_call``) is dead code whose payload
+    shape doesn't match any command this file's other methods use — it looks
+    modelled on Twilio's compat API, not ``/api/calling/calls``. Shipping
+    live-call surgery on that is how LIFE-02 desynced DB state from
+    SignalWire state and got the transfer path 501'd. Every primitive used
+    below is one this repo already exercises on real calls.
+
+    Order matters and is chosen so the caller is never lied to:
+      1. Atomically claim the call, losing to an agent who just took it.
+      2. Create + COMMIT the callback row, so the promise is durable.
+      3. Only then announce it.
+      4. Dequeue before the settle sleep, so no dispatch lands on a leg we
+         are about to drop.
+      5. Hang up, then run the standard end-of-call cleanup.
+
+    Best-effort throughout: a failure after the claim still releases the
+    caller, because leaving them on hold forever is the bug being fixed.
+    """
+    from datetime import datetime
+
+    from sqlalchemy import text
+
+    from app import db, socketio
+    from app.models import Call, Callback
+    from app.services.call_watchdog import reap_call
+    from app.services.queue_service import QueueService
+    from app.services.redis_service import get_redis_client
+    from app.services.signalwire_api import get_signalwire_api
+    from app.tenancy import workspace_context
+
+    # Pin the workspace so the auto-scope, the flush-time stamper and the
+    # per-workspace callback cap all resolve to this caller's tenant — the
+    # documented mechanism for background jobs (tenancy.py:18-26).
+    with workspace_context(workspace_id):
+        call = Call.find_by_sid(call_sid)
+        if call is None:
+            logger.warning(
+                f"Hold timeout {call_sid}: no Call row — dequeuing only"
+            )
+            try:
+                QueueService(
+                    get_redis_client(), workspace_id=workspace_id,
+                ).remove_call_from_all_queues(call_sid)
+            except Exception as e:
+                logger.warning(f"Hold timeout {call_sid}: dequeue failed: {e}")
+            return
+
+        # (1) Compare-and-set on end_reason. Whoever moves it off NULL owns
+        # the teardown, and the extra predicates lose to an agent who was
+        # dispatched between our cap check and now (push-dispatch fires from
+        # another greenlet the moment an agent goes available) or to a
+        # hangup/watchdog reap that already ended the call. Same shape as
+        # the assigned_agent_id claim in enqueue_and_build_swml.
+        try:
+            claim = db.session.execute(
+                text(
+                    "UPDATE calls SET end_reason = :reason "
+                    "WHERE id = :id AND end_reason IS NULL "
+                    "AND ended_at IS NULL AND assigned_agent_id IS NULL "
+                    "RETURNING id"
+                ),
+                {'reason': END_REASON_CALLBACK_SCHEDULED, 'id': call.id},
+            )
+            claimed = claim.fetchone() is not None
+            if claimed:
+                db.session.commit()
+            else:
+                db.session.rollback()
+        except Exception as e:
+            db.session.rollback()
+            logger.warning(f"Hold timeout {call_sid}: claim failed: {e}")
+            return
+
+        if not claimed:
+            logger.info(
+                f"Hold timeout {call_sid}: lost the claim — the call was "
+                f"assigned or already ended. Leaving it alone."
+            )
+            return
+        db.session.refresh(call)
+
+        # (2) Only promise a callback we can actually place. No number to
+        # dial (SIP/web origin, withheld caller ID) or the workspace is at
+        # its callback cap → release honestly with no promise attached.
+        to_number = (call.from_number or '').strip()
+        dialable = bool(to_number) and (
+            to_number.startswith('+') or to_number.isdigit()
+        )
+
+        callback = None
+        blocked_reason = None
+        if not dialable:
+            blocked_reason = f'no dialable caller number ({call.from_number!r})'
+        else:
+            from app.utils.workspace_caps import cap_denial
+            capped = cap_denial('callbacks')
+            if capped:
+                blocked_reason = f'workspace callback cap reached ({capped[0].get("cap")})'
+
+        if blocked_reason is None:
+            # Idempotence: a re-enqueued caller starts a fresh announcement
+            # greenlet, and two greenlets for one call must not mint two
+            # promises. Reuse any live pending row instead.
+            try:
+                callback = (
+                    db.session.query(Callback)
+                    .filter(
+                        Callback.call_id == call.id,
+                        Callback.completed_at.is_(None),
+                        Callback.expires_at > datetime.utcnow(),
+                    )
+                    .order_by(Callback.requested_at.desc())
+                    .first()
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Hold timeout {call_sid}: existing-callback lookup failed: {e}"
+                )
+                callback = None
+
+            if callback is None:
+                try:
+                    # create_from_call snapshots the AI-collected reason,
+                    # caller name and context, so the agent who dials back
+                    # picks up the thread instead of re-triaging. The
+                    # system-side fact goes in notes, NOT reason — reason is
+                    # the caller's own words and overwriting it would throw
+                    # away the triage.
+                    callback = Callback.create_from_call(call, queue_id=queue_slug)
+                    callback.phone_number = to_number
+                    callback.notes = (
+                        f'Auto-enrolled by the queue hold timeout: waited '
+                        f'{waited_seconds}s in "{queue_slug}", past the queue\'s '
+                        f'{cap_seconds}s maximum, with no agent available.'
+                    )
+                    db.session.add(callback)
+                    db.session.commit()
+                except Exception as e:
+                    db.session.rollback()
+                    callback = None
+                    blocked_reason = f'callback row create failed: {e}'
+                    logger.error(f"Hold timeout {call_sid}: {blocked_reason}")
+                else:
+                    try:
+                        # Canonical emitter — reused rather than duplicated so
+                        # the payload shape can't drift from the REST paths.
+                        from app.api.callbacks import _emit_callback_event
+                        _emit_callback_event('created', callback)
+                    except Exception as e:
+                        logger.warning(
+                            f"Hold timeout {call_sid}: callback_event emit failed: {e}"
+                        )
+
+        # (3) Tell the caller what just happened. Only promise the callback
+        # when there is a row backing it.
+        if callback is not None:
+            message = (
+                "Thanks for your patience. Rather than keep you holding, we've "
+                "added you to our callback list, and one of our specialists "
+                "will call you back on this number. You can hang up now. "
+                "Goodbye."
+            )
+        else:
+            message = (
+                "We're sorry — our specialists are all still busy, and we "
+                "haven't been able to connect you. Please try your call again "
+                "a little later. Goodbye."
+            )
+        try:
+            get_signalwire_api().play_tts(call_sid, message)
+        except Exception as e:
+            logger.warning(
+                f"Hold timeout {call_sid}: closing announcement failed "
+                f"(releasing anyway): {e}"
+            )
+
+        # (4) Out of the queue before the settle sleep — a caller we are
+        # about to hang up on must not be dispatched to an agent.
+        try:
+            QueueService(
+                get_redis_client(), workspace_id=workspace_id,
+            ).remove_call_from_all_queues(call_sid)
+        except Exception as e:
+            logger.warning(f"Hold timeout {call_sid}: dequeue failed: {e}")
+
+        socketio.sleep(CALLBACK_ANNOUNCE_SETTLE_SECONDS)
+
+        # (5) Drop the leg, then run the same end-of-call cleanup the
+        # /call-status webhook and the watchdog run: legs closed, conference
+        # ended, agent released, dashboards told. end_reason is already
+        # stamped, so reap_call keeps 'callback_scheduled' rather than
+        # computing 'abandoned_in_queue'.
+        try:
+            get_signalwire_api().end_call(call_sid)
+        except Exception as e:
+            logger.warning(
+                f"Hold timeout {call_sid}: end_call failed (cleaning up "
+                f"anyway; the watchdog is the backstop): {e}"
+            )
+        try:
+            reap_call(call)
+        except Exception as e:
+            logger.error(f"Hold timeout {call_sid}: cleanup failed: {e}")
+
+        if callback is not None:
+            logger.warning(
+                f"[hold_timeout] {call_sid} waited {waited_seconds}s in "
+                f"'{queue_slug}' (cap {cap_seconds}s) → callback {callback.id} "
+                f"for {to_number}, line released"
+            )
+        else:
+            logger.warning(
+                f"[hold_timeout] {call_sid} waited {waited_seconds}s in "
+                f"'{queue_slug}' (cap {cap_seconds}s) → released with NO "
+                f"callback: {blocked_reason}"
+            )
+
+
 def _announcement_loop(
     app, call_sid: str, queue_slug: str, interval_seconds: int, workspace_id=None
 ) -> None:
@@ -85,10 +418,21 @@ def _announcement_loop(
 
         queue_key = ws_key(workspace_id, f"queue:{queue_slug}")
         # Initial delay so the caller has time to actually land in the
-        # conference before we try to play anything to them.
-        socketio.sleep(interval_seconds)
+        # conference before we try to play anything to them. Clamped to the
+        # queue's hold cap so a cap shorter than the announcement interval
+        # still fires roughly on time instead of a full interval late.
+        cap_seconds = _queue_hold_cap_seconds(queue_slug, workspace_id)
+        socketio.sleep(
+            interval_seconds if cap_seconds is None
+            else max(1, min(interval_seconds, cap_seconds))
+        )
 
         iteration = 0
+        tts_failures = 0
+        # Sum of the delays we've waited through. Only used for the
+        # disabled-cap backstop, so intended-sleep accounting is precise
+        # enough and keeps the loop testable without faking a clock.
+        elapsed_seconds = 0
         while True:
             iteration += 1
 
@@ -100,11 +444,14 @@ def _announcement_loop(
                 return
 
             position = None
+            entry = None
             for idx, raw in enumerate(members):
                 try:
                     raw_str = raw.decode() if isinstance(raw, bytes) else raw
-                    if json.loads(raw_str).get('call_id') == call_sid:
+                    parsed = json.loads(raw_str)
+                    if parsed.get('call_id') == call_sid:
                         position = idx + 1
+                        entry = parsed
                         break
                 except Exception:
                     continue
@@ -112,6 +459,29 @@ def _announcement_loop(
             if position is None:
                 logger.info(
                     f"Announcement loop {call_sid} exiting — no longer in queue"
+                )
+                return
+
+            # Hold timeout. Checked BEFORE the position announcement so we
+            # never tell someone "please continue holding" and then take
+            # them off hold in the same breath.
+            cap_seconds = _queue_hold_cap_seconds(queue_slug, workspace_id)
+            waited = _waited_seconds(entry)
+            if cap_seconds is not None and waited is not None and waited >= cap_seconds:
+                _offer_callback_and_release(
+                    call_sid, queue_slug, workspace_id, waited, cap_seconds,
+                )
+                return
+
+            # Backstop for a cap the admin disabled (0) — and for a stale
+            # zset entry whose call is long gone but whose play_tts keeps
+            # being accepted.
+            if elapsed_seconds >= HOLD_LOOP_CEILING_SECONDS:
+                logger.warning(
+                    f"Announcement loop {call_sid} exiting — hit the "
+                    f"{HOLD_LOOP_CEILING_SECONDS}s hard ceiling after "
+                    f"{iteration} announcements (queue '{queue_slug}' has no "
+                    f"max-wait configured)"
                 )
                 return
 
@@ -123,12 +493,26 @@ def _announcement_loop(
                         f"Please continue holding."
                     ),
                 )
+                tts_failures = 0
             except Exception as e:
+                tts_failures += 1
                 logger.warning(
                     f"Announcement loop {call_sid} play_tts iteration {iteration} failed: {e}"
                 )
+                if tts_failures >= MAX_CONSECUTIVE_TTS_FAILURES:
+                    logger.warning(
+                        f"Announcement loop {call_sid} exiting — "
+                        f"{tts_failures} consecutive play_tts failures, the "
+                        f"leg is almost certainly gone"
+                    )
+                    return
 
-            socketio.sleep(interval_seconds)
+            # Land the next pass on the cap rather than one interval past it.
+            sleep_for = interval_seconds
+            if cap_seconds is not None and waited is not None:
+                sleep_for = max(1, min(interval_seconds, cap_seconds - waited))
+            elapsed_seconds += sleep_for
+            socketio.sleep(sleep_for)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +545,9 @@ def enqueue_and_build_swml(
         assigned, sets their Redis status to busy, removes from queue zset,
         emits ``call_assignment`` to the agent's room (which also fires the
         caller pre-join TTS announcement)
-      - Otherwise, starts the periodic position-announcement greenlet
+      - Otherwise, starts the periodic position-announcement greenlet, which
+        also enforces the queue's ``max_wait_before_ai_fallback`` — see
+        ``_offer_callback_and_release``
 
     Returns: SWML dict for the caller's leg. ALWAYS ends with
         join_conference(interaction-<call_sid>) + hangup-on-exit.
@@ -321,7 +707,8 @@ def enqueue_and_build_swml(
 
     # Start the announcement loop only when the caller is actually going to
     # wait. If we dispatched, the pre-join TTS already fired and a second
-    # loop would clash with it.
+    # loop would clash with it. The loop owns the hold timeout too, so this
+    # is also what bounds the wait for a caller nobody picks up.
     if not agent_dispatched:
         try:
             start_position_announcement_loop(

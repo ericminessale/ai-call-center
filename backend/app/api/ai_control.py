@@ -4,7 +4,8 @@ Allows supervisors to monitor and control active AI agent calls in real-time
 """
 
 from flask import Blueprint, jsonify, request
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import jwt_required
+from app.utils.jwt_utils import current_user_id
 import requests
 import os
 import logging
@@ -615,7 +616,7 @@ def initiate_outbound_ai_call():
         from app.services.signalwire_api import get_signalwire_api
         from app.utils.url_utils import get_base_url, signed_webhook_url
 
-        user_id = get_jwt_identity()
+        user_id = current_user_id()
         data = request.get_json()
 
         phone = data.get('phone')

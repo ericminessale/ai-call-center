@@ -14,14 +14,26 @@ def generate_tokens(user_id, extra_claims=None):
     """
     access_payload = {
         'user_id': user_id,
-        'sub': user_id,  # Flask-JWT-Extended requires 'sub' claim
+        # Flask-JWT-Extended requires a 'sub' claim, and RFC 7519 makes it a
+        # StringOrURI. PyJWT >= 2.10 enforces that on decode
+        # (InvalidSubjectError: "Subject must be a string"), so the old int
+        # here made every token undecodable the moment PyJWT was upgraded for
+        # its CVEs. Identity is read from 'user_id' (an int) throughout —
+        # 'sub' exists only to satisfy the two libraries.
+        'sub': str(user_id),
         'exp': datetime.utcnow() + current_app.config['JWT_ACCESS_TOKEN_EXPIRES'],
         'type': 'access'
     }
 
     refresh_payload = {
         'user_id': user_id,
-        'sub': user_id,  # Flask-JWT-Extended requires 'sub' claim
+        # Flask-JWT-Extended requires a 'sub' claim, and RFC 7519 makes it a
+        # StringOrURI. PyJWT >= 2.10 enforces that on decode
+        # (InvalidSubjectError: "Subject must be a string"), so the old int
+        # here made every token undecodable the moment PyJWT was upgraded for
+        # its CVEs. Identity is read from 'user_id' (an int) throughout —
+        # 'sub' exists only to satisfy the two libraries.
+        'sub': str(user_id),
         'exp': datetime.utcnow() + current_app.config['JWT_REFRESH_TOKEN_EXPIRES'],
         'type': 'refresh'
     }
@@ -54,18 +66,53 @@ def generate_tokens(user_id, extra_claims=None):
 
 
 def decode_token(token):
-    """Decode and validate a JWT token."""
+    """Decode and validate a JWT token.
+
+    ``verify_sub`` is off deliberately. PyJWT's subject check only asserts
+    that ``sub`` is a *string* (we pass no expected ``subject=``), so it
+    carries no security value here — identity comes from the ``user_id``
+    claim, never from ``sub``. Leaving it on would reject every token minted
+    before the str(user_id) change above, i.e. force-log-out everyone holding
+    a live access or 30-day refresh token at deploy time. Signature, exp and
+    algorithm verification are all untouched.
+    """
     try:
         payload = jwt.decode(
             token,
             current_app.config['JWT_SECRET_KEY'],
-            algorithms=['HS256']
+            algorithms=['HS256'],
+            options={'verify_sub': False},
         )
         return payload
     except jwt.ExpiredSignatureError:
         return {'error': 'Token has expired'}
     except jwt.InvalidTokenError:
         return {'error': 'Invalid token'}
+
+
+def current_user_id():
+    """The authenticated user's id as an int, for ``@jwt_required()`` routes.
+
+    ``get_jwt_identity()`` returns the raw ``sub`` claim, which is now a
+    string (see :func:`generate_tokens`). Every consumer feeds it into an
+    integer-PK lookup, so coerce once here rather than relying on the
+    database's implicit cast.
+
+    Returns None only for a present-but-unusable identity (non-numeric ``sub``).
+    Called outside a verified-JWT request it propagates
+    ``get_jwt_identity()``'s RuntimeError rather than degrading to None — a
+    silent None here would turn "this route forgot @jwt_required" into a
+    plausible-looking 404.
+    """
+    from flask_jwt_extended import get_jwt_identity
+
+    raw = get_jwt_identity()
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def persona_claims_are_stale(payload):

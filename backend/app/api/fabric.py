@@ -5,7 +5,8 @@ canonical signalwire-sdk REST client.
 """
 
 from flask import Blueprint, jsonify, request
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import jwt_required
+from app.utils.jwt_utils import current_user_id
 import logging
 import os
 
@@ -200,7 +201,7 @@ def get_subscriber_token():
         and mints against the columns on the user row.
     """
     try:
-        user_id = get_jwt_identity()
+        user_id = current_user_id()
         from app.models import User
         user = User.query.filter_by(id=user_id).first()
 
@@ -280,7 +281,7 @@ def create_subscriber():
     Note: Subscribers are now auto-created when getting tokens, so this is optional.
     """
     try:
-        user_id = get_jwt_identity()
+        user_id = current_user_id()
         from app.models import User
         user = User.query.filter_by(id=user_id).first()
 
@@ -341,8 +342,7 @@ def list_subscribers():
     # agent has no reason to enumerate the roster, and on the shared instance it
     # leaked all personas' details. (SUPERVISORY_ROLES includes the hosted
     # 'visitor' role, which used to reach this as an 'admin'.)
-    from flask_jwt_extended import get_jwt_identity
-    _requester = User.find_by_id(get_jwt_identity())
+    _requester = User.find_by_id(current_user_id())
     if not _requester or (_requester.role or '') not in SUPERVISORY_ROLES:
         return jsonify({'error': 'Insufficient permissions'}), 403
     try:

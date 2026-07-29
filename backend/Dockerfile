@@ -14,8 +14,11 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies. pip/setuptools are upgraded first because the
+# base image ships an older setuptools that pip-audit flags (PYSEC-2026-3447);
+# it isn't a pinned dependency, so only the image build can fix it.
+RUN pip install --no-cache-dir --upgrade pip setuptools \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .

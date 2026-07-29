@@ -87,6 +87,16 @@ def create_app():
     app.config['SECRET_KEY'] = _require_env('SECRET_KEY')
     app.config['JWT_SECRET_KEY'] = _require_env('JWT_SECRET_KEY')
 
+    # Match jwt_utils.decode_token's options={'verify_sub': False}, and for the
+    # same reason: the check only asserts that `sub` is a string, identity is
+    # always read from the `user_id` claim, and leaving it on would 422 every
+    # @jwt_required() route (Call Fabric token mint, AI control, contacts) for
+    # anyone still holding a token minted before generate_tokens started
+    # emitting str(user_id) — up to the 30-day refresh window. Signature, exp
+    # and algorithm verification are unaffected. Safe to drop once no
+    # pre-upgrade refresh tokens can still be in circulation.
+    app.config['JWT_VERIFY_SUB'] = False
+
     # Webhook/internal auth credentials — secure-by-default. SignalWire-facing
     # webhooks and the private backend⇄ai-agents routes authenticate via HTTP
     # Basic (see app/utils/webhook_auth.py). Require the creds at boot unless

@@ -9,6 +9,7 @@ redirects by default — validating only the admin-supplied URL let a public hos
 bounce the probe onto an internal one.
 """
 import pytest
+from requests.auth import HTTPBasicAuth
 
 from app.api.mcp_gateways import (
     _GatewayProbeError,
@@ -86,12 +87,18 @@ class _FakeResponse:
         self.is_redirect = location is not None
 
 
-def _fake_requests(monkeypatch, script):
-    """Patch requests.get with a url -> _FakeResponse map; record the calls."""
+def _fake_requests(monkeypatch, script, seen=None):
+    """Patch requests.get with a url -> _FakeResponse map; record the calls.
+
+    Pass ``seen`` to also capture each hop's full kwargs (for the
+    credential-forwarding assertions).
+    """
     calls = []
 
     def fake_get(url, **kwargs):
         calls.append(url)
+        if seen is not None:
+            seen.append({'url': url, **kwargs})
         assert kwargs.get('allow_redirects') is False, (
             'requests must not be allowed to follow redirects itself — '
             'that is exactly what bypasses the per-hop check'
@@ -181,6 +188,98 @@ def test_non_http_redirect_scheme_is_refused(monkeypatch):
             'https://93.184.216.34/services', headers={}, auth=None, timeout=1,
         )
     assert 'non-HTTP scheme' in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# _safe_get — credentials must not follow a redirect off-host
+# ---------------------------------------------------------------------------
+
+_A = '93.184.216.34'   # both public, both resolve without network
+_B = '93.184.216.35'
+
+
+def test_credentials_are_withheld_after_cross_host_redirect(monkeypatch):
+    """REGRESSION. requests strips Authorization across hosts itself
+    (Session.rebuild_auth); re-issuing hops by hand bypassed that and handed
+    the gateway's configured secret to whatever host it named."""
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    seen = []
+    _fake_requests(monkeypatch, {
+        f'https://{_A}/services': _FakeResponse(
+            302, location=f'https://{_B}/services'),
+        f'https://{_B}/services': _FakeResponse(200),
+    }, seen=seen)
+
+    resp = _safe_get(
+        f'https://{_A}/services',
+        headers={'Authorization': 'Bearer s3cret'},
+        auth=HTTPBasicAuth('admin', 'hunter2'),
+        timeout=1,
+    )
+
+    assert resp.status_code == 200
+    assert len(seen) == 2
+    # Hop 1 (the configured gateway) is authenticated...
+    assert seen[0]['headers']['Authorization'] == 'Bearer s3cret'
+    assert seen[0]['auth'] is not None
+    # ...hop 2 (a host the gateway chose) gets neither secret.
+    assert 'Authorization' not in seen[1]['headers']
+    assert seen[1]['auth'] is None
+
+
+def test_credentials_survive_same_host_https_upgrade(monkeypatch):
+    """The trust boundary is the HOSTNAME, not the full origin — otherwise the
+    ordinary http->https upgrade would strip auth and 401 a valid gateway."""
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    seen = []
+    _fake_requests(monkeypatch, {
+        f'http://{_A}/services': _FakeResponse(
+            301, location=f'https://{_A}/services'),
+        f'https://{_A}/services': _FakeResponse(200),
+    }, seen=seen)
+
+    _safe_get(
+        f'http://{_A}/services',
+        headers={'Authorization': 'Bearer s3cret'},
+        auth=HTTPBasicAuth('admin', 'hunter2'),
+        timeout=1,
+    )
+
+    assert [s['headers'].get('Authorization') for s in seen] == [
+        'Bearer s3cret', 'Bearer s3cret',
+    ]
+    assert all(s['auth'] is not None for s in seen)
+
+
+def test_caller_headers_are_not_mutated(monkeypatch):
+    """Stripping must not reach back into the caller's dict — _probe_gateway
+    reuses it for the per-service /tools fetches."""
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    _fake_requests(monkeypatch, {
+        f'https://{_A}/services': _FakeResponse(
+            302, location=f'https://{_B}/services'),
+    })
+    headers = {'Authorization': 'Bearer s3cret'}
+
+    _safe_get(f'https://{_A}/services', headers=headers, auth=None, timeout=1)
+
+    assert headers == {'Authorization': 'Bearer s3cret'}
+
+
+def test_https_to_http_downgrade_is_refused(monkeypatch):
+    """A public->public hop passes the SSRF check but must not silently drop
+    off TLS, which would expose the probe (and its body) on the wire."""
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    calls = _fake_requests(monkeypatch, {
+        f'https://{_A}/services': _FakeResponse(
+            302, location=f'http://{_A}/services'),
+    })
+
+    with pytest.raises(_GatewayProbeError) as exc:
+        _safe_get(f'https://{_A}/services', headers={}, auth=None, timeout=1)
+
+    assert 'downgrade' in str(exc.value)
+    assert calls == [f'https://{_A}/services']
 
 
 def test_redirect_loop_is_bounded(monkeypatch):

@@ -113,7 +113,16 @@ def _safe_get(url: str, *, headers: dict, auth, timeout: float):
 
     So: ``allow_redirects=False``, validate each Location, and re-issue the
     request ourselves. Raises :class:`_GatewayProbeError` on an unsafe hop, a
-    relative/unparseable Location, a non-http(s) scheme, or too many hops.
+    relative/unparseable Location, a non-http(s) scheme, an HTTPS→HTTP
+    downgrade, or too many hops.
+
+    Credentials do NOT follow a redirect to another host. ``requests`` strips
+    ``Authorization`` across hosts itself (``Session.rebuild_auth``), but
+    re-issuing hops by hand bypasses that — so a gateway answering ``302
+    Location: https://attacker.example/`` would have been handed the
+    configured Bearer token or Basic password. Hostname is the trust boundary
+    rather than the full origin, so the ordinary same-host ``http://`` →
+    ``https://`` upgrade keeps its credentials and still authenticates.
 
     KNOWN RESIDUAL — this does not stop DNS rebinding. ``_url_host_is_safe``
     resolves the host, then ``requests`` resolves it again for the actual
@@ -124,13 +133,15 @@ def _safe_get(url: str, *, headers: dict, auth, timeout: float):
     redirects entirely unchecked; the route stays full-admin + non-demo gated.
     """
     current = url
+    hop_headers = dict(headers)
+    hop_auth = auth
     for _ in range(_MAX_PROBE_REDIRECTS + 1):
         safe, reason = _url_host_is_safe(current)
         if not safe:
             raise _GatewayProbeError(f"Refusing to probe unsafe gateway URL: {reason}")
         try:
             resp = requests.get(
-                current, headers=headers, auth=auth, timeout=timeout,
+                current, headers=hop_headers, auth=hop_auth, timeout=timeout,
                 allow_redirects=False,
             )
         except requests.exceptions.RequestException as exc:
@@ -144,9 +155,37 @@ def _safe_get(url: str, *, headers: dict, auth, timeout: float):
         # same-origin `/services/` redirect still works — and an absolute one
         # goes through _url_host_is_safe on the next pass.
         nxt = urljoin(current, location)
-        if urlparse(nxt).scheme not in ('http', 'https'):
+        cur_parsed, nxt_parsed = urlparse(current), urlparse(nxt)
+        if nxt_parsed.scheme not in ('http', 'https'):
             raise _GatewayProbeError(
                 f"Gateway redirected to a non-HTTP scheme: {location[:120]!r}"
+            )
+        # Vet the target BEFORE the transport/credential rules below, so a
+        # redirect at an internal address is always refused as an unsafe host
+        # rather than incidentally as (say) an HTTPS downgrade. The top of the
+        # loop re-checks it a moment later; the two answer different questions
+        # — "are we willing to go here?" vs "is it still safe as we connect?"
+        # — and getaddrinfo is OS-cached, so the extra lookup is free.
+        safe, reason = _url_host_is_safe(nxt)
+        if not safe:
+            raise _GatewayProbeError(f"Refusing to probe unsafe gateway URL: {reason}")
+        if cur_parsed.scheme == 'https' and nxt_parsed.scheme == 'http':
+            raise _GatewayProbeError(
+                "Gateway redirected from HTTPS to plain HTTP — refusing to "
+                "downgrade the transport mid-probe"
+            )
+        if (nxt_parsed.hostname or '').lower() != (cur_parsed.hostname or '').lower():
+            # Different host — drop the credentials rather than hand them to
+            # whoever the gateway named. The probe usually then 401s, which is
+            # the correct, visible outcome for a misconfigured gateway.
+            hop_headers = {
+                k: v for k, v in hop_headers.items() if k.lower() != 'authorization'
+            }
+            hop_auth = None
+            logger.warning(
+                "MCP gateway probe redirected across hosts (%s -> %s) — "
+                "credentials withheld",
+                cur_parsed.hostname, nxt_parsed.hostname,
             )
         logger.info("MCP gateway probe following redirect %s -> %s", current, nxt)
         current = nxt

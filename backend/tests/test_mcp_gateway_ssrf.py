@@ -3,8 +3,19 @@
 _url_host_is_safe resolves the admin-supplied gateway URL and refuses internal
 targets before the backend fetches it server-side. Uses IP-literal hosts so
 getaddrinfo resolves without touching the network.
+
+_safe_get then applies that guard to EVERY hop, because requests follows
+redirects by default — validating only the admin-supplied URL let a public host
+bounce the probe onto an internal one.
 """
-from app.api.mcp_gateways import _url_host_is_safe
+import pytest
+
+from app.api.mcp_gateways import (
+    _GatewayProbeError,
+    _MAX_PROBE_REDIRECTS,
+    _safe_get,
+    _url_host_is_safe,
+)
 
 
 def test_blocks_loopback(monkeypatch):
@@ -59,3 +70,125 @@ def test_blocks_ipv4_mapped_ipv6_metadata(monkeypatch):
     monkeypatch.setenv('SWML_ALLOW_PRIVATE_URLS', 'true')
     ok, _ = _url_host_is_safe('http://[::ffff:169.254.169.254]/services')
     assert not ok
+
+
+# ---------------------------------------------------------------------------
+# _safe_get — per-hop validation
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """Minimal stand-in for requests.Response (only what _safe_get reads)."""
+
+    def __init__(self, status_code=200, location=None):
+        self.status_code = status_code
+        self.headers = {'Location': location} if location else {}
+        self.is_redirect = location is not None
+
+
+def _fake_requests(monkeypatch, script):
+    """Patch requests.get with a url -> _FakeResponse map; record the calls."""
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        assert kwargs.get('allow_redirects') is False, (
+            'requests must not be allowed to follow redirects itself — '
+            'that is exactly what bypasses the per-hop check'
+        )
+        return script.get(url, _FakeResponse(200))
+
+    monkeypatch.setattr('app.api.mcp_gateways.requests.get', fake_get)
+    return calls
+
+
+def test_redirect_to_cloud_metadata_is_refused(monkeypatch):
+    """The bypass this exists for: a public gateway 302s to the metadata IP."""
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    evil = 'http://169.254.169.254/latest/meta-data/'
+    calls = _fake_requests(monkeypatch, {
+        'https://93.184.216.34/services': _FakeResponse(302, location=evil),
+    })
+
+    with pytest.raises(_GatewayProbeError) as exc:
+        _safe_get(
+            'https://93.184.216.34/services', headers={}, auth=None, timeout=1,
+        )
+
+    assert 'unsafe gateway URL' in str(exc.value)
+    assert '169.254.169.254' in str(exc.value)
+    # The metadata endpoint itself was never fetched.
+    assert calls == ['https://93.184.216.34/services']
+
+
+def test_redirect_to_rfc1918_is_refused(monkeypatch):
+    monkeypatch.setenv('SWML_ALLOW_PRIVATE_URLS', 'false')
+    calls = _fake_requests(monkeypatch, {
+        'https://93.184.216.34/services': _FakeResponse(
+            301, location='http://10.1.2.3:8000/services'),
+    })
+
+    with pytest.raises(_GatewayProbeError):
+        _safe_get(
+            'https://93.184.216.34/services', headers={}, auth=None, timeout=1,
+        )
+    assert calls == ['https://93.184.216.34/services']
+
+
+def test_safe_redirect_is_followed(monkeypatch):
+    """A public->public hop still works, so http->https gateways keep probing."""
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    calls = _fake_requests(monkeypatch, {
+        'http://93.184.216.34/services': _FakeResponse(
+            301, location='https://93.184.216.34/services'),
+        'https://93.184.216.34/services': _FakeResponse(200),
+    })
+
+    resp = _safe_get(
+        'http://93.184.216.34/services', headers={}, auth=None, timeout=1,
+    )
+    assert resp.status_code == 200
+    assert calls == [
+        'http://93.184.216.34/services',
+        'https://93.184.216.34/services',
+    ]
+
+
+def test_relative_redirect_resolves_against_current_url(monkeypatch):
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    calls = _fake_requests(monkeypatch, {
+        'https://93.184.216.34/services': _FakeResponse(
+            302, location='/v2/services'),
+        'https://93.184.216.34/v2/services': _FakeResponse(200),
+    })
+
+    resp = _safe_get(
+        'https://93.184.216.34/services', headers={}, auth=None, timeout=1,
+    )
+    assert resp.status_code == 200
+    assert calls[-1] == 'https://93.184.216.34/v2/services'
+
+
+def test_non_http_redirect_scheme_is_refused(monkeypatch):
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    _fake_requests(monkeypatch, {
+        'https://93.184.216.34/services': _FakeResponse(
+            302, location='file:///etc/passwd'),
+    })
+
+    with pytest.raises(_GatewayProbeError) as exc:
+        _safe_get(
+            'https://93.184.216.34/services', headers={}, auth=None, timeout=1,
+        )
+    assert 'non-HTTP scheme' in str(exc.value)
+
+
+def test_redirect_loop_is_bounded(monkeypatch):
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    url = 'https://93.184.216.34/services'
+    calls = _fake_requests(monkeypatch, {url: _FakeResponse(302, location=url)})
+
+    with pytest.raises(_GatewayProbeError) as exc:
+        _safe_get(url, headers={}, auth=None, timeout=1)
+    assert 'redirects' in str(exc.value)
+    assert len(calls) == _MAX_PROBE_REDIRECTS + 1

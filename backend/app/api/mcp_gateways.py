@@ -24,7 +24,7 @@ import logging
 import os
 import socket
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from flask import jsonify, request
@@ -93,6 +93,68 @@ def _url_host_is_safe(url: str) -> tuple[bool, str]:
                 'set SWML_ALLOW_PRIVATE_URLS=true to allow'
             )
     return True, ''
+
+
+# Redirects are followed manually (see _safe_get) so every hop is re-checked.
+# 3 is generous for a gateway that only ever needs http→https or a trailing
+# slash; it exists to bound a redirect loop, not to support long chains.
+_MAX_PROBE_REDIRECTS = 3
+
+
+def _safe_get(url: str, *, headers: dict, auth, timeout: float):
+    """GET ``url`` with the SSRF guard applied to every hop.
+
+    ``requests.get`` follows redirects by default, and it re-resolves each
+    Location itself — so a one-time check of the admin-supplied URL proved
+    nothing about where the request actually landed. A public host answering
+    ``302 Location: http://169.254.169.254/latest/meta-data/`` (or any
+    RFC1918 address) got fetched and its body reflected back to the admin,
+    which is the whole SSRF the guard exists to stop.
+
+    So: ``allow_redirects=False``, validate each Location, and re-issue the
+    request ourselves. Raises :class:`_GatewayProbeError` on an unsafe hop, a
+    relative/unparseable Location, a non-http(s) scheme, or too many hops.
+
+    KNOWN RESIDUAL — this does not stop DNS rebinding. ``_url_host_is_safe``
+    resolves the host, then ``requests`` resolves it again for the actual
+    connection; a TTL-0 record can answer differently between the two. Closing
+    that needs connection-level pinning of the validated IP (a custom
+    HTTPAdapter), which trades away SNI/vhost correctness. Per-hop validation
+    narrows the window to a single resolve pair per request instead of leaving
+    redirects entirely unchecked; the route stays full-admin + non-demo gated.
+    """
+    current = url
+    for _ in range(_MAX_PROBE_REDIRECTS + 1):
+        safe, reason = _url_host_is_safe(current)
+        if not safe:
+            raise _GatewayProbeError(f"Refusing to probe unsafe gateway URL: {reason}")
+        try:
+            resp = requests.get(
+                current, headers=headers, auth=auth, timeout=timeout,
+                allow_redirects=False,
+            )
+        except requests.exceptions.RequestException as exc:
+            raise _GatewayProbeError(f"Gateway unreachable: {exc}") from exc
+
+        if not resp.is_redirect:
+            return resp
+
+        location = resp.headers.get('Location') or ''
+        # urljoin resolves a relative Location against the current URL, so a
+        # same-origin `/services/` redirect still works — and an absolute one
+        # goes through _url_host_is_safe on the next pass.
+        nxt = urljoin(current, location)
+        if urlparse(nxt).scheme not in ('http', 'https'):
+            raise _GatewayProbeError(
+                f"Gateway redirected to a non-HTTP scheme: {location[:120]!r}"
+            )
+        logger.info("MCP gateway probe following redirect %s -> %s", current, nxt)
+        current = nxt
+
+    raise _GatewayProbeError(
+        f"Gateway exceeded {_MAX_PROBE_REDIRECTS} redirects — "
+        "configure the final URL directly"
+    )
 
 
 def _validate_payload(payload: dict[str, Any]) -> tuple[dict, int] | None:
@@ -275,16 +337,10 @@ def _probe_gateway(config: McpGatewayConfig, *, timeout: float = 8.0) -> list[di
         auth = HTTPBasicAuth(config.auth_user, password)
 
     services_url = f"{config.gateway_url.rstrip('/')}/services"
-    # Re-validate at fetch time: a row may predate the create-time guard, or the
-    # host may now resolve to an internal address (DNS rebinding). _probe_service_tools
-    # reuses this same (now-validated) host, so one check here covers both fetches.
-    safe, reason = _url_host_is_safe(services_url)
-    if not safe:
-        raise _GatewayProbeError(f"Refusing to probe unsafe gateway URL: {reason}")
-    try:
-        resp = requests.get(services_url, headers=headers, auth=auth, timeout=timeout)
-    except requests.exceptions.RequestException as exc:
-        raise _GatewayProbeError(f"Gateway unreachable: {exc}") from exc
+    # Re-validate at fetch time: a stored row may predate the create-time guard.
+    # _safe_get does that check on this URL and on every redirect hop, so a
+    # public host can't bounce the probe onto an internal address.
+    resp = _safe_get(services_url, headers=headers, auth=auth, timeout=timeout)
 
     if resp.status_code == 401:
         raise _GatewayProbeError("Gateway rejected credentials (401)")
@@ -323,14 +379,19 @@ def _probe_service_tools(
     auth,
     timeout: float,
 ) -> list[str]:
-    """Best-effort tool listing per service. Returns [] on failure."""
+    """Best-effort tool listing per service. Returns [] on failure.
+
+    Goes through _safe_get for its own SSRF check: this fetch has the same
+    host as /services but a different path, so it can be redirected
+    independently — the /services hop being clean says nothing about it.
+    """
     tools_url = f"{gateway_url.rstrip('/')}/services/{service_name}/tools"
     try:
-        resp = requests.get(tools_url, headers=headers, auth=auth, timeout=timeout)
+        resp = _safe_get(tools_url, headers=headers, auth=auth, timeout=timeout)
         if resp.status_code >= 400:
             return []
         body = resp.json()
         # Skill expects {"tools": [{name, description, ...}, ...]}.
         return [t.get('name') for t in (body.get('tools') or []) if isinstance(t, dict)]
-    except (requests.exceptions.RequestException, ValueError):
+    except (_GatewayProbeError, requests.exceptions.RequestException, ValueError):
         return []

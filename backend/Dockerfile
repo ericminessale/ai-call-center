@@ -14,10 +14,25 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python dependencies. pip/setuptools are upgraded first because the
-# base image ships an older setuptools that pip-audit flags (PYSEC-2026-3447);
-# it isn't a pinned dependency, so only the image build can fix it.
-RUN pip install --no-cache-dir --upgrade pip setuptools \
+# Install Python dependencies.
+#
+# ACCEPTED ADVISORY — setuptools PYSEC-2026-3447 / CVE-2026-59890 (fixed in
+# 83.0.0) is NOT cleared here and cannot be from this file: signalwire-sdk
+# 3.0.2 declares `setuptools<81,>=66.1.1`, so pip resolves setuptools to
+# 80.10.2 no matter what an earlier `--upgrade setuptools` installed. (An
+# earlier revision of this Dockerfile upgraded setuptools on the line below
+# and claimed that fixed it — it didn't; the requirements install downgraded
+# it right back.) Forcing >=83.0.0 would break the SDK's declared constraint
+# for a flaw that cannot affect this image:
+#
+#   The bug is in `FileList`/`MANIFEST.in` handling while BUILDING an sdist —
+#   NFD/NFC filename mismatches on macOS APFS/HFS+ let an excluded file get
+#   packed into a .tar.gz. It affects package maintainers publishing sdists on
+#   macOS. This is a Linux runtime image that never invokes `setup.py sdist`.
+#
+# Revisit when signalwire-sdk lifts the <81 cap. pip-audit reports it as two
+# findings; it is one advisory, double-sourced (PyPI + OSV) under one ID.
+RUN pip install --no-cache-dir --upgrade pip wheel \
     && pip install --no-cache-dir -r requirements.txt
 
 # Copy application code

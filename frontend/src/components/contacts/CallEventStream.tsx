@@ -30,6 +30,13 @@ import { useSocketContext } from '../../contexts/SocketContext';
 
 interface CallEvent {
   call_id: number | string;
+  /**
+   * SignalWire call SID. Backend emits carry both ids: `call_id` is the DB id
+   * (what workspace routing keys on) and `call_sid` the SignalWire one. This
+   * panel is mounted with the SID, so without this field every event a backend
+   * producer keyed by DB id was filtered out below.
+   */
+  call_sid?: string | null;
   event_type: string;
   data: Record<string, any>;
   timestamp: string;
@@ -121,9 +128,16 @@ export default function CallEventStream({ callId, callSid, maxEvents = 100 }: Ca
     if (!socket) return;
 
     const handleCallEvent = (event: CallEvent) => {
-      // Filter to events for this call
-      const eventCallId = String(event.call_id);
-      if (eventCallId !== String(callId) && eventCallId !== callSid) return;
+      // Filter to events for this call, matching on either id the event
+      // carries — producers key `call_id` by DB id, this panel is mounted with
+      // the SignalWire SID, so neither side alone is enough.
+      const eventIds = [event.call_id, event.call_sid]
+        .filter(value => value !== null && value !== undefined)
+        .map(String);
+      const wanted = [callId, callSid]
+        .filter(value => value !== null && value !== undefined)
+        .map(String);
+      if (!eventIds.some(id => wanted.includes(id))) return;
 
       setEvents(prev => {
         const updated = [...prev, event];

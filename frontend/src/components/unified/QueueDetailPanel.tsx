@@ -3,7 +3,7 @@ import { Phone, User } from 'lucide-react';
 import { Call, QueueConfig, Interaction } from '../../types/callcenter';
 import { contactsApi } from '../../services/api';
 import { logger } from '../../lib/logger';
-import { Button, Chip, AI_GLYPH } from '../restraint';
+import { Button, Chip } from '../restraint';
 import { AISummaryDisplay } from '../contacts/ContactDetailView';
 
 interface QueueDetailPanelProps {
@@ -35,9 +35,14 @@ export function QueueDetailPanel({ call, queueConfigs, onAnswer, onOpenContact }
   const slug = call.queue_id || (call as any).queueId || '';
   const qc: any = queueConfigs?.find((q) => q.slug === slug);
   const slaSec = Number(qc?.sla_threshold_seconds) || 60;
-  const fallbackSec = Number(qc?.max_wait_before_ai_fallback) || 120;
+  // Hold cap (`max_wait_before_ai_fallback` — legacy field name). 0 means the
+  // admin disabled it, so `??` not `||`: coercing an explicit 0 to 120 would
+  // show a countdown to something the backend will never do. null/undefined =
+  // config not loaded yet, so use the model default.
+  const holdCapSec = qc?.max_wait_before_ai_fallback == null
+    ? 120
+    : Number(qc.max_wait_before_ai_fallback);
   const strategy = STRATEGY_LABEL[qc?.routing_strategy || ''] || qc?.routing_strategy || '—';
-  const hasAiFallback = !!qc?.ai_agent_route || call.handler_type === 'ai' || !!call.ai_agent_name;
 
   const name = call.contact?.displayName || call.from_number || call.phoneNumber || 'Unknown caller';
   const phone = call.from_number || call.phoneNumber || (call as any).fromNumber || '';
@@ -55,7 +60,7 @@ export function QueueDetailPanel({ call, queueConfigs, onAnswer, onOpenContact }
     return () => clearInterval(id);
   }, [call.created_at]);
   const overSla = waitSec > slaSec;
-  const fallbackIn = Math.max(0, fallbackSec - waitSec);
+  const callbackIn = Math.max(0, holdCapSec - waitSec);
 
   // The caller's most recent prior interaction (triage context). Skips cleanly
   // for unknown callers / first-time contacts.
@@ -110,11 +115,9 @@ export function QueueDetailPanel({ call, queueConfigs, onAnswer, onOpenContact }
             />
           </div>
           <div className="text-[11px] text-ink-dim mt-2">
-            {hasAiFallback ? (
-              <><span className="text-ai" aria-hidden>{AI_GLYPH}</span> AI specialist engages in {fmtMMSS(fallbackIn)} if no agent answers</>
-            ) : (
-              'No AI fallback configured for this queue'
-            )}
+            {holdCapSec > 0
+              ? `Caller is offered a callback in ${fmtMMSS(callbackIn)} if no agent answers`
+              : 'No hold limit set for this queue'}
           </div>
         </div>
 

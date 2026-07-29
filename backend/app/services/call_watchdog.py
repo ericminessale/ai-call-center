@@ -70,12 +70,19 @@ STALE_MAX_AGE = {
 _SWEEP_LOCK_KEY = 'call_watchdog:sweep_lock'
 
 
-def _reap_call(call) -> None:
+def reap_call(call) -> None:
     """Run end-of-call cleanup for one stale call.
 
     Mirrors the 'ended' branch of /api/webhooks/call-status. Pulled out into
     a helper so any future cleanup callsite (manual admin button, REST API
-    sweep) can reuse the same logic and stay in sync.
+    sweep) can reuse the same logic and stay in sync. Public because
+    ``queue_dispatch._offer_callback_and_release`` is now one of those
+    callsites: the hold timeout ends the call deliberately rather than
+    reaping it, but the teardown is identical.
+
+    Honours a pre-set ``call.end_reason`` — a caller that already knows how
+    the call ended (the hold timeout stamps 'callback_scheduled') keeps its
+    classification instead of getting 'abandoned_in_queue' computed over it.
     """
     from app import db, socketio
     from app.models import Conference, CallLeg
@@ -224,7 +231,7 @@ def _scan_once(app) -> int:
                 f"[call_watchdog] reaping {call_sid}: status={call.status!r} "
                 f"age={age:.0f}s exceeds cap {max_age}s"
             )
-            _reap_call(call)
+            reap_call(call)
             reaped += 1
 
     return reaped

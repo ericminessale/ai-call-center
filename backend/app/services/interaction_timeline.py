@@ -151,12 +151,42 @@ def record_queue_entered(
     return attempt
 
 
+def _latest_attempt(call):
+    """Most recent attempt for the call, open or closed (pending rows first)."""
+    if not call.id:
+        return None
+    pending = _pending(QueueAttempt, call.id)
+    if pending:
+        return max(pending, key=lambda row: row.attempt_number or 0)
+    with db.session.no_autoflush:
+        return (
+            QueueAttempt.query
+            .filter_by(call_id=call.id)
+            .order_by(QueueAttempt.attempt_number.desc())
+            .first()
+        )
+
+
 def _ensure_open_attempt(call, at=None):
     attempt = _open_attempt(call)
     if attempt:
         return attempt
     if not call.queue_id:
         return None
+    # An already-ANSWERED latest attempt means this call's queue stay is over
+    # and nothing has re-queued it — a second "human started" for the same
+    # stay (resume-from-hold, a repeated conference-join webhook, a status
+    # write that re-asserts 'active') must reuse it, not open a new one.
+    # Without this the fresh attempt got accepted_at/exit_reason='answered'
+    # immediately, so one accepted call reported two answered attempts and
+    # double-counted every queue metric derived from them.
+    #
+    # A genuine re-queue goes through record_return_to_queue →
+    # record_queue_entered, which leaves an OPEN attempt that _open_attempt
+    # above already returns, so this never suppresses a real second stay.
+    latest = _latest_attempt(call)
+    if latest is not None and latest.accepted_at is not None:
+        return latest
     return record_queue_entered(call, call.queue_id, entered_at=at)
 
 

@@ -15,6 +15,7 @@ from app.services.interaction_timeline import (
     record_queue_offer_declined,
     record_queue_offered,
     record_return_to_queue,
+    record_status_transition,
     start_handling_segment,
 )
 
@@ -182,6 +183,48 @@ def test_metrics_combine_timeline_and_legacy_without_double_counting(timeline_ap
         'answered': 2,
         'abandoned': 0,
     }
+
+
+def test_hold_resume_does_not_invent_a_second_answered_attempt(timeline_app):
+    """A hold/resume cycle is one queue journey, not two.
+
+    Returning to 'active' calls record_human_started, whose record_queue_accepted
+    used to find no OPEN attempt (accept closes it) and mint a fresh one that it
+    then immediately stamped accepted/'answered' — so a single accepted call
+    reported two answered attempts and doubled every derived queue metric.
+    """
+    _workspace, agent, call = _interaction()
+    started = datetime(2026, 7, 20, 9, 0, 0)
+
+    accepted = record_queue_entered(call, 'support', entered_at=started)
+    call.assigned_agent_id = agent.id
+    record_human_started(call, agent.id, started + timedelta(seconds=10))
+    db.session.commit()
+
+    assert QueueAttempt.query.count() == 1
+
+    record_status_transition(call, 'active', 'on_hold')
+    record_status_transition(call, 'on_hold', 'active')
+    db.session.commit()
+
+    attempts = QueueAttempt.query.all()
+    assert len(attempts) == 1
+    assert attempts[0].id == accepted.id
+    assert attempts[0].attempt_number == 1
+    assert [row.exit_reason for row in attempts] == ['answered']
+
+    # The handling record still shows the hold: human, hold, then human again.
+    segments = HandlingSegment.query.order_by(HandlingSegment.started_at).all()
+    assert [row.segment_type for row in segments] == [
+        'human', 'hold', 'human',
+    ]
+
+    # A REAL re-queue still opens attempt 2 — the guard only suppresses the
+    # implicit re-accept, never an explicit return-to-queue.
+    record_return_to_queue(call, 'support', reason='cannot-resolve')
+    record_human_started(call, agent.id)
+    db.session.commit()
+    assert QueueAttempt.query.count() == 2
 
 
 def test_status_hook_records_ai_and_keeps_call_control_resilient(

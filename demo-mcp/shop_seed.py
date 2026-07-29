@@ -1,9 +1,23 @@
 """
 shop_seed.py — create + populate the DemoShop SQLite database.
 
-Idempotent: skips if the DB file already exists. To regenerate from
-scratch, delete shop.db and rerun. The MCP server reads from this DB
-read-mostly; only ``start_return`` writes (it inserts a returns row).
+Two modes:
+
+  - default (``python3 shop_seed.py``) — idempotent first-boot seed:
+    skips entirely if the DB file already exists. This is what the
+    container entrypoint runs.
+  - ``--force`` (``python3 shop_seed.py --force``) — restore an existing
+    DB to seed state: drop, recreate and repopulate in ONE transaction,
+    so a tool call landing mid-reset either waits for the lock or sees
+    the finished result, never a half-empty shop. It also refreshes the
+    relative order dates, which otherwise age forever after first boot.
+
+The MCP server reads this DB read-mostly; only ``start_return`` writes
+(it inserts a returns row and flips the order to 'returned'). So
+without a periodic ``--force`` every caller's RMAs accumulate for the
+life of the volume — on the hosted demo that's cross-visitor data
+bleed, which is why ``shop_admin.py`` exposes the force path to the
+nightly demo-reset cron.
 
 Schema is deliberately minimal — enough to demo voice-driven order
 lookups, status checks, and return creation, without simulating a full
@@ -15,9 +29,15 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from datetime import datetime, timedelta
+from typing import Any
 
 DB_PATH = os.environ.get("SHOP_DB_PATH", "/app/shop.db")
+
+# Seconds to wait out a concurrent tool call's lock before giving up. A
+# reset is a handful of INSERTs, so anything near this is pathological.
+SQLITE_TIMEOUT = 15.0
 
 
 SCHEMA = """
@@ -68,6 +88,23 @@ CREATE INDEX idx_customers_phone ON customers(phone);
 CREATE INDEX idx_orders_customer ON orders(customer_id);
 """
 
+# Drop order for a re-seed: children first, so it stays correct if a
+# future schema turns ``PRAGMA foreign_keys`` on. DROP TABLE takes the
+# table's indexes with it, so they need no separate handling.
+_TABLES_CHILD_FIRST = ("returns", "order_items", "orders", "products", "customers")
+
+
+def _sql_statements(script: str) -> list[str]:
+    """Split a DDL script into individual statements.
+
+    ``Connection.executescript`` is unusable on the reset path: it issues
+    an implicit COMMIT before running, which would break the
+    single-transaction guarantee. SCHEMA has no semicolons inside string
+    literals or comments, so a plain split is enough — keep it that way
+    if you extend it.
+    """
+    return [stmt.strip() for stmt in script.split(';') if stmt.strip()]
+
 
 # Ten days ago, in ISO format — used for relative dates in seed data.
 def _days_ago(n: int) -> str:
@@ -117,16 +154,11 @@ ORDERS = [
 ]
 
 
-def seed() -> None:
-    if os.path.exists(DB_PATH):
-        print(f"DemoShop DB already exists at {DB_PATH}; skipping seed.", flush=True)
-        return
+def _populate(cur: sqlite3.Cursor) -> dict[str, int]:
+    """Insert the seed rows into a freshly-created schema.
 
-    print(f"Seeding DemoShop DB at {DB_PATH}…", flush=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript(SCHEMA)
-    cur = conn.cursor()
-
+    The caller owns the transaction. Returns per-table row counts.
+    """
     # Customers
     now = _days_ago(0)
     for phone, name, email, tier in CUSTOMERS:
@@ -179,17 +211,63 @@ def seed() -> None:
             )
             rma_serial += 1
 
-    conn.commit()
-    conn.close()
+    return {
+        'customers': len(CUSTOMERS),
+        'products': len(PRODUCTS),
+        'orders': len(ORDERS),
+        'returns': rma_serial - 1,
+    }
+
+
+def seed(force: bool = False) -> dict[str, Any]:
+    """Create + populate the DB. Returns a summary dict.
+
+    ``force=False`` (the first-boot path the entrypoint runs): no-op when
+    the DB file already exists. ``force=True``: drop, recreate and
+    repopulate in one transaction, restoring seed state over a live DB.
+    """
+    existed = os.path.exists(DB_PATH)
+    if existed and not force:
+        print(f"DemoShop DB already exists at {DB_PATH}; skipping seed.", flush=True)
+        return {'seeded': False, 'reason': 'db_exists', 'db_path': DB_PATH}
+
     print(
-        f"Seeded {len(CUSTOMERS)} customers, {len(PRODUCTS)} products, "
-        f"{len(ORDERS)} orders.",
+        f"{'Re-seeding' if existed else 'Seeding'} DemoShop DB at {DB_PATH}…",
+        flush=True,
+    )
+
+    # isolation_level=None turns off the driver's implicit transaction
+    # handling so we can drive BEGIN/COMMIT ourselves, DDL included.
+    # BEGIN IMMEDIATE takes the write lock up front instead of
+    # discovering a conflict halfway through the rebuild.
+    conn = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT, isolation_level=None)
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            for table in _TABLES_CHILD_FIRST:
+                conn.execute(f'DROP TABLE IF EXISTS {table}')
+            for stmt in _sql_statements(SCHEMA):
+                conn.execute(stmt)
+            counts = _populate(conn.cursor())
+            conn.execute('COMMIT')
+        except Exception:
+            conn.execute('ROLLBACK')
+            raise
+    finally:
+        conn.close()
+
+    print(
+        f"Seeded {counts['customers']} customers, {counts['products']} products, "
+        f"{counts['orders']} orders.",
         flush=True,
     )
     print("Demo customers (callable phones for the AI to look up):", flush=True)
     for phone, name, _, tier in CUSTOMERS:
         print(f"  {phone}  {name}  ({tier})", flush=True)
+    return {'seeded': True, 'reset': existed, 'db_path': DB_PATH, **counts}
 
 
 if __name__ == "__main__":
-    seed()
+    # --force / --reset restores an existing DB to seed state (see the
+    # module docstring); no flag = the idempotent first-boot seed.
+    seed(force=any(arg in ('--force', '--reset') for arg in sys.argv[1:]))

@@ -4,5 +4,7 @@
 # reap expired workspaces only — live visitors are untouched.
 30 * * * * /usr/local/bin/demo-reset.sh hourly > /proc/1/fd/1 2>&1
 # Nightly safety pass at 00:00 UTC: same GC + MAX_WORKSPACES cap
-# enforcement + template-workspace interaction hygiene.
+# enforcement + template-workspace interaction hygiene, plus a restore of
+# the shared DemoShop MCP database to its seeded state (the shop is the
+# one piece of demo state no per-workspace reap can reach).
 0 0 * * * /usr/local/bin/demo-reset.sh nightly > /proc/1/fd/1 2>&1

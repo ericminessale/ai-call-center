@@ -182,15 +182,42 @@ def provision_workspace(session_token: str):
 
     token_hash = _hash_token(session_token)
 
-    # A dead workspace may still hold this cookie's hash (expired while the
-    # cookie lived on) — free the unique binding before re-claiming it.
     with workspace_context(None):
         # Must come before the cap count below — see _serialize_admission.
         _serialize_admission()
 
-        stale = Workspace.query.filter_by(session_token_hash=token_hash).first()
-        if stale is not None:
-            stale.session_token_hash = None
+        # Re-resolve the cookie's binding UNDER the lock before deciding it's
+        # dead. The resume_workspace() above ran BEFORE we held the lock, so a
+        # concurrent /demo/start for this same cookie may have committed a
+        # workspace in between; that row is live, not stale. Freeing its hash
+        # and provisioning another would leave two live workspaces for one
+        # cookie with the first orphaned — unreachable (nothing maps to it) but
+        # still holding a cap slot until its TTL.
+        #
+        # Serializing admission makes that MORE likely, not less: it removes
+        # the duplicate-hash INSERT collision that the IntegrityError handler
+        # below exists to recover from, so the second request no longer fails
+        # into the resume path — it succeeds at stealing the binding.
+        bound = Workspace.query.filter_by(session_token_hash=token_hash).first()
+        if bound is not None and bound.id != DEFAULT_WORKSPACE_ID and bound.is_live():
+            owner = _workspace_owner(bound)
+            if owner is not None:
+                # Commit to release the advisory lock before the activity
+                # touch: touch_workspace is Redis-rate-limited and may return
+                # without committing, which would pin the lock until request
+                # teardown and serialize every other visitor behind us.
+                db.session.commit()
+                touch_workspace(bound)
+                return bound, owner
+            logger.error(
+                "workspace %s holds this session hash but has no owner user — "
+                "re-provisioning", bound.public_id,
+            )
+
+        # Genuinely dead (expired while the cookie lived on, or ownerless) —
+        # free the unique binding before re-claiming it.
+        if bound is not None:
+            bound.session_token_hash = None
             # Emit the hash-freeing UPDATE now — flush ordering between an
             # UPDATE and a same-table INSERT is not guaranteed, and the new
             # workspace row below re-claims this exact unique value.

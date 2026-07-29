@@ -830,16 +830,35 @@ def update_agent_assignments():
         if not data or 'assignments' not in data:
             return jsonify({'error': 'assignments array is required'}), 400
 
-        # Clear existing assignments
-        AgentCollectionAssignment.query.delete()
+        # Clear existing assignments.
+        #
+        # Deliberately NOT `AgentCollectionAssignment.query.delete()`: tenancy
+        # auto-scoping only rewrites SELECTs (see tenancy.py — bulk
+        # UPDATE/DELETE is skipped on purpose so the demo-reset wipe isn't
+        # silently narrowed to one tenant). A bulk delete here therefore wiped
+        # EVERY workspace's assignments whenever one workspace saved its KB
+        # bindings. Fetch-then-delete runs the scoped SELECT first, so this
+        # only ever touches the caller's own workspace — and stays a full wipe
+        # for a platform-level (clone-and-own) admin, whose context is None.
+        # The row count is a handful of agent↔collection pairs; per-row
+        # deletes cost nothing.
+        for existing in AgentCollectionAssignment.query.all():
+            db.session.delete(existing)
 
         # Insert new assignments
         for item in data['assignments']:
             if not item.get('agent_id') or not item.get('collection_id'):
                 continue
 
-            # Verify collection exists
-            collection = DocumentCollection.query.get(item['collection_id'])
+            # Verify the collection exists AND belongs to the caller's
+            # workspace. filter_by().first() rather than .get(): a cold .get()
+            # does emit a filtered SELECT, but a warm one is answered straight
+            # from the identity map — so if anything earlier in the request
+            # loaded that row under a wider scope, .get() would hand it back
+            # unfiltered. An explicit query always goes through the filter.
+            collection = DocumentCollection.query.filter_by(
+                id=item['collection_id']
+            ).first()
             if not collection:
                 continue
 

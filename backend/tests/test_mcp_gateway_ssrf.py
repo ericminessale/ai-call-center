@@ -227,9 +227,57 @@ def test_credentials_are_withheld_after_cross_host_redirect(monkeypatch):
     assert seen[1]['auth'] is None
 
 
+def test_credentials_are_withheld_on_same_host_port_change(monkeypatch):
+    """REGRESSION. Hostname alone was too broad a trust boundary: :443 -> :8443
+    on one host is a DIFFERENT service and must not inherit the secret."""
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    seen = []
+    _fake_requests(monkeypatch, {
+        f'https://{_A}/services': _FakeResponse(
+            302, location=f'https://{_A}:8443/services'),
+        f'https://{_A}:8443/services': _FakeResponse(200),
+    }, seen=seen)
+
+    _safe_get(
+        f'https://{_A}/services',
+        headers={'Authorization': 'Bearer s3cret'},
+        auth=HTTPBasicAuth('admin', 'hunter2'),
+        timeout=1,
+    )
+
+    assert len(seen) == 2
+    assert seen[0]['headers']['Authorization'] == 'Bearer s3cret'
+    assert 'Authorization' not in seen[1]['headers']
+    assert seen[1]['auth'] is None
+
+
+def test_credentials_survive_explicit_default_port(monkeypatch):
+    """The other half of the port rule: https://h and https://h:443 are the
+    SAME service spelled two ways, so a naive `port !=` check would strip here
+    and 401 a gateway that merely spells its port out."""
+    monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
+    seen = []
+    _fake_requests(monkeypatch, {
+        f'https://{_A}/services': _FakeResponse(
+            302, location=f'https://{_A}:443/services'),
+        f'https://{_A}:443/services': _FakeResponse(200),
+    }, seen=seen)
+
+    _safe_get(
+        f'https://{_A}/services',
+        headers={'Authorization': 'Bearer s3cret'},
+        auth=None,
+        timeout=1,
+    )
+
+    assert [s['headers'].get('Authorization') for s in seen] == [
+        'Bearer s3cret', 'Bearer s3cret',
+    ]
+
+
 def test_credentials_survive_same_host_https_upgrade(monkeypatch):
-    """The trust boundary is the HOSTNAME, not the full origin — otherwise the
-    ordinary http->https upgrade would strip auth and 401 a valid gateway."""
+    """The standard http:80 -> https:443 upgrade keeps its credentials —
+    otherwise a stricter rule would 401 an ordinary valid gateway."""
     monkeypatch.delenv('SWML_ALLOW_PRIVATE_URLS', raising=False)
     seen = []
     _fake_requests(monkeypatch, {

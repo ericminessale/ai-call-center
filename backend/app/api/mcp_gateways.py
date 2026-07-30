@@ -100,6 +100,18 @@ def _url_host_is_safe(url: str) -> tuple[bool, str]:
 # slash; it exists to bound a redirect loop, not to support long chains.
 _MAX_PROBE_REDIRECTS = 3
 
+# Redirect credential policy, delegated to requests rather than reimplemented.
+# Session.should_strip_auth already encodes the rule we want: keep credentials
+# on the same hostname, tolerate the standard http:80 → https:443 upgrade, and
+# strip on any other scheme or port change. Hand-rolling it invites exactly the
+# bugs it has already absorbed — a same-host port change (443 → 8443) is a
+# DIFFERENT service and must not inherit the secret, while implicit and
+# explicit default ports (https://h and https://h:443) are the SAME one and
+# must not trigger a strip. Delegating also means we track upstream if the
+# policy is refined. The Session is a holder for that method only; no request
+# is ever issued through it.
+_REDIRECT_AUTH_POLICY = requests.Session()
+
 
 def _safe_get(url: str, *, headers: dict, auth, timeout: float):
     """GET ``url`` with the SSRF guard applied to every hop.
@@ -116,13 +128,13 @@ def _safe_get(url: str, *, headers: dict, auth, timeout: float):
     relative/unparseable Location, a non-http(s) scheme, an HTTPS→HTTP
     downgrade, or too many hops.
 
-    Credentials do NOT follow a redirect to another host. ``requests`` strips
-    ``Authorization`` across hosts itself (``Session.rebuild_auth``), but
-    re-issuing hops by hand bypasses that — so a gateway answering ``302
-    Location: https://attacker.example/`` would have been handed the
-    configured Bearer token or Basic password. Hostname is the trust boundary
-    rather than the full origin, so the ordinary same-host ``http://`` →
-    ``https://`` upgrade keeps its credentials and still authenticates.
+    Credentials do NOT follow a redirect off the configured service.
+    ``requests`` strips ``Authorization`` itself for the redirects it follows
+    (``Session.rebuild_auth``), but re-issuing hops by hand bypasses that — so
+    a gateway answering ``302 Location: https://attacker.example/`` would have
+    been handed the configured Bearer token or Basic password. The decision is
+    delegated to ``Session.should_strip_auth`` (see ``_REDIRECT_AUTH_POLICY``)
+    so it matches upstream exactly.
 
     KNOWN RESIDUAL — this does not stop DNS rebinding. ``_url_host_is_safe``
     resolves the host, then ``requests`` resolves it again for the actual
@@ -174,18 +186,19 @@ def _safe_get(url: str, *, headers: dict, auth, timeout: float):
                 "Gateway redirected from HTTPS to plain HTTP — refusing to "
                 "downgrade the transport mid-probe"
             )
-        if (nxt_parsed.hostname or '').lower() != (cur_parsed.hostname or '').lower():
-            # Different host — drop the credentials rather than hand them to
-            # whoever the gateway named. The probe usually then 401s, which is
-            # the correct, visible outcome for a misconfigured gateway.
+        if _REDIRECT_AUTH_POLICY.should_strip_auth(current, nxt):
+            # Off the configured service — drop the credentials rather than
+            # hand them to wherever the gateway pointed. The probe usually then
+            # 401s, which is the correct, visible outcome for a misconfigured
+            # gateway.
             hop_headers = {
                 k: v for k, v in hop_headers.items() if k.lower() != 'authorization'
             }
             hop_auth = None
             logger.warning(
-                "MCP gateway probe redirected across hosts (%s -> %s) — "
+                "MCP gateway probe redirected off-service (%s -> %s) — "
                 "credentials withheld",
-                cur_parsed.hostname, nxt_parsed.hostname,
+                cur_parsed.netloc, nxt_parsed.netloc,
             )
         logger.info("MCP gateway probe following redirect %s -> %s", current, nxt)
         current = nxt

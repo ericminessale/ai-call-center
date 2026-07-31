@@ -4,5 +4,12 @@
 # `signalwire` package on PyPI which maxes out at 2.x. The
 # [mcp-gateway] extra brings in the flask + flask-limiter deps the
 # gateway CLI needs.
-mcp>=1.0.0
+# Capped below 2.0: mcp 2.x removed `mcp.server.fastmcp`, which
+# shop_mcp_server.py imports (FastMCP). The old unbounded `mcp>=1.0.0` meant
+# the pin that made this build work was just "whatever was current the day you
+# built it" — images built before mcp 2.0 kept running, while any REBUILD or
+# fresh clone silently got 2.x and a demoshop that exits 1 on startup with
+# ModuleNotFoundError. Caught by rebuilding this image during a deploy smoke
+# test. Lift the cap only together with porting the FastMCP import.
+mcp>=1.0.0,<2.0.0
 signalwire-sdk[mcp-gateway]>=3.0.1

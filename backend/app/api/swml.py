@@ -125,31 +125,31 @@ def initial_call():
         # Look up or create contact based on from_number — scoped to the
         # attributed workspace in hosted mode (phone is per-workspace
         # unique; an unscoped lookup could bind another tenant's contact).
+        #
+        # Goes through contact_directory rather than doing its own
+        # query-then-insert: hosted-demo pairing seeds a contact for the
+        # visitor's own number and can be committing it while this request
+        # runs, so both sides have to agree on the key AND survive losing the
+        # race. See that module for why a pre-check can't fix it.
         contact = None
         contact_id = None
         if from_number:
-            from app.models import Contact
-            contact_q = Contact.query.filter_by(phone=from_number)
-            if ws_id is not None:
-                contact_q = contact_q.filter_by(workspace_id=ws_id)
-            contact = contact_q.first()
-            if not contact:
-                # Create a new contact for unknown caller
-                contact = Contact(
-                    phone=from_number,
-                    display_name=from_number,  # Use phone as display name initially
-                    account_tier='free',
-                    account_status='prospect',
-                    workspace_id=ws_id,  # None → flush stamper defaults (clone-and-own)
-                )
-                db.session.add(contact)
+            from app.services.contact_directory import resolve_contact
+            contact = resolve_contact(
+                ws_id,  # None → flush stamper defaults (clone-and-own)
+                from_number,
+                display_name=from_number,  # phone as display name initially
+                account_tier='free',
+                account_status='prospect',
+            )
+            if contact is not None:
                 db.session.flush()  # Get the ID
+                contact_id = contact.id
                 logger.info(
-                    "Created new contact for %s: ID %s",
+                    "Resolved contact for %s: ID %s",
                     mask_phone(from_number),
-                    contact.id,
+                    contact_id,
                 )
-            contact_id = contact.id
             # Update last interaction timestamp
             contact.last_interaction_at = datetime.utcnow()
             contact.total_calls = (contact.total_calls or 0) + 1

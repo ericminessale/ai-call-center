@@ -309,13 +309,11 @@ def _self_contact_id(workspace_id, norm_number: Optional[str]) -> Optional[int]:
     if not workspace_id or not norm_number:
         return None
     try:
-        from app.models import Contact
+        from app.services.contact_directory import find_contact
         from app.tenancy import workspace_context
 
         with workspace_context(None):
-            row = Contact.query.filter_by(
-                workspace_id=int(workspace_id), phone=norm_number,
-            ).first()
+            row = find_contact(int(workspace_id), norm_number)
         return row.id if row is not None else None
     except Exception:
         return None
@@ -334,38 +332,35 @@ def _ensure_self_contact(workspace_id: int, norm_number: str) -> Optional[int]:
     just proven by SMS, and the row was going to exist after their first call
     regardless. Pre-empting it is not fabricating it.
 
-    Keyed exactly the way the inbound path keys it — ``(workspace_id, phone)``
-    on the ``_norm``-ed E.164 — so the call webhook FINDS this row rather than
-    inserting a second one for the same phone. ``uq_contacts_workspace_phone``
-    is the backstop if the two ever disagree on format.
+    Goes through ``contact_directory.resolve_contact`` — the SAME function the
+    inbound-call webhook uses — so the two cannot drift apart on either the key
+    or the race. That matters concretely here: this runs AFTER pairing has
+    published the Redis binding, and the binding is exactly what lets an
+    inbound call past the verify-first gate, so the call webhook can be
+    inserting this very number while we are.
 
     Best-effort: a failure here must never fail the pairing itself.
     """
     try:
         from app import db
-        from app.models import Contact
+        from app.services.contact_directory import resolve_contact
         from app.tenancy import workspace_context
 
         with workspace_context(None):
-            existing = Contact.query.filter_by(
-                workspace_id=int(workspace_id), phone=norm_number,
-            ).first()
-            if existing is not None:
-                return existing.id
-
-            contact = Contact(
-                workspace_id=int(workspace_id),
-                phone=norm_number,
+            contact = resolve_contact(
+                int(workspace_id),
+                norm_number,
                 display_name=_SELF_CONTACT_NAME,
                 # 'prospect' tier renders no tier chip in the contact row —
                 # the visitor's own phone shouldn't wear a customer badge.
                 account_tier='prospect',
                 account_status='active',
             )
-            db.session.add(contact)
+            if contact is None:
+                return None
             db.session.commit()
             logger.info(
-                "demo_verify: seeded self-contact %s for workspace %s",
+                "demo_verify: self-contact %s ready for workspace %s",
                 contact.id, workspace_id,
             )
             return contact.id

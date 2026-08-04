@@ -307,15 +307,6 @@ export function UnifiedAgentDesktop() {
       ));
     });
 
-    // Hosted demo: pairing seeds a contact for the visitor's own verified
-    // number server-side (demo_verify._ensure_self_contact), so the rail has
-    // to refetch or it stays empty until the next navigation — and the
-    // "this is you" tip would point at a row that isn't rendered.
-    socket.on('demo_phone_verified', () => {
-      logger.debug('[Unified] demo_phone_verified — reloading contacts');
-      void loadContacts();
-    });
-
     return () => {
       socket.off('call_update');
       socket.off('call_assigned');
@@ -327,7 +318,6 @@ export function UnifiedAgentDesktop() {
       socket.off('queue_update');
       socket.off('queue_config_changed');
       socket.off('sentiment_update');
-      socket.off('demo_phone_verified');
     };
     // Load helpers are sampled by stable socket callbacks. Rebinding every
     // time search/contact state changes would duplicate live subscriptions.
@@ -349,6 +339,30 @@ export function UnifiedAgentDesktop() {
       setIsLoadingContacts(false);
     }
   }, [searchQuery]);
+
+  // Hosted demo: pairing seeds a contact for the visitor's own verified number
+  // server-side (demo_verify._ensure_self_contact), so the rail must refetch or
+  // it stays empty until the next navigation — and the "this is you" tip would
+  // point at a row that isn't rendered.
+  //
+  // Its OWN effect, keyed on the CURRENT loadContacts, deliberately. The main
+  // socket effect is pinned to [socket] so live subscriptions aren't torn down
+  // and rebuilt on every keystroke — which means the callbacks it closes over
+  // are the first render's, and loadContacts closes over searchQuery. Reusing
+  // that stale copy here would refetch UNFILTERED while the search box still
+  // showed the query, silently replacing a visitor's filtered list. This
+  // rebinds one listener as the search changes; nothing else is touched.
+  useEffect(() => {
+    if (!socket) return;
+    const onVerified = () => {
+      logger.debug('[Unified] demo_phone_verified — reloading contacts');
+      void loadContacts();
+    };
+    socket.on('demo_phone_verified', onVerified);
+    return () => {
+      socket.off('demo_phone_verified', onVerified);
+    };
+  }, [socket, loadContacts]);
 
   // Load contact detail
   const loadContactDetail = useCallback(async (id: number) => {

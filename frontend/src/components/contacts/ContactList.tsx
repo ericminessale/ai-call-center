@@ -5,6 +5,8 @@ import { contactsApi } from '../../services/api';
 import { ContactListSkeletonGroup } from '../shared/Skeleton';
 import { logger } from '../../lib/logger';
 import { Button, Chip, StatusDot, RailContactRow } from '../restraint';
+import { DemoTip, useDemoTip } from '../shared/DemoTip';
+import { useVerifyStore } from '../../stores/verifyStore';
 
 interface ContactListProps {
   contacts: ContactMinimal[];
@@ -27,8 +29,23 @@ export function ContactList({
 }: ContactListProps) {
   const [showNewContactModal, setShowNewContactModal] = useState(false);
 
+  // Hosted demo: pairing seeds a contact for the visitor's own verified
+  // number. Point a one-time tip at that exact row (by id, not by matching
+  // the masked number's last 4 — two contacts can share those) so the first
+  // thing they see is something of theirs rather than an empty rail.
+  const selfContactId = useVerifyStore((s) => s.selfContactId);
+  const selfTip = useDemoTip('demo-verified-self-contact');
+  const hasSelfContact = selfContactId != null && contacts.some(c => c.id === selfContactId);
+
   const handleContactCreated = (contact: ContactMinimal) => {
     onContactCreated?.(contact);
+    onSelectContact(contact);
+  };
+
+  // Clicking the row is an acknowledgement — the tip has served its purpose,
+  // so retire it permanently rather than leaving it to be X'd out later.
+  const handleSelectContact = (contact: ContactMinimal) => {
+    if (selfTip.shouldShow && contact.id === selfContactId) selfTip.dismiss();
     onSelectContact(contact);
   };
 
@@ -80,21 +97,21 @@ export function ContactList({
             {activeContacts.length > 0 && (
               <Section title="On call" count={activeContacts.length} tone="live">
                 {activeContacts.map(c => (
-                  <ContactCard key={c.id} contact={c} isSelected={c.id === selectedContactId} onClick={() => onSelectContact(c)} />
+                  <ContactCard key={c.id} contact={c} isSelected={c.id === selectedContactId} onClick={() => handleSelectContact(c)} isSelf={c.id === selfContactId} showSelfTip={selfTip.shouldShow && hasSelfContact} />
                 ))}
               </Section>
             )}
             {recentContacts.length > 0 && (
               <Section title="Recent" count={recentContacts.length}>
                 {recentContacts.slice(0, 20).map(c => (
-                  <ContactCard key={c.id} contact={c} isSelected={c.id === selectedContactId} onClick={() => onSelectContact(c)} />
+                  <ContactCard key={c.id} contact={c} isSelected={c.id === selectedContactId} onClick={() => handleSelectContact(c)} isSelf={c.id === selfContactId} showSelfTip={selfTip.shouldShow && hasSelfContact} />
                 ))}
               </Section>
             )}
             {otherContacts.length > 0 && (
               <Section title="All contacts" count={otherContacts.length}>
                 {otherContacts.map(c => (
-                  <ContactCard key={c.id} contact={c} isSelected={c.id === selectedContactId} onClick={() => onSelectContact(c)} />
+                  <ContactCard key={c.id} contact={c} isSelected={c.id === selectedContactId} onClick={() => handleSelectContact(c)} isSelf={c.id === selfContactId} showSelfTip={selfTip.shouldShow && hasSelfContact} />
                 ))}
               </Section>
             )}
@@ -119,7 +136,7 @@ function EmptyList({ query }: { query: string }) {
         {query ? 'Nothing matches' : 'No contacts yet'}
       </p>
       <p className="text-[12px] text-ink-dim">
-        {query ? `No results for "${query}"` : 'Contacts will appear here after your first call.'}
+        {query ? `No results for "${query}"` : 'Contacts appear here as calls come in.'}
       </p>
     </div>
   );
@@ -151,10 +168,16 @@ function ContactCard({
   contact,
   isSelected,
   onClick,
+  isSelf = false,
+  showSelfTip = false,
 }: {
   contact: ContactMinimal;
   isSelected: boolean;
   onClick: () => void;
+  /** This row is the visitor's own verified number (hosted demo). */
+  isSelf?: boolean;
+  /** Tip is live and undismissed — only the isSelf row renders it. */
+  showSelfTip?: boolean;
 }) {
   const hasActiveCall = !!contact.activeCall;
   const tierChip = contact.accountTier && contact.accountTier !== 'prospect' ? contact.accountTier : null;
@@ -169,7 +192,7 @@ function ContactCard({
     <Chip className="capitalize">{tierChip}</Chip>
   ) : null;
 
-  return (
+  const row = (
     <RailContactRow
       name={contact.displayName}
       phone={contact.phone}
@@ -179,6 +202,24 @@ function ContactCard({
       badge={contact.isVip ? <Star className="w-3 h-3 text-status-warning fill-status-warning" /> : undefined}
       trailing={trailing}
     />
+  );
+
+  if (!isSelf) return row;
+
+  // `relative` so the tip anchors to this row; `placement="right"` sends the
+  // bubble out of the narrow rail and into the open middle of the screen,
+  // with its tail still touching the row it's talking about.
+  return (
+    <div className="relative">
+      {row}
+      <DemoTip
+        id="demo-verified-self-contact"
+        show={showSelfTip}
+        title="This one's you"
+        body="We added your verified number as a contact. Open it to see the call history, or use “Have the AI call me” up top and watch it land here live."
+        placement="right"
+      />
+    </div>
   );
 }
 

@@ -27,6 +27,10 @@ export function useDemoVerification() {
     const onVerified = (data: { masked_number?: string }) => {
       const { verified } = useVerifyStore.getState();
       useVerifyStore.getState().markVerified(data?.masked_number ?? null);
+      // The socket payload deliberately carries only the masked number, so
+      // re-hydrate to pick up selfContactId — pairing seeds the visitor's own
+      // contact server-side and the Contacts tip anchors to that id.
+      void useVerifyStore.getState().hydrate();
       // Only celebrate the transition, not a redundant re-emit.
       if (!verified) {
         toast.success('Phone verified — call the demo number and your AI picks up');

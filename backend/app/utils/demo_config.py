@@ -85,6 +85,20 @@ def demo_phone_numbers() -> list[dict]:
     return out
 
 
+def repo_url() -> str | None:
+    """Public repo the demo invites visitors to clone (``DEMO_REPO_URL``).
+
+    Env-driven rather than hardcoded. "Clone this yourself" is the whole point
+    of the hosted demo, but the URL is deployment identity — whoever stands up
+    a demo of their own fork should point at THEIR repo, not this one. Unset
+    means the frontend renders no CTA at all rather than a wrong link.
+    """
+    raw = os.getenv('DEMO_REPO_URL', '').strip()
+    if not raw.startswith(('http://', 'https://')):
+        return None
+    return raw
+
+
 def runtime_config() -> dict:
     """Public-safe runtime config for the frontend.
 
@@ -119,6 +133,9 @@ def runtime_config() -> dict:
         # Workspace lifetime for landing/banner copy — the operator can
         # tune WORKSPACE_TTL_DAYS, so the UI must not hardcode "7 days".
         'workspace_ttl_days': ttl_days,
+        # "Clone this yourself" target for the demo CTA. Demo-only: a
+        # clone-and-own deployment has no reason to advertise a repo.
+        'repo_url': repo_url() if is_demo_mode() else None,
         # White-label branding (IMP-02) — public by design: the login page
         # must render the brand before any auth exists. Name/logo/colors
         # only, never secrets.

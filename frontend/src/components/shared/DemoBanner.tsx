@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Clock, LogOut, Phone, PhoneCall, ShieldCheck, Sparkles } from 'lucide-react';
+import { Clock, Github, LogOut, Phone, PhoneCall, ShieldCheck, Sparkles } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useAuthStore } from '../../stores/authStore';
 import { useVerifyStore } from '../../stores/verifyStore';
@@ -9,13 +9,22 @@ import { demoApi } from '../../services/api';
  * Thin persistent chrome strip across the top of the agent dashboard, only
  * rendered when the backend's runtime config reports DEMO_MODE=true.
  *
- * Carries: the "DEMO" label, the visitor's private-workspace + lifetime,
- * the demo number for reference, and Leave-demo. The VERIFICATION FLOW
- * itself lives in the prominent PhoneVerificationCard below this strip
- * (shown while unverified); once verified this strip shows a compact
- * "Verified" badge plus the "have the AI call me" action. Verification
- * state comes from the shared useVerifyStore (hydrated by
- * useDemoVerification), not a local fetch.
+ * Deliberately carries ONLY data a visitor can act on:
+ *   - how long this workspace lives (the one thing they can lose)
+ *   - the number to CALL to test it, and the number they VERIFIED
+ *   - have-the-AI-call-me, clone-the-repo, leave-demo
+ *
+ * What used to be here and isn't: a "DEMO" sparkle chip and "Your private
+ * workspace — signed in as Demo Admin". Both were decoration paying no rent
+ * — the persona name is a generated placeholder, and a visitor who clicked
+ * "try the demo" does not need to be told they're in a demo. The strip has
+ * to earn its horizontal space; every remaining item is either a fact they
+ * need or a button they press.
+ *
+ * The VERIFICATION FLOW itself lives in the prominent PhoneVerificationCard
+ * below this strip (shown while unverified); once verified this strip shows a
+ * compact "Verified" badge. Verification state comes from the shared
+ * useVerifyStore (hydrated by useDemoVerification), not a local fetch.
  *
  * Renders nothing in production-shape clone-and-own deployments.
  */
@@ -51,6 +60,7 @@ export function DemoBanner() {
 
   const personaName = user?.name ?? user?.email ?? 'demo agent';
   const phoneNumbers = runtimeConfig?.demo_phone_numbers ?? [];
+  const repoUrl = runtimeConfig?.repo_url ?? null;
   const remaining = timeLeft(workspace?.expires_at);
   const isPlatformUser = user != null && user.workspace_id == null;
 
@@ -97,16 +107,6 @@ export function DemoBanner() {
       role="status"
       aria-label="Demo mode banner"
     >
-      <span className="inline-flex items-center gap-1.5 font-mono uppercase tracking-[0.2em] text-[10px] text-ai-soft">
-        <Sparkles className="h-3 w-3" />
-        demo
-      </span>
-
-      <span className="text-ink-muted">
-        Your private workspace — signed in as{' '}
-        <span className="text-ink font-medium">{personaName}</span>.
-      </span>
-
       {remaining && (
         <span
           className={`inline-flex items-center gap-1 font-mono text-[11px] ${
@@ -147,6 +147,9 @@ export function DemoBanner() {
         </span>
       )}
 
+      {/* Right cluster: the number to call, then the two exits. `ml-auto` on
+          whichever item comes first so the cluster pins right regardless of
+          which pieces are configured. */}
       {phoneNumbers.length > 0 && (
         <span className="hidden md:flex items-center gap-3 ml-auto">
           {phoneNumbers.map((p) => (
@@ -164,11 +167,26 @@ export function DemoBanner() {
         </span>
       )}
 
+      {repoUrl && (
+        <a
+          href={repoUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={`inline-flex items-center gap-1.5 text-ai-soft hover:text-ai transition-colors ${
+            phoneNumbers.length > 0 ? '' : 'ml-auto'
+          }`}
+          title="This whole call center is open source — clone it and run your own"
+        >
+          <Github className="h-3 w-3" />
+          Clone this
+        </a>
+      )}
+
       <button
         type="button"
         onClick={logout}
         className={`inline-flex items-center gap-1.5 text-ink-muted hover:text-ink transition-colors ${
-          phoneNumbers.length > 0 ? '' : 'ml-auto'
+          phoneNumbers.length > 0 || repoUrl ? '' : 'ml-auto'
         }`}
         title="End your demo and release this workspace"
       >

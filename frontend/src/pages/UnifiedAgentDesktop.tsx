@@ -307,6 +307,15 @@ export function UnifiedAgentDesktop() {
       ));
     });
 
+    // Hosted demo: pairing seeds a contact for the visitor's own verified
+    // number server-side (demo_verify._ensure_self_contact), so the rail has
+    // to refetch or it stays empty until the next navigation — and the
+    // "this is you" tip would point at a row that isn't rendered.
+    socket.on('demo_phone_verified', () => {
+      logger.debug('[Unified] demo_phone_verified — reloading contacts');
+      void loadContacts();
+    });
+
     return () => {
       socket.off('call_update');
       socket.off('call_assigned');
@@ -318,6 +327,7 @@ export function UnifiedAgentDesktop() {
       socket.off('queue_update');
       socket.off('queue_config_changed');
       socket.off('sentiment_update');
+      socket.off('demo_phone_verified');
     };
     // Load helpers are sampled by stable socket callbacks. Rebinding every
     // time search/contact state changes would duplicate live subscriptions.

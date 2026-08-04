@@ -17,6 +17,9 @@ interface VerifyState {
   verified: boolean;
   code: string | null;
   maskedNumber: string | null;
+  /** Contact row for the visitor's own verified number, seeded at pairing.
+   *  Lets the Contacts rail point its "this is you" tip at the exact row. */
+  selfContactId: number | null;
   hydrated: boolean;   // false until the first status fetch resolves
   requesting: boolean; // a pairing-code request is in flight
   hydrate: () => Promise<void>;
@@ -29,6 +32,7 @@ export const useVerifyStore = create<VerifyState>((set, get) => ({
   verified: false,
   code: null,
   maskedNumber: null,
+  selfContactId: null,
   hydrated: false,
   requesting: false,
 
@@ -38,6 +42,7 @@ export const useVerifyStore = create<VerifyState>((set, get) => ({
       set({
         verified: r.data.verified,
         maskedNumber: r.data.masked_number,
+        selfContactId: r.data.contact_id ?? null,
         // Keep any locally-issued code if the server didn't echo one back.
         code: r.data.verified ? null : (r.data.code ?? get().code),
         hydrated: true,
@@ -64,5 +69,8 @@ export const useVerifyStore = create<VerifyState>((set, get) => ({
     set({ verified: true, maskedNumber, code: null }),
 
   reset: () =>
-    set({ verified: false, code: null, maskedNumber: null, hydrated: false, requesting: false }),
+    set({
+      verified: false, code: null, maskedNumber: null, selfContactId: null,
+      hydrated: false, requesting: false,
+    }),
 }));

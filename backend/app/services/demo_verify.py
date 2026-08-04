@@ -284,6 +284,10 @@ def pair_number(code: str, number: str) -> dict:
     except Exception:
         pass
 
+    # Seed the visitor's own number as a contact so the Contacts screen isn't
+    # empty before their first call. Best-effort by design — see the helper.
+    contact_id = _ensure_self_contact(workspace_id, norm)
+
     logger.info(
         "demo_verify: paired number %s → workspace %s (user %s)",
         mask_number(norm), workspace_id, user_id,
@@ -293,7 +297,86 @@ def pair_number(code: str, number: str) -> dict:
         'workspace_id': workspace_id,
         'user_id': user_id,
         'masked': mask_number(norm),
+        'contact_id': contact_id,
     }
+
+
+_SELF_CONTACT_NAME = 'My phone'
+
+
+def _self_contact_id(workspace_id, norm_number: Optional[str]) -> Optional[int]:
+    """Read-only: id of the contact row for this workspace's own number."""
+    if not workspace_id or not norm_number:
+        return None
+    try:
+        from app.models import Contact
+        from app.tenancy import workspace_context
+
+        with workspace_context(None):
+            row = Contact.query.filter_by(
+                workspace_id=int(workspace_id), phone=norm_number,
+            ).first()
+        return row.id if row is not None else None
+    except Exception:
+        return None
+
+
+def _ensure_self_contact(workspace_id: int, norm_number: str) -> Optional[int]:
+    """Seed the visitor's OWN number as a contact, once, at pairing time.
+
+    Contacts are otherwise born on the first inbound call (the
+    look-up-or-create on ``from_number`` in ``api/swml.py``), so the Contacts
+    screen reads as empty for the whole window between verifying and calling
+    — which is the first thing a visitor sees.
+
+    This does NOT break the "structural seed only — no simulated colleagues,
+    no fake history" rule (§10.3): it is the visitor's own number, possession
+    just proven by SMS, and the row was going to exist after their first call
+    regardless. Pre-empting it is not fabricating it.
+
+    Keyed exactly the way the inbound path keys it — ``(workspace_id, phone)``
+    on the ``_norm``-ed E.164 — so the call webhook FINDS this row rather than
+    inserting a second one for the same phone. ``uq_contacts_workspace_phone``
+    is the backstop if the two ever disagree on format.
+
+    Best-effort: a failure here must never fail the pairing itself.
+    """
+    try:
+        from app import db
+        from app.models import Contact
+        from app.tenancy import workspace_context
+
+        with workspace_context(None):
+            existing = Contact.query.filter_by(
+                workspace_id=int(workspace_id), phone=norm_number,
+            ).first()
+            if existing is not None:
+                return existing.id
+
+            contact = Contact(
+                workspace_id=int(workspace_id),
+                phone=norm_number,
+                display_name=_SELF_CONTACT_NAME,
+                # 'prospect' tier renders no tier chip in the contact row —
+                # the visitor's own phone shouldn't wear a customer badge.
+                account_tier='prospect',
+                account_status='active',
+            )
+            db.session.add(contact)
+            db.session.commit()
+            logger.info(
+                "demo_verify: seeded self-contact %s for workspace %s",
+                contact.id, workspace_id,
+            )
+            return contact.id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("demo_verify: self-contact seed failed: %s", exc)
+        try:
+            from app import db
+            db.session.rollback()
+        except Exception:
+            pass
+        return None
 
 
 def get_verified_number(workspace_id) -> Optional[str]:
@@ -434,6 +517,11 @@ def verify_status(workspace_id) -> dict:
         'verified': verified is not None,
         'code': code,
         'masked_number': mask_number(verified),
+        # Lets the demo UI anchor its "this is you" tip to the exact contact
+        # row instead of guessing from the masked number's last 4 (two
+        # contacts can share those). Demo-only field; the product's own
+        # contacts API is untouched.
+        'contact_id': _self_contact_id(workspace_id, verified),
     }
 
 

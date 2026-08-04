@@ -142,6 +142,9 @@ export interface RuntimeConfig {
   workspace_ttl_days?: number | null;
   // White-label branding (IMP-02); null/absent means stock SignalWire.
   branding?: Branding | null;
+  // "Clone this yourself" target (DEMO_REPO_URL), hosted demo only. Null when
+  // unset — render no CTA rather than a wrong link.
+  repo_url?: string | null;
 }
 
 export const runtimeApi = {
@@ -170,9 +173,14 @@ export const demoApi = {
   pairingCode: () =>
     api.post<{ code: string }>('/api/demo/verify/pairing-code'),
   verifyStatus: () =>
-    api.get<{ verified: boolean; code: string | null; masked_number: string | null }>(
-      '/api/demo/verify/status'
-    ),
+    api.get<{
+      verified: boolean;
+      code: string | null;
+      masked_number: string | null;
+      // Contact row seeded for the visitor's own verified number. Anchors the
+      // "this is you" tip precisely instead of matching on the masked last 4.
+      contact_id?: number | null;
+    }>('/api/demo/verify/status'),
   // "Have the AI call me" — outbound AI call to the visitor's verified number.
   // agent_type must be a known outbound agent id (see AI_AGENTS in ai_control).
   callMe: (agent_type: string = 'outbound-sales') =>

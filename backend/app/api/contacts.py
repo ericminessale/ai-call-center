@@ -104,6 +104,10 @@ def create_contact():
 
     # Check if contact already exists
     normalized_phone = Contact.normalize_phone(phone)
+    if not normalized_phone:
+        # normalize_phone now returns None for junk instead of an empty string,
+        # which used to sail through and create a contact with a blank phone.
+        return jsonify({'error': "That doesn't look like a dialable phone number"}), 400
     existing = Contact.find_by_phone(normalized_phone)
     if existing:
         return jsonify({'error': 'Contact with this phone number already exists', 'contact': existing.to_dict()}), 409
@@ -189,6 +193,8 @@ def update_contact(contact_id):
     # Phone number change requires uniqueness check
     if 'phone' in data:
         new_phone = Contact.normalize_phone(data['phone'])
+        if not new_phone:
+            return jsonify({'error': "That doesn't look like a dialable phone number"}), 400
         if new_phone != contact.phone:
             existing = Contact.find_by_phone(new_phone)
             if existing:
@@ -262,8 +268,11 @@ def lookup_or_create_contact():
         capped = cap_denial('contacts')
         if capped:
             return jsonify(capped[0]), capped[1]
+        normalized = Contact.normalize_phone(phone)
+        if not normalized:
+            return jsonify({'error': "That doesn't look like a dialable phone number"}), 400
         contact = Contact(
-            phone=Contact.normalize_phone(phone),
+            phone=normalized,
             first_name=data.get('firstName'),
             last_name=data.get('lastName'),
             display_name=data.get('displayName'),

@@ -85,7 +85,9 @@ def route_call_to_queue(queue_id):
         merged_global_data = {**global_data, **url_context}
         global_data = merged_global_data
 
-        logger.info(f"Merged context data: {json.dumps(global_data, default=str)}")
+        # Keys only (R1 redaction prereq, CONTEXT_AUDIT_2026-08-04): this
+        # blob now routinely carries caller names and interaction history.
+        logger.info("Merged context fields: %s", payload_keys(global_data))
         logger.debug(f"caller_number: {caller_number}, call_id: {call_id}")
 
         context = {
@@ -136,6 +138,7 @@ def route_call_to_queue(queue_id):
         # /initial-call before the AI transferred here); the new-row path
         # below is the clone-and-own shape plus a verify-first backstop.
         call = Call.query.filter_by(signalwire_call_sid=call_id).first() if call_id else None
+        created_call_here = call is None
         if not call:
             route_ws_binding = None
             owner_user_id = None
@@ -206,70 +209,55 @@ def route_call_to_queue(queue_id):
         contact_id = None
         if caller_number:
             try:
-                if is_demo_mode() and call.workspace_id:
-                    contact = Contact.query.filter_by(
-                        phone=caller_number, workspace_id=call.workspace_id
-                    ).first()
-                    if not contact:
-                        contact = Contact(
-                            phone=caller_number,
-                            display_name=caller_number,
-                            account_tier='free',
-                            account_status='prospect',
-                            workspace_id=call.workspace_id,
-                        )
-                        db.session.add(contact)
-                        db.session.flush()
-                else:
-                    contact = Contact.find_or_create_by_phone(caller_number)
+                # Both branches go through contact_directory: one canonical
+                # key, and a create that survives losing the race to another
+                # writer for the same number. The demo branch pins the
+                # workspace explicitly; clone-and-own passes None and lets the
+                # flush stamper decide, which is what find_or_create_by_phone
+                # did here before.
+                from app.services.contact_directory import resolve_contact
+                contact = resolve_contact(
+                    call.workspace_id if (is_demo_mode() and call.workspace_id) else None,
+                    caller_number,
+                    display_name=caller_number,
+                    account_tier='free',
+                    account_status='prospect',
+                )
+                if contact is None:
+                    raise ValueError(f'unusable caller number {caller_number!r}')
+                db.session.flush()
                 contact_id = contact.id
-                contact_updated = False
 
-                # Parse customer_name into first/last name
-                customer_name = context.get('customer_name')
-                if customer_name:
-                    # Update display_name if not set OR if it's just a phone number
-                    current_display = contact.display_name or ''
-                    is_phone_display = current_display.startswith('+') or current_display.isdigit()
-                    if not contact.display_name or is_phone_display:
-                        contact.display_name = customer_name
-                        contact_updated = True
-                        logger.info(f"Updated contact display_name to: {customer_name}")
-
-                    # Try to parse into first/last name if not already set OR if display was phone
-                    if not contact.first_name or is_phone_display:
-                        name_parts = customer_name.strip().split(' ', 1)
-                        if len(name_parts) >= 1:
-                            contact.first_name = name_parts[0]
-                            contact_updated = True
-                            logger.info(f"Updated contact first_name to: {name_parts[0]}")
-                        if len(name_parts) >= 2:
-                            contact.last_name = name_parts[1]
-                            contact_updated = True
-                            logger.info(f"Updated contact last_name to: {name_parts[1]}")
-
-                # Update company if AI collected it and contact doesn't have one
-                company = context.get('company')
-                if company and not contact.company:
-                    contact.company = company
-                    contact_updated = True
+                # Shared no-clobber projection of AI-learned fields (R2) —
+                # identical rules to the post-prompt writer, so mid-call
+                # transfer and call-end enrichment can't drift apart.
+                from app.services.contact_enrichment import (
+                    apply_learned_contact_fields,
+                )
+                extra_fields = {
+                    field: context[field]
+                    for field in ('department', 'interest', 'budget', 'urgency')
+                    if context.get(field)
+                }
+                contact_updated = apply_learned_contact_fields(
+                    contact,
+                    {
+                        'customer_name': context.get('customer_name'),
+                        'company': context.get('company'),
+                        'caller_language': context.get('caller_language'),
+                    },
+                    custom_extras=extra_fields,
+                )
 
                 # Update last interaction timestamp
                 contact.last_interaction_at = datetime.utcnow()
-                contact.total_calls = (contact.total_calls or 0) + 1
                 contact_updated = True
-
-                # Store additional AI context in custom_fields
-                extra_fields = {}
-                for field in ['department', 'interest', 'budget', 'urgency']:
-                    if context.get(field):
-                        extra_fields[field] = context[field]
-
-                if extra_fields:
-                    existing_custom = contact.custom_fields_dict or {}
-                    existing_custom.update(extra_fields)
-                    contact.custom_fields_dict = existing_custom
-                    contact_updated = True
+                # Count the call once, where its row is created (G6). Calls
+                # arriving from initial-call were already counted there; the
+                # terminal call-status webhook reconciles from truth via
+                # Contact.update_stats().
+                if created_call_here:
+                    contact.total_calls = (contact.total_calls or 0) + 1
 
                 # Link call to contact
                 if call:
@@ -481,6 +469,7 @@ def direct_inbound_queue(queue_slug):
         # path can derive it without DB lookup.
         conference_name = f"interaction-{call_id}"
 
+        created_call_here = call is None
         if not call:
             ws_id = None
             if ws_binding is not None:
@@ -545,27 +534,29 @@ def direct_inbound_queue(queue_slug):
         contact_id = None
         if caller_number:
             try:
-                if ws_binding is not None:
-                    contact_ws_id = ws_binding[0]
-                    contact = Contact.query.filter_by(
-                        phone=caller_number, workspace_id=contact_ws_id
-                    ).first()
-                    if not contact:
-                        contact = Contact(
-                            phone=caller_number,
-                            display_name=caller_number,
-                            account_tier='free',
-                            account_status='prospect',
-                            workspace_id=contact_ws_id,
-                        )
-                        db.session.add(contact)
-                        db.session.flush()
-                else:
-                    contact = Contact.find_or_create_by_phone(caller_number)
+                # See the matching block in the queue-routing path above —
+                # same reasons, same helper. Direct inbound is the likeliest
+                # place to actually lose the race: the caller is often the
+                # hosted-demo visitor whose own contact was seeded moments
+                # earlier by pairing.
+                from app.services.contact_directory import resolve_contact
+                contact = resolve_contact(
+                    ws_binding[0] if ws_binding is not None else None,
+                    caller_number,
+                    display_name=caller_number,
+                    account_tier='free',
+                    account_status='prospect',
+                )
+                if contact is None:
+                    raise ValueError(f'unusable caller number {caller_number!r}')
+                db.session.flush()
                 call.contact_id = contact.id
                 contact_id = contact.id
                 contact.last_interaction_at = datetime.utcnow()
-                contact.total_calls = (contact.total_calls or 0) + 1
+                # Once per created call — carrier retry storms re-enter this
+                # block for the same call row and used to inflate the stat (G6).
+                if created_call_here:
+                    contact.total_calls = (contact.total_calls or 0) + 1
             except Exception as e:
                 logger.warning(f"Direct inbound: failed to create contact: {e}")
 

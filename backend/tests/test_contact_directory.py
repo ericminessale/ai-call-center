@@ -150,35 +150,74 @@ def test_losing_the_insert_race_returns_the_winner(ws_app):
     assert Contact.query.filter_by(workspace_id=ws_id).count() == 1
 
 
-def test_race_recovery_leaves_the_session_usable(ws_app):
-    """The savepoint must not poison the caller's transaction — api/swml.py has
-    an unflushed system-user insert pending and is nowhere near its commit."""
+def test_race_recovery_preserves_pending_work(ws_app):
+    """THE savepoint claim, and the thing that distinguishes it from a bare
+    rollback: work already pending on the caller's session when the conflict
+    fires must SURVIVE it.
+
+    api/swml.py is the real case — it has an unflushed system-user insert
+    pending and is nowhere near its commit, so a bare
+    ``db.session.rollback()`` in the recovery path would silently discard it.
+
+    An earlier version of this test added the unrelated row AFTER the race and
+    let the simulated winner commit through the same session, which proves only
+    that the session still works — true of a bare rollback too.
+    """
     _app, ws_id = ws_app
     import app.services.contact_directory as cd
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session as SASession
 
+    # PENDING BEFORE the race, never flushed, on the caller's session.
+    pending = Workspace(name='PendingBefore', status=Workspace.STATUS_ACTIVE)
+    db.session.add(pending)
+
+    # The competing writer must be a genuinely SEPARATE connection, or its
+    # commit would flush our pending row along with it and the test would pass
+    # for the wrong reason.
+    engine = db.session.get_bind()
     real_find = cd.find_contact
     state = {'first': True}
 
     def racing_find(workspace_id, raw_number):
         if state['first']:
             state['first'] = False
-            db.session.add(Contact(
-                workspace_id=workspace_id, phone=CANON, display_name='winner',
-            ))
-            db.session.commit()
+            with SASession(bind=engine) as other:
+                other.execute(
+                    Contact.__table__.insert().values(
+                        workspace_id=workspace_id, phone=CANON,
+                        display_name='winner',
+                    )
+                )
+                other.commit()
             return None
         return real_find(workspace_id, raw_number)
 
     cd.find_contact = racing_find
     try:
-        resolve_contact(ws_id, RAW)
+        got = resolve_contact(ws_id, RAW, display_name='loser')
     finally:
         cd.find_contact = real_find
 
-    # Caller carries on and commits unrelated work.
-    db.session.add(Workspace(name='After', status=Workspace.STATUS_ACTIVE))
+    assert got is not None and got.display_name == 'winner'
+
+    # The distinguishing assertion. `pending` is no longer in session.new —
+    # resolve_contact's first lookup is a query, so autoflush wrote it into the
+    # OUTER transaction before any savepoint existed. That is precisely why it
+    # survives: the SAVEPOINT opens after it, so rolling back to that point
+    # cannot reach it. A bare db.session.rollback() in the recovery path would
+    # unwind the whole transaction and take this row with it.
+    #
+    # Read it back INSIDE the still-open transaction — uncommitted, so only
+    # this session can see it. Committing first would prove nothing about
+    # whether the recovery discarded it.
+    assert pending not in db.session.new, 'expected autoflush before the savepoint'
+    still_there = db.session.query(Workspace).filter_by(name='PendingBefore').first()
+    assert still_there is not None, 'savepoint recovery discarded pending work'
+
     db.session.commit()
-    assert Workspace.query.filter_by(name='After').first() is not None
+    assert Workspace.query.filter_by(name='PendingBefore').first() is not None
+    assert Contact.query.filter_by(workspace_id=ws_id).count() == 1
 
 
 def test_workspaces_stay_isolated(ws_app):

@@ -193,19 +193,22 @@ class Contact(WorkspaceScoped, db.Model):
 
     @staticmethod
     def normalize_phone(phone):
-        """Normalize phone number to E.164 format."""
-        if not phone:
-            return None
+        """Canonical storage spelling for a phone number, or None.
 
-        # Remove all non-digit characters except leading +
-        has_plus = phone.startswith('+')
-        digits = ''.join(c for c in phone if c.isdigit())
+        Delegates to :func:`app.utils.phone.normalize_phone` so there is
+        exactly ONE definition of the key. This used to have its own, and the
+        two disagreed: it returned BARE digits (no ``+``) for anything under
+        10 digits without a leading plus, and an empty string for input with
+        no digits at all — so ``Contact(phone='')`` was reachable. Rows written
+        under those rules are why lookups keyed on the canonical form could
+        miss an existing contact and insert a duplicate; migration
+        x4y5z6a7b8c9 rewrites them.
 
-        # Add + prefix if not present and looks like full number
-        if has_plus or len(digits) >= 10:
-            return f'+{digits}' if not has_plus else f'+{digits}'
-
-        return digits
+        Returns None for anything unusable. Callers must handle that rather
+        than storing it — ``phone`` is NOT NULL.
+        """
+        from app.utils.phone import normalize_phone as _normalize
+        return _normalize(phone)
 
     @classmethod
     def search(cls, query, limit=20):

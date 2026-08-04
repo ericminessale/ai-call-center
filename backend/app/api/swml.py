@@ -8,6 +8,7 @@ from app.models.system_config import SystemConfig
 from app.utils.request_logging import mask_phone, request_summary
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.utils.demo_config import is_demo_mode
+import base64
 import logging
 import json
 import os
@@ -150,9 +151,21 @@ def initial_call():
                     mask_phone(from_number),
                     contact_id,
                 )
-            # Update last interaction timestamp
-            contact.last_interaction_at = datetime.utcnow()
-            contact.total_calls = (contact.total_calls or 0) + 1
+                # Update last interaction timestamp
+                contact.last_interaction_at = datetime.utcnow()
+                contact.total_calls = (contact.total_calls or 0) + 1
+            else:
+                # resolve_contact returns None when from_number can't be a
+                # dialable key — withheld/anonymous caller ID, a short code, a
+                # SIP URI. Before contact_directory this branch didn't exist
+                # (a Contact was always constructed), so these two updates sat
+                # unguarded and an anonymous caller crashed the SWML response
+                # with AttributeError on None, dropping the call. The call
+                # itself is still perfectly valid without a contact — take it.
+                logger.info(
+                    "No contact for unkeyable caller %s — proceeding without one",
+                    mask_phone(from_number),
+                )
 
         # Create new call record
         # Calls coming to /initial-call are INBOUND (SignalWire calling us when someone dials our number)
@@ -349,11 +362,40 @@ def initial_call():
     # any unsigned/forged call_db_id.
     from app.utils.url_utils import call_context_token
     _ctk = call_context_token(call.id)
+    agent_dest = f"{base_url}{initial_handler}?call_db_id={call.id}&ctk={_ctk}"
+
+    # R3 (CONTEXT_AUDIT_2026-08-04): dial-outs through this route — callback
+    # dials pre-create the Call with the snapshotted ai_context — used to
+    # reach the agent blind: the context sat on the row and was never
+    # re-injected. Forward a compact whitelist as ?ctx= (same mechanism as
+    # /api/ai/outbound-swml); capped keys keep the URL bounded. Genuine
+    # inbound calls have a fresh row with no ai_context and are unaffected.
+    if call.direction == 'outbound' and call.ai_context:
+        _ctx_src = call.ai_context_dict
+        _ctx = {
+            k: _ctx_src[k]
+            for k in (
+                'customer_name', 'company', 'reason', 'department',
+                'urgency', 'additional_info', 'caller_language',
+                'callback', 'callback_reason', 'callback_requested_at',
+            )
+            if _ctx_src.get(k) not in (None, '')
+        }
+        if _ctx:
+            _ctx_b64 = base64.urlsafe_b64encode(
+                json.dumps(_ctx).encode()
+            ).decode()
+            agent_dest += f"&ctx={_ctx_b64}"
+            logger.info(
+                "initial-call: re-injecting stored context (keys: %s) for "
+                "outbound call %s", sorted(_ctx.keys()), call.id,
+            )
+
     post_answer.append(
         # Transfer to AI agent — caller's A-leg runs the AI agent's SWML directly
         {
             "transfer": {
-                "dest": f"{base_url}{initial_handler}?call_db_id={call.id}&ctk={_ctk}"
+                "dest": agent_dest
             }
         }
     )

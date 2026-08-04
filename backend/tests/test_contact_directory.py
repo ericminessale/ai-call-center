@@ -240,3 +240,27 @@ def test_unusable_number_creates_nothing(ws_app):
     assert resolve_contact(ws_id, '123') is None
     assert resolve_contact(ws_id, None) is None
     assert Contact.query.filter_by(workspace_id=ws_id).count() == 0
+
+
+# --------------------------------------------------------------------------
+# Callers must survive an unkeyable number
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize('unkeyable', [
+    'anonymous',    # withheld caller ID — SignalWire really does send this
+    'unavailable',
+    '911',          # short code
+    'sip:someone@example.com',
+])
+def test_unkeyable_caller_returns_none_rather_than_raising(ws_app, unkeyable):
+    """REGRESSION GUARD for the callers, not this function.
+
+    resolve_contact returning None introduced a branch that did not exist when
+    every path unconditionally constructed a Contact. api/swml.py kept updating
+    contact.last_interaction_at outside the None check, so a withheld caller ID
+    raised AttributeError inside the inbound SWML response and dropped the
+    call. Anything calling this must handle None.
+    """
+    _app, ws_id = ws_app
+    assert resolve_contact(ws_id, unkeyable) is None
+    assert Contact.query.filter_by(workspace_id=ws_id).count() == 0

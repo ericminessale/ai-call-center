@@ -3,7 +3,13 @@ Flask==3.1.3
 Flask-SQLAlchemy==3.1.1
 Flask-Migrate==4.0.5
 Flask-CORS==6.0.0
-Flask-SocketIO==5.5.1
+# 5.6.1, NOT 5.5.1: 5.5.1 assigns `ctx.session`, which Flask 3.1 made a
+# read-only property. Every Socket.IO CONNECT handler raised
+# "AttributeError: property 'session' of 'RequestContext' object has no setter",
+# so no client joined any room and ALL realtime was silently dead. 5.6.1 assigns
+# `ctx._session` when present (upstream comment: "for Flask >= 3.1.3"). If Flask
+# is ever pinned back below 3.1, this may move too — they go together.
+Flask-SocketIO==5.6.1
 python-socketio[client]==5.16.2
 Flask-Bcrypt==1.0.1 
  

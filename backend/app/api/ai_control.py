@@ -536,13 +536,28 @@ def outbound_ai_swml(call_id):
 
     # Encode context as base64 query param (same pattern as queue routing)
     if context:
+        # F-12/F-13: bound every value so the transfer URL stays under
+        # proxy/platform limits, and stamp a context version. Notes get the
+        # biggest budget — they're the outbound briefing.
+        def _clamp_ctx(key, value):
+            if not isinstance(value, str):
+                return value
+            limit = 400 if key in ('notes', 'additional_context') else 200
+            return value if len(value) <= limit else value[:limit - 3] + '...'
+        context = {k: _clamp_ctx(k, v) for k, v in context.items()}
+        context['ctxv'] = 1
         context_json = json.dumps(context)
         context_b64 = base64.urlsafe_b64encode(context_json.encode()).decode()
         agent_url = f"{agent_url}&ctx={context_b64}"
 
     status_callback = signed_webhook_url(f"{base_url}/api/webhooks/call-status")
 
-    logger.info(f"Outbound AI SWML: transferring to {agent_url}")
+    # Keys only (F-03): the full URL embeds base64 contact context — base64
+    # is encoding, not redaction, and info logs are a durable sink.
+    logger.info(
+        "Outbound AI SWML: transferring to %s (ctx keys: %s)",
+        agent_route, sorted(context.keys()) if context else [],
+    )
 
     # AMD before the AI transfer: outbound AI must not deliver its pitch to a
     # voicemail greeting. detect_result: machine → short message + hangup via
@@ -624,6 +639,19 @@ def initiate_outbound_ai_call():
         agent_type = data.get('agent_type', 'sales')
         context = data.get('context', {})
 
+        # F-02: contact_id is client input — resolve it in the caller's
+        # workspace BEFORE binding it to the Call. A foreign/unknown id is
+        # dropped, not stored: the terminal-path memory writers key off
+        # call.contact_id and must never be steerable cross-tenant.
+        if contact_id:
+            from app.models import Contact
+            if Contact.query.get(contact_id) is None:
+                logger.warning(
+                    "outbound-call: dropping unresolvable contact_id %r "
+                    "(not in caller's workspace)", contact_id,
+                )
+                contact_id = None
+
         # Demo outbound gate: FORCE the destination to the workspace's own
         # verified number — the client can't dial anywhere else, and doesn't
         # even need to know the full number (the UI only shows it masked).
@@ -689,7 +717,8 @@ def initiate_outbound_ai_call():
         swml_url = signed_webhook_url(f"{base_url}/api/ai/outbound-swml/{call.id}")
         status_callback = signed_webhook_url(f"{base_url}/api/webhooks/call-status")
 
-        logger.info(f"SWML URL for outbound AI call: {swml_url}")
+        # Path only (F-03): signed_webhook_url embeds Basic credentials.
+        logger.info("SWML URL for outbound AI call: /api/ai/outbound-swml/%s", call.id)
 
         # Dial the customer using SignalWireAPI (correct command/params format)
         sw_api = get_signalwire_api()

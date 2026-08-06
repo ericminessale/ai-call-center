@@ -8,7 +8,7 @@ from app.utils.decorators import require_auth, require_permission, require_role,
 from app.utils.demo_config import is_demo_mode, block_in_demo_mode, DEMO_BLOCKED_RESPONSE
 from app.utils.rate_limit import rate_limit
 from app.utils.feature_flags import require_coach_enabled
-from app.utils.webhook_auth import require_internal_auth
+from app.utils.webhook_auth import internal_service_auth, require_internal_auth
 from app.utils.moderation import is_text_acceptable
 from app.utils.url_utils import get_base_url, signed_webhook_url
 from app.services.queue_service import QueueService
@@ -373,6 +373,7 @@ def kb_search(call_id):
     try:
         resp = http_requests.post(
             f"{ai_agents_url}/search",
+            auth=internal_service_auth(),
             json={
                 'collection_name': collection_name,
                 'query': query,
@@ -449,6 +450,7 @@ def kb_search_from_transcript(call_id):
     try:
         resp = http_requests.post(
             f"{ai_agents_url}/search",
+            auth=internal_service_auth(),
             json={
                 'collection_name': collection_name,
                 'query': query,
@@ -896,6 +898,11 @@ def end_call(call_id):
         CallLeg.end_all_open(call.id, reason='hangup')
         db.session.commit()
         logger.info(f"Call status updated to 'completed' in database")
+
+        # F-05: manual end doesn't reliably trigger the 'ended' webhook (see
+        # comment above) — finalize caller memory here as well (idempotent).
+        from app.services.contact_enrichment import finalize_call_memory
+        finalize_call_memory(call)
 
         # Redis queue cleanup — /end sets status='completed' directly, which does
         # NOT trigger the webhook cleanup path (that fires on SignalWire's 'ended'
@@ -1478,6 +1485,16 @@ def update_call_status(call_id):
         db.session.commit()
         logger.info(f"Call {call_id} status updated: {old_status} -> {new_status}")
 
+        # A-3 (verification audit): this is the AGENT DESKTOP's authoritative
+        # end-of-call write — CallFabricContext posts status='ended' from the
+        # SDK teardown handlers precisely because SignalWire's call-state
+        # webhook "may be delayed or not arrive". Without finalizing here, a
+        # call ended this way never reconciles stats, never enters the
+        # interaction digest, and never reaches the history index. No-ops for
+        # non-terminal statuses.
+        from app.services.contact_enrichment import finalize_call_memory
+        finalize_call_memory(call)
+
         # Emit update to the call's workspace
         from app import socketio
         from app.services.ws_rooms import workspace_room
@@ -1672,11 +1689,16 @@ def update_wrap_up(call_id):
                 }), 422
 
         # Look up by numeric ID first, then SignalWire call_sid.
+        # F-07: FOR UPDATE — this handler and the post-prompt webhook both
+        # read-merge-write disposition/notes/wrap_up_source; the row lock
+        # makes "human wins" actually atomic instead of commit-order luck.
         call = None
         if str(call_id).isdigit():
-            call = db.session.query(Call).filter_by(id=int(call_id)).first()
+            call = db.session.query(Call).filter_by(
+                id=int(call_id)).with_for_update().first()
         if not call:
-            call = Call.find_by_sid(call_id)
+            call = db.session.query(Call).filter_by(
+                signalwire_call_sid=call_id).with_for_update().first()
         if not call:
             return jsonify({'error': 'Call not found'}), 404
 
@@ -1794,6 +1816,12 @@ def cleanup_stale_calls():
             cleaned_count += 1
 
         db.session.commit()
+
+        # F-05: reaped calls still deserve memory finalization — their
+        # summaries (if any) should reach the digest/index like any end.
+        from app.services.contact_enrichment import finalize_call_memory
+        for call in stale_calls:
+            finalize_call_memory(call)
 
         # Emit updates for cleaned calls
         from app.services.callcenter_socketio import emit_call_update

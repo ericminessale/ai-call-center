@@ -230,17 +230,34 @@ def create_callback():
             if data.get('caller_name'):
                 cb.caller_name = data['caller_name']
             if data.get('contact_id'):
-                cb.contact_id = data['contact_id']
+                # F-02: client input — bind only a contact resolvable in the
+                # caller's workspace; drop foreign/unknown ids.
+                if Contact.query.get(data['contact_id']) is not None:
+                    cb.contact_id = data['contact_id']
+                else:
+                    logger.warning(
+                        'create_callback: dropping unresolvable contact_id %r',
+                        data['contact_id'],
+                    )
         else:
             # Pure-API create (e.g., agent schedules a proactive callback for
             # a contact without a current call).
             ai_context = data.get('ai_context')
+            requested_contact_id = data.get('contact_id')
+            if requested_contact_id and \
+                    Contact.query.get(requested_contact_id) is None:
+                # F-02: same guard as above.
+                logger.warning(
+                    'create_callback: dropping unresolvable contact_id %r',
+                    requested_contact_id,
+                )
+                requested_contact_id = None
             cb = Callback(
                 phone_number=phone_number,
                 caller_name=data.get('caller_name'),
                 reason=data.get('reason'),
                 queue_id=data.get('queue_id'),
-                contact_id=data.get('contact_id'),
+                contact_id=requested_contact_id,
                 ai_context=json.dumps(ai_context) if isinstance(ai_context, dict) else ai_context,
                 requested_at=datetime.utcnow(),
                 expires_at=_compute_expiry(data.get('expiry_hours', 24)),
@@ -517,6 +534,18 @@ def dial_callback(callback_id):
 
         # Record a Call row for the outbound leg, linked back to the
         # originating callback for reporting.
+        # R3 (CONTEXT_AUDIT_2026-08-04): enrich the carried context so the
+        # AI opens by RETURNING the call instead of asking who they are —
+        # initial-call forwards these keys to the agent as ?ctx=.
+        cb_ctx = dict(cb.ai_context_dict or {})
+        if cb.caller_name and not cb_ctx.get('customer_name'):
+            cb_ctx['customer_name'] = cb.caller_name
+        cb_ctx['callback'] = True
+        if cb.reason:
+            cb_ctx['callback_reason'] = cb.reason
+        if cb.requested_at:
+            cb_ctx['callback_requested_at'] = cb.requested_at.isoformat()
+
         outbound_call = Call(
             user_id=request.current_user.id,
             signalwire_call_sid=new_call_id,
@@ -528,7 +557,7 @@ def dial_callback(callback_id):
             status='initiated',
             queue_id=cb.queue_id,
             contact_id=cb.contact_id,
-            ai_context=cb.ai_context,  # carry the captured context forward
+            ai_context=json.dumps(cb_ctx),  # carry the captured context forward
             transcription_active=True,
         )
         db.session.add(outbound_call)

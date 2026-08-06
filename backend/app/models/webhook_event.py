@@ -26,12 +26,18 @@ class WebhookEvent(WorkspaceScoped, db.Model):
         return f'<WebhookEvent {self.event_type} - {self.id}>'
 
     def to_dict(self):
-        """Convert webhook event to dictionary."""
+        """Convert webhook event to dictionary.
+
+        Scrubs on READ as well as on write (see log_event) so rows persisted
+        before the scrub existed can't serve an embedded credential to the
+        webhook-log viewer.
+        """
+        from app.utils.request_logging import scrub_embedded_credentials
         return {
             'id': self.id,
             'call_id': self.call_id,
             'event_type': self.event_type,
-            'payload': self.payload,
+            'payload': scrub_embedded_credentials(self.payload),
             'processed': self.processed,
             'error_message': self.error_message,
             'created_at': self.created_at.isoformat() if self.created_at else None
@@ -39,10 +45,17 @@ class WebhookEvent(WorkspaceScoped, db.Model):
 
     @classmethod
     def log_event(cls, event_type, payload, call_id=None):
-        """Log a webhook event."""
+        """Log a webhook event.
+
+        The payload is stored with ``://user:pass@`` credentials scrubbed:
+        SignalWire echoes our signed callback URLs back inside post-prompt
+        payloads, so the raw body carries the install's WEBHOOK_AUTH secret —
+        which is also the INTERNAL_AUTH fallback and the ctk signing key.
+        """
+        from app.utils.request_logging import scrub_embedded_credentials
         event = cls(
             event_type=event_type,
-            payload=payload,
+            payload=scrub_embedded_credentials(payload),
             call_id=call_id
         )
         db.session.add(event)

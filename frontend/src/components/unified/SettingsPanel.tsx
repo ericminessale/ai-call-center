@@ -316,7 +316,7 @@ export function SettingsPanel() {
         {activeTab === 'external-tools' && showExternalToolsTab && <ExternalToolsTab />}
         {activeTab === 'branding' && <BrandingTab />}
         {activeTab === 'users' && <UserManagementTab canManageUsers={canManageUsers} />}
-        {activeTab === 'webhooks' && <WebhookLogTab />}
+        {activeTab === 'webhooks' && <WebhookLogTab canView={canManageUsers} />}
         {activeTab === 'workspaces' && showWorkspacesTab && <WorkspacesTab />}
       </div>
     </div>

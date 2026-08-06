@@ -230,7 +230,10 @@ services:
       - ./ai-agents:/app
     ports:
       - "8080:8080"
-      - "8081:8081"
+      # Loopback only (F-01): the admin API can read/write caller-memory
+      # collections — never expose it on the LAN. Backend reaches it over
+      # the compose network; host access is for local debugging only.
+      - "127.0.0.1:8081:8081"
     command: python main_agent.py
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

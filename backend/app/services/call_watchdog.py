@@ -144,6 +144,14 @@ def reap_call(call) -> None:
         logger.warning(f"watchdog reap {call_sid}: commit failed: {e}")
         return
 
+    # F-05: a reaped call is still a finished interaction — finalize its
+    # caller memory (stats/digest/index; idempotent, never raises).
+    try:
+        from app.services.contact_enrichment import finalize_call_memory
+        finalize_call_memory(call)
+    except Exception as e:
+        logger.warning(f"watchdog reap {call_sid}: memory finalization failed: {e}")
+
     # Notify the call's workspace (§8.1 — reaps were global broadcasts).
     try:
         from app.services.ws_rooms import workspace_room

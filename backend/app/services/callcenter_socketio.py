@@ -535,6 +535,11 @@ def handle_end_call(data):
                     return
                 call.update_status('ended')
                 db.session.commit()
+                # A-3: registered terminal writer with no shipped emitter
+                # today — finalize here so the first UI that wires it up
+                # doesn't silently skip caller-memory bookkeeping.
+                from app.services.contact_enrichment import finalize_call_memory
+                finalize_call_memory(call)
         except Exception as e:
             logger.error(f"Error ending call: {e}")
 

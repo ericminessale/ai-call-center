@@ -120,9 +120,16 @@ def build_whisper_text(context: dict) -> str:
     if account:
         parts.append(f"Account: {account}")
 
-    # AI summary (brief, if available and nothing else covered it)
+    # AI summary — always spoken when present (F-14: escalations carry the
+    # specialist's work_summary here, and they virtually always ALSO have a
+    # reason, so the old "only if nothing else covered it" gate silently
+    # dropped the briefing on exactly the calls that need it). Bounded so
+    # the whisper stays a briefing, not a lecture.
     summary = context.get('ai_summary')
-    if summary and not issue:
+    if summary:
+        summary = str(summary)
+        if len(summary) > 300:
+            summary = summary[:297] + '...'
         parts.append(summary)
 
     if not parts:
@@ -1096,6 +1103,12 @@ def handle_call_conference_status(conference_name, event_type, participant_call_
             call.update_status('ended')
             db.session.commit()
 
+            # F-05: this terminal path used to bypass caller-memory
+            # finalization (stats/digest/index). Idempotent — safe if the
+            # call-status webhook also fires.
+            from app.services.contact_enrichment import finalize_call_memory
+            finalize_call_memory(call)
+
             # Emit call update
             from app.services.callcenter_socketio import emit_call_update
             emit_call_update(call)
@@ -1278,6 +1291,12 @@ def conference_status_callback(conference_name):
                         logger.info(f"Updated call {call.id} status to 'completed'")
 
                     db.session.commit()
+
+                    # F-05: finalize caller memory on this terminal path too.
+                    from app.services.contact_enrichment import (
+                        finalize_call_memory,
+                    )
+                    finalize_call_memory(call)
 
                     # Emit call_update so frontend removes from active calls
                     emit_call_update(call)
@@ -1555,6 +1574,18 @@ def dial_out_to_conference(conference_name):
     if not phone_number:
         return jsonify({'error': 'phone_number is required'}), 400
 
+    # F-02: contact_id is client input — resolve it in the caller's
+    # workspace before it gets bound to the Call; foreign/unknown ids are
+    # dropped so downstream memory writers can't be steered cross-tenant.
+    if contact_id:
+        from app.models import Contact
+        if Contact.query.get(contact_id) is None:
+            logger.warning(
+                'conference dial-out: dropping unresolvable contact_id %r',
+                contact_id,
+            )
+            contact_id = None
+
     current_user_id = request.current_user.id
 
     from app.utils.demo_config import is_demo_mode
@@ -1750,6 +1781,11 @@ def call_state_webhook(conference_name):
         logger.info(f"Call {call.id} status: {old_status} -> {new_status}")
 
         db.session.commit()
+
+        # F-05: dial-out terminal events bypass /api/webhooks/call-status —
+        # finalize caller memory here (no-op for non-terminal states).
+        from app.services.contact_enrichment import finalize_call_memory
+        finalize_call_memory(call)
 
         # Emit update to frontend
         emit_call_update(call)

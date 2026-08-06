@@ -15,11 +15,32 @@ interface IncomingCallBannerProps {
   whisperMode?: boolean;
 }
 
+interface DigestEntry {
+  ended_at?: string;
+  reason?: string;
+  summary?: string;
+  disposition?: string;
+}
+
 interface ContactInfo {
   displayName: string;
   company?: string;
   isVip?: boolean;
   accountTier?: string;
+  totalCalls?: number;
+  interactionDigest?: DigestEntry[];
+}
+
+// "2d ago" style age for the last-interaction chip; empty when unparseable.
+function ageLabel(iso?: string): string {
+  if (!iso) return '';
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return '';
+  const days = Math.floor((Date.now() - then) / 86_400_000);
+  if (days <= 0) return 'today';
+  if (days < 7) return `${days}d ago`;
+  if (days < 30) return `${Math.floor(days / 7)}w ago`;
+  return `${Math.floor(days / 30)}mo ago`;
 }
 
 export function IncomingCallBanner({
@@ -37,10 +58,11 @@ export function IncomingCallBanner({
   const [isLookingUp, setIsLookingUp] = useState(!callerName);
 
   useEffect(() => {
-    if (callerName) {
-      setIsLookingUp(false);
-      return;
-    }
+    // F-11: ALWAYS look the contact up. Queue assignments pass the
+    // AI-collected name as callerName, and the old early-return skipped the
+    // lookup for exactly those known callers — starving the VIP star, tier,
+    // and Returning/history line on the path most likely to have history.
+    // callerName still wins for display; the lookup only adds context.
     const lookupContact = async () => {
       try {
         const response = await contactsApi.lookup(phoneNumber);
@@ -51,6 +73,8 @@ export function IncomingCallBanner({
             company: data.company,
             isVip: data.isVip,
             accountTier: data.accountTier,
+            totalCalls: data.totalCalls,
+            interactionDigest: data.interactionDigest,
           });
         }
       } catch {
@@ -152,6 +176,24 @@ export function IncomingCallBanner({
                       <span className="capitalize">{contactInfo.accountTier}</span>
                     </>
                   )}
+                  {/* R4/G7: returning-caller recognition at answer time —
+                      digest holds terminal calls only, so it never counts
+                      the call that's ringing right now. */}
+                  {(contactInfo?.interactionDigest?.length ?? 0) > 0 && (() => {
+                    const last = contactInfo!.interactionDigest![0];
+                    const topic = (last.reason || last.summary || '').slice(0, 48);
+                    const age = ageLabel(last.ended_at);
+                    return (
+                      <>
+                        <span className="text-ink-faint">·</span>
+                        <span className="text-sw-turquoise">
+                          Returning
+                          {topic && <> · last: {topic}</>}
+                          {age && <span className="text-ink-faint"> · {age}</span>}
+                        </span>
+                      </>
+                    );
+                  })()}
                   {isFromQueue && (
                     <>
                       <span className="text-ink-faint">·</span>

@@ -7,6 +7,7 @@ from app.models.document import DocumentCollection, Document, AgentCollectionAss
 from app.models.queue import Queue, QueueAgentAssignment
 from app.models.user import ADMIN_SURFACE_ROLES
 from app.utils.decorators import require_auth, require_full_admin, require_role
+from app.utils.webhook_auth import internal_service_auth
 from app.utils.jwt_utils import verify_token
 from app.utils.rate_limit import rate_limit
 from app.utils.url_utils import get_base_url
@@ -752,6 +753,7 @@ def reindex_collection(collection_id):
         logger.info(f"Triggering reindex for collection '{collection.name}' with {len(documents)} documents")
         resp = http_requests.post(
             f"{AI_AGENTS_ADMIN_URL}/reindex",
+            auth=internal_service_auth(),
             json=payload,
             timeout=120,  # Embedding can take time
         )
@@ -1766,8 +1768,15 @@ _WEBHOOK_PAGE_LIMIT_MAX = 200
 
 
 @admin_bp.route('/webhook-events', methods=['GET'])
+@require_full_admin
 def list_webhook_events():
     """List webhook events with optional filtering.
+
+    @require_full_admin (2026-08-05, verification audit A-1): raw webhook
+    bodies are the least-filtered data in the product — every tenant's
+    transcripts, numbers, global_data, and (until the scrub) the install's
+    own callback credentials. Hosted-demo *visitors* sit on the admin
+    surface, so the coarse before_request gate is not enough here.
 
     Query params:
         event_type: Substring match against event_type (case-insensitive).
@@ -1816,6 +1825,7 @@ def list_webhook_events():
 
 
 @admin_bp.route('/webhook-events/event-types', methods=['GET'])
+@require_full_admin
 def list_webhook_event_types():
     """Return distinct event_type values for the dropdown filter.
 

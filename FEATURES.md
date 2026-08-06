@@ -9,7 +9,7 @@ This is a reference implementation built on **SignalWire's Programmable Unified 
 ## Overview
 
 - **AI-first call handling.** Inbound callers reach an AI receptionist that gathers name, preferred language, and intent, then routes to a specialist — AI or human — with full context carried forward.
-- **Hybrid routing.** Four queue strategies (FIFO, Round-Robin, Priority-Based, Skill-Based) with per-queue SLA thresholds, AI fallbacks when waits exceed limits, and language-matched agent preference.
+- **Hybrid routing.** Four queue strategies (FIFO, Round-Robin, Priority-Based, Skill-Based) with per-queue SLA thresholds, automatic callback enrollment when waits exceed the cap, and language-matched agent preference.
 - **One runtime for everything.** Calls are stateful objects on SignalWire's control plane — no external state machines, no middleware reassembly, no separate "AI provider" and "telephony provider."
 - **Browser-based agent desktop.** WebRTC softphone, real-time transcription, sentiment tracking, live event stream, and in-call controls — all in a dark-themed React UI designed for dense operator use.
 
@@ -50,7 +50,7 @@ Every strategy runs **after** a language-preference pass: the router first narro
 Additional per-queue knobs:
 
 - **SLA threshold** — time the caller can wait before the queue is considered at risk.
-- **Max wait before AI fallback** — after this threshold, the caller is transferred to a queue-specific AI agent instead of waiting longer.
+- **Max wait cap → callback enrollment** — after this threshold, the still-waiting caller is auto-enrolled in the callback queue, hears an announcement, and the call ends. (The config field is named `max_wait_before_ai_fallback` for historical reasons, but it does NOT hand the caller to an AI agent — redirecting a live waiting leg to new SWML isn't possible; see `queue_dispatch._offer_callback_and_release`.)
 - **Default priority** — seeds the priority attribute on new calls into this queue.
 - **AI agent route** — which AI agent handles the fallback path.
 - **Per-agent skill levels** — 0–10, used by skill-based routing.
@@ -114,6 +114,14 @@ Five AI agents ship out-of-box; all are Python-defined using the SignalWire Agen
 - Caller name, intent, language, and any additional data collected by one agent are passed through to the next via SWML `global_data`.
 - Context survives AI-to-AI transfers (receptionist → sales-AI), AI-to-human transfers (hands off to agent with full background), and human-to-AI handoffs (agent can re-hand a call back to an AI specialist).
 - When a human agent picks up a transferred call, a **pre-join TTS whisper** speaks the collected context into their ear *before* they enter the conference — they walk in knowing who's on the other end and why.
+- **Returning-caller memory (2026-08-04).** Inbound calls now resolve the caller's contact server-side and inject a tiered memory block into the AI (`/internal/call-context` → `global_data` + a "Known Caller" prompt section): known callers are greeted by confirmation ("Am I speaking with Fred?") instead of interrogation, and after they confirm, the AI may offer the last call's topic once — recent, non-spam topics only. Caller ID is treated as a hint, never verification; `Contact.notes`/`custom_fields` are deliberately excluded from the payload.
+- **AI-only calls learn.** The post-prompt now lifts confirmed name/company/language onto the Contact with the same no-clobber rules as queue transfers (shared `contact_enrichment` service) — an AI-resolved call finally updates durable customer identity. AI prose never touches `Contact.notes` (human-curated).
+- **Callback dials open with context.** A dialed callback re-injects the snapshotted context (name, reason, callback flag) so the AI opens by *returning* the call about the stated reason rather than asking who they are.
+- **Escalations carry the specialist's work.** `escalate_to_human` now captures a current `work_summary` (steps tried, results, next step) at transfer time; it renders in the AgentContextCard and pre-join whisper, so callers stop repeating themselves to the human.
+- **Multi-agent summaries compose.** Each AI session's assessment is kept under `ai_context.session_summaries`; prose summary/notes append labeled sections instead of first-write-wins, and the latest AI disposition wins unless a human saved one. Contact call counts increment once per call (creation-site only) and reconcile from truth at call end.
+- **Interaction digest (2026-08-04).** Every contact carries a rolling, token-bounded digest of their last 3 terminal calls (reason, outcome, one-line summary), regenerated at call end. One producer, three consumers: the AI's Known Caller context, the agent desktop's ring-time banner ("Returning · last: vacuum suction · 2d ago"), and — by construction — the future chat kernel.
+- **Language memory (2026-08-05).** `Contact.preferred_language` is a durable, human-settable language for a caller (the AI seeds it from a call while empty and never overwrites a human's value). On a later call the agent **opens in that language** — the per-request language list is reordered so the right voice speaks first — then offers English in one short phrase, because a phone number is not a person: if the caller answers in English the AI switches immediately and re-stamps the call's language. Applies only when the documented language is non-English *and* one the agent actually speaks; anything else opens in English exactly as before. Backfilled from existing call history, so callers who already told us once benefit on their next call.
+- **Caller-history search (2026-08-04).** AI specialists on calls with an identified returning caller get a `search_caller_history` tool over a per-workspace pgvector index of past-call summaries, hard-filtered server-side to that contact. For "I called months ago about..." moments the digest can't hold; the AI is instructed to search before making the caller re-explain.
 
 ### Mid-call AI message injection
 
@@ -218,6 +226,8 @@ Ten languages configured by default: English (US), Spanish, French, German, Ital
 
 A per-call AI copilot for the human agent, built on SignalWire's `ai_sidecar` — the coach hears the live call audio and pushes help into the agent's UI without ever speaking on the call.
 
+> **Off by default.** The Coach is gated behind the `COACH_ENABLED` env flag and disabled in hosted demo mode (pre-release platform verb, per-minute billing). The KB Factbook below is independent of that flag and always available.
+
 - **Modes**: off / on-request / auto, selectable per agent. Auto mode volunteers suggestions as the conversation develops; on-request answers only when asked.
 - **Coaching suggestions** stream into the Coach panel in real time as the sidecar observes the call.
 - **Ask Coach** — the agent types a question mid-call and gets an answer grounded in the live conversation context.
@@ -277,7 +287,7 @@ The Settings tab is the complete configuration surface. Admin-only.
 ### Queues
 
 - Create, edit, and delete queues.
-- Configure routing strategy, SLA threshold, AI fallback route, default priority, max wait before AI fallback.
+- Configure routing strategy, SLA threshold, AI agent route, default priority, max wait cap (auto-callback enrollment).
 - Assign agents to queues with per-queue skill levels (0–10) used by skill-based routing.
 
 ### AI Agents
@@ -299,7 +309,7 @@ Bridge customer-owned MCP (Model Context Protocol) servers into agents. Each row
 - Per-agent binding — pick which agents (receptionist, sales-ai, support-ai, outbound-sales, outbound-support) should load each gateway.
 - Connection test — probes the gateway's `/services` endpoint with the configured credentials and lists the services + tools it exposes inline. Confirms the connection is live before committing to the binding.
 - Encrypted at rest — passwords and bearer tokens stored via the same Fernet helper as other secrets.
-- Loaded at agent boot via the SDK's `mcp_gateway` skill — no code changes, no rebuild. Restart the agent to pick up new gateways or binding changes.
+- Attached **per request** via the SDK's `mcp_gateway` skill from the call's workspace config — no code changes, no rebuild, no restart; gateway/binding changes apply to the next call.
 
 **Bundled "DemoShop" gateway** ships in docker-compose so the feature works the moment the cloner runs `docker-compose up`. A small SQLite-backed e-commerce backend exposes six tools: `find_customer_by_phone`, `get_order`, `list_recent_orders`, `track_shipment`, `start_return`, `check_inventory`. Pre-seeded customers, products, and orders. Pre-bound to the sales + support AI specialists. The cloner sees a working "Test" button on first login. Replace with a real gateway when ready (see `demo-mcp/README.md`).
 
@@ -327,11 +337,12 @@ Every inbound SignalWire webhook is logged as a `WebhookEvent` row and browsable
 
 ## Security & access control
 
-### Three roles
+### Four roles
 
 - **Admin** — full access to every configuration surface; can edit any user.
 - **Supervisor** — sees the Supervisor tab and observer actions on other users' calls; no admin configuration access.
 - **Agent** — participates in calls; default observer permissions are off.
+- **Visitor** (hosted demo only) — an anonymous demo persona: workspace-scoped admin surface with the destructive/platform routes carved out via `@require_full_admin`. Included in `SUPERVISORY_ROLES`, so supervisor surfaces also admit it in demo mode.
 
 ### Gating layers
 
@@ -396,7 +407,7 @@ Every inbound SignalWire webhook is logged as a `WebhookEvent` row and browsable
 - **Call Fabric** for all voice — phone numbers, SIP endpoints, subscribers, conferences, routing resources all addressable through one API.
 - **SWML** (SignalWire Markup Language) for declarative call-flow definition, in use across every entry point.
 - **Agents SDK** for AI agent definitions, SWAIG function tool-calling, Prompt Object Model, multilingual support.
-- **REST SDK** (`signalwire-sdk`) for all platform management — phone number configuration, subscriber CRUD, Fabric resource management, DataSphere access. No raw HTTP; the app uses the canonical SDK throughout.
+- **REST SDK** (`signalwire-sdk`) for platform management — phone number configuration, subscriber CRUD, Fabric resource management, DataSphere access (`services/signalwire_client.py`). Call control (`services/signalwire_api.py`) drives the Calling API over direct HTTP.
 - **Fabric resource auto-sync** — a backend service keeps managed SWML Webhook resources pointed at the current external URL so the call center works through ngrok tunnel rotation without manual dashboard edits.
 
 ### Deployment

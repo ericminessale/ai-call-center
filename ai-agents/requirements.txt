@@ -1,6 +1,9 @@
 # signalwire-sdk is the new SDK on PyPI (provides the `signalwire`
 # import — distinct from the legacy 2.x `signalwire` package).
-signalwire-sdk>=3.0.1
+# Upper-bounded (F-13): caller-memory injection relies on set_global_data
+# MERGE semantics and per-request ephemeral tool registries — verified for
+# the 3.x line; a silent major-version jump must not change them under us.
+signalwire-sdk>=3.0.1,<4
 fastapi
 uvicorn[standard]
 python-dotenv

@@ -5,8 +5,12 @@ from app.models import Call, CallLeg, Transcription, WebhookEvent
 from app.models.user import User
 from app.services.knowledge import DEFAULT_KB_COLLECTION, kb_collection_for_queue
 from app.services.redis_service import publish_event
-from app.utils.request_logging import mask_phone, request_summary
-from app.utils.webhook_auth import require_webhook_auth
+from app.utils.request_logging import (
+    mask_phone,
+    request_summary,
+    scrub_embedded_credentials,
+)
+from app.utils.webhook_auth import internal_service_auth, require_webhook_auth
 from datetime import datetime
 from typing import Optional
 import logging
@@ -54,7 +58,10 @@ def capture_webhook_payload(kind: str, payload, *, latest: bool = True,
     try:
         record = {
             'captured_at': datetime.utcnow().isoformat() + 'Z',
-            'payload': payload,
+            # Scrubbed like the DB copy (A-1): SignalWire echoes our signed
+            # callback URLs back in post-prompt payloads, and the embedded
+            # credential has no debug value — the URL shape does.
+            'payload': scrub_embedded_credentials(payload),
         }
         with _capture_lock:
             os.makedirs(_CAPTURE_DIR, exist_ok=True)
@@ -126,6 +133,7 @@ def _trigger_kb_auto_search_if_enabled(call, call_sid_str):
     try:
         resp = http_requests.post(
             f"{ai_agents_url}/search",
+            auth=internal_service_auth(),
             json={
                 'collection_name': kb_collection_for_queue(
                     call.queue_id, call.workspace_id),
@@ -389,6 +397,16 @@ def call_status():
                     db.session.commit()
                     logger.info(f"Closed {closed_count} open leg(s) for call {call.id}")
 
+                # R2/G6: reconcile denormalized contact stats from truth at
+                # call end — the ad-hoc += sites now fire only at row
+                # creation; this snaps count/last-interaction/sentiment back
+                # to reality no matter what the increments did.
+                # R2/R4/R5 via the shared finalizer (F-05): ws-checked
+                # contact, stats reconcile, digest, index push — idempotent,
+                # so the post-prompt re-running it later is fine.
+                from app.services.contact_enrichment import finalize_call_memory
+                finalize_call_memory(call)
+
                 # Mark the conference row as ended too. Same negligence pattern
                 # as Bug B: prior code left Conference rows in 'active' forever
                 # because nothing wrote the terminal status on call end. The
@@ -582,6 +600,14 @@ def _apply_ai_wrapup_summary(data, summary_text):
         logger.warning(f"conversation_summary emit failed: {e}")
 
 
+# Transcript text of the AI→human handoff marker row (speaker='system').
+# Inserted by _process_utterance_event at the first human-agent utterance that
+# follows AI utterances, so transcripts show where the human took over. The
+# frontends render 'system' rows as a divider, and
+# Transcription.get_full_transcript excludes them (nobody said this out loud).
+HANDOFF_MARKER_TEXT = 'Human agent took over the call'
+
+
 def _process_utterance_event(data, *, source: str) -> tuple:
     """Persist + emit a SignalWire transcription utterance event.
 
@@ -667,8 +693,46 @@ def _process_utterance_event(data, *, source: str) -> tuple:
     ).order_by(Transcription.sequence_number.desc()).first()
     sequence = (last_trans.sequence_number + 1) if last_trans else 0
 
-    # Map role to speaker format expected by frontend
-    speaker = 'caller' if role == 'remote-caller' else 'agent'
+    # Map role to speaker format expected by frontend. 'remote-caller' is
+    # always the caller; the other side is whoever is handling the call RIGHT
+    # NOW. The same live_transcribe session spans the AI→human handoff (it's
+    # started once on the caller's A-leg and survives the conference join —
+    # see queue_dispatch.enqueue_and_build_swml), so the decision must be made
+    # per-utterance from Call.handler_type, never derived once per session.
+    # handler_type (not CallLeg) is the authority here: the queue handoff path
+    # never closes the ai_agent leg, so "an AI leg is active" stays true long
+    # after a human took over.
+    if role == 'remote-caller':
+        speaker = 'caller'
+    elif call.handler_type == 'ai':
+        speaker = 'ai'
+    else:
+        speaker = 'agent'
+
+    # AI→human handoff marker: when the first human-side utterance lands after
+    # AI-side ones, insert a 'system' divider row ahead of it so the transcript
+    # shows where the human picked up. Detecting the boundary from persisted
+    # rows keeps this agnostic to which control path did the handoff (queue
+    # take, direct takeover, conference join) and self-limiting — once the
+    # marker exists, the previous non-caller row is 'system' or 'agent', so it
+    # can't re-fire.
+    handoff_marker = None
+    if speaker == 'agent':
+        prev_non_caller = db.session.query(Transcription).filter(
+            Transcription.call_id == call.id,
+            Transcription.speaker.in_(('ai', 'agent', 'system')),
+        ).order_by(Transcription.sequence_number.desc()).first()
+        if prev_non_caller is not None and prev_non_caller.speaker == 'ai':
+            handoff_marker = Transcription(
+                call_id=call.id,
+                transcript=HANDOFF_MARKER_TEXT,
+                is_final=True,
+                sequence_number=sequence,
+                speaker='system',
+                language=language
+            )
+            db.session.add(handoff_marker)
+            sequence += 1
 
     # Save transcription
     transcription = Transcription(
@@ -689,7 +753,19 @@ def _process_utterance_event(data, *, source: str) -> tuple:
     )
 
     # Emit transcription to call room (all agents viewing this call have
-    # joined this room)
+    # joined this room). The handoff marker goes out first so live viewers see
+    # the divider land in the same spot history readers will.
+    if handoff_marker is not None:
+        socketio.emit('transcription', {
+            'call_sid': call_id,
+            'text': HANDOFF_MARKER_TEXT,
+            'confidence': None,
+            'is_final': True,
+            'sequence': handoff_marker.sequence_number,
+            'role': 'system',
+            'speaker': 'system',
+            'timestamp': timestamp
+        }, room=call_id)
     transcription_data = {
         'call_sid': call_id,
         'text': text,
@@ -697,7 +773,8 @@ def _process_utterance_event(data, *, source: str) -> tuple:
         'is_final': is_final,
         'sequence': sequence,
         'role': role,
-        'speaker': speaker,  # 'caller' or 'agent' (mapped from role)
+        # 'caller' | 'ai' | 'agent' — mapped from role + current handler_type
+        'speaker': speaker,
         'timestamp': timestamp
     }
     socketio.emit('transcription', transcription_data, room=call_id)
@@ -941,6 +1018,13 @@ def queue_status():
             except Exception as e:
                 db.session.rollback()
                 logger.warning(f"queue-status: failed to persist Call row: {e}")
+            else:
+                # A-3: the abandoned-in-queue terminal for bridge-transport
+                # queues arrives HERE and nowhere else — finalize the caller's
+                # memory. Outside the try/except above so a finalize failure
+                # can't trigger that rollback (it handles its own).
+                from app.services.contact_enrichment import finalize_call_memory
+                finalize_call_memory(call)
 
         # Emit Socket.IO for the dashboard. Frontend Queue tab listens for
         # `queue_update` with action='added'/'ended'/'updated'. 'added' is
@@ -1270,6 +1354,10 @@ def coach_lookup_kb():
         try:
             resp = http_requests.post(
                 f"{ai_agents_url}/search",
+                # F-01: the admin API is authenticated now — without these
+                # creds this lookup 401s. (Missed on the first pass: this call
+                # site is nested deeper than the other /search callers.)
+                auth=internal_service_auth(),
                 json={
                     'collection_name': collection_name,
                     'query': query,
@@ -1361,8 +1449,17 @@ def post_prompt():
         logger.info(f"Caller: {caller_id_name} ({caller_id_num})")
         logger.info(f"Global data keys: {list(global_data.keys())}")
 
-        # Find the call in database
-        call = Call.find_by_sid(call_id) if call_id else None
+        # Find the call in database.
+        # F-07: FOR UPDATE — concurrent post-prompts (triage + specialist
+        # sessions of one call can end near-simultaneously) and the human
+        # wrap-up PUT all read-merge-write the same JSON/wrap-up columns;
+        # the row lock serializes them. SQLite (tests) ignores it.
+        call = (
+            db.session.query(Call)
+            .filter_by(signalwire_call_sid=call_id)
+            .with_for_update()
+            .first()
+        ) if call_id else None
 
         if call:
             # Update call with post_prompt data
@@ -1384,7 +1481,12 @@ def post_prompt():
                 ai_assessment = parsed_summary[0] if isinstance(parsed_summary[0], dict) else {}
                 ai_filled_wrapup = False
                 raw_disp = (ai_assessment.get('disposition') or '').strip()
-                if raw_disp and not call.disposition_code:
+                # G10: latest AI session wins (the specialist's 'resolved'
+                # must beat triage's 'transferred') — but a human's saved
+                # disposition (wrap_up_source='agent') is never overwritten.
+                if raw_disp and (
+                    not call.disposition_code or call.wrap_up_source != 'agent'
+                ):
                     # Validate against the canonical list — defensive; the LLM
                     # was told to pick from that list but might hallucinate.
                     from app.api.calls import DISPOSITION_CODE_SET
@@ -1400,24 +1502,110 @@ def post_prompt():
                             f"for call {call.id}; ignoring"
                         )
                 post_mortem = (ai_assessment.get('post_mortem') or '').strip()
-                if post_mortem and not call.agent_notes:
-                    call.agent_notes = post_mortem
-                    ai_filled_wrapup = True
-                    logger.info(
-                        f"post_prompt: AI post_mortem auto-filled into agent_notes "
-                        f"for call {call.id} ({len(post_mortem)} chars)"
-                    )
+                if post_mortem:
+                    if not call.agent_notes:
+                        call.agent_notes = post_mortem
+                        ai_filled_wrapup = True
+                        logger.info(
+                            f"post_prompt: AI post_mortem auto-filled into agent_notes "
+                            f"for call {call.id} ({len(post_mortem)} chars)"
+                        )
+                    elif (
+                        call.wrap_up_source != 'agent'
+                        and post_mortem not in call.agent_notes
+                    ):
+                        # G10: a second AI session (specialist after triage)
+                        # used to be dropped by first-write-wins. Append it
+                        # labeled instead — never touch a human-owned note.
+                        call.agent_notes = (
+                            f"{call.agent_notes}\n\n[{app_name or 'AI session'}] {post_mortem}"
+                        )
+                        ai_filled_wrapup = True
                 # Explicit provenance for the "Captured by AI" badge — stamped
                 # only when we actually auto-filled this pass and a human hasn't
                 # already claimed the wrap-up.
                 if ai_filled_wrapup and not call.wrap_up_source:
                     call.wrap_up_source = 'ai'
 
+            # G10: a call can get post-prompts from BOTH the receptionist and
+            # a specialist. Keep every session's structured assessment keyed
+            # by agent (parsed_summary stays last-write for compatibility).
+            if parsed_summary and len(parsed_summary) > 0:
+                sessions = merged_context.get('session_summaries') or {}
+                # F-07: the same agent can produce more than one session on
+                # a call (hand-back flows) — uniquify instead of overwrite.
+                session_key = app_name or f"session-{len(sessions) + 1}"
+                if session_key in sessions:
+                    suffix = str(ai_session_id)[:8] if ai_session_id else str(len(sessions) + 1)
+                    session_key = f"{session_key}#{suffix}"
+                sessions[session_key] = parsed_summary[0]
+                merged_context['session_summaries'] = sessions
             call.ai_context = json.dumps(merged_context)
 
-            # If we have a raw summary and no existing summary, use it
-            if raw_summary and not call.summary:
-                call.summary = raw_summary
+            # Prose summary: first writer keeps the field; later AI sessions
+            # append a labeled section instead of being dropped (G10).
+            if raw_summary:
+                if not call.summary:
+                    call.summary = raw_summary
+                elif raw_summary.strip() and raw_summary.strip() not in call.summary:
+                    call.summary = (
+                        f"{call.summary}\n\n[{app_name or 'AI session'}]\n{raw_summary}"
+                    )
+
+            # R2 (CONTEXT_AUDIT_2026-08-04): lift learned identity to the
+            # Contact so AI-only calls finally update durable memory — same
+            # no-clobber rules as the queue-route writer (shared helper).
+            # Deliberately never writes Contact.notes.
+            if call.contact_id:
+                try:
+                    from app.models import Contact
+                    from app.services.contact_enrichment import (
+                        apply_learned_contact_fields,
+                    )
+                    # F-07: lock the contact row too — enrichment is a
+                    # read-check-write (no-clobber) sequence.
+                    contact = (
+                        db.session.query(Contact)
+                        .filter_by(id=call.contact_id)
+                        .with_for_update()
+                        .first()
+                    )
+                    # F-02: refuse cross-workspace enrichment through a
+                    # mis-bound contact_id.
+                    if contact is not None and contact.workspace_id != call.workspace_id:
+                        logger.warning(
+                            "post_prompt: call %s bound to foreign-workspace "
+                            "contact %s — skipping enrichment", call.id, contact.id,
+                        )
+                        contact = None
+                    if contact is not None and apply_learned_contact_fields(
+                        contact,
+                        {
+                            'customer_name': (
+                                ai_assessment.get('customer_name')
+                                or merged_context.get('customer_name')
+                            ),
+                            'company': (
+                                ai_assessment.get('company')
+                                or merged_context.get('company')
+                            ),
+                            'caller_language': (
+                                call.caller_language
+                                or merged_context.get('caller_language')
+                            ),
+                        },
+                    ):
+                        logger.info(
+                            f"post_prompt: contact {contact.id} enriched from AI summary"
+                        )
+                    # Digest/index regeneration moved to the handler TAIL
+                    # (F-04): at this point the outcome routing below may not
+                    # have made the call terminal yet, and the AI-only
+                    # self-ended path would otherwise be skipped forever.
+                except Exception as e:
+                    logger.warning(
+                        f"post_prompt: contact enrichment failed (non-fatal): {e}"
+                    )
 
             # RE-AUDIT-05 fix (2026-06-03): the previous code REMOVED the
             # call from the queue zset here, then immediately below set
@@ -1477,6 +1665,14 @@ def post_prompt():
 
             db.session.commit()
             logger.info(f"✓ Updated call {call.id} with post_prompt data (status: {call.status})")
+
+            # F-04: memory finalization runs AFTER the outcome routing above
+            # — an AI-only call this handler itself just closed (the path
+            # that never gets a separate call-status webhook) is terminal by
+            # now, so its digest/index/stats land. Idempotent with the
+            # call-status finalizer in either arrival order.
+            from app.services.contact_enrichment import finalize_call_memory
+            finalize_call_memory(call)
 
             # Log the webhook event
             WebhookEvent.log_event(

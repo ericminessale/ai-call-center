@@ -382,6 +382,12 @@ def initial_call():
             if _ctx_src.get(k) not in (None, '')
         }
         if _ctx:
+            # F-12/F-13: clamp values (URL budget) + version the envelope.
+            _ctx = {
+                k: (v[:297] + '...' if isinstance(v, str) and len(v) > 300 else v)
+                for k, v in _ctx.items()
+            }
+            _ctx['ctxv'] = 1
             _ctx_b64 = base64.urlsafe_b64encode(
                 json.dumps(_ctx).encode()
             ).decode()

@@ -161,6 +161,27 @@ def chunk_text(text, max_sentences=5):
     return chunks
 
 
+def _ensure_chunks_table(cur, table_name):
+    """Extensions + chunks table DDL shared by full reindex and the
+    single-document interaction upsert (R5)."""
+    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id SERIAL PRIMARY KEY,
+            content TEXT NOT NULL,
+            processed_content TEXT,
+            embedding vector({EMBEDDING_DIM}),
+            filename TEXT,
+            section TEXT,
+            tags JSONB DEFAULT '[]'::jsonb,
+            metadata JSONB DEFAULT '{{}}'::jsonb,
+            metadata_text TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+
 def do_reindex(collection_name, documents, connection_string):
     """Reindex documents into pgvector.
 
@@ -178,25 +199,7 @@ def do_reindex(collection_name, documents, connection_string):
 
     table_name = f"chunks_{collection_name}"
 
-    # Ensure pgvector extension is enabled
-    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-
-    # Create chunks table if needed
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            id SERIAL PRIMARY KEY,
-            content TEXT NOT NULL,
-            processed_content TEXT,
-            embedding vector({EMBEDDING_DIM}),
-            filename TEXT,
-            section TEXT,
-            tags JSONB DEFAULT '[]'::jsonb,
-            metadata JSONB DEFAULT '{{}}'::jsonb,
-            metadata_text TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
+    _ensure_chunks_table(cur, table_name)
 
     # Create collection_config table if needed
     cur.execute("""
@@ -275,10 +278,15 @@ def do_reindex(collection_name, documents, connection_string):
     return total_chunks
 
 
-def do_search(collection_name, query, top_k, connection_string):
+def do_search(collection_name, query, top_k, connection_string, contact_id=None):
     """Vector similarity search against chunks_<collection>. Returns [] if
     the chunks table doesn't exist — that's a normal state for an unindexed
-    collection, not an error."""
+    collection, not an error.
+
+    ``contact_id`` (R5) restricts results to rows whose metadata carries that
+    contact — the HARD tenant/person filter for caller-history search. It is
+    always server-derived (never model/caller input) at the call sites.
+    """
     import psycopg2
 
     if not _COLLECTION_NAME_RE.match(collection_name):
@@ -297,12 +305,19 @@ def do_search(collection_name, query, top_k, connection_string):
         cur.execute("SELECT to_regclass(%s)", (table_name,))
         if cur.fetchone()[0] is None:
             return []
+        where_sql = ""
+        params = [query_embedding]
+        if contact_id is not None:
+            where_sql = "WHERE metadata->>'contact_id' = %s "
+            params.append(str(contact_id))
+        params.extend([query_embedding, top_k])
         cur.execute(
             f"SELECT content, filename, section, metadata, "
             f"1 - (embedding <=> %s::vector) AS score "
             f"FROM {table_name} "
+            f"{where_sql}"
             f"ORDER BY embedding <=> %s::vector LIMIT %s",
-            (query_embedding, query_embedding, top_k),
+            tuple(params),
         )
         return [
             {
@@ -537,13 +552,14 @@ def fetch_call_context(call_db_id, ctk=None):
             payload = resp.json()
         elif resp.status_code == 403:
             # Forged/unsigned call_db_id — do NOT cache (a legit signed
-            # retry for the same id should still resolve).
-            print(f"Warning: call-context {key} rejected (403) — serving template config", flush=True)
+            # retry for the same id should still resolve). Log the call id
+            # only — the cache key embeds the signed ctk (F-17).
+            print(f"Warning: call-context for call {call_db_id} rejected (403) — serving template config", flush=True)
             return None
         else:
-            print(f"Warning: call-context {key} returned HTTP {resp.status_code}", flush=True)
+            print(f"Warning: call-context for call {call_db_id} returned HTTP {resp.status_code}", flush=True)
     except Exception as e:
-        print(f"Warning: call-context fetch failed for {key}: {e}", flush=True)
+        print(f"Warning: call-context fetch failed for call {call_db_id}: {e}", flush=True)
     with _ctx_cache_lock:
         if len(_ctx_cache) > 512:
             _ctx_cache.clear()
@@ -783,6 +799,46 @@ def attach_mcp_gateways(agent, call_ctx=None):
             )
 
 
+def _admin_request_authorized(request) -> bool:
+    """HTTP Basic gate for the admin API (F-01,
+    CONTEXT_MEMORY_VERIFICATION_AUDIT 2026-08-04).
+
+    Same trust principal as the backend's ``require_internal_auth``: the
+    segregated INTERNAL_AUTH service credentials (WEBHOOK_AUTH fallback,
+    mirroring ``_internal_auth()``). FAIL-CLOSED: unconfigured credentials
+    reject every request rather than leaving the reindex/search/interaction
+    surface open — these endpoints can now read and write caller memory,
+    not just product KB.
+    """
+    import base64 as _b64
+
+    expected_user = os.getenv('INTERNAL_AUTH_USER') or os.getenv('WEBHOOK_AUTH_USER')
+    expected_pw = os.getenv('INTERNAL_AUTH_PASSWORD') or os.getenv('WEBHOOK_AUTH_PASSWORD')
+    if not expected_user or not expected_pw:
+        print(
+            '[admin_api] rejecting request: INTERNAL_AUTH_*/WEBHOOK_AUTH_* not '
+            'configured — admin API is fail-closed.',
+            flush=True,
+        )
+        return False
+    header = request.headers.get('authorization') or ''
+    if not header.lower().startswith('basic '):
+        return False
+    try:
+        decoded = _b64.b64decode(header[6:].strip()).decode('utf-8')
+        user, _, pw = decoded.partition(':')
+        # Compare as BYTES: hmac.compare_digest raises TypeError on str with
+        # any non-ASCII character, which would turn a wrong-credential 401
+        # into a 500 — and would break every admin call outright if the
+        # operator chose a non-ASCII password.
+        return (
+            hmac.compare_digest(user.encode('utf-8'), expected_user.encode('utf-8'))
+            and hmac.compare_digest(pw.encode('utf-8'), expected_pw.encode('utf-8'))
+        )
+    except Exception:
+        return False
+
+
 def start_admin_api():
     """Start a lightweight FastAPI server for admin operations (reindex)."""
     from fastapi import FastAPI, Request
@@ -791,8 +847,22 @@ def start_admin_api():
 
     admin_app = FastAPI(title="AI Agents Admin API")
 
+    def _reject_unauthorized(request):
+        """None when authorized; a 401 response otherwise. /admin/health
+        stays open for container healthchecks — it returns no data."""
+        if _admin_request_authorized(request):
+            return None
+        return JSONResponse(
+            {'error': 'unauthorized'},
+            status_code=401,
+            headers={'WWW-Authenticate': 'Basic realm="ai-agents-admin"'},
+        )
+
     @admin_app.post("/reindex")
     async def reindex(request: Request):
+        denied = _reject_unauthorized(request)
+        if denied is not None:
+            return denied
         try:
             data = await request.json()
             collection_name = data.get('collection_name')
@@ -825,6 +895,9 @@ def start_admin_api():
 
     @admin_app.post("/search")
     async def search(request: Request):
+        denied = _reject_unauthorized(request)
+        if denied is not None:
+            return denied
         try:
             data = await request.json()
             collection_name = data.get('collection_name')
@@ -849,6 +922,112 @@ def start_admin_api():
             })
         except ValueError as e:
             return JSONResponse({'error': str(e)}, status_code=400)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({'error': str(e)}, status_code=500)
+
+    @admin_app.post("/index-interaction")
+    async def index_interaction(request: Request):
+        """Single-document upsert into an interaction-history collection (R5).
+
+        Auth-gated like every admin endpoint (F-01): this one WRITES caller
+        memory that later renders into prompts — poisoning it is prompt
+        injection with a paper trail.
+
+        Called by the backend at call end with one summary doc per call,
+        keyed by metadata.call_id (re-posting the same call replaces its
+        row). Unlike /reindex this never drops the collection — it's an
+        incremental writer for the per-workspace caller-history index.
+        """
+        denied = _reject_unauthorized(request)
+        if denied is not None:
+            return denied
+        try:
+            data = await request.json()
+            collection_name = data.get('collection_name')
+            content = (data.get('content') or '').strip()
+            metadata = data.get('metadata') or {}
+
+            if not collection_name or not _COLLECTION_NAME_RE.match(collection_name):
+                return JSONResponse({'error': 'invalid collection_name'}, status_code=400)
+            if not content:
+                return JSONResponse({'error': 'content is required'}, status_code=400)
+            if not str(metadata.get('call_id') or '').strip():
+                return JSONResponse({'error': 'metadata.call_id is required'}, status_code=400)
+            if not str(metadata.get('contact_id') or '').strip():
+                return JSONResponse({'error': 'metadata.contact_id is required'}, status_code=400)
+            if not DATABASE_URL:
+                return JSONResponse({'error': 'DATABASE_URL not configured'}, status_code=500)
+
+            model = get_embedding_model()
+            if model is None:
+                return JSONResponse({'error': 'embedding model unavailable'}, status_code=503)
+
+            import json as _json
+
+            import psycopg2
+            embedding = model.encode([content])[0].tolist()
+            table_name = f"chunks_{collection_name}"
+            conn = psycopg2.connect(DATABASE_URL)
+            try:
+                cur = conn.cursor()
+                # DDL in its own transaction: table, then the partial unique
+                # expression index that makes the write below a REAL upsert
+                # (F-08 — DELETE+INSERT raced under concurrent finalizers).
+                _ensure_chunks_table(cur, table_name)
+                index_name = f"uq_{table_name}_call_id"
+                cur.execute("SELECT to_regclass(%s)", (index_name,))
+                if cur.fetchone()[0] is None:
+                    # ONE TIME per collection: rows written before the index
+                    # existed may already be duplicated by call_id, which
+                    # would make CREATE UNIQUE INDEX fail. Collapse them
+                    # (newest id wins) and then create the index. Gated on
+                    # index absence so the O(n^2)-ish self-join never runs
+                    # on the steady-state path — this endpoint fires on
+                    # every call end.
+                    cur.execute(
+                        f"DELETE FROM {table_name} a USING {table_name} b "
+                        f"WHERE a.id < b.id "
+                        f"AND a.metadata->>'call_id' IS NOT NULL "
+                        f"AND a.metadata->>'call_id' = b.metadata->>'call_id'"
+                    )
+                    cur.execute(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} "
+                        f"ON {table_name} (((metadata->>'call_id'))) "
+                        f"WHERE metadata->>'call_id' IS NOT NULL"
+                    )
+                conn.commit()
+
+                cur.execute(
+                    f"INSERT INTO {table_name} "
+                    f"(content, processed_content, embedding, filename, section, "
+                    f"tags, metadata, metadata_text) "
+                    f"VALUES (%s, %s, %s::vector, %s, %s, %s::jsonb, %s::jsonb, %s) "
+                    f"ON CONFLICT ((metadata->>'call_id')) "
+                    f"WHERE metadata->>'call_id' IS NOT NULL "
+                    f"DO UPDATE SET "
+                    f"content = EXCLUDED.content, "
+                    f"processed_content = EXCLUDED.processed_content, "
+                    f"embedding = EXCLUDED.embedding, "
+                    f"metadata = EXCLUDED.metadata, "
+                    f"metadata_text = EXCLUDED.metadata_text, "
+                    f"created_at = NOW()",
+                    (
+                        content,
+                        content.lower(),
+                        embedding,
+                        f"call-{metadata['call_id']}",
+                        'interaction',
+                        _json.dumps([]),
+                        _json.dumps({k: str(v) for k, v in metadata.items()}),
+                        content.lower(),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return JSONResponse({'success': True, 'collection_name': collection_name})
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -913,6 +1092,38 @@ def capture_base_url(query_params, body_params, headers, agent):
         ctk = ctk or gd.get('ctk')
     tenant_ctx = fetch_call_context(call_db_id, ctk)
 
+    # Caller memory (R1, CONTEXT_AUDIT_2026-08-04): the backend's tiered
+    # contact block. Only inbound agents opt in via _inbound_caller_memory —
+    # the outbound agents already receive richer, human-vetted context via
+    # ?ctx= and must not get a second, competing section.
+    caller_mem_enabled = bool(getattr(agent, '_inbound_caller_memory', False))
+    mem_contact = (tenant_ctx or {}).get('contact') if caller_mem_enabled else None
+    mem_last = (tenant_ctx or {}).get('last_interaction') if caller_mem_enabled else None
+    mem_callback = (tenant_ctx or {}).get('open_callback') if caller_mem_enabled else None
+    mem_direction = (tenant_ctx or {}).get('direction')
+    # Vet topics ONCE and reuse (A-5): the triage greeting step and the
+    # "Known Caller" facts block must not disagree about which past topic may
+    # be raised. Specialists have no greeting step at all, so for them this
+    # vetted result is the ONLY thing standing between a closed/stale topic
+    # and the caller hearing about it.
+    caller_hint = (
+        _caller_greeting_hint(mem_contact, mem_last, mem_callback, mem_direction)
+        if caller_mem_enabled else None
+    )
+    # Language memory: open in the caller's documented language when we speak
+    # it. Must run BEFORE the greeting is built so the hint can carry it.
+    #
+    # Gated on caller_hint being present — i.e. only when the prompt will ALSO
+    # carry the instruction. Reordering the voice list without instructing the
+    # model would have it speak English text through a Spanish voice, which is
+    # worse than not doing this at all.
+    opening_language = (
+        _open_in_documented_language(agent, mem_contact, mem_last)
+        if (caller_mem_enabled and caller_hint is not None) else None
+    )
+    if opening_language:
+        caller_hint['opening_language'] = opening_language
+
     # Bind KB search to the workspace's assigned collection (falls back to
     # the template cache / hardcoded fallback without tenant context). Runs
     # on the ephemeral copy, so each request reflects assignments within
@@ -933,7 +1144,7 @@ def capture_base_url(query_params, body_params, headers, agent):
     if getattr(agent, '_is_triage', False) and tenant_ctx is not None \
             and tenant_ctx.get('queues') is not None:
         try:
-            configure_triage_queues(agent, tenant_ctx['queues'])
+            configure_triage_queues(agent, tenant_ctx['queues'], caller=caller_hint)
         except Exception as e:
             # A failed rebuild leaves the deep-copied template contexts in
             # place — degraded (template queues) but functional.
@@ -1027,15 +1238,265 @@ def capture_base_url(query_params, body_params, headers, agent):
             new_global['ctk'] = ctk
         print(f"Call DB ID: {call_db_id}", flush=True)
 
-    # Read context from query params (for outbound AI calls)
+    # Read context from query params (outbound AI calls + callback dials).
+    # Values-level logging removed on purpose (R1 redaction prereq): this
+    # payload now routinely carries contact names/notes — keys only.
     ctx_param = query_params.get('ctx')
     if ctx_param:
         try:
             ctx_data = json.loads(base64.urlsafe_b64decode(ctx_param).decode())
-            print(f"Received outbound context: {ctx_data}", flush=True)
+            print(f"Received context param with keys: {sorted(ctx_data.keys())}", flush=True)
             new_global.update(ctx_data)
         except Exception as e:
-            print(f"Warning: Failed to decode ctx param: {e}", flush=True)
+            # F-13: loud — a malformed envelope means a producer bug, and
+            # silently dropping it is how context loss hides.
+            print(f"ERROR: rejected malformed ctx param (continuing without context): {e}", flush=True)
+
+    # Caller-memory injection (R1): structured facts into global_data plus
+    # one behavioral prompt section. setdefault so explicit ?ctx= values
+    # (applied just above) win on collision. Unknown caller → mem_contact is
+    # None → the render is identical to pre-R1 output.
+    if mem_contact and (mem_contact.get('previous_calls') or mem_contact.get('name_known')):
+        mem_keys = {
+            'returning_caller': bool(mem_contact.get('previous_calls')),
+            'previous_calls': mem_contact.get('previous_calls') or 0,
+            'is_vip': bool(mem_contact.get('is_vip')),
+        }
+        # contact_id rides along for tools that need a hard server-side
+        # filter (R5's search_caller_history) — backend-derived, never
+        # caller-supplied.
+        if mem_contact.get('id'):
+            mem_keys['contact_id'] = mem_contact['id']
+        if mem_contact.get('name_known') and mem_contact.get('name'):
+            mem_keys['contact_name'] = mem_contact['name']
+        if mem_contact.get('company'):
+            mem_keys['contact_company'] = mem_contact['company']
+        if mem_contact.get('account_tier'):
+            mem_keys['account_tier'] = mem_contact['account_tier']
+        if mem_last:
+            if mem_last.get('reason'):
+                mem_keys['last_call_reason'] = mem_last['reason']
+            if mem_last.get('disposition'):
+                mem_keys['last_call_disposition'] = mem_last['disposition']
+            if mem_last.get('summary_short'):
+                mem_keys['last_call_summary'] = mem_last['summary_short']
+            if mem_last.get('caller_language'):
+                mem_keys['known_caller_language'] = mem_last['caller_language']
+        if mem_callback and mem_callback.get('reason'):
+            mem_keys['open_callback_reason'] = mem_callback['reason']
+        for key, value in mem_keys.items():
+            new_global.setdefault(key, value)
+
+        try:
+            facts = []
+            if mem_keys.get('contact_name'):
+                facts.append(f"Name on file: {mem_keys['contact_name']}")
+            if mem_keys.get('contact_company'):
+                facts.append(f"Company: {mem_keys['contact_company']}")
+            if mem_keys.get('account_tier'):
+                facts.append(
+                    f"Account tier: {mem_keys['account_tier']}"
+                    + (" (VIP)" if mem_keys.get('is_vip') else "")
+                )
+            facts.append(f"Previous calls with us: {mem_keys['previous_calls']}")
+            # A-5: every history line says explicitly whether it may be
+            # RAISED or is BACKGROUND ONLY, decided by the same
+            # _offerable_topic gate the greeting uses (recent + still open).
+            # Without this the facts block was an unconditional licence to
+            # bring up any topic at any age — and for specialists, which have
+            # no greeting step, it was the whole policy.
+            vetted_topic = (caller_hint or {}).get('last_reason')
+            multiple_topics = bool((caller_hint or {}).get('multiple_topics'))
+            if mem_keys.get('last_call_reason'):
+                line = f"Last call was about: {mem_keys['last_call_reason']}"
+                if mem_keys.get('last_call_disposition'):
+                    line += f" (outcome: {mem_keys['last_call_disposition']})"
+                raisable = (
+                    vetted_topic
+                    and mem_keys['last_call_reason'].strip().lower()
+                    == str(vetted_topic).strip().lower()
+                )
+                line += (
+                    " [may be raised once, as a question]" if raisable
+                    else " [BACKGROUND ONLY — closed or old; do not raise it]"
+                )
+                facts.append(line)
+            if mem_keys.get('last_call_summary'):
+                facts.append(
+                    f"Last call notes (background only): "
+                    f"{mem_keys['last_call_summary']}"
+                )
+            # R4: earlier interactions beyond the latest one (digest is
+            # newest-first; entry 0 duplicates the last-call lines above).
+            # These are never offer-eligible — at most one topic may ever be
+            # raised, and that one is decided above.
+            for entry in (mem_contact.get('interaction_digest') or [])[1:3]:
+                if not isinstance(entry, dict):
+                    continue
+                topic = entry.get('reason') or entry.get('summary')
+                if not topic:
+                    continue
+                line = f"Earlier interaction: {topic}"
+                if entry.get('disposition'):
+                    line += f" (outcome: {entry['disposition']})"
+                if entry.get('ended_at'):
+                    line += f" — {str(entry['ended_at'])[:10]}"
+                facts.append(line + " [BACKGROUND ONLY — do not raise it]")
+            if mem_keys.get('open_callback_reason'):
+                # F-06 completion: the greeting withholds this until identity
+                # is confirmed, but the fact itself was stated plainly here —
+                # so the model could still volunteer it to whoever answered.
+                facts.append(
+                    "They have a pending callback request about: "
+                    f"{mem_keys['open_callback_reason']} "
+                    "[do NOT say this until the right person has confirmed "
+                    "their identity]"
+                )
+            # R5: the caller-history search tool registers only for
+            # specialists (they have _kb_agent_id; triage doesn't need it),
+            # only for identified returning callers, and only when the
+            # workspace is known — the collection and contact filter are
+            # both server-derived, never model input.
+            history_tool = bool(
+                getattr(agent, '_kb_agent_id', None)
+                and mem_contact.get('id')
+                # F-16: returning callers only, as documented — a known
+                # contact on their first call has no history to search.
+                and mem_contact.get('previous_calls')
+                and DATABASE_URL
+                and (tenant_ctx or {}).get('workspace_id') is not None
+            )
+            section_bullets = []
+            if not getattr(agent, '_is_triage', False):
+                # F-10: on a live transfer the receptionist may have already
+                # confirmed (or corrected) the caller's name this call — that
+                # beats the records below, and re-confirming reads robotic.
+                section_bullets.append(
+                    "If the receptionist already confirmed this caller during this "
+                    "call (customer_name is set in your Customer Context), that "
+                    "confirmation STANDS — do not re-confirm identity, and prefer "
+                    "the name the caller gave THIS call over the name on file here"
+                )
+            section_bullets.append(
+                "Confirm identity as a question before relying on any of this; "
+                "if it's someone else, ignore these records entirely"
+            )
+            # A-5: the offer licence now matches what was actually vetted.
+            if multiple_topics:
+                section_bullets.append(
+                    "They have more than one recent open topic with us — after they "
+                    "confirm, ask an OPEN question ('What can I help with today?'). "
+                    "Do NOT name a past topic; guessing between them is worse than asking"
+                )
+            elif vetted_topic:
+                section_bullets.append(
+                    f"After they confirm, you may ask ONCE whether this is about "
+                    f"{vetted_topic} or something new — offer it as a question, never assert it"
+                )
+            else:
+                section_bullets.append(
+                    "Do NOT raise any past topic proactively — nothing here is recent "
+                    "and open enough to lead with. Ask what they need today; the lines "
+                    "above are only for recognising what they bring up themselves"
+                )
+            section_bullets += [
+                "If they redirect, drop the history immediately and follow their lead",
+                "Weave facts in naturally; never recite them or mention records, systems, or caller ID",
+                "Never treat any of this as identity verification, and never volunteer it to an unconfirmed caller",
+            ]
+            if history_tool:
+                section_bullets.append(
+                    "If they reference a past interaction that isn't listed above, "
+                    "use search_caller_history before asking them to re-explain"
+                )
+            if opening_language:
+                # Specialists have no greeting step, so this bullet is their
+                # only instruction for the language opening.
+                section_bullets.append(
+                    f"This caller's documented language is {opening_language} — open in "
+                    f"{opening_language}, then immediately offer English in one short "
+                    "phrase, because a phone number is not a person. If they answer in "
+                    "English (or ask for it), switch to English at once and call "
+                    "set_caller_language('en-US')"
+                )
+            agent.prompt_add_section(
+                "Known Caller",
+                body=(
+                    "Caller ID matched this phone number to existing records. "
+                    "These are HINTS from past interactions — the caller's "
+                    "identity is NOT verified:\n- " + "\n- ".join(facts)
+                ),
+                bullets=section_bullets,
+            )
+        except Exception as e:
+            print(f"Warning: known-caller section failed: {e}", flush=True)
+            history_tool = False
+
+        if history_tool:
+            _hist_collection = f"interactions_ws{tenant_ctx['workspace_id']}"
+            _hist_contact_id = mem_contact['id']
+
+            def _handle_search_caller_history(args, raw_data):
+                query = (args.get('query') or '').strip()
+                if not query:
+                    return FunctionResult("Please provide a search query.")
+                try:
+                    results = do_search(
+                        _hist_collection, query, 3, DATABASE_URL,
+                        contact_id=_hist_contact_id,
+                    )
+                except Exception as exc:
+                    print(f"search_caller_history failed: {exc}", flush=True)
+                    return FunctionResult(
+                        "History search is unavailable right now."
+                    )
+                if not results:
+                    return FunctionResult(
+                        "No past-interaction records matched that query."
+                    )
+                lines = []
+                for r in results:
+                    meta = r.get('metadata') or {}
+                    stamp = str(meta.get('ended_at') or '')[:10]
+                    lines.append(f"- [{stamp}] {r['content']}")
+                return FunctionResult(
+                    "Records from this caller's past interactions (weave in "
+                    "naturally — never recite verbatim):\n" + "\n".join(lines)
+                )
+
+            try:
+                agent.define_tool(
+                    name="search_caller_history",
+                    description=(
+                        "Search THIS caller's past interactions with us. Use when "
+                        "they reference a previous call, ticket, or promise that "
+                        "isn't in your provided context — instead of making them "
+                        "re-explain. Do not use for product or policy questions "
+                        "(use search_knowledge for those)."
+                    ),
+                    parameters={
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "What to look for in their history, e.g. "
+                                "'vacuum suction troubleshooting steps tried'"
+                            ),
+                        }
+                    },
+                    handler=_handle_search_caller_history,
+                    required=["query"],
+                    # define_tool takes language-keyed fillers (unlike the
+                    # @AgentBase.tool decorator's bare list).
+                    fillers={"en-US": [
+                        "Let me check your history.",
+                        "One moment while I look that up.",
+                    ]},
+                )
+            except Exception as e:
+                print(
+                    f"Warning: search_caller_history registration failed: {e}",
+                    flush=True,
+                )
 
     if new_global:
         agent.set_global_data(new_global)
@@ -1126,6 +1587,125 @@ def add_sentiment_tool(agent):
     )
 
 
+# Dispositions whose topic must NEVER lead a greeting (F-09: closed or
+# non-conversations — proactively reopening them reads wrong).
+_CLOSED_DISPOSITIONS = {'resolved', 'no-answer', 'wrong-number', 'spam', 'abandoned'}
+_TOPIC_MAX_AGE_DAYS = 14
+
+
+def _offerable_topic(entry):
+    """The reason from one digest/last-interaction entry IF the greeting may
+    proactively offer it: has a reason, isn't a closed outcome, and is
+    verifiably recent — an unparseable/missing date means unknown age, and
+    unknown age never leads (F-09)."""
+    if not isinstance(entry, dict):
+        return None
+    reason = entry.get('reason')
+    if not reason:
+        return None
+    if (entry.get('disposition') or '') in _CLOSED_DISPOSITIONS:
+        return None
+    ended = entry.get('ended_at')
+    if not ended:
+        return None
+    try:
+        from datetime import datetime
+        if (datetime.utcnow() - datetime.fromisoformat(str(ended))).days > _TOPIC_MAX_AGE_DAYS:
+            return None
+    except (ValueError, TypeError):
+        return None
+    return reason
+
+
+def _open_in_documented_language(agent, mem_contact, mem_last):
+    """Make a returning caller's documented language the one the AI OPENS in.
+
+    The rendered SWML carries ``languages`` in list order and the platform
+    treats the first entry as the opening language, so this reorders the
+    ephemeral copy's list — the same per-request, deep-copied structure the
+    KB/MCP/prompt shaping already mutates, so it cannot leak across calls.
+
+    Returns the language's display name (e.g. ``"Spanish"``) when a switch was
+    made, else None. Deliberately no-ops when:
+      * there is no documented language, or it is English — English is already
+        the default, and a bilingual opening for an English speaker is noise;
+      * the agent does not actually SPEAK that language. A voice/language the
+        agent was never configured with would render as a bad voice id (a
+        runtime voice_error) or silence, which is far worse than opening in
+        English. Only the languages added via add_language() are eligible.
+    """
+    code = (mem_contact or {}).get('preferred_language') \
+        or (mem_last or {}).get('caller_language')
+    code = (code or '').strip()
+    if not code or code.lower().startswith('en'):
+        return None
+    languages = getattr(agent, '_languages', None)
+    if not languages:
+        return None
+    # Match on the full tag first, then the primary subtag ('es' == 'es-MX'),
+    # so a caller recorded as es-MX still opens in the agent's es-ES voice.
+    primary = code.split('-')[0].lower()
+    match = next(
+        (
+            lang for lang in languages
+            if str(lang.get('code', '')).lower() == code.lower()
+        ),
+        None,
+    ) or next(
+        (
+            lang for lang in languages
+            if str(lang.get('code', '')).split('-')[0].lower() == primary
+        ),
+        None,
+    )
+    if match is None or languages[0] is match:
+        return match.get('name') if match is not None else None
+    languages.remove(match)
+    languages.insert(0, match)
+    return match.get('name')
+
+
+def _caller_greeting_hint(contact, last, open_callback=None, direction=None):
+    """Compact hint configure_triage_queues uses to shape the greeting step.
+
+    Returns None for unknown callers, so the greeting stays exactly as it
+    was before R1. Topic selection (F-09): only recent, OPEN topics are
+    offerable; exactly one candidate → offer it as a question; two or more
+    distinct candidates → flag multiple_topics so the greeting asks an open
+    question instead of guessing.
+    """
+    if not contact:
+        return None
+    hint = {
+        'name': contact.get('name') if contact.get('name_known') else None,
+        'previous_calls': contact.get('previous_calls') or 0,
+    }
+    candidates = []
+    if last:
+        candidates.append(last)
+    candidates.extend(
+        e for e in (contact.get('interaction_digest') or []) if isinstance(e, dict)
+    )
+    topics, seen = [], set()
+    for entry in candidates:
+        reason = _offerable_topic(entry)
+        if reason and reason.strip().lower() not in seen:
+            seen.add(reason.strip().lower())
+            topics.append(reason)
+    if len(topics) == 1:
+        hint['last_reason'] = topics[0]
+    elif len(topics) >= 2:
+        hint['multiple_topics'] = True
+    if open_callback and open_callback.get('reason'):
+        hint['callback_reason'] = open_callback['reason']
+        # outbound + pending callback = we are dialing THEM back;
+        # inbound + pending callback = they called before we got to it.
+        hint['callback_dialed'] = direction == 'outbound'
+    if hint['name'] or hint['previous_calls'] or hint.get('callback_reason'):
+        return hint
+    return None
+
+
 # Shared post_prompt wrap-up fields appended to every agent's per-call
 # JSON summary. The post-prompt webhook persists these into
 # calls.disposition_code + calls.agent_notes so the wrap-up panel in the
@@ -1141,8 +1721,13 @@ WRAP_UP_POST_PROMPT_FIELDS = (
 )
 
 
-def configure_triage_queues(agent, queues):
+def configure_triage_queues(agent, queues, caller=None):
     """(Re)build everything queue-shaped on a triage agent.
+
+    ``caller`` is the optional _caller_greeting_hint dict (R1): when present
+    the greeting step confirms the known caller instead of interrogating
+    them, and callback dials open by returning the call. Boot renders and
+    unknown callers pass None and get the original greeting verbatim.
 
     Contexts, the slug→AI-route transfer map, speech hints, and the
     post-prompt department enum all derive from the queue list. Runs at
@@ -1235,16 +1820,88 @@ def configure_triage_queues(agent, queues):
     else:
         dept_menu = dept_names[0] if dept_names else 'general assistance'
 
-    # Step 1: Greet and get name (also detects caller's language)
+    # Step 1: Greet and get name (also detects caller's language).
+    # Known callers (R1) get a confirm-not-interrogate variant; callback
+    # dials open by returning the call. Unknown callers get the original
+    # greeting text verbatim.
+    greeting_goal = (
+        "Welcome the caller and get their name. Introduce yourself as Sam. "
+        "Be warm but brief — this should take one exchange. "
+        "Detect their language from their first words and respond in kind.")
+    greeting_criteria = (
+        "The customer has stated their name and you have called set_caller_language")
+    # Language memory: the caller's documented language is now the voice this
+    # call OPENS in (the agent reordered its language list). Say the first line
+    # in that language, then offer English in one short phrase — the number is
+    # not the person, and a wrong guess here is a comprehension failure, not
+    # merely an awkward one. Composed as a suffix so it works with every
+    # greeting variant below (unknown / known name / callback).
+    lang = (caller or {}).get('opening_language')
+    language_clause = (
+        (
+            f" IMPORTANT — LANGUAGE: this caller's records say they speak {lang}, and "
+            f"you are opening in {lang}. Say your greeting in {lang} first, then add ONE "
+            f"short English phrase offering English (e.g. 'or English, if you prefer?'). "
+            f"If they reply in English or ask for English, switch immediately, finish the "
+            f"rest of the call in English, and call set_caller_language('en-US'). If they "
+            f"continue in {lang}, stay in {lang} and call set_caller_language with that "
+            f"language's code. Never make them ask twice."
+        ) if lang else ""
+    )
+    if caller and caller.get('callback_reason') and caller.get('callback_dialed'):
+        # F-06: confirm the PERSON before disclosing WHY we're calling — a
+        # callback reason can be sensitive, and whoever answers the phone is
+        # not necessarily who requested the call.
+        who = (
+            f" {caller['name']}" if caller.get('name')
+            else " the person who requested a callback from us"
+        )
+        greeting_goal = (
+            "This is a callback WE are placing at the customer's request. "
+            "Introduce yourself as Sam from the company, and FIRST confirm you "
+            f"have reached{who} — BEFORE saying anything about why you're calling. "
+            "Only once the right person has confirmed, tell them you're returning "
+            f"their call about: {caller['callback_reason']}, and check it's a good "
+            "time. If it's someone else or they won't confirm, do NOT state the "
+            "reason for the call — just say you'll try again later. If it's a bad "
+            "time, apologize briefly and offer to call back. "
+            "Detect their language from their first words and respond in kind.")
+        greeting_criteria = (
+            "You have confirmed you reached the right person and you have called "
+            "set_caller_language")
+    elif caller and caller.get('name'):
+        topic = caller.get('last_reason') or caller.get('callback_reason')
+        if caller.get('multiple_topics'):
+            # F-09: several plausible open topics — never guess one.
+            offer = (
+                " They have more than one recent open topic with us — once they "
+                "confirm, ask an open question like 'What can I help with today?' "
+                "instead of guessing which topic they're calling about.")
+        elif topic:
+            offer = (
+                f" Once they confirm, you may ask ONCE whether they're calling about "
+                f"{topic} or something new — offer it as a question, never assume.")
+        else:
+            offer = ""
+        greeting_goal = (
+            f"Welcome the caller back. Caller ID suggests this may be {caller['name']}, "
+            "but that is unverified — confirm with a short, warm question like "
+            f"'Am I speaking with {caller['name']}?' instead of asking for their name cold."
+            f"{offer} If it turns out to be someone else, just welcome them and ask their "
+            "name as usual. Introduce yourself as Sam. "
+            "Detect their language from their first words and respond in kind.")
+        greeting_criteria = (
+            "The caller's identity is confirmed or corrected and you have called "
+            "set_caller_language")
+    # Applies to whichever variant was selected above (empty when there is no
+    # documented non-English language we speak).
+    greeting_goal += language_clause
     triage_ctx.add_step("greeting") \
-        .add_section("Goal",
-            "Welcome the caller and get their name. Introduce yourself as Sam. "
-            "Be warm but brief — this should take one exchange. "
-            "Detect their language from their first words and respond in kind.") \
+        .add_section("Goal", greeting_goal) \
         .add_section("Handling Eager Callers",
             "If the caller gives you their name AND mentions what they need in the same breath, "
             "great — note both. You can skip asking about the department in the next step.") \
-        .set_step_criteria("The customer has stated their name and you have called set_caller_language") \
+        .set_step_criteria(greeting_criteria) \
         .set_valid_steps(["route_department"]) \
         .set_functions(["report_sentiment", "set_caller_language"])
 
@@ -1451,6 +2108,7 @@ class CallCenterTriageAgent(CallCenterAgent):
         # the TEMPLATE queues — per-call tenant queues rebuild this whole
         # block on the ephemeral copy via configure_triage_queues (§7.2).
         self._is_triage = True
+        self._inbound_caller_memory = True  # R1: consume call-context contact block
         self.add_hints(["SignalWire"])  # brand hint, queue-independent
         queues = get_active_queues()
 
@@ -1685,6 +2343,7 @@ class SalesAISpecialist(CallCenterAgent):
         self._kb_agent_id = 'sales-ai'
         self._kb_fallback_collection = 'sales_knowledge'
         self._mcp_agent_id = 'sales-ai'  # MCP gateways attach per-request (callback), not at boot
+        self._inbound_caller_memory = True  # R1: consume call-context contact block
 
         self.set_post_prompt(
             'Summarize this sales consultation as a JSON object: '
@@ -1743,7 +2402,8 @@ class SalesAISpecialist(CallCenterAgent):
                 "They're ready to make a purchase or need a formal quote",
                 "They need custom pricing or contract terms",
                 "They specifically ask to speak with a person",
-                "The question is about billing or account-specific details you can't access"
+                "The question is about billing or account-specific details you can't access",
+                "Always fill work_summary with what you've covered so far — the rep reads it before joining and the customer should never have to repeat themselves"
             ]
         )
 
@@ -1757,12 +2417,23 @@ class SalesAISpecialist(CallCenterAgent):
         ),
         parameters={
             "reason": {"type": "string", "description": "Why the caller needs a human rep"},
+            "work_summary": {
+                "type": "string",
+                "description": (
+                    "2-4 sentences FOR THE HUMAN REP taking over, current as of right now: "
+                    "what the customer needs, what you already discussed or recommended and "
+                    "how they responded, and the logical next step. They should not have to "
+                    "re-ask anything you already covered."
+                ),
+            },
         },
+        required=["reason", "work_summary"],
         fillers=["Let me get a sales representative for you.", "One moment."],
     )
     def escalate_to_human(self, args, raw_data):
         """Sales specialist's hand-off back to a human rep."""
         global_data = raw_data.get('global_data', {})
+        work_summary = args.get("work_summary", "")
         return self._transfer_to_human_queue(
             department='sales',
             spoken_response="I'll connect you with a sales representative who can help with that.",
@@ -1773,6 +2444,11 @@ class SalesAISpecialist(CallCenterAgent):
                 'priority': global_data.get('priority', 5),
                 'additional_info': global_data.get('additional_info', ''),
                 'escalation_reason': args.get("reason", ""),
+                # R7 (G9): the specialist's CURRENT work, captured at transfer
+                # time. ai_summary is the key AgentContextCard + the pre-join
+                # whisper already render — no frontend change needed.
+                'work_summary': work_summary,
+                'ai_summary': work_summary,
                 'escalated_from': 'sales_ai_specialist',
                 'source_agent': 'sales_ai_specialist',
             },
@@ -1825,6 +2501,7 @@ class SupportAISpecialist(CallCenterAgent):
         self._kb_agent_id = 'support-ai'
         self._kb_fallback_collection = 'support_knowledge'
         self._mcp_agent_id = 'support-ai'  # MCP gateways attach per-request (callback), not at boot
+        self._inbound_caller_memory = True  # R1: consume call-context contact block
 
         self.set_post_prompt(
             'Summarize this support consultation as a JSON object: '
@@ -1886,6 +2563,7 @@ class SupportAISpecialist(CallCenterAgent):
                 "The customer asks to speak with a person — escalate IMMEDIATELY, do not try to troubleshoot first",
                 "You've tried two or three approaches and the issue persists",
                 "The issue requires account access or admin-level changes you can't make",
+                "Always fill work_summary with the steps already tried and their results — the specialist reads it before joining and must never repeat a step",
             ]
         )
 
@@ -1900,12 +2578,23 @@ class SupportAISpecialist(CallCenterAgent):
         ),
         parameters={
             "reason": {"type": "string", "description": "Why the caller needs a human specialist"},
+            "work_summary": {
+                "type": "string",
+                "description": (
+                    "2-4 sentences FOR THE HUMAN SPECIALIST taking over, current as of "
+                    "right now: the issue, every troubleshooting step already attempted "
+                    "and its result, and your proposed next step. They should never "
+                    "repeat a step you already tried."
+                ),
+            },
         },
+        required=["reason", "work_summary"],
         fillers=["Let me get a support specialist for you.", "One moment."],
     )
     def escalate_to_human(self, args, raw_data):
         """Support specialist's hand-off back to a human rep."""
         global_data = raw_data.get('global_data', {})
+        work_summary = args.get("work_summary", "")
         return self._transfer_to_human_queue(
             department='support',
             spoken_response="I'll connect you with a support specialist who can help with that.",
@@ -1916,6 +2605,11 @@ class SupportAISpecialist(CallCenterAgent):
                 'priority': global_data.get('priority', 5),
                 'additional_info': global_data.get('additional_info', ''),
                 'escalation_reason': args.get("reason", ""),
+                # R7 (G9): the specialist's CURRENT work, captured at transfer
+                # time. ai_summary is the key AgentContextCard + the pre-join
+                # whisper already render — no frontend change needed.
+                'work_summary': work_summary,
+                'ai_summary': work_summary,
                 'escalated_from': 'support_ai_specialist',
                 'source_agent': 'support_ai_specialist',
             },

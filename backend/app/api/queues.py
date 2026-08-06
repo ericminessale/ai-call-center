@@ -74,7 +74,12 @@ def route_call_to_queue(queue_id):
                     payload_keys(url_context),
                 )
             except Exception as e:
-                logger.warning(f"Failed to decode ctx param: {e}")
+                # F-13: malformed context is a wiring bug, not noise — shout,
+                # then fail open to no-context (a live call must still route).
+                logger.error(
+                    "REJECTED malformed ctx param on /route (proceeding "
+                    "without it): %s", e,
+                )
 
         # PRIORITY 2: Get context from request body global_data (backup)
         # The AI agents also set global_data which SignalWire may or may not forward
@@ -192,8 +197,15 @@ def route_call_to_queue(queue_id):
             )
             db.session.add(call)
 
-        # Store AI context (customer info collected by AI agent)
-        call.ai_context = json.dumps(context) if context else None
+        # Store AI context (customer info collected by AI agent).
+        # MERGE, don't replace (verification audit A-6): /route and
+        # /api/webhooks/post-prompt are concurrent by design — the same AI
+        # transfer that redirects the caller here also fires the post-prompt,
+        # which writes parsed_summary / session_summaries onto this same
+        # column. A full overwrite silently dropped whichever landed first.
+        if context:
+            merged_ai_context = {**(call.ai_context_dict or {}), **context}
+            call.ai_context = json.dumps(merged_ai_context)
 
         # Persist caller's language so the agent UI + auto-start hooks can read it
         call.caller_language = caller_language
@@ -257,7 +269,17 @@ def route_call_to_queue(queue_id):
                 # terminal call-status webhook reconciles from truth via
                 # Contact.update_stats().
                 if created_call_here:
-                    contact.total_calls = (contact.total_calls or 0) + 1
+                    # SQL-side increment (A-6): this writer takes no row lock
+                    # (deliberately — note below), so a Python
+                    # read-modify-write could lose a concurrent bump.
+                    contact.total_calls = Contact.total_calls + 1
+                # NOTE on locking: unlike the post-prompt writer this path does
+                # NOT take `with_for_update()` on the Call/Contact. It holds its
+                # transaction across Redis dispatch and a socket emit further
+                # down, so a row lock here would be held across network I/O —
+                # trading lost-update risk for lock-contention risk. The two
+                # genuinely racy writes are made safe individually instead:
+                # ai_context merges (above), and total_calls increments in SQL.
 
                 # Link call to contact
                 if call:
@@ -345,6 +367,12 @@ def route_call_to_queue(queue_id):
                 call_to_end.update_status('failed')
                 call_to_end.ended_at = call_to_end.ended_at or datetime.utcnow()
                 db.session.commit()
+                # A-3: 'failed' is terminal (Call.TERMINAL_STATUSES) and the
+                # watchdog never revisits a terminal row, so this is the last
+                # chance to reconcile the caller's memory for a route that
+                # blew up mid-transfer.
+                from app.services.contact_enrichment import finalize_call_memory
+                finalize_call_memory(call_to_end)
                 from app import socketio
                 from app.services.ws_rooms import workspace_room
                 fail_room = workspace_room(call_to_end.workspace_id)
@@ -381,6 +409,22 @@ def route_call_to_queue(queue_id):
 
 
 @queues_bp.route('/<queue_slug>/direct-inbound', methods=['POST'])
+# NO @require_webhook_auth — deliberate, and it must stay that way until the
+# URL producers sign it. This is a PHONE-NUMBER TARGET: the URL SignalWire
+# stores for a `human_direct` number is built unsigned (api/admin.py
+# _compute_phone_routing_url returns a bare f-string; services/fabric_sync.py
+# re-hosts primary_request_url verbatim — both sign only the STATUS callback).
+# WEBHOOK_AUTH_REQUIRED defaults to 'true' (docker-compose.yml, prod too), so
+# decorating this route returns 401 with no SWML for every inbound PSTN call to
+# such a number — dead air on any install that doesn't override the default.
+# (Regression caught by the 2026-08-05 verification audit, A-2; it was invisible
+# locally only because .env sets WEBHOOK_AUTH_REQUIRED=false, i.e. soft mode.)
+# The sibling phone targets /api/swml/initial-call and /api/swml/ai-specialist
+# are undecorated for the same reason. To authenticate this route properly:
+# route the human_direct result through signed_webhook_url(..., persistent=True)
+# at BOTH producers and re-push with fabric_sync so stored URLs carry the token.
+# F-15's actual harm (a forged call inflating returning-caller signals) is
+# addressed instead by counting only TERMINAL calls in _caller_memory.
 def direct_inbound_queue(queue_slug):
     """Direct inbound call entry point — bypasses AI, routes straight to human queue.
 
@@ -555,8 +599,9 @@ def direct_inbound_queue(queue_slug):
                 contact.last_interaction_at = datetime.utcnow()
                 # Once per created call — carrier retry storms re-enter this
                 # block for the same call row and used to inflate the stat (G6).
+                # SQL-side increment (A-6): unlocked writer, let the DB add.
                 if created_call_here:
-                    contact.total_calls = (contact.total_calls or 0) + 1
+                    contact.total_calls = Contact.total_calls + 1
             except Exception as e:
                 logger.warning(f"Direct inbound: failed to create contact: {e}")
 

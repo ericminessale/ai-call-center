@@ -47,6 +47,16 @@ class Contact(WorkspaceScoped, db.Model):
     total_calls = db.Column(db.Integer, default=0, nullable=False)
     last_interaction_at = db.Column(db.DateTime, nullable=True)
     average_sentiment = db.Column(db.Float, nullable=True)  # -1.0 to 1.0
+    # The caller's documented language (BCP-47, e.g. 'es-ES'). Durable and
+    # HUMAN-SETTABLE, unlike calls.caller_language which records one call.
+    # The AI seeds it only while empty and never overwrites it, so an agent's
+    # assertion wins. Drives the AI opening in that language on later calls.
+    preferred_language = db.Column(db.String(20), nullable=True)
+    # R4: rolling caller-memory digest — JSON array (newest first, max 3) of
+    # {ended_at, handler, ai_agent, reason, disposition, summary}. Regenerated
+    # from Call rows at call end (services/contact_enrichment.py); consumed by
+    # call-context (AI), the agent desktop, and the future chat kernel.
+    interaction_digest = db.Column(db.Text, nullable=True)
 
     # Timestamps
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
@@ -120,6 +130,7 @@ class Contact(WorkspaceScoped, db.Model):
             'externalId': self.external_id,
             'isVip': self.is_vip,
             'isBlocked': self.is_blocked,
+            'preferredLanguage': self.preferred_language,
             'tags': self.tags_list,
             'notes': self.notes,
             'customFields': self.custom_fields_dict,
@@ -132,9 +143,21 @@ class Contact(WorkspaceScoped, db.Model):
                 'totalCalls': self.total_calls,
                 'lastInteractionAt': self.last_interaction_at.isoformat() if self.last_interaction_at else None,
                 'averageSentiment': self.average_sentiment,
+                'interactionDigest': self.interaction_digest_list,
             })
 
         return data
+
+    @property
+    def interaction_digest_list(self):
+        """Parsed interaction digest (empty list when not yet generated)."""
+        if not self.interaction_digest:
+            return []
+        try:
+            parsed = json.loads(self.interaction_digest)
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, TypeError):
+            return []
 
     def to_dict_minimal(self):
         """Minimal dict for list views."""
@@ -150,22 +173,35 @@ class Contact(WorkspaceScoped, db.Model):
         }
 
     def update_stats(self):
-        """Update computed statistics from calls."""
+        """Update computed statistics from calls.
+
+        Every aggregate is restricted to calls in THIS contact's workspace.
+        The relationship itself is unfiltered, and the finalizer that calls
+        this runs in webhook context with no workspace set — so without the
+        explicit predicate a call mis-bound to a foreign workspace's contact
+        would inflate that contact's counters even though the interaction
+        digest (which does filter) correctly excludes it. Keeping both on the
+        same predicate stops the counters and the digest disagreeing.
+        (Verification audit B-1, 2026-08-05.)
+        """
         from sqlalchemy import func
 
+        from app.models.call import Call
+
+        own_calls = self.calls.filter(Call.workspace_id == self.workspace_id)
+
         # Count total calls
-        self.total_calls = self.calls.count()
+        self.total_calls = own_calls.count()
 
         # Get last interaction
-        last_call = self.calls.order_by(db.desc('created_at')).first()
+        last_call = own_calls.order_by(db.desc('created_at')).first()
         if last_call:
             self.last_interaction_at = last_call.created_at
 
         # Average sentiment across calls that carry a score (stays None
         # until at least one call has one)
-        from app.models.call import Call
         avg = (
-            self.calls.filter(Call.sentiment_score.isnot(None))
+            own_calls.filter(Call.sentiment_score.isnot(None))
             .with_entities(func.avg(Call.sentiment_score))
             .scalar()
         )

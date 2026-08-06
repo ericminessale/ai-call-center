@@ -151,6 +151,130 @@ def list_agent_assignments():
     })
 
 
+def _caller_memory(call):
+    """Tiered caller-memory block for the call-context payload (R1,
+    CONTEXT_AUDIT_2026-08-04).
+
+    Includes only what is safe for the agent to *offer* an unverified
+    caller: an identity to confirm (greet-as-question, never assert),
+    light account shape, and the latest prior interaction's topic and
+    outcome. ``Contact.notes`` and ``custom_fields`` are deliberately
+    excluded — caller ID is spoofable, so curated notes stay behind a
+    future verified-lookup tool, not the greeting path.
+
+    Must run inside the call's ``workspace_context`` so the Call queries
+    are tenant-scoped; the Contact is fetched by primary key and re-checked
+    against the call's workspace explicitly.
+    """
+    from app import db
+    from app.models import Call, Contact
+    from app.models.callback import Callback
+
+    if not call.contact_id:
+        return None, None, None
+    contact = db.session.get(Contact, call.contact_id)
+    if contact is None or contact.workspace_id != call.workspace_id:
+        return None, None, None
+
+    # Phone-shaped or placeholder displays aren't names — never have the agent
+    # ask "am I speaking with +1555… / My phone?". The demo seed's placeholder
+    # is imported so the two can't drift apart.
+    #
+    # ONE guarded value feeds BOTH name_known and the emitted name. An earlier
+    # version tested `first_name or <guarded display>` and then emitted the
+    # RAW display, so a contact with a learned first_name plus a placeholder
+    # display (exactly what the demo seed + AI enrichment produce) was offered
+    # to the caller as "My phone" (verification audit A-4).
+    from app.services.demo_verify import _SELF_CONTACT_NAME
+
+    def _usable_name(value):
+        value = (value or '').strip()
+        if not value or value == _SELF_CONTACT_NAME:
+            return None
+        compact = value.replace(' ', '').replace('-', '').replace('.', '')
+        if value.startswith('+') or compact.isdigit():
+            return None
+        return value
+
+    offerable_name = (
+        _usable_name(contact.computed_display_name)
+        or _usable_name(contact.first_name)
+    )
+    name_known = offerable_name is not None
+
+    # Terminal calls only (F-15): "previous calls" means completed
+    # interactions — live/forged 'waiting' rows must not make a first-time
+    # caller read as returning.
+    prior_calls = Call.query.filter(
+        Call.contact_id == contact.id,
+        Call.id != call.id,
+        Call.status.in_(Call.TERMINAL_STATUSES),
+    )
+    previous_count = prior_calls.count()
+    # The most recent finished call — resolved BEFORE the contact block so the
+    # language fallback below can read it (prior_calls is already filtered to
+    # terminal statuses).
+    prior = prior_calls.order_by(Call.created_at.desc()).first()
+
+    contact_block = {
+        'id': contact.id,
+        'name': offerable_name,
+        'first_name': contact.first_name,
+        'company': contact.company,
+        'account_tier': contact.account_tier,
+        'is_vip': bool(contact.is_vip),
+        'previous_calls': previous_count,
+        'last_interaction_at': (
+            contact.last_interaction_at.isoformat()
+            if contact.last_interaction_at else None
+        ),
+        'name_known': name_known,
+        # The caller's DOCUMENTED language. Contact-level (human-settable)
+        # wins; otherwise fall back to what their last call was actually
+        # conducted in. The agent opens in this language when it speaks it.
+        'preferred_language': (
+            contact.preferred_language
+            or (prior.caller_language if prior is not None else None)
+        ),
+        # R4: the rolling digest (empty until the first post-R4 call ends —
+        # last_interaction below still derives live, so older contacts keep
+        # their single-topic greeting).
+        'interaction_digest': contact.interaction_digest_list,
+    }
+
+    last_block = None
+    if prior is not None:
+        ctx = prior.ai_context_dict or {}
+        parsed = ctx.get('parsed_summary')
+        parsed = parsed if isinstance(parsed, dict) else {}
+        reason = parsed.get('reason') or ctx.get('reason') or ctx.get('issue')
+        # Human-authored wrap-up prose is withheld from injected context —
+        # see contact_enrichment.injectable_call_summary for why, and note
+        # this is the SAME helper the digest and the history index use, so
+        # the three consumers cannot drift apart on the trust decision.
+        from app.services.contact_enrichment import injectable_call_summary
+        raw_summary = injectable_call_summary(prior, 280)
+        last_block = {
+            'ended_at': prior.ended_at.isoformat() if prior.ended_at else None,
+            'reason': reason,
+            'disposition': prior.disposition_code,
+            'summary_short': raw_summary or None,
+            'handler': prior.handler_type,
+            'caller_language': prior.caller_language,
+        }
+
+    cb_block = None
+    cb = Callback.find_pending_for_contact(contact.id)
+    if cb is not None:
+        cb_block = {
+            'reason': cb.reason,
+            'requested_at': (
+                cb.requested_at.isoformat() if cb.requested_at else None
+            ),
+        }
+    return contact_block, last_block, cb_block
+
+
 @internal_bp.route('/call-context', methods=['GET'])
 @require_internal_auth
 def get_call_context():
@@ -170,7 +294,10 @@ def get_call_context():
         list), kb_assignments {agent_slug: physical collection name},
         mcp_gateways (workspace rows, cleartext creds — same trust
         boundary as /mcp-gateways above), agent_config (v1: company name
-        from the workspace's branding layer).
+        from the workspace's branding layer), and the caller-memory trio
+        (R1): contact (tiered identity block, None when unknown),
+        last_interaction (topic/outcome of the most recent prior terminal
+        call), open_callback (pending callback reason, if any).
 
     Unknown call ids 404; the agent falls back to its boot/template
     config, which carries no tenant data.
@@ -208,10 +335,19 @@ def get_call_context():
         assignments = ACA.query.all()
         gateways = McpGatewayConfig.query.filter_by(enabled=True).all()
         branding = SystemConfig.get_branding_config()
+        # Caller memory (R1): tiered contact block so inbound agents stop
+        # greeting known callers as strangers. None for unknown callers —
+        # the agent then behaves exactly as before this field existed.
+        contact_block, last_interaction, open_callback = _caller_memory(call)
 
     return jsonify({
+        'context_version': 1,
         'workspace_id': ws_id,
         'call_db_id': call.id,
+        'direction': call.direction,
+        'contact': contact_block,
+        'last_interaction': last_interaction,
+        'open_callback': open_callback,
         'queues': [
             {
                 'slug': q.slug,

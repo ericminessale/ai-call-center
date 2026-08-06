@@ -7,6 +7,8 @@ shape of a request without copying those values into a second data store.
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -47,3 +49,42 @@ def mask_phone(value: Any) -> str | None:
         return None
     digits = ''.join(char for char in str(value) if char.isdigit())
     return f"***{digits[-4:]}" if digits else '***'
+
+
+# Matches the credentials in a ``scheme://user:pass@host`` URL. SignalWire
+# echoes our own signed callback URLs back inside post-prompt payloads
+# (swaig_log[].delayed_post_response), so any raw payload we persist or serve
+# can carry the install's WEBHOOK_AUTH credential verbatim — which is also the
+# INTERNAL_AUTH fallback and the ctk signing key. Base64/JSON is not redaction.
+# Userinfo can contain neither whitespace, '/', '@', nor a quote — a quote would
+# mean the match ran past a JSON string boundary. The user half also excludes
+# ':' so it cannot swallow the separator.
+_CRED_USER_CHARS = r"[^\s/@:\"']"
+_CRED_PASS_CHARS = r"[^\s/@\"']"
+_CREDENTIAL_URL_RE = re.compile(
+    '(://)' + _CRED_USER_CHARS + '+:' + _CRED_PASS_CHARS + '+(@)'
+)
+
+
+def scrub_embedded_credentials(payload: Any) -> Any:
+    """Replace ``://user:pass@`` with ``://***:***@`` anywhere in a payload.
+
+    Operates on the JSON serialization so it reaches arbitrarily nested
+    values without walking the structure. Returns the input unchanged when
+    it is not JSON-serializable or contains no credential-shaped URL, so
+    callers can use it unconditionally. The debug value of these payloads is
+    the URL *shape*; the secret has none.
+    """
+    if payload is None:
+        return None
+    try:
+        serialized = json.dumps(payload, default=str)
+    except (TypeError, ValueError):
+        return payload
+    scrubbed = _CREDENTIAL_URL_RE.sub(r'\1***:***\2', serialized)
+    if scrubbed == serialized:
+        return payload
+    try:
+        return json.loads(scrubbed)
+    except ValueError:
+        return payload

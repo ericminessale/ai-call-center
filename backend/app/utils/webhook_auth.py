@@ -86,6 +86,17 @@ def _expected_internal_credentials() -> tuple[str | None, str | None]:
     return user, pw
 
 
+def internal_service_auth():
+    """requests-compatible ``(user, pass)`` for OUTBOUND calls to the other
+    internal service surface — the ai-agents admin API (F-01,
+    CONTEXT_MEMORY_VERIFICATION_AUDIT). Same trust principal as
+    :func:`require_internal_auth`; None when unconfigured so ``requests``
+    sends no header and the (now fail-closed) admin API rejects loudly.
+    """
+    user, pw = _expected_internal_credentials()
+    return (user, pw) if (user and pw) else None
+
+
 def _enforce_mode() -> bool:
     """Whether failed webhook auth REJECTS (vs soft-logs).
 

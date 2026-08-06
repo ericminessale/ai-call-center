@@ -36,7 +36,7 @@ interface WebhookEventRow {
 
 const PER_PAGE = 50;
 
-export function WebhookLogTab() {
+export function WebhookLogTab({ canView = true }: { canView?: boolean }) {
   const [events, setEvents] = useState<WebhookEventRow[]>([]);
   const [eventTypes, setEventTypes] = useState<string[]>([]);
   const [page, setPage] = useState(1);
@@ -79,16 +79,18 @@ export function WebhookLogTab() {
   }, [eventTypeFilter, callIdFilter, processedFilter]);
 
   useEffect(() => {
+    if (!canView) return;
     load();
-  }, [load]);
+  }, [load, canView]);
 
   // Lazy-load the dropdown choices once.
   useEffect(() => {
+    if (!canView) return;
     adminApi
       .listWebhookEventTypes()
       .then((res) => setEventTypes(res.data.event_types))
       .catch((err) => logger.error('Failed to load webhook event types', err));
-  }, []);
+  }, [canView]);
 
   const toggleExpanded = (id: number) => {
     setExpanded((prev) => {
@@ -100,6 +102,22 @@ export function WebhookLogTab() {
   };
 
   const lastPage = useMemo(() => Math.max(1, Math.ceil(total / PER_PAGE)), [total]);
+
+  // Scoped, not hidden (repo convention): the tab stays reachable and explains
+  // itself rather than vanishing or showing a bare 403. Raw webhook bodies are
+  // the least-filtered data in the product, so the route is full-admin only.
+  if (!canView) {
+    return (
+      <div className="max-w-2xl">
+        <h2 className="font-heading text-[18px] text-ink mb-1">Webhook Log</h2>
+        <p className="text-[13px] text-ink-muted">
+          Raw webhook payloads are available to full administrators only. They contain
+          unfiltered request bodies — transcripts, phone numbers, and agent context —
+          so this view is restricted even on the admin surface.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="text-ink">

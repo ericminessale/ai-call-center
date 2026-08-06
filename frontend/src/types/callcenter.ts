@@ -25,6 +25,19 @@ export interface Contact {
   totalCalls: number;
   lastInteractionAt?: string;
   averageSentiment?: number;
+  /** R4: rolling caller-memory digest — newest-first terminal calls,
+   *  {ended_at, reason, summary, disposition, handler, ai_agent}. */
+  interactionDigest?: Array<{
+    call_id?: number;
+    ended_at?: string;
+    channel?: string;
+    direction?: string;
+    handler?: string;
+    ai_agent?: string;
+    reason?: string;
+    disposition?: string;
+    summary?: string;
+  }>;
   createdAt: string;
   updatedAt: string;
 }
@@ -258,7 +271,9 @@ export type CallCapability =
 
 export interface TranscriptionMessage {
   id?: string;
-  speaker: 'agent' | 'customer' | 'ai' | 'caller';  // Added 'caller' alias for 'customer'
+  // 'caller' is an alias for 'customer'; 'system' rows are synthetic markers
+  // (e.g. the AI→human handoff divider) — rendered as a seam, not speech.
+  speaker: 'agent' | 'customer' | 'ai' | 'caller' | 'system';
   speakerName?: string;
   text: string;
   timestamp: string | Date;  // ISO string or Date object

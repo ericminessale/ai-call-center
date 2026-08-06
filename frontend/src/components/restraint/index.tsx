@@ -559,6 +559,26 @@ export function TranscriptUtterance({ speaker, role = 'caller', text, timestamp,
   );
 }
 
+export interface TranscriptDividerProps {
+  /** Divider label, e.g. "Human agent took over the call". */
+  label: React.ReactNode;
+  className?: string;
+}
+
+/** In-transcript boundary marker (speaker='system' rows, e.g. the AI→human
+ *  handoff): hairline — label — hairline. Nothing was said; it's a seam. */
+export function TranscriptDivider({ label, className }: TranscriptDividerProps) {
+  return (
+    <div role="separator" className={cx('flex items-center gap-2.5 py-2.5', className)}>
+      <span aria-hidden className="h-px flex-1 bg-rule" />
+      <span className="mono text-[11px] font-medium uppercase tracking-wider text-ink-dim whitespace-nowrap">
+        {label}
+      </span>
+      <span aria-hidden className="h-px flex-1 bg-rule" />
+    </div>
+  );
+}
+
 /* ===========================================================================
  * 12. CALL-TIMELINE NODE
  * ======================================================================== */

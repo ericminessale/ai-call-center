@@ -13,6 +13,7 @@ import {
   Chip,
   ContextBox,
   TranscriptUtterance,
+  TranscriptDivider,
   AI_GLYPH,
   type RestraintStatus,
 } from '../restraint';
@@ -186,6 +187,10 @@ export function CallDetailTab({
             ) : transcriptions.length > 0 ? (
               <div className="divide-y divide-rule/40">
                 {transcriptions.map((entry, idx) => {
+                  if (entry.speaker === 'system') {
+                    // Synthetic marker row (AI→human handoff) — a seam, not speech.
+                    return <TranscriptDivider key={idx} label={entry.text} />;
+                  }
                   const isAgent = entry.speaker === 'agent' || entry.speaker === 'ai';
                   const speakerLabel = entry.speaker === 'agent' ? 'Agent' : entry.speaker === 'ai' ? 'AI' : 'Caller';
                   return (

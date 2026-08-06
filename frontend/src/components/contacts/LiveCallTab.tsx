@@ -11,6 +11,7 @@ import CallEventStream from './CallEventStream';
 import {
   Chip,
   TranscriptUtterance,
+  TranscriptDivider,
   TemplatePill,
   SegmentedModeControl,
   AI_GLYPH,
@@ -433,6 +434,16 @@ export function LiveCallTab({
             ) : transcription.length > 0 ? (
               <div className="divide-y divide-rule/40">
                 {transcription.map((entry, idx) => {
+                  if (entry.speaker === 'system') {
+                    // Synthetic marker row (AI→human handoff) — a seam, not speech.
+                    return (
+                      <TranscriptDivider
+                        key={entry.id || idx}
+                        className="animate-fade-up"
+                        label={entry.text}
+                      />
+                    );
+                  }
                   const isAgent = entry.speaker === 'agent' || entry.speaker === 'ai';
                   const speaker = entry.speaker === 'agent'
                     ? 'Agent'

@@ -103,7 +103,10 @@ export default function CallDetails() {
     if (data.call_sid === callSid) {
       // Add to live transcript
       setLiveTranscript(prev => {
-        const prefix = data.role === 'remote-caller' ? 'Caller: ' : 'Agent: ';
+        // 'system' rows are synthetic markers (AI→human handoff), not speech.
+        const prefix = data.role === 'remote-caller' ? 'Caller: '
+          : data.role === 'system' ? '— '
+          : 'Agent: ';
         return prev + '\n' + prefix + data.text;
       });
 

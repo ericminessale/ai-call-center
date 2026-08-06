@@ -149,7 +149,7 @@ class Callback(WorkspaceScoped, db.Model):
         caller_name = (
             ctx.get('customer_name')
             or ctx.get('caller_name')
-            or (call.contact.name if getattr(call, 'contact', None) else None)
+            or (call.contact.computed_display_name if getattr(call, 'contact', None) else None)
         )
         # Reason: prefer caller-provided slot; fall back to argument; final fallback empty.
         reason_text = reason or ctx.get('reason') or ctx.get('issue') or ctx.get('issue_description')

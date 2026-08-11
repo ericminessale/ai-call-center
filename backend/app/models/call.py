@@ -257,11 +257,18 @@ class Call(WorkspaceScoped, db.Model):
         """Find all calls for a user."""
         return db.session.query(cls).filter_by(user_id=user_id).order_by(cls.created_at.desc()).all()
 
-    def compute_end_reason(self):
+    def compute_end_reason(self, pre_status=None):
         """Deterministic classification of HOW this call ended.
 
         Pure read of the call's own fields — safe to call repeatedly. Returns
         one of the end_reason codes documented on the column.
+
+        ``pre_status`` is the status the call held just before it went
+        terminal, when the caller knows it (update_status passes it; the
+        watchdog computes before flipping so its self.status is already the
+        pre-end status). Queue-death classification keys off it: a caller
+        parked 'waiting' when the call died abandoned the queue, however
+        long the AI talked to them beforehand.
         """
         if self.status == 'failed':
             return 'failed'
@@ -269,6 +276,13 @@ class Call(WorkspaceScoped, db.Model):
         answered = self.answered_at is not None
         had_agent = self.assigned_agent_id is not None
         duration = self.duration or 0
+
+        # Died while parked for a human — the AI conversation before the
+        # queue doesn't change that the queue is where we lost them. Without
+        # this, stamping answered_at for AI-handled calls would flip genuine
+        # queue abandons to 'completed'.
+        if (pre_status or self.status) in ('waiting', 'queued', 'pending', 'assigned'):
+            return 'missed' if had_agent else 'abandoned_in_queue'
 
         if not answered and duration == 0:
             # Never carried audio. Was an agent already on the hook (missed
@@ -302,7 +316,16 @@ class Call(WorkspaceScoped, db.Model):
         """
         previous_status = self.status
         self.status = status
-        if status == 'answered' and not self.answered_at:
+        if status in ('answered', 'ai_active') and not self.answered_at:
+            # 'ai_active' counts as answered: the SWML already ran `answer`
+            # and the AI is conversing. Inbound relay_script calls never get
+            # a call-state webhook (see call_watchdog docstring), so without
+            # this stamp AI-handled calls kept answered_at=NULL forever —
+            # duration never sealed, and compute_end_reason's
+            # "never carried audio" branch labeled every clean AI-only call
+            # 'abandoned_in_queue'. Stamping here also wakes the
+            # interaction_timeline's ai_active handling-segment path, which
+            # already gated on answered_at being set by now.
             self.answered_at = datetime.utcnow()
         elif status in self.TERMINAL_STATUSES and not self.ended_at:
             self.ended_at = datetime.utcnow()
@@ -310,7 +333,9 @@ class Call(WorkspaceScoped, db.Model):
                 delta = self.ended_at - self.answered_at
                 self.duration = int(delta.total_seconds())
         if status in self.TERMINAL_STATUSES and not self.end_reason:
-            self.end_reason = end_reason or self.compute_end_reason()
+            self.end_reason = end_reason or self.compute_end_reason(
+                pre_status=previous_status
+            )
 
         # A savepoint keeps analytics failures from blocking live call control
         # while successful writes still commit atomically with the outer state

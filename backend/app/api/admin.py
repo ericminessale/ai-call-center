@@ -7,7 +7,6 @@ from app.models.document import DocumentCollection, Document, AgentCollectionAss
 from app.models.queue import Queue, QueueAgentAssignment
 from app.models.user import ADMIN_SURFACE_ROLES
 from app.utils.decorators import require_auth, require_full_admin, require_role
-from app.utils.webhook_auth import internal_service_auth
 from app.utils.jwt_utils import verify_token
 from app.utils.rate_limit import rate_limit
 from app.utils.url_utils import get_base_url
@@ -83,14 +82,9 @@ def _enforce_admin_role():
     # stay unscoped. Mirrors require_auth (see app/tenancy.py).
     g.workspace_id = user.workspace_id
 import logging
-import os
 import re
-import requests as http_requests
 
 logger = logging.getLogger(__name__)
-
-# AI agents URL for internal communication (port 8081 for admin/reindex API)
-AI_AGENTS_ADMIN_URL = os.getenv('AI_AGENTS_ADMIN_URL', 'http://ai-agents:8081')
 
 
 # =============================================================================
@@ -724,67 +718,46 @@ def reindex_collection(collection_id):
     outbound POST goes to a fixed internal URL (AI_AGENTS_ADMIN_URL, env — not
     request data), so there's no SSRF here; the abuse angle is embedding
     compute, which the per-IP rate limit above bounds (HIGH-3 / HIGH-5).
+
+    The work itself lives in app.services.kb_index, which boot and workspace
+    provisioning also call — this endpoint is the manual entry point to it,
+    no longer the only one.
     """
+    from app.services.kb_index import reindex_collection as run_reindex
+
     try:
         collection = DocumentCollection.query.get(collection_id)
         if not collection:
             return jsonify({'error': 'Collection not found'}), 404
 
-        # Get all documents in the collection
-        documents = Document.query.filter_by(collection_id=collection_id).all()
+        logger.info(f"Triggering reindex for collection '{collection.name}'")
+        result = run_reindex(collection)
+        status = result.get('status')
 
-        if not documents:
-            return jsonify({'error': 'No documents to index'}), 400
-
-        # Prepare payload for AI agents reindex endpoint.
-        # Tenancy: the chunk-table identity is physical_name (ws{ID}_{name}
-        # for clones, = name for the default workspace's migrated rows) —
-        # NEVER the per-workspace display name, or every workspace's
-        # "sales_knowledge" reindex would clobber the same chunks_ table.
-        payload = {
-            'collection_name': collection.physical_name or collection.name,
-            'documents': [
-                {'title': d.title, 'content': d.content}
-                for d in documents
-            ],
-        }
-
-        # Call AI agents reindex endpoint
-        logger.info(f"Triggering reindex for collection '{collection.name}' with {len(documents)} documents")
-        resp = http_requests.post(
-            f"{AI_AGENTS_ADMIN_URL}/reindex",
-            auth=internal_service_auth(),
-            json=payload,
-            timeout=120,  # Embedding can take time
-        )
-
-        if resp.status_code == 200:
-            result = resp.json()
-            # Mark all documents as published
-            for doc in documents:
-                doc.is_published = True
-            db.session.commit()
-
+        if status == 'ok':
             return jsonify({
                 'success': True,
-                'collection': collection.name,
-                'documents_indexed': len(documents),
-                'chunks_indexed': result.get('chunks_indexed', 0),
+                'collection': result['collection'],
+                'documents_indexed': result['documents'],
+                'chunks_indexed': result['chunks_indexed'],
             }), 200
-        else:
-            error_msg = resp.text
-            logger.error(f"Reindex failed: {resp.status_code} - {error_msg}")
+        if status == 'empty':
+            return jsonify({'error': 'No documents to index'}), 400
+        if status == 'unreachable':
+            logger.error("Cannot reach AI agents service for reindex")
+            return jsonify({'error': 'Cannot reach AI agents service. Is it running?'}), 503
+        if status == 'timeout':
+            logger.error("Reindex request timed out")
+            return jsonify({'error': 'Reindex timed out. Try again or reduce document count.'}), 504
+        if status == 'failed':
+            logger.error(f"Reindex failed: {result.get('http_status')} - {result.get('error')}")
             return jsonify({
-                'error': f'Reindex failed: {error_msg}',
-                'status_code': resp.status_code,
+                'error': f"Reindex failed: {result.get('error')}",
+                'status_code': result.get('http_status'),
             }), 502
 
-    except http_requests.exceptions.ConnectionError:
-        logger.error("Cannot reach AI agents service for reindex")
-        return jsonify({'error': 'Cannot reach AI agents service. Is it running?'}), 503
-    except http_requests.exceptions.Timeout:
-        logger.error("Reindex request timed out")
-        return jsonify({'error': 'Reindex timed out. Try again or reduce document count.'}), 504
+        logger.error(f"Failed to reindex: {result.get('error')}")
+        return jsonify({'error': result.get('error', 'reindex failed')}), 500
     except Exception as e:
         db.session.rollback()
         logger.error(f"Failed to reindex: {str(e)}")

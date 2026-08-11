@@ -315,6 +315,22 @@ def create_app():
         except Exception as e:
             app.logger.error(f"[tenancy] default-workspace ensure failed (non-fatal): {e}")
 
+        # Knowledge base: seed the template workspace's example documents
+        # (once, tracked by a SystemConfig marker) and embed them into
+        # pgvector in the background. Both KB collections shipped EMPTY —
+        # no documents, no chunk tables — so every specialist's
+        # search_knowledge found nothing in every deployment shape. The
+        # seed is a plain DB write; the indexing waits on the ai-agents
+        # service, so it retries on its own greenlet rather than here.
+        try:
+            with app.app_context():
+                from app.services.knowledge_seed import seed_template_knowledge
+                seed_template_knowledge()
+            from app.services.kb_index import start_template_indexing
+            start_template_indexing(app)
+        except Exception as e:
+            app.logger.error(f"[knowledge_seed] boot seed failed (non-fatal): {e}")
+
         try:
             from app.utils.demo_config import tenancy_mode_active
             if tenancy_mode_active():

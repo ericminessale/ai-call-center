@@ -7,13 +7,19 @@ anonymous HttpOnly cookie token binds to a workspace via
 the DB), so the binding survives Redis flushes and the 7-day idle window.
 
 Creation seeds the workspace from the TEMPLATE workspace (id 1 — the same
-rows migrations seed for clone-and-own): the 3 queues, both KB collections
-WITH their documents (editable copies are the demo — "change what the AI
-knows"), agent→collection assignments, MCP gateway bindings, and the
-route.* config keys from the global (workspace 0) layer. Deliberately NO
-simulated colleagues and NO fake history (§10.3) — the seed is structural
-only. The visitor's own User row is the one user: role='visitor', generated
-email, unusable password (JWTs come from /api/demo/start, never login).
+rows migrations and app.services.knowledge_seed seed for clone-and-own):
+the 3 queues, both KB collections WITH their documents (editable copies
+are the demo — "change what the AI knows"), agent→collection assignments,
+MCP gateway bindings, and the route.* config keys from the global
+(workspace 0) layer. The cloned documents are then embedded into this
+workspace's own chunk tables by a post-commit background task, because
+copying the rows alone leaves search_knowledge finding nothing — that was
+the state of every workspace, template included, until 2026-08-11.
+
+Deliberately NO simulated colleagues and NO fake history (§10.3) — the
+seed is structural only. The visitor's own User row is the one user:
+role='visitor', generated email, unusable password (JWTs come from
+/api/demo/start, never login).
 
 The owner used to be minted as role='admin', which handed every anonymous
 visitor the whole /api/admin/* surface (HIGH-3). 'visitor' keeps the
@@ -296,6 +302,19 @@ def provision_workspace(session_token: str):
     bump_workspace_epoch(ws.public_id)
     mark_session_alive(ws.public_id)
 
+    # Embed the cloned KB documents so this workspace's specialists can
+    # actually find them. Cloning the rows was never enough — search reads
+    # chunks_{physical_name}, which is per-workspace and doesn't exist yet.
+    # Deliberately AFTER the commit and off the request path: embedding is
+    # the one part of provisioning that isn't sub-second.
+    try:
+        from flask import current_app
+
+        from app.services.kb_index import start_workspace_indexing
+        start_workspace_indexing(current_app._get_current_object(), ws.id)
+    except Exception as exc:
+        logger.warning("workspace %s KB indexing not started: %s", ws.public_id, exc)
+
     try:
         from app.services.demo_telemetry import bump_daily
         bump_daily('ws_created')
@@ -360,7 +379,11 @@ def _clone_templates(ws) -> None:
                     collection_id=clone.id,
                     title=doc.title,
                     content=doc.content,
-                    is_published=doc.is_published,
+                    # NOT copied from the template's flag. is_published is
+                    # the UI's "the AI can find this" badge, and the clone
+                    # has no chunk table yet — it earns the badge when the
+                    # post-commit index (kb_index) succeeds, not before.
+                    is_published=False,
                 ))
 
         for a in template_assignments:

@@ -296,6 +296,25 @@ def call_report():
             'contact': None,
         }
         if contact is not None:
+            # Queue-scenario ground truth: the durable promise minted by a
+            # hold timeout (or an explicit callback request) for this caller.
+            from app.models.callback import Callback
+            pending_cb = Callback.find_pending_for_contact(contact.id)
+            report['pending_callback'] = (
+                {
+                    'reason': pending_cb.reason,
+                    'requested_at': (
+                        pending_cb.requested_at.isoformat()
+                        if pending_cb.requested_at else None
+                    ),
+                }
+                if pending_cb is not None else None
+            )
+            report['callback_count'] = (
+                db.session.query(Callback)
+                .filter_by(contact_id=contact.id)
+                .count()
+            )
             report['contact'] = {
                 'id': contact.id,
                 'phone': contact.phone,

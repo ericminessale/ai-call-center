@@ -1,0 +1,45 @@
+{
+  "name": "hank_hold_callback",
+  "description": "One real call exercising the human-queue path in an agentless demo workspace: caller insists on a human, holds through position announcements, hits max_wait_before_ai_fallback (120s), and receives the callback promise. Asserts enqueue, bounded hold, the durable Callback row, and end_reason=callback_scheduled.",
+  "missions": [
+    {
+      "id": "hank-hold",
+      "label": "call 1: Hank insists on a human, holds to the callback offer",
+      "await": {"summary": true, "transcript": true},
+      "temperature": 0.5,
+      "max_call_s": 300,
+      "params": {"inactivity_timeout": 300000, "attention_timeout": 60000},
+      "persona": "You are Hank Morrison, calling a company's line about a problem with a recent order. You are the CALLER; wait for their greeting. Goals in order: (1) Early on, give your name: 'Hi, this is Hank Morrison.' (2) Explain briefly: you have an issue with a recent order and you want to speak with a HUMAN agent about it. (3) If they offer an AI specialist or AI assistant instead, politely decline: 'No thanks, I'd rather talk to a real person.' Insist on a human, politely, every time it's offered. (4) Answer their intake questions briefly (it's about an order problem; pick whichever department they suggest handles that). (5) When you are transferred to the queue and hear hold music or announcements like 'you are number N in the queue': WAIT SILENTLY. Do not hang up during hold. Do not keep talking - nobody is listening during hold. Just wait patiently, even for a couple of minutes. (6) If a voice announces that no agents are available and that they WILL CALL YOU BACK: mission accomplished - say 'Okay, thank you' if you get the chance, and if the call does not end on its own within a few seconds, use the end_call function. (7) If instead a human agent actually answers, ask your order question, thank them, say goodbye, and use end_call. HARD RULE: if the call somehow passes about six minutes total, say goodbye and use end_call. Style: natural, brief spoken sentences. Never mention being an AI, a bot, or a test. Observe carefully: hold music, queue position announcements, and exactly what is said about calling you back - you will report on all of it.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences, even if the call was cut off mid-conversation (report your best observations up to that point). Keys exactly: mission (string, 'hank_hold'), requested_human (boolean - did you ask for a human agent), refused_ai_specialist (boolean - were you offered an AI option and did you decline it), was_placed_on_hold (boolean - did you experience hold music or queue announcements), heard_position_announcements (boolean - did you hear anything like 'you are number N in the queue'), callback_promised (boolean - did a voice tell you no agents were available and they would call you back), human_answered (boolean - did an actual human agent take the call), call_ended_by_system (boolean - did the call end from their side rather than you hanging up), turns (integer), notes (short string)."
+    }
+  ],
+  "assertions": [
+    {"label": "bot returned a structured verdict",
+     "target": "verdict1.parsed", "op": "truthy", "level": "hard"},
+    {"label": "bot requested a human agent",
+     "target": "verdict1.parsed.requested_human", "op": "truthy", "level": "hard"},
+    {"label": "caller was placed on hold (queue experience)",
+     "target": "verdict1.parsed.was_placed_on_hold", "op": "truthy", "level": "hard"},
+    {"label": "callback was promised on hold timeout (bot observation)",
+     "target": "verdict1.parsed.callback_promised", "op": "truthy", "level": "hard"},
+    {"label": "call was enqueued to a human queue (Call.queue_id set)",
+     "target": "report1.call.queue_id", "op": "truthy", "level": "hard"},
+    {"label": "durable Callback row minted for the contact",
+     "target": "report1.pending_callback", "op": "truthy", "level": "hard"},
+    {"label": "call classified end_reason=callback_scheduled",
+     "target": "report1.call.end_reason", "op": "eq", "value": "callback_scheduled", "level": "hard"},
+
+    {"label": "receptionist post-prompt landed (summary)",
+     "target": "report1.call.summary", "op": "truthy", "level": "soft"},
+    {"label": "bot declined an offered AI specialist",
+     "target": "verdict1.parsed.refused_ai_specialist", "op": "truthy", "level": "soft"},
+    {"label": "position announcements heard during hold",
+     "target": "verdict1.parsed.heard_position_announcements", "op": "truthy", "level": "soft"},
+    {"label": "system ended the call after the promise (release, not abandon)",
+     "target": "verdict1.parsed.call_ended_by_system", "op": "truthy", "level": "soft"},
+    {"label": "callback reason captured from intake",
+     "target": "report1.pending_callback.reason", "op": "non_empty", "level": "soft"},
+    {"label": "call status reached ended",
+     "target": "report1.call.status", "op": "eq", "value": "ended", "level": "soft"}
+  ]
+}

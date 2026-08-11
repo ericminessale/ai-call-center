@@ -80,10 +80,14 @@ HOLD_LOOP_CEILING_SECONDS = 2100
 # The two release announcements. Wording is load-bearing: the synthetic
 # scenarios assert the caller actually HEARD "call you back" phrasing, and
 # the promise variant must only ever play once a Callback row is committed.
+# Deliberately NO "you can hang up now": the old REST flow said that to
+# cover its 9s settle-sleep before end_call, but here ``hangup`` executes
+# the moment the audio ends — inviting the caller to hang up first just
+# races them against us and makes the release read as an abandon.
 RELEASE_MESSAGE_PROMISE = (
     "Thanks for your patience. Rather than keep you holding, we've "
     "added you to our callback list, and one of our specialists "
-    "will call you back on this number. You can hang up now. "
+    "will call you back on this number. Thank you for calling. "
     "Goodbye."
 )
 RELEASE_MESSAGE_NO_PROMISE = (

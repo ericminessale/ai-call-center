@@ -133,19 +133,18 @@ def notify_assigned_agent(*, call, agent, conference_name: str, queue_slug: str,
 
 
 # ---------------------------------------------------------------------------
-# Per-call operations (hold / play / record / sidecar / transcription)
+# Per-call operations (hold / record / sidecar / transcription)
 #
 # Most of these are AGN/PER-CALL — they operate on call legs the same way in
 # both transports. We surface them here anyway so callers go through a single
 # import path, and so M1 can override hold (and DTMF later) without callsite
 # changes.
+#
+# There is deliberately NO play_to_caller here: REST audio injection into a
+# live leg is a verified silent no-op on this space (2026-08-11) in every
+# shape. Caller-audible audio rides SWML documents the leg fetches — see
+# queue_dispatch.hold_cycle_swml / after_conference_swml.
 # ---------------------------------------------------------------------------
-
-def play_to_caller(call, *, tts: Optional[str] = None, url: Optional[str] = None) -> Any:
-    """Play TTS or a media URL to the caller leg. Same in both transports."""
-    impl = _impl_for(call)
-    return impl.play_to_caller(call, tts=tts, url=url)
-
 
 def hold_caller(call, *, by_agent) -> Any:
     """Place the caller on hold.

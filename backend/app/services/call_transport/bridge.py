@@ -255,18 +255,6 @@ def notify_assigned_agent(*, call, agent, conference_name: str,
 # Per-call operations
 # ---------------------------------------------------------------------------
 
-def play_to_caller(call, *, tts: Optional[str] = None,
-                   url: Optional[str] = None) -> Any:
-    """Per-leg ``calling.play`` — identical to conference impl."""
-    from app.services.signalwire_api import get_signalwire_api
-    api = get_signalwire_api()
-    if tts is not None:
-        return api.play_tts(call.signalwire_call_sid, tts)
-    if url is not None:
-        return api.play_audio(call.signalwire_call_sid, url)
-    raise ValueError("play_to_caller requires either tts or url")
-
-
 def hold_caller(call, *, by_agent) -> Any:
     """Bridge hold = REST ``calling.hold`` on the caller's leg.
 

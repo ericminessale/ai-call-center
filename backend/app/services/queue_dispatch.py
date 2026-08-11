@@ -72,6 +72,13 @@ RELEASE_TEARDOWN_DELAY_SECONDS = 15
 # call_watchdog.STALE_MAX_AGE['waiting'].
 HOLD_LOOP_CEILING_SECONDS = 2100
 
+# Seconds between a returned-to-queue caller leaving their conference (the
+# customer-leave webhook) and _return_verify checking that their leg actually
+# survived the conference teardown. A surviving leg fetches /after-conference
+# and heartbeats within a second or two; 15s comfortably covers webhook and
+# fetch skew without leaving a dead leg's row open for long.
+RETURN_VERIFY_DELAY_SECONDS = 15
+
 
 # ---------------------------------------------------------------------------
 # Hold-cycle SWML builders
@@ -98,6 +105,15 @@ RELEASE_MESSAGE_NO_PROMISE = (
 
 PRE_JOIN_ANNOUNCEMENT = "An agent is joining you now. Please hold."
 
+# First audio of a renewed hold after an agent returned the caller to the
+# queue. Rides the after-conference SWML document — the only channel a
+# post-conference leg provably hears on this space; the REST TTS the old
+# return flow attempted was a silent no-op for every caller.
+RETURN_TO_QUEUE_ANNOUNCEMENT = (
+    "Let me connect you with someone better suited. "
+    "Please hold for just a moment."
+)
+
 
 def _swml_doc(main: list) -> Dict[str, Any]:
     return {"version": "1.0.0", "sections": {"main": main}}
@@ -120,6 +136,19 @@ def _hold_music_url(base_url: str) -> str:
     return f"{base_url}/api/queues/hold-music"
 
 
+def after_conference_url(base_url: str, call_sid: str) -> str:
+    """Signed URL a caller's leg fetches when its interaction conference ends
+    under it (the agent's member joins with ``end_on_exit``, so the agent
+    leaving — return-to-queue, end of call, browser death — ends the
+    conference and the caller's script resumes). No queue slug in the path:
+    the decision reads the call's live ``queue_id``, which return-to-queue
+    may have retargeted while the caller sat in the conference."""
+    from app.utils.url_utils import signed_webhook_url
+    return signed_webhook_url(
+        f"{base_url}/api/queues/after-conference?call_sid={call_sid}"
+    )
+
+
 def _release_swml(promised: bool) -> Dict[str, Any]:
     """The final document of a released hold: closing announcement, then the
     leg hangs itself up. Playing the message from SWML (not REST) is the
@@ -132,18 +161,28 @@ def _release_swml(promised: bool) -> Dict[str, Any]:
     ])
 
 
-def _join_conference_swml(call) -> Dict[str, Any]:
+def _join_conference_swml(call, base_url: str) -> Dict[str, Any]:
     """Document for a caller whose agent was dispatched while they cycled:
     announce, then join the interaction conference the agent is (about to
     be) in. Mirrors the entry SWML's dispatched branch — same conference
-    name, same hangup-on-exit semantics."""
+    name, same post-conference decision fetch.
+
+    The verb AFTER ``join_conference`` runs when the conference ends with
+    this leg still alive — which happens whenever the agent leaves first,
+    because the agent's member joins with ``end_on_exit``. That boundary is
+    a decision point exactly like a hold-cycle fetch: ``transfer`` to
+    /after-conference, whose answer re-queues a returned caller (the ONLY
+    audible path for the return-to-queue announcement on this space) or
+    hangs up a finished one, which is all the old inline ``hangup`` did."""
     conference_name = (
         call.conference_name or f"interaction-{call.signalwire_call_sid}"
     )
     return _swml_doc([
         {"play": {"url": f"say:{PRE_JOIN_ANNOUNCEMENT}"}},
         {"join_conference": {"name": conference_name, "end_on_exit": False}},
-        "hangup",
+        {"transfer": {
+            "dest": after_conference_url(base_url, call.signalwire_call_sid)
+        }},
     ])
 
 
@@ -552,7 +591,7 @@ def hold_cycle_swml(
                 f"Hold cycle {call_sid}: agent {call.assigned_agent_id} "
                 f"dispatched — sending caller into the conference"
             )
-            return _join_conference_swml(call)
+            return _join_conference_swml(call, base_url)
 
         redis = get_redis_client()
         position = entry = None
@@ -600,7 +639,7 @@ def hold_cycle_swml(
             # check and now. Serve whatever the winner decided.
             db.session.refresh(call)
             if call.assigned_agent_id:
-                return _join_conference_swml(call)
+                return _join_conference_swml(call, base_url)
             if call.end_reason == END_REASON_CALLBACK_SCHEDULED:
                 _schedule_release_teardown(call_sid, workspace_id)
                 return _release_swml(_pending_callback_for(call) is not None)
@@ -640,6 +679,175 @@ def hold_cycle_swml(
         )
 
 
+def after_conference_swml(call_sid: str, base_url: str) -> Dict[str, Any]:
+    """Decide the fate of a caller leg whose interaction conference just
+    ended under it.
+
+    The agent's conference member joins with ``end_on_exit``, so the agent
+    leaving ends the conference and the caller's script resumes at the
+    ``transfer`` that fetches this. Two ways that happens with the caller
+    still alive:
+
+      - Return-to-queue: call_control committed status='waiting', cleared
+        the assignment and re-enqueued BEFORE telling the agent's browser
+        to hang up, so by the time this fetch arrives the durable state
+        already says "back in the queue". Speak the handoff announcement
+        and ``transfer`` into the SWML hold cycle — the machine that owns
+        position announcements, re-dispatch and the hold cap. This is the
+        only architecture in which the caller HEARS the announcement: the
+        old flow's REST TTS was a proven silent no-op, and worse, the old
+        inline ``hangup`` after ``join_conference`` disconnected the
+        returned caller outright the moment the agent left.
+
+      - End of call where the agent's leg dropped first (agent clicked
+        End, or their browser died): the caller is done. Hang up — exactly
+        what the old inline verb did.
+
+    A caller re-taken by another agent between the return commit and this
+    fetch (status 'assigned') joins the new agent's conference directly,
+    same as the hold cycle's dispatched branch. Everything else defaults
+    to hangup: this endpoint must never strand a leg in silence or re-join
+    a conference nobody is coming back to.
+    """
+    from app.models import Call
+    from app.services.redis_service import get_redis_client
+    from app.tenancy import workspace_context
+
+    call = Call.find_by_sid(call_sid) if call_sid else None
+    if call is None:
+        logger.warning(
+            f"After-conference: unknown call {call_sid!r} — hanging up"
+        )
+        return _swml_doc(["hangup"])
+
+    with workspace_context(call.workspace_id):
+        if (
+            call.ended_at is not None
+            or call.status in Call.TERMINAL_STATUSES
+            or call.end_reason is not None
+        ):
+            return _swml_doc(["hangup"])
+
+        if call.status == 'waiting' and call.assigned_agent_id is None:
+            queue_slug = (call.queue_id or '').strip()
+            if not queue_slug:
+                logger.warning(
+                    f"After-conference {call_sid}: returned to queue but no "
+                    f"queue to hold in — hanging up"
+                )
+                return _swml_doc(["hangup"])
+            # The fetch itself proves the leg survived the conference
+            # teardown — heartbeat immediately so _return_verify and the
+            # watchdog both know. (A vanished queue entry is NOT checked
+            # here: the hold cycle's first fetch releases honestly in that
+            # case, with wording we'd only duplicate.)
+            redis = get_redis_client()
+            if redis:
+                try:
+                    redis.set(f"call_heartbeat:{call_sid}", '1', ex=90)
+                except Exception:
+                    pass
+            logger.info(
+                f"After-conference {call_sid}: returned to queue "
+                f"'{queue_slug}' — announcing and entering the hold cycle"
+            )
+            return _swml_doc([
+                {"play": {"url": f"say:{RETURN_TO_QUEUE_ANNOUNCEMENT}"}},
+                {"transfer": {
+                    "dest": hold_cycle_url(base_url, queue_slug, call_sid, 1)
+                }},
+            ])
+
+        if call.status == 'assigned' and call.assigned_agent_id:
+            # Re-taken between the return commit and this fetch. Same
+            # conference name, fresh instance — the new agent's leg joins
+            # it on Accept.
+            return _join_conference_swml(call, base_url)
+
+        # 'active' with an agent = normal end where the agent's leg dropped
+        # first; anything unrecognised gets the same safe teardown.
+        return _swml_doc(["hangup"])
+
+
+def schedule_return_verify(call_sid: str, workspace_id) -> None:
+    """Arrange the survival check for a returned-to-queue caller whose
+    customer-leave event just arrived. The conference dying under the
+    caller is BY DESIGN on that path — their leg should be fetching
+    /after-conference right now — but if SignalWire tore the leg down with
+    the conference instead, nothing else will ever close the row
+    (SWML-parked legs deliver no call-state webhook), so verify shortly
+    and reap only if the leg never checked in."""
+    from flask import current_app
+
+    from app import socketio
+
+    app = current_app._get_current_object()
+    socketio.start_background_task(_return_verify, app, call_sid, workspace_id)
+
+
+def _return_verify(app, call_sid: str, workspace_id) -> None:
+    """Internal — runs ~RETURN_VERIFY_DELAY_SECONDS after a returned-to-queue
+    caller left their conference. A surviving leg has heartbeated (the
+    /after-conference fetch and every hold cycle set ``call_heartbeat``) or
+    the call has progressed (re-assigned / active / terminal); absent all
+    of those, the leg died with the conference: dequeue, backstop-end the
+    leg, and let ``reap_call`` classify the row (abandoned_in_queue)."""
+    from app import socketio
+    from app.models import Call
+    from app.services.call_watchdog import reap_call
+    from app.services.queue_service import QueueService
+    from app.services.redis_service import get_redis_client
+    from app.services.signalwire_api import get_signalwire_api
+    from app.tenancy import workspace_context
+
+    with app.app_context():
+        socketio.sleep(RETURN_VERIFY_DELAY_SECONDS)
+        with workspace_context(workspace_id):
+            call = Call.find_by_sid(call_sid)
+            if call is None:
+                return
+            if call.ended_at is not None or call.status in Call.TERMINAL_STATUSES:
+                return
+            if call.status != 'waiting' or call.assigned_agent_id is not None:
+                # Progressed — re-taken or otherwise moved on. Not ours.
+                return
+            redis = get_redis_client()
+            if redis is None:
+                return
+            try:
+                heartbeat = redis.get(f"call_heartbeat:{call_sid}")
+            except Exception as e:
+                # Unknown is not gone — never reap a live caller over a
+                # Redis blip. The watchdog's sweep owns the long tail.
+                logger.warning(
+                    f"Return verify {call_sid}: heartbeat read failed: {e}"
+                )
+                return
+            if heartbeat:
+                return  # leg alive in the hold cycle
+            logger.warning(
+                f"Return verify {call_sid}: leg never re-entered the hold "
+                f"cycle after its conference ended — closing the row"
+            )
+            try:
+                QueueService(
+                    redis, workspace_id=workspace_id,
+                ).remove_call_from_all_queues(call_sid)
+            except Exception as e:
+                logger.warning(f"Return verify {call_sid}: dequeue failed: {e}")
+            try:
+                get_signalwire_api().end_call(call_sid)
+            except Exception as e:
+                logger.info(
+                    f"Return verify {call_sid}: end_call backstop errored "
+                    f"(leg normally already gone): {e}"
+                )
+            try:
+                reap_call(call)
+            except Exception as e:
+                logger.error(f"Return verify {call_sid}: cleanup failed: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Unified queue onboarding — used by both /direct-inbound and /route
 # ---------------------------------------------------------------------------
@@ -671,7 +879,9 @@ def enqueue_and_build_swml(
         emits ``call_assignment`` to the agent's room
 
     Returns: SWML dict for the caller's leg. Ends with
-        join_conference(interaction-<call_sid>) + hangup when an agent was
+        join_conference(interaction-<call_sid>) + a ``transfer`` to
+        /after-conference (the post-conference decision — re-queue or
+        hangup, see ``after_conference_swml``) when an agent was
         dispatched, or a ``transfer`` into the SWML hold cycle otherwise —
         the cycle (``hold_cycle_swml``) owns position announcements, the
         ``max_wait_before_ai_fallback`` timeout and the eventual conference
@@ -884,14 +1094,22 @@ def enqueue_and_build_swml(
     main_section.append({"play": {"url": greeting}})
     if agent_dispatched:
         # Agent already on the way — park the caller in the conference the
-        # agent's WebRTC leg joins on Accept.
+        # agent's WebRTC leg joins on Accept. When the conference later ends
+        # with this leg still alive (the agent's member joins with
+        # end_on_exit, so their exit ends it), the script resumes at the
+        # transfer: /after-conference re-queues a returned caller or hangs
+        # up a finished one — see after_conference_swml.
         main_section.append({
             "join_conference": {
                 "name": conference_name,
                 "end_on_exit": False,
             }
         })
-        main_section.append("hangup")
+        main_section.append({
+            "transfer": {
+                "dest": after_conference_url(base_url, call_sid)
+            }
+        })
     else:
         # Nobody available: enter the SWML hold cycle instead of the
         # conference. Each cycle plays the position + music and transfers

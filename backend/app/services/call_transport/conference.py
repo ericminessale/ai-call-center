@@ -81,23 +81,6 @@ def notify_assigned_agent(*, call, agent, conference_name: str,
 # Per-call operations
 # ---------------------------------------------------------------------------
 
-def play_to_caller(call, *, tts: Optional[str] = None,
-                   url: Optional[str] = None) -> Any:
-    """Play TTS or media URL to the caller leg.
-
-    Uses ``calling.play`` REST on the caller's call_id. Same in conference
-    and bridge — no conference-specific routing is needed because we target
-    the actual leg, not a conference participant.
-    """
-    from app.services.signalwire_api import get_signalwire_api
-    api = get_signalwire_api()
-    if tts is not None:
-        return api.play_tts(call.signalwire_call_sid, tts)
-    if url is not None:
-        return api.play_audio(call.signalwire_call_sid, url)
-    raise ValueError("play_to_caller requires either tts or url")
-
-
 def hold_caller(call, *, by_agent) -> Any:
     """Conference hold = mute+deaf the agent's conference member.
 

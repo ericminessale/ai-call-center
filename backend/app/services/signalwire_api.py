@@ -915,57 +915,19 @@ class SignalWireAPI:
         """Resume a held call."""
         return self._call_command(call_id, "calling.unhold")
 
-    def _play_media(self, call_id, media_items):
-        """POST to the per-call ``/play`` endpoint (the documented REST play
-        API): ``POST {api_url}/{call_id}/play`` with ``{"play": [...]}``.
-
-        The previous implementation sent a ``calling.play`` command envelope
-        to the bare collection endpoint. SignalWire answered 200 and played
-        NOTHING — the same silently-accepted-imaginary-payload class as the
-        ``media`` param-key bug below, and the reason no caller ever heard a
-        queue position announcement or the hold-timeout callback promise
-        (caught 2026-08-11 by the hank_hold_callback synthetic scenario:
-        the DB said 'promise made', the caller heard hold music then dead
-        air).
-        """
-        headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'Authorization': self.auth_header,
-        }
-        response = requests.post(
-            f"{self.api_url}/{call_id}/play",
-            json={"play": media_items},
-            headers=headers,
-        )
-        if 200 <= response.status_code < 300:
-            try:
-                return response.json()
-            except ValueError:
-                return {}
-        logger.error(
-            f"play on call {call_id} failed: {response.status_code} - "
-            f"{response.text[:300]}"
-        )
-        raise Exception(f"play failed: {response.status_code}")
-
-    def play_audio(self, call_id, url):
-        """Play an audio file into an active call.
-
-        Param key MUST be ``play`` (historical: an earlier version used
-        ``media`` — SignalWire silently accepted the request but never
-        emitted audio).
-        """
-        return self._play_media(call_id, [{"type": "audio", "url": url}])
-
-    def play_tts(self, call_id, text, voice="en-US-Neural2-F"):
-        """Play text-to-speech into an active call. See ``_play_media`` for
-        why this uses the per-call /play endpoint, not a command envelope.
-
-        Note: playback may fail on AI-managed calls since the ai verb owns
-        the audio pipeline. Works on human-agent or conference calls.
-        """
-        return self._play_media(call_id, [{"type": "tts", "text": text}])
+    # REST audio injection (play_tts / play_audio) is deliberately ABSENT.
+    # Every shape was tested live against a held leg on 2026-08-11 with
+    # transcript verification, and none produce audio on this space: the
+    # ``calling.play`` command envelope returns 200 and plays nothing (a 200
+    # from /api/calling/calls means "call exists", not "command executed" —
+    # unknown commands are silently ignored), and the documented per-call
+    # ``/play`` path 404s. The silent-success version of this bug is how
+    # callers heard hold music and then dead air while the DB recorded a
+    # perfect announcement flow (hank_hold_callback, sid 2228783d). Audio a
+    # caller actually hears rides an SWML document their leg fetches — see
+    # queue_dispatch.hold_cycle_swml / after_conference_swml — or the ai
+    # verb on AI-handled calls. Do not reintroduce a play method here
+    # without live transcript proof that the audio is audible.
 
     def start_recording(self, call_id, stereo=False, direction="both"):
         """Start recording an active call. Returns control_id for stopping."""

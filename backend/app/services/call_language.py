@@ -150,8 +150,33 @@ def restart_ai_leg_transcription(call, base_url):
     human handoff the running session carries ``ai_summary: true`` whose
     teardown summary feeds the wrap-up note — killing and replacing that
     session would silently lose the end-of-call summary.
+
+    DEFAULT OFF (2026-08-11, maria_language_memory run 20260811-130839):
+    in live verification, every stop+start issued against a leg running
+    the ``ai`` verb made transcription events CEASE entirely — no rows in
+    any language after the restart — and the affected calls died early
+    with their post-prompts never delivered (call rows stuck ai_active,
+    no summary, no enrichment). That is the same media-fork seizure
+    signature the diagnostics.live_transcribe_enabled kill-switch was
+    added to triage. Until SignalWire confirms a safe way to swap
+    transcription language mid-``ai``-verb, the restart stays behind
+    ``transcription.language_restart_enabled`` (default false): first
+    contact with an unknown non-English caller keeps a wrong-language
+    transcript for THAT call only — the language gate still captures
+    caller_language mid-call, the contact still gets seeded, and every
+    subsequent call transcribes correctly from second zero.
     """
     from app.models.system_config import SystemConfig
+
+    if SystemConfig.get(
+            'transcription.language_restart_enabled', 'false'
+    ).strip().lower() != 'true':
+        logger.info(
+            "restart_ai_leg_transcription: disabled "
+            "(transcription.language_restart_enabled != true) — call %s "
+            "keeps its current transcription language", call.id,
+        )
+        return False
 
     # Same diagnostic kill-switch as the initial-call start (2026-06-11
     # media-fork triage): when live_transcribe is disabled for A/B calls,

@@ -173,6 +173,25 @@ def test_derive_defaults_when_nothing_known(lang_app):
     assert derive_call_language(call) == DEFAULT_LANGUAGE
 
 
+def test_restart_is_disabled_by_default(lang_app, monkeypatch):
+    """Live finding (run 20260811-130839): stop+start against a leg running
+    the ai verb kills transcription delivery and the call with it. The real
+    restart function must therefore no-op unless explicitly enabled."""
+    _fa, ws, _wso, user, _contact = lang_app
+    call = _call(ws, user, sid='call-restart-default')
+
+    from app.services import call_language as cl_real
+    api_calls = []
+    import app.services.signalwire_api as sw
+    monkeypatch.setattr(
+        sw, 'get_signalwire_api',
+        lambda: api_calls.append('constructed'),
+    )
+
+    assert cl_real.restart_ai_leg_transcription(call, 'http://test') is False
+    assert api_calls == []
+
+
 # ---------------------------------------------------------------------------
 # POST /api/calls/<id>/caller-language — the tool's write-through
 # ---------------------------------------------------------------------------

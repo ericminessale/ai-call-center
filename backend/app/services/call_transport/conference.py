@@ -38,8 +38,9 @@ def build_ingress_swml(
     """Conference-mode ingress — delegates to the existing
     ``queue_dispatch.enqueue_and_build_swml`` which already implements the
     full conference lifecycle (Conference row creation, Redis enqueue,
-    immediate-dispatch attempt, position-announcement loop start, and
-    caller-leg SWML ending in ``join_conference``).
+    immediate-dispatch attempt, and caller-leg SWML: ``join_conference``
+    when an agent was dispatched, otherwise a ``transfer`` into the SWML
+    hold cycle that owns announcements + the hold timeout).
     """
     from app.services.queue_dispatch import enqueue_and_build_swml
     return enqueue_and_build_swml(
@@ -65,7 +66,9 @@ def notify_assigned_agent(*, call, agent, conference_name: str,
                           context: Optional[Dict[str, Any]] = None) -> bool:
     """Conference-mode agent notification — delegates to the existing
     ``queue_dispatch.emit_call_assignment_to_agent`` which emits the
-    Socket.IO ``call_assignment`` event AND fires the pre-join announcement.
+    Socket.IO ``call_assignment`` event. The caller-side pre-join
+    announcement rides the caller's own SWML (entry greeting or hold-cycle
+    join document), not REST play.
     """
     from app.services.queue_dispatch import emit_call_assignment_to_agent
     return emit_call_assignment_to_agent(

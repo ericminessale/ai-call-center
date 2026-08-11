@@ -7,14 +7,22 @@ room. The agent's frontend renders the incoming-call banner; on Accept, the
 frontend hits `/api/conferences/prepare-join` to stash assignment data with a
 token, then dials the AGENT_CONFERENCE_RESOURCE Fabric address with that
 token. SignalWire calls our /api/conferences/agent-conference webhook, which
-returns SWML that joins the agent's leg into the named conference. Caller is
-already in the same conference (placed there by /direct-inbound's SWML), so
-both end up bridged with no additional plumbing.
+returns SWML that joins the agent's leg into the named conference.
 
-Also hosts the per-caller in-conference announcement loop — periodic position
-updates while the caller waits, pre-join "agent joining" TTS the moment a
-dispatch fires, and the hold timeout that bounds the wait (see
-``_offer_callback_and_release``).
+Also hosts the SWML hold cycle — the caller-audible half of waiting in a
+queue. A caller with no agent available does NOT sit in the conference:
+their leg loops through short SWML documents (position announcement + hold
+music + ``transfer`` back to /api/queues/<slug>/hold), and each fetch is a
+decision point: keep holding, join the conference the moment an agent was
+dispatched, or — past the queue's ``max_wait_before_ai_fallback`` — commit a
+Callback row and speak the callback promise before releasing the line.
+
+Why SWML and not REST audio: this space's /api/calling/calls command
+envelope silently ignores play commands (HTTP 200, no audio — proven live
+2026-08-11 by the hank_hold_callback synthetic scenario), and the documented
+per-call /play path 404s on live legs. There is no REST audio-injection
+primitive here; SWML documents are the only thing a parked caller provably
+hears, so the hold experience is built entirely out of them.
 
 This file exists to avoid duplicating the emit code in multiple callers and
 to sidestep circular imports between queue_service.py and queues.py.
@@ -22,13 +30,13 @@ to sidestep circular imports between queue_service.py and queues.py.
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Hold-timeout tunables
+# Hold-cycle tunables
 # ---------------------------------------------------------------------------
 
 # end_reason stamped on a call we released into the callback queue. Distinct
@@ -38,67 +46,135 @@ logger = logging.getLogger(__name__)
 # Call.update_status feeds end_reason to close_open_queue_attempt.
 END_REASON_CALLBACK_SCHEDULED = 'callback_scheduled'
 
-# Seconds to let the closing announcement play before we drop the caller's
-# leg. calling.play returns when SignalWire ACCEPTS the command, not when the
-# audio finishes, so ending the call immediately would cut the caller off
-# mid-sentence — they'd hear a syllable and a hangup instead of the promise
-# we just made them.
-CALLBACK_ANNOUNCE_SETTLE_SECONDS = 9
+# Length of the bundled hold-music segment (backend/app/assets/hold_music.wav,
+# served at /api/queues/hold-music). One hold cycle ≈ announcement + this, so
+# it is also the cadence of position announcements AND the worst-case lag
+# between an agent being dispatched and the caller's leg reaching the
+# join_conference decision point. Keep it short: a dispatched agent sits
+# alone in the conference until the caller's current cycle finishes.
+HOLD_MUSIC_SECONDS = 20
 
-# Consecutive play_tts failures that end the loop. A leg that has gone away
-# without us being told (carrier drop, stale zset entry) fails every single
-# announcement; previously those failures were logged and ignored forever.
-MAX_CONSECUTIVE_TTS_FAILURES = 3
+# Rough spoken length of the position announcement. Only used to aim the
+# last cycle at the hold cap instead of overshooting by a full segment.
+HOLD_ANNOUNCE_SECONDS = 5
 
-# Absolute ceiling on one caller's announcement loop, however the queue is
-# configured. Only reachable when an admin has disabled the per-queue cap
-# (set it to 0) — it exists so a disabled cap can still never mean "this
-# greenlet runs until the process restarts". Matches
-# call_watchdog.STALE_MAX_AGE['waiting']: past that point the watchdog has
-# reaped the Call row, so announcing into it is provably pointless.
+# Seconds before the background teardown reaps a released call. The release
+# SWML plays the ~9s closing announcement and then executes ``hangup``
+# itself, so this only needs to comfortably outlast the audio; the REST
+# end_call inside the teardown is a backstop for a leg whose hangup verb
+# never ran.
+RELEASE_TEARDOWN_DELAY_SECONDS = 15
+
+# Absolute ceiling on one caller's hold, however the queue is configured.
+# Only reachable when an admin has disabled the per-queue cap (set it to 0) —
+# it exists so a disabled cap can still never mean "this caller cycles until
+# the heartbeat keeps the watchdog away forever". Matches
+# call_watchdog.STALE_MAX_AGE['waiting'].
 HOLD_LOOP_CEILING_SECONDS = 2100
 
 
 # ---------------------------------------------------------------------------
-# In-conference TTS announcements
+# Hold-cycle SWML builders
 # ---------------------------------------------------------------------------
 
-def play_caller_pre_join_announcement(call_sid: str) -> None:
-    """Tell the caller an agent is about to join. Fired the moment we dispatch
-    an agent (immediate at call arrival OR later via push-dispatch). Best-
-    effort — if play_tts fails, dispatch still proceeds. Caller will hear the
-    music duck and the agent's voice when they join either way.
-    """
-    if not call_sid:
-        return
-    try:
-        from app.services.signalwire_api import get_signalwire_api
-        get_signalwire_api().play_tts(
-            call_sid,
-            "An agent is joining you now. Please hold.",
-        )
-    except Exception as e:
-        logger.warning(f"play_caller_pre_join_announcement failed for {call_sid}: {e}")
+# The two release announcements. Wording is load-bearing: the synthetic
+# scenarios assert the caller actually HEARD "call you back" phrasing, and
+# the promise variant must only ever play once a Callback row is committed.
+RELEASE_MESSAGE_PROMISE = (
+    "Thanks for your patience. Rather than keep you holding, we've "
+    "added you to our callback list, and one of our specialists "
+    "will call you back on this number. You can hang up now. "
+    "Goodbye."
+)
+RELEASE_MESSAGE_NO_PROMISE = (
+    "We're sorry — our specialists are all still busy, and we "
+    "haven't been able to connect you. Please try your call again "
+    "a little later. Goodbye."
+)
+
+PRE_JOIN_ANNOUNCEMENT = "An agent is joining you now. Please hold."
 
 
-def start_position_announcement_loop(
-    app, call_sid: str, queue_slug: str, interval_seconds: int = 30,
-    workspace_id=None,
-) -> None:
-    """Spawn an eventlet background task that periodically plays the caller's
-    current queue position via play_tts. Self-terminates when the call is no
-    longer in the queue zset (dispatched / hung up / abandoned).
+def _swml_doc(main: list) -> Dict[str, Any]:
+    return {"version": "1.0.0", "sections": {"main": main}}
 
-    ``app`` must be the actual Flask app object (not the current_app proxy)
-    so the background greenlet can push its own context. ``workspace_id``
-    picks which workspace's queue zset to watch (queue keys are
-    ``ws:{id}:queue:{slug}`` — slugs repeat across workspaces).
-    """
-    from app import socketio
-    socketio.start_background_task(
-        _announcement_loop, app, call_sid, queue_slug, interval_seconds,
-        workspace_id,
+
+def hold_cycle_url(base_url: str, queue_slug: str, call_sid: str,
+                   cycle: int) -> str:
+    """Signed URL for one iteration of the hold cycle. The token binds the
+    path only, so the per-cycle query params don't invalidate it."""
+    from app.utils.url_utils import signed_webhook_url
+    return signed_webhook_url(
+        f"{base_url}/api/queues/{queue_slug}/hold"
+        f"?call_sid={call_sid}&n={cycle}"
     )
+
+
+def _hold_music_url(base_url: str) -> str:
+    # Public media fetch — SignalWire's player does not carry webhook auth,
+    # and the asset is not sensitive.
+    return f"{base_url}/api/queues/hold-music"
+
+
+def _release_swml(promised: bool) -> Dict[str, Any]:
+    """The final document of a released hold: closing announcement, then the
+    leg hangs itself up. Playing the message from SWML (not REST) is the
+    whole point — hangup runs only after the audio finished, so the caller
+    hears the entire promise instead of a syllable and a click."""
+    message = RELEASE_MESSAGE_PROMISE if promised else RELEASE_MESSAGE_NO_PROMISE
+    return _swml_doc([
+        {"play": {"url": f"say:{message}"}},
+        "hangup",
+    ])
+
+
+def _join_conference_swml(call) -> Dict[str, Any]:
+    """Document for a caller whose agent was dispatched while they cycled:
+    announce, then join the interaction conference the agent is (about to
+    be) in. Mirrors the entry SWML's dispatched branch — same conference
+    name, same hangup-on-exit semantics."""
+    conference_name = (
+        call.conference_name or f"interaction-{call.signalwire_call_sid}"
+    )
+    return _swml_doc([
+        {"play": {"url": f"say:{PRE_JOIN_ANNOUNCEMENT}"}},
+        {"join_conference": {"name": conference_name, "end_on_exit": False}},
+        "hangup",
+    ])
+
+
+def _cycle_swml(base_url: str, queue_slug: str, call_sid: str, cycle: int,
+                position: Optional[int], waited: Optional[int],
+                cap: Optional[int]) -> Dict[str, Any]:
+    """One hold iteration: (announcement +) music, then transfer back to the
+    hold endpoint for the next decision. Cycle 1 skips the announcement —
+    the entry SWML's greeting said the position seconds ago."""
+    urls = []
+    announce = cycle > 1 and position is not None
+    if announce:
+        urls.append(
+            f"say:You are number {position} in the queue. "
+            f"Please continue holding."
+        )
+
+    # Land the release near the cap instead of a full segment past it: when
+    # less than one normal cycle remains, pad with silence sized to the
+    # remainder rather than starting another 20s music segment.
+    remaining = None
+    if cap is not None and waited is not None:
+        remaining = max(0, cap - waited)
+    announce_len = HOLD_ANNOUNCE_SECONDS if announce else 0
+    if remaining is not None and remaining < announce_len + HOLD_MUSIC_SECONDS:
+        urls.append(f"silence:{max(2, remaining - announce_len)}")
+    else:
+        urls.append(_hold_music_url(base_url))
+
+    return _swml_doc([
+        {"play": {"urls": urls}},
+        {"transfer": {
+            "dest": hold_cycle_url(base_url, queue_slug, call_sid, cycle + 1)
+        }},
+    ])
 
 
 def _queue_hold_cap_seconds(queue_slug: str, workspace_id) -> Optional[int]:
@@ -167,11 +243,35 @@ def _waited_seconds(entry: Optional[Dict[str, Any]]) -> Optional[int]:
     return max(0, int((datetime.utcnow() - enqueued_at).total_seconds()))
 
 
-def _offer_callback_and_release(
-    call_sid: str, queue_slug: str, workspace_id, waited_seconds: int,
-    cap_seconds: int,
-) -> None:
-    """Hold timeout: put the caller on the callback list and free the line.
+def _pending_callback_for(call):
+    """The call's live pending Callback row, if any. 'Live' means not
+    completed and not expired — the same definition the callback board uses.
+    None on lookup failure (callers treat that as 'no promise to speak of')."""
+    from datetime import datetime
+
+    from app import db
+    from app.models import Callback
+
+    try:
+        return (
+            db.session.query(Callback)
+            .filter(
+                Callback.call_id == call.id,
+                Callback.completed_at.is_(None),
+                Callback.expires_at > datetime.utcnow(),
+            )
+            .order_by(Callback.requested_at.desc())
+            .first()
+        )
+    except Exception as e:
+        logger.warning(f"Pending-callback lookup failed for call {call.id}: {e}")
+        return None
+
+
+def _claim_hold_release(
+    call, queue_slug: str, workspace_id, waited_seconds: int, cap_seconds: int,
+) -> Tuple[bool, Optional[Any]]:
+    """Hold timeout: claim the call and make the callback promise durable.
 
     Runs when a waiting caller passes their queue's
     ``max_wait_before_ai_fallback``. Enrolling them in the callback queue
@@ -180,339 +280,360 @@ def _offer_callback_and_release(
     row lands on the callback board, an agent claims and dials it, and the
     outcome vocabulary already covers "caller said no thanks" (`declined`).
 
-    Deliberately NOT an AI hand-back, despite the column name. Sending the
-    caller's leg back to ``queue.ai_agent_route`` means re-pointing a leg
-    that is mid-``join_conference`` at new SWML, and the only primitive here
-    for that (``signalwire_api.update_call``) is dead code whose payload
-    shape doesn't match any command this file's other methods use — it looks
-    modelled on Twilio's compat API, not ``/api/calling/calls``. Shipping
-    live-call surgery on that is how LIFE-02 desynced DB state from
-    SignalWire state and got the transfer path 501'd. Every primitive used
-    below is one this repo already exercises on real calls.
+    Deliberately NOT an AI hand-back, despite the column name — there is no
+    working primitive to re-point a live leg at an AI route from REST (see
+    signalwire_api.update_call), and LIFE-02 is what shipping that anyway
+    looks like. The hold CYCLE is what makes this announcement possible at
+    all: the caller's leg fetches its next document from us, so the promise
+    rides back as SWML instead of a REST play that provably never sounds.
 
-    Order matters and is chosen so the caller is never lied to:
+    Ordering — the caller is never lied to:
       1. Atomically claim the call, losing to an agent who just took it.
       2. Create + COMMIT the callback row, so the promise is durable.
-      3. Only then announce it.
-      4. Dequeue before the settle sleep, so no dispatch lands on a leg we
-         are about to drop.
-      5. Hang up, then run the standard end-of-call cleanup.
+      3. Dequeue, so no dispatch lands on a leg we are about to release.
+    Only then does the hold endpoint serve the release SWML that actually
+    speaks the promise (and hangs up after it finished playing).
 
-    Best-effort throughout: a failure after the claim still releases the
-    caller, because leaving them on hold forever is the bug being fixed.
+    Returns ``(claimed, callback)``: ``claimed`` False means someone else
+    (dispatch, hangup, another cycle) owns the call — serve their outcome
+    instead. ``callback`` None with ``claimed`` True means release WITHOUT a
+    promise (no dialable number / workspace cap / row create failed).
+
+    Caller must hold ``workspace_context(workspace_id)`` — the auto-scope,
+    the flush-time stamper and the per-workspace callback cap all key off it.
     """
-    from datetime import datetime
-
     from sqlalchemy import text
 
-    from app import db, socketio
-    from app.models import Call, Callback
-    from app.services.call_watchdog import reap_call
+    from app import db
     from app.services.queue_service import QueueService
     from app.services.redis_service import get_redis_client
+
+    call_sid = call.signalwire_call_sid
+
+    # (1) Compare-and-set on end_reason. Whoever moves it off NULL owns the
+    # teardown, and the extra predicates lose to an agent who was dispatched
+    # between the cap check and now (push-dispatch fires from another
+    # greenlet the moment an agent goes available) or to a hangup/watchdog
+    # reap that already ended the call. Same shape as the assigned_agent_id
+    # claim in enqueue_and_build_swml.
+    try:
+        claim = db.session.execute(
+            text(
+                "UPDATE calls SET end_reason = :reason "
+                "WHERE id = :id AND end_reason IS NULL "
+                "AND ended_at IS NULL AND assigned_agent_id IS NULL "
+                "RETURNING id"
+            ),
+            {'reason': END_REASON_CALLBACK_SCHEDULED, 'id': call.id},
+        )
+        claimed = claim.fetchone() is not None
+        if claimed:
+            db.session.commit()
+        else:
+            db.session.rollback()
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f"Hold timeout {call_sid}: claim failed: {e}")
+        return False, None
+
+    if not claimed:
+        logger.info(
+            f"Hold timeout {call_sid}: lost the claim — the call was "
+            f"assigned or already ended. Leaving it alone."
+        )
+        return False, None
+    db.session.refresh(call)
+
+    # (2) Only promise a callback we can actually place. No number to dial
+    # (SIP/web origin, withheld caller ID) or the workspace is at its
+    # callback cap → release honestly with no promise attached.
+    to_number = (call.from_number or '').strip()
+    dialable = bool(to_number) and (
+        to_number.startswith('+') or to_number.isdigit()
+    )
+
+    callback = None
+    blocked_reason = None
+    if not dialable:
+        blocked_reason = f'no dialable caller number ({call.from_number!r})'
+    else:
+        from app.utils.workspace_caps import cap_denial
+        capped = cap_denial('callbacks')
+        if capped:
+            blocked_reason = f'workspace callback cap reached ({capped[0].get("cap")})'
+
+    if blocked_reason is None:
+        # Idempotence: a redelivered release document or a re-enqueued
+        # caller must not mint two live promises for one call. Reuse any
+        # pending row instead.
+        callback = _pending_callback_for(call)
+
+        if callback is None:
+            try:
+                # create_from_call snapshots the AI-collected reason,
+                # caller name and context, so the agent who dials back
+                # picks up the thread instead of re-triaging. The
+                # system-side fact goes in notes, NOT reason — reason is
+                # the caller's own words and overwriting it would throw
+                # away the triage.
+                from app.models import Callback
+                callback = Callback.create_from_call(call, queue_id=queue_slug)
+                callback.phone_number = to_number
+                callback.notes = (
+                    f'Auto-enrolled by the queue hold timeout: waited '
+                    f'{waited_seconds}s in "{queue_slug}", past the queue\'s '
+                    f'{cap_seconds}s maximum, with no agent available.'
+                )
+                db.session.add(callback)
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                callback = None
+                blocked_reason = f'callback row create failed: {e}'
+                logger.error(f"Hold timeout {call_sid}: {blocked_reason}")
+            else:
+                try:
+                    # Canonical emitter — reused rather than duplicated so
+                    # the payload shape can't drift from the REST paths.
+                    from app.api.callbacks import _emit_callback_event
+                    _emit_callback_event('created', callback)
+                except Exception as e:
+                    logger.warning(
+                        f"Hold timeout {call_sid}: callback_event emit failed: {e}"
+                    )
+
+    # (3) Out of the queue before the goodbye plays — a caller we are about
+    # to release must not be dispatched to an agent.
+    try:
+        QueueService(
+            get_redis_client(), workspace_id=workspace_id,
+        ).remove_call_from_all_queues(call_sid)
+    except Exception as e:
+        logger.warning(f"Hold timeout {call_sid}: dequeue failed: {e}")
+
+    if callback is not None:
+        logger.warning(
+            f"[hold_timeout] {call_sid} waited {waited_seconds}s in "
+            f"'{queue_slug}' (cap {cap_seconds}s) → callback {callback.id} "
+            f"for {to_number}, line released"
+        )
+    else:
+        logger.warning(
+            f"[hold_timeout] {call_sid} waited {waited_seconds}s in "
+            f"'{queue_slug}' (cap {cap_seconds}s) → released with NO "
+            f"callback: {blocked_reason}"
+        )
+    return True, callback
+
+
+def _schedule_release_teardown(call_sid: str, workspace_id) -> None:
+    """Arrange the DB/Redis teardown for a call whose release SWML was just
+    served. Runs delayed in a greenlet because the leg is still playing the
+    closing announcement — and SWML-parked legs deliver NO call-state
+    webhook (see the /api/webhooks/call-heartbeat docstring), so if we
+    don't close the row ourselves nobody will until the watchdog."""
+    from flask import current_app
+
+    from app import socketio
+
+    app = current_app._get_current_object()
+    socketio.start_background_task(_release_teardown, app, call_sid, workspace_id)
+
+
+def _release_teardown(app, call_sid: str, workspace_id) -> None:
+    """Internal — runs in a greenlet ~RELEASE_TEARDOWN_DELAY_SECONDS after
+    the release document went out. By then the announcement has played and
+    the document's own ``hangup`` has dropped the leg; end_call is only a
+    backstop for a leg whose hangup verb never ran, so an error from it is
+    the EXPECTED outcome, not a failure. reap_call keeps a pre-stamped
+    'callback_scheduled' end_reason and emits the same events the webhook
+    'ended' branch would."""
+    from app import socketio
+    from app.models import Call
+    from app.services.call_watchdog import reap_call
     from app.services.signalwire_api import get_signalwire_api
     from app.tenancy import workspace_context
 
-    # Pin the workspace so the auto-scope, the flush-time stamper and the
-    # per-workspace callback cap all resolve to this caller's tenant — the
-    # documented mechanism for background jobs (tenancy.py:18-26).
-    with workspace_context(workspace_id):
-        call = Call.find_by_sid(call_sid)
-        if call is None:
-            logger.warning(
-                f"Hold timeout {call_sid}: no Call row — dequeuing only"
-            )
+    with app.app_context():
+        socketio.sleep(RELEASE_TEARDOWN_DELAY_SECONDS)
+        with workspace_context(workspace_id):
+            call = Call.find_by_sid(call_sid)
+            if call is None:
+                return
+            if call.ended_at is not None or call.status in Call.TERMINAL_STATUSES:
+                return
             try:
-                QueueService(
-                    get_redis_client(), workspace_id=workspace_id,
-                ).remove_call_from_all_queues(call_sid)
+                get_signalwire_api().end_call(call_sid)
             except Exception as e:
-                logger.warning(f"Hold timeout {call_sid}: dequeue failed: {e}")
-            return
-
-        # (1) Compare-and-set on end_reason. Whoever moves it off NULL owns
-        # the teardown, and the extra predicates lose to an agent who was
-        # dispatched between our cap check and now (push-dispatch fires from
-        # another greenlet the moment an agent goes available) or to a
-        # hangup/watchdog reap that already ended the call. Same shape as
-        # the assigned_agent_id claim in enqueue_and_build_swml.
-        try:
-            claim = db.session.execute(
-                text(
-                    "UPDATE calls SET end_reason = :reason "
-                    "WHERE id = :id AND end_reason IS NULL "
-                    "AND ended_at IS NULL AND assigned_agent_id IS NULL "
-                    "RETURNING id"
-                ),
-                {'reason': END_REASON_CALLBACK_SCHEDULED, 'id': call.id},
-            )
-            claimed = claim.fetchone() is not None
-            if claimed:
-                db.session.commit()
-            else:
-                db.session.rollback()
-        except Exception as e:
-            db.session.rollback()
-            logger.warning(f"Hold timeout {call_sid}: claim failed: {e}")
-            return
-
-        if not claimed:
-            logger.info(
-                f"Hold timeout {call_sid}: lost the claim — the call was "
-                f"assigned or already ended. Leaving it alone."
-            )
-            return
-        db.session.refresh(call)
-
-        # (2) Only promise a callback we can actually place. No number to
-        # dial (SIP/web origin, withheld caller ID) or the workspace is at
-        # its callback cap → release honestly with no promise attached.
-        to_number = (call.from_number or '').strip()
-        dialable = bool(to_number) and (
-            to_number.startswith('+') or to_number.isdigit()
-        )
-
-        callback = None
-        blocked_reason = None
-        if not dialable:
-            blocked_reason = f'no dialable caller number ({call.from_number!r})'
-        else:
-            from app.utils.workspace_caps import cap_denial
-            capped = cap_denial('callbacks')
-            if capped:
-                blocked_reason = f'workspace callback cap reached ({capped[0].get("cap")})'
-
-        if blocked_reason is None:
-            # Idempotence: a re-enqueued caller starts a fresh announcement
-            # greenlet, and two greenlets for one call must not mint two
-            # promises. Reuse any live pending row instead.
+                logger.info(
+                    f"Release teardown {call_sid}: end_call backstop errored "
+                    f"(leg normally already hung itself up): {e}"
+                )
             try:
-                callback = (
-                    db.session.query(Callback)
-                    .filter(
-                        Callback.call_id == call.id,
-                        Callback.completed_at.is_(None),
-                        Callback.expires_at > datetime.utcnow(),
-                    )
-                    .order_by(Callback.requested_at.desc())
-                    .first()
-                )
+                reap_call(call)
             except Exception as e:
-                logger.warning(
-                    f"Hold timeout {call_sid}: existing-callback lookup failed: {e}"
-                )
-                callback = None
-
-            if callback is None:
-                try:
-                    # create_from_call snapshots the AI-collected reason,
-                    # caller name and context, so the agent who dials back
-                    # picks up the thread instead of re-triaging. The
-                    # system-side fact goes in notes, NOT reason — reason is
-                    # the caller's own words and overwriting it would throw
-                    # away the triage.
-                    callback = Callback.create_from_call(call, queue_id=queue_slug)
-                    callback.phone_number = to_number
-                    callback.notes = (
-                        f'Auto-enrolled by the queue hold timeout: waited '
-                        f'{waited_seconds}s in "{queue_slug}", past the queue\'s '
-                        f'{cap_seconds}s maximum, with no agent available.'
-                    )
-                    db.session.add(callback)
-                    db.session.commit()
-                except Exception as e:
-                    db.session.rollback()
-                    callback = None
-                    blocked_reason = f'callback row create failed: {e}'
-                    logger.error(f"Hold timeout {call_sid}: {blocked_reason}")
-                else:
-                    try:
-                        # Canonical emitter — reused rather than duplicated so
-                        # the payload shape can't drift from the REST paths.
-                        from app.api.callbacks import _emit_callback_event
-                        _emit_callback_event('created', callback)
-                    except Exception as e:
-                        logger.warning(
-                            f"Hold timeout {call_sid}: callback_event emit failed: {e}"
-                        )
-
-        # (3) Tell the caller what just happened. Only promise the callback
-        # when there is a row backing it.
-        if callback is not None:
-            message = (
-                "Thanks for your patience. Rather than keep you holding, we've "
-                "added you to our callback list, and one of our specialists "
-                "will call you back on this number. You can hang up now. "
-                "Goodbye."
-            )
-        else:
-            message = (
-                "We're sorry — our specialists are all still busy, and we "
-                "haven't been able to connect you. Please try your call again "
-                "a little later. Goodbye."
-            )
-        try:
-            get_signalwire_api().play_tts(call_sid, message)
-        except Exception as e:
-            logger.warning(
-                f"Hold timeout {call_sid}: closing announcement failed "
-                f"(releasing anyway): {e}"
-            )
-
-        # (4) Out of the queue before the settle sleep — a caller we are
-        # about to hang up on must not be dispatched to an agent.
-        try:
-            QueueService(
-                get_redis_client(), workspace_id=workspace_id,
-            ).remove_call_from_all_queues(call_sid)
-        except Exception as e:
-            logger.warning(f"Hold timeout {call_sid}: dequeue failed: {e}")
-
-        socketio.sleep(CALLBACK_ANNOUNCE_SETTLE_SECONDS)
-
-        # (5) Drop the leg, then run the same end-of-call cleanup the
-        # /call-status webhook and the watchdog run: legs closed, conference
-        # ended, agent released, dashboards told. end_reason is already
-        # stamped, so reap_call keeps 'callback_scheduled' rather than
-        # computing 'abandoned_in_queue'.
-        try:
-            get_signalwire_api().end_call(call_sid)
-        except Exception as e:
-            logger.warning(
-                f"Hold timeout {call_sid}: end_call failed (cleaning up "
-                f"anyway; the watchdog is the backstop): {e}"
-            )
-        try:
-            reap_call(call)
-        except Exception as e:
-            logger.error(f"Hold timeout {call_sid}: cleanup failed: {e}")
-
-        if callback is not None:
-            logger.warning(
-                f"[hold_timeout] {call_sid} waited {waited_seconds}s in "
-                f"'{queue_slug}' (cap {cap_seconds}s) → callback {callback.id} "
-                f"for {to_number}, line released"
-            )
-        else:
-            logger.warning(
-                f"[hold_timeout] {call_sid} waited {waited_seconds}s in "
-                f"'{queue_slug}' (cap {cap_seconds}s) → released with NO "
-                f"callback: {blocked_reason}"
-            )
+                logger.error(f"Release teardown {call_sid}: cleanup failed: {e}")
 
 
-def _announcement_loop(
-    app, call_sid: str, queue_slug: str, interval_seconds: int, workspace_id=None
-) -> None:
-    """Internal — runs in an eventlet greenlet."""
-    from app import socketio
-    from app.services.redis_service import get_redis_client
-    from app.services.signalwire_api import get_signalwire_api
+def _queue_entry_for(redis, workspace_id, queue_slug: str, call_sid: str):
+    """(position, entry) for this caller in the queue zset, or (None, None)
+    when they are not queued. Raises on a Redis read failure — the caller
+    must treat that as 'unknown', NOT 'gone' (releasing a live caller over
+    a Redis blip would be the old bug with a new face)."""
     from app.services.ws_rooms import ws_key
 
-    with app.app_context():
+    members = redis.zrange(ws_key(workspace_id, f"queue:{queue_slug}"), 0, -1)
+    for idx, raw in enumerate(members):
+        try:
+            raw_str = raw.decode() if isinstance(raw, bytes) else raw
+            parsed = json.loads(raw_str)
+            if parsed.get('call_id') == call_sid:
+                return idx + 1, parsed
+        except Exception:
+            continue
+    return None, None
+
+
+def hold_cycle_swml(
+    call_sid: str, queue_slug: str, cycle: int, base_url: str,
+) -> Dict[str, Any]:
+    """Decide and build the next SWML document for a caller parked on hold.
+
+    This is the whole hold state machine. The caller's leg fetches it via
+    the ``transfer`` at the end of the entry SWML (cycle 1) and of every
+    cycle document after that, so each fetch is a decision point observed at
+    most one music segment after the state changed:
+
+      - release already claimed        → speak it again (redelivery) + hangup
+      - call ended                     → hangup
+      - agent dispatched               → pre-join announcement + join_conference
+      - past the queue's hold cap      → claim, mint the Callback, promise, hangup
+      - past the hard ceiling          → honest no-promise release
+      - otherwise                      → position announcement + music + transfer
+
+    Checked in that order so we never announce "please continue holding" on
+    the same pass that takes the caller off hold. Any unexpected error in
+    the HTTP wrapper (api/queues.py) degrades to a polite hangup rather
+    than dead air.
+    """
+    from app import db
+    from app.models import Call
+    from app.services.redis_service import get_redis_client
+    from app.tenancy import workspace_context
+
+    call = Call.find_by_sid(call_sid) if call_sid else None
+    if call is None:
+        logger.warning(f"Hold cycle: unknown call {call_sid!r} — hanging up")
+        return _swml_doc(["hangup"])
+
+    workspace_id = call.workspace_id
+    with workspace_context(workspace_id):
+        # Redelivery of an already-claimed release (previous response lost
+        # mid-flight, or a crash between claim and respond): the durable
+        # state decides the wording, and the teardown is (re)scheduled —
+        # it no-ops on an already-ended call.
+        if call.end_reason == END_REASON_CALLBACK_SCHEDULED:
+            _schedule_release_teardown(call_sid, workspace_id)
+            return _release_swml(_pending_callback_for(call) is not None)
+
+        if call.ended_at is not None or call.status in Call.TERMINAL_STATUSES:
+            return _swml_doc(["hangup"])
+
+        # Dispatched while cycling → join the conference the agent was sent
+        # to. Both dispatch paths commit assigned_agent_id BEFORE dequeuing,
+        # so a caller observed neither assigned nor queued below is
+        # genuinely out of routing, not mid-handoff.
+        if call.assigned_agent_id:
+            logger.info(
+                f"Hold cycle {call_sid}: agent {call.assigned_agent_id} "
+                f"dispatched — sending caller into the conference"
+            )
+            return _join_conference_swml(call)
+
         redis = get_redis_client()
-        if not redis:
-            logger.warning(f"Announcement loop {call_sid}: Redis unavailable, exiting")
-            return
+        position = entry = None
+        queue_read_ok = False
+        if redis:
+            try:
+                position, entry = _queue_entry_for(
+                    redis, workspace_id, queue_slug, call_sid,
+                )
+                queue_read_ok = True
+            except Exception as e:
+                logger.warning(f"Hold cycle {call_sid}: queue read failed: {e}")
 
-        queue_key = ws_key(workspace_id, f"queue:{queue_slug}")
-        # Initial delay so the caller has time to actually land in the
-        # conference before we try to play anything to them. Clamped to the
-        # queue's hold cap so a cap shorter than the announcement interval
-        # still fires roughly on time instead of a full interval late.
-        cap_seconds = _queue_hold_cap_seconds(queue_slug, workspace_id)
-        socketio.sleep(
-            interval_seconds if cap_seconds is None
-            else max(1, min(interval_seconds, cap_seconds))
+        if not queue_read_ok:
+            # Redis unavailable: keep the caller alive on plain music and
+            # retry the decision next cycle. position=None suppresses the
+            # announcement (we don't know it).
+            return _cycle_swml(
+                base_url, queue_slug, call_sid, cycle, None, None, None,
+            )
+
+        if position is None:
+            # Not queued, not assigned, not ended — the queue entry
+            # evaporated under a live leg (admin cleared the queue, watchdog
+            # swept a sibling, stale re-enqueue). Release honestly instead
+            # of cycling music forever on a call routing has forgotten.
+            logger.warning(
+                f"Hold cycle {call_sid}: no longer queued in '{queue_slug}' "
+                f"and not assigned — releasing with no promise"
+            )
+            _schedule_release_teardown(call_sid, workspace_id)
+            return _release_swml(False)
+
+        cap = _queue_hold_cap_seconds(queue_slug, workspace_id)
+        waited = _waited_seconds(entry)
+
+        if cap is not None and waited is not None and waited >= cap:
+            claimed, callback = _claim_hold_release(
+                call, queue_slug, workspace_id, waited, cap,
+            )
+            if claimed:
+                _schedule_release_teardown(call_sid, workspace_id)
+                return _release_swml(callback is not None)
+            # Lost the claim — a dispatch or teardown won between the cap
+            # check and now. Serve whatever the winner decided.
+            db.session.refresh(call)
+            if call.assigned_agent_id:
+                return _join_conference_swml(call)
+            if call.end_reason == END_REASON_CALLBACK_SCHEDULED:
+                _schedule_release_teardown(call_sid, workspace_id)
+                return _release_swml(_pending_callback_for(call) is not None)
+            return _swml_doc(["hangup"])
+
+        if waited is not None and waited >= HOLD_LOOP_CEILING_SECONDS:
+            # Cap disabled by the admin; the hard ceiling still bounds the
+            # hold. Dequeue first so no dispatch lands during the goodbye.
+            # No claim and no promise: a disabled cap must not silently
+            # start scheduling callbacks.
+            try:
+                from app.services.queue_service import QueueService
+                QueueService(
+                    redis, workspace_id=workspace_id,
+                ).remove_call_from_all_queues(call_sid)
+            except Exception as e:
+                logger.warning(
+                    f"Hold cycle {call_sid}: ceiling dequeue failed: {e}"
+                )
+            logger.warning(
+                f"Hold cycle {call_sid}: hit the {HOLD_LOOP_CEILING_SECONDS}s "
+                f"ceiling (queue '{queue_slug}' has no max-wait cap) — "
+                f"releasing with no promise"
+            )
+            _schedule_release_teardown(call_sid, workspace_id)
+            return _release_swml(False)
+
+        # Normal iteration. The fetch itself proves the leg is alive — feed
+        # the watchdog's heartbeat fast-skip (same key the legacy bridge
+        # hold loop used) so a long-but-live hold isn't reaped mid-music.
+        try:
+            redis.set(f"call_heartbeat:{call_sid}", '1', ex=90)
+        except Exception:
+            pass
+        return _cycle_swml(
+            base_url, queue_slug, call_sid, cycle, position, waited, cap,
         )
-
-        iteration = 0
-        tts_failures = 0
-        # Sum of the delays we've waited through. Only used for the
-        # disabled-cap backstop, so intended-sleep accounting is precise
-        # enough and keeps the loop testable without faking a clock.
-        elapsed_seconds = 0
-        while True:
-            iteration += 1
-
-            # Find the caller's current position in the queue zset.
-            try:
-                members = redis.zrange(queue_key, 0, -1)
-            except Exception as e:
-                logger.warning(f"Announcement loop {call_sid}: zrange failed: {e}")
-                return
-
-            position = None
-            entry = None
-            for idx, raw in enumerate(members):
-                try:
-                    raw_str = raw.decode() if isinstance(raw, bytes) else raw
-                    parsed = json.loads(raw_str)
-                    if parsed.get('call_id') == call_sid:
-                        position = idx + 1
-                        entry = parsed
-                        break
-                except Exception:
-                    continue
-
-            if position is None:
-                logger.info(
-                    f"Announcement loop {call_sid} exiting — no longer in queue"
-                )
-                return
-
-            # Hold timeout. Checked BEFORE the position announcement so we
-            # never tell someone "please continue holding" and then take
-            # them off hold in the same breath.
-            cap_seconds = _queue_hold_cap_seconds(queue_slug, workspace_id)
-            waited = _waited_seconds(entry)
-            if cap_seconds is not None and waited is not None and waited >= cap_seconds:
-                _offer_callback_and_release(
-                    call_sid, queue_slug, workspace_id, waited, cap_seconds,
-                )
-                return
-
-            # Backstop for a cap the admin disabled (0) — and for a stale
-            # zset entry whose call is long gone but whose play_tts keeps
-            # being accepted.
-            if elapsed_seconds >= HOLD_LOOP_CEILING_SECONDS:
-                logger.warning(
-                    f"Announcement loop {call_sid} exiting — hit the "
-                    f"{HOLD_LOOP_CEILING_SECONDS}s hard ceiling after "
-                    f"{iteration} announcements (queue '{queue_slug}' has no "
-                    f"max-wait configured)"
-                )
-                return
-
-            try:
-                get_signalwire_api().play_tts(
-                    call_sid,
-                    (
-                        f"You are number {position} in the queue. "
-                        f"Please continue holding."
-                    ),
-                )
-                tts_failures = 0
-            except Exception as e:
-                tts_failures += 1
-                logger.warning(
-                    f"Announcement loop {call_sid} play_tts iteration {iteration} failed: {e}"
-                )
-                if tts_failures >= MAX_CONSECUTIVE_TTS_FAILURES:
-                    logger.warning(
-                        f"Announcement loop {call_sid} exiting — "
-                        f"{tts_failures} consecutive play_tts failures, the "
-                        f"leg is almost certainly gone"
-                    )
-                    return
-
-            # Land the next pass on the cap rather than one interval past it.
-            sleep_for = interval_seconds
-            if cap_seconds is not None and waited is not None:
-                sleep_for = max(1, min(interval_seconds, cap_seconds - waited))
-            elapsed_seconds += sleep_for
-            socketio.sleep(sleep_for)
 
 
 # ---------------------------------------------------------------------------
@@ -543,17 +664,16 @@ def enqueue_and_build_swml(
       - Emits ``queue_update action='added'`` so dashboards refresh
       - If an agent is available right now, dispatches them: marks Call as
         assigned, sets their Redis status to busy, removes from queue zset,
-        emits ``call_assignment`` to the agent's room (which also fires the
-        caller pre-join TTS announcement)
-      - Otherwise, starts the periodic position-announcement greenlet, which
-        also enforces the queue's ``max_wait_before_ai_fallback`` — see
-        ``_offer_callback_and_release``
+        emits ``call_assignment`` to the agent's room
 
-    Returns: SWML dict for the caller's leg. ALWAYS ends with
-        join_conference(interaction-<call_sid>) + hangup-on-exit.
+    Returns: SWML dict for the caller's leg. Ends with
+        join_conference(interaction-<call_sid>) + hangup when an agent was
+        dispatched, or a ``transfer`` into the SWML hold cycle otherwise —
+        the cycle (``hold_cycle_swml``) owns position announcements, the
+        ``max_wait_before_ai_fallback`` timeout and the eventual conference
+        join. See ``_claim_hold_release``.
     """
     from datetime import datetime
-    from flask import current_app
     from app import db, socketio
     from app.models import Conference, User
     from app.services.queue_service import QueueService
@@ -705,19 +825,6 @@ def enqueue_and_build_swml(
     except Exception as e:
         logger.warning(f"enqueue_and_build_swml: immediate-dispatch check failed (non-fatal): {e}")
 
-    # Start the announcement loop only when the caller is actually going to
-    # wait. If we dispatched, the pre-join TTS already fired and a second
-    # loop would clash with it. The loop owns the hold timeout too, so this
-    # is also what bounds the wait for a caller nobody picks up.
-    if not agent_dispatched:
-        try:
-            start_position_announcement_loop(
-                current_app._get_current_object(), call_sid, queue_slug,
-                workspace_id=call.workspace_id,
-            )
-        except Exception as e:
-            logger.warning(f"enqueue_and_build_swml: announcement loop failed to start: {e}")
-
     # Caller-side SWML — same structure for /direct-inbound and /route.
     main_section: list = [
         {
@@ -771,13 +878,29 @@ def enqueue_and_build_swml(
             }
         })
     main_section.append({"play": {"url": greeting}})
-    main_section.append({
-        "join_conference": {
-            "name": conference_name,
-            "end_on_exit": False,
-        }
-    })
-    main_section.append("hangup")
+    if agent_dispatched:
+        # Agent already on the way — park the caller in the conference the
+        # agent's WebRTC leg joins on Accept.
+        main_section.append({
+            "join_conference": {
+                "name": conference_name,
+                "end_on_exit": False,
+            }
+        })
+        main_section.append("hangup")
+    else:
+        # Nobody available: enter the SWML hold cycle instead of the
+        # conference. Each cycle plays the position + music and transfers
+        # back to /api/queues/<slug>/hold, whose response is the next
+        # decision (keep holding / join_conference once dispatched /
+        # callback promise at the hold cap). This is the only architecture
+        # in which the caller actually HEARS any of that — REST play into
+        # a parked leg is a proven silent no-op on this space.
+        main_section.append({
+            "transfer": {
+                "dest": hold_cycle_url(base_url, queue_slug, call_sid, 1)
+            }
+        })
 
     return {"version": "1.0.0", "sections": {"main": main_section}}
 
@@ -847,12 +970,11 @@ def emit_call_assignment_to_agent(
         f"({agent.email}) via conference {conference_name}"
     )
 
-    # Tell the caller an agent is about to join. Fires now (when the agent
-    # sees the banner) rather than at conference participantJoined because we
-    # don't currently subscribe to SignalWire's conference events. Slight
-    # timing risk if the agent dawdles before accepting, but the wording
-    # ("joining you now") absorbs a few seconds gracefully.
-    play_caller_pre_join_announcement(call.signalwire_call_sid)
+    # No caller-side announcement from here: REST play into a parked leg is
+    # a proven silent no-op on this space. The caller hears "an agent is
+    # joining you now" from their own SWML — the entry greeting on immediate
+    # dispatch, or the hold cycle's join document on push-dispatch (served
+    # at their next cycle boundary, ≤ one music segment away).
 
     # AI Coach (sidecar) attach is NOT done here. The sidecar bills per-minute,
     # so we don't pre-attach speculatively at dispatch — the agent decides

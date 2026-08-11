@@ -76,9 +76,9 @@ def reap_call(call) -> None:
     Mirrors the 'ended' branch of /api/webhooks/call-status. Pulled out into
     a helper so any future cleanup callsite (manual admin button, REST API
     sweep) can reuse the same logic and stay in sync. Public because
-    ``queue_dispatch._offer_callback_and_release`` is now one of those
-    callsites: the hold timeout ends the call deliberately rather than
-    reaping it, but the teardown is identical.
+    ``queue_dispatch._release_teardown`` is now one of those callsites: the
+    hold timeout releases the call deliberately (the caller's own SWML plays
+    the promise and hangs up), but the DB/Redis teardown is identical.
 
     Honours a pre-set ``call.end_reason`` — a caller that already knows how
     the call ended (the hold timeout stamps 'callback_scheduled') keeps its

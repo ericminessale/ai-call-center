@@ -50,9 +50,10 @@ def build_ingress_swml(
 ) -> Dict[str, Any]:
     """Build the SWML that handles a caller arriving at a queue.
 
-    Conference: park caller in interaction-{sid} conference, kick off the
-    position-announcement loop if no agent is immediately available, dispatch
-    via Socket.IO call_assignment when an agent comes up.
+    Conference: join the interaction-{sid} conference when an agent is
+    dispatched immediately; otherwise park the caller in the SWML hold
+    cycle (announcements + hold timeout), which joins them to the
+    conference at the cycle boundary after a dispatch fires.
 
     Bridge: park the caller with SignalWire's native ``enter_queue`` verb and
     connect the selected agent through a regular two-leg bridge.

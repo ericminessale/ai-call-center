@@ -692,6 +692,80 @@ def direct_inbound_queue(queue_slug):
         }), 500
 
 
+@queues_bp.route('/<queue_slug>/hold', methods=['POST'])
+@require_webhook_auth
+def hold_cycle(queue_slug):
+    """One iteration of the SWML hold cycle for a parked caller.
+
+    This is the ``transfer`` target of the queue entry SWML (and of every
+    cycle document it returns), fetched by SignalWire while the caller's leg
+    is alive — each fetch is a decision point. All state logic lives in
+    ``queue_dispatch.hold_cycle_swml``; this wrapper only resolves request
+    params and guarantees that SignalWire ALWAYS receives a playable
+    document: a 5xx here would strand a live caller in dead air, which is
+    the exact failure mode the hold cycle exists to kill.
+
+    Auth: signed URL (``signed_webhook_url``) + ``require_webhook_auth`` —
+    both callback auth schemes accepted, same as the other queue webhooks.
+    """
+    from app.services import queue_dispatch
+
+    call_sid = request.args.get('call_sid')
+    if not call_sid:
+        data = request.json or {}
+        call_sid = (data.get('call') or {}).get('call_id') or data.get('call_id')
+    try:
+        cycle = max(1, int(request.args.get('n', 1)))
+    except (TypeError, ValueError):
+        cycle = 1
+
+    try:
+        swml = queue_dispatch.hold_cycle_swml(
+            call_sid, queue_slug, cycle, get_base_url(),
+        )
+        return jsonify(swml)
+    except Exception as e:
+        logger.error(
+            f"hold_cycle failed for call {call_sid!r} in '{queue_slug}' "
+            f"(cycle {cycle}): {e}"
+        )
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {"main": [
+                {"play": {"url": (
+                    "say:We're sorry, we're having trouble connecting you. "
+                    "Please try your call again later. Goodbye."
+                )}},
+                "hangup",
+            ]}
+        })
+
+
+@queues_bp.route('/hold-music', methods=['GET'])
+def hold_music():
+    """The bundled hold-music segment the hold cycle plays between position
+    announcements (``backend/app/assets/hold_music.wav``, regenerate with
+    ``backend/scripts/generate_hold_music.py`` — keep
+    ``queue_dispatch.HOLD_MUSIC_SECONDS`` matching its length).
+
+    Deliberately unauthenticated: SignalWire's media player fetches this as
+    plain audio (no webhook auth is attached to ``play`` URLs), and the
+    asset is not sensitive. ``conditional=True`` serves range requests,
+    which media fetchers commonly issue.
+    """
+    import os as _os
+    from flask import send_file
+    asset = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        'assets', 'hold_music.wav',
+    )
+    try:
+        return send_file(asset, mimetype='audio/wav', conditional=True)
+    except Exception as e:
+        logger.error(f"hold-music asset unavailable: {e}")
+        return jsonify({'error': 'hold music asset missing'}), 404
+
+
 @queues_bp.route('/<queue_id>/next', methods=['GET'])
 @require_auth
 def get_next_queued_call(queue_id):

@@ -1,10 +1,18 @@
-"""Hold timeout on the in-conference announcement loop.
+"""Hold timeout + the SWML hold cycle.
 
-The loop used to be an unbounded ``while True`` whose only exit was the caller
-dropping out of the queue zset, and ``Queue.max_wait_before_ai_fallback`` was
-stored, editable, and read by nothing. These tests pin the contract that it is
-now enforced: past the cap the caller is enrolled in the callback queue, told
-so, and released — and the loop stops.
+The hold experience used to be a backend greenlet pushing REST ``calling.play``
+into a conference-parked leg — which this space silently ignores (HTTP 200, no
+audio; proven live 2026-08-11 by the hank_hold_callback synthetic scenario).
+The caller heard music and then dead air while the DB recorded a perfect flow.
+
+Now the caller's own leg drives the hold: each cycle document plays the
+position + music and ``transfer``s back to /api/queues/<slug>/hold, and
+``queue_dispatch.hold_cycle_swml`` answers with the next decision. These tests
+pin that state machine: announcements phrased and paced right, the
+``max_wait_before_ai_fallback`` cap enforced with a durable Callback promise
+the caller actually gets to HEAR before the hangup, dispatch and teardown
+races resolved in the winner's favor, and the release teardown closing the row
+without relabeling it.
 """
 
 from datetime import datetime, timedelta
@@ -21,6 +29,7 @@ from app.services import redis_service, signalwire_api
 
 CALL_SID = 'call-hold-timeout-test'
 QUEUE_SLUG = 'support'
+BASE_URL = 'http://backend.test'
 
 
 # ---------------------------------------------------------------------------
@@ -43,32 +52,27 @@ def hold_app():
         db.drop_all()
 
 
-class FakeQueueZset:
-    """Stands in for Redis. ``zrange`` serves one scripted reply per pass so a
-    test can make the caller leave the queue on a chosen iteration."""
+class FakeRedis:
+    """Stands in for Redis: a static queue-zset reply plus the heartbeat set.
+    ``zrange_error`` simulates a Redis outage mid-hold."""
 
-    def __init__(self, replies):
-        self.replies = list(replies)
-        self.calls = 0
+    def __init__(self, members=None, zrange_error=None):
+        self.members = list(members or [])
+        self.zrange_error = zrange_error
+        self.heartbeats = []
 
     def zrange(self, _key, _start, _stop):
-        self.calls += 1
-        if self.replies:
-            return self.replies.pop(0)
-        return []
+        if self.zrange_error is not None:
+            raise self.zrange_error
+        return list(self.members)
+
+    def set(self, key, value, ex=None):
+        self.heartbeats.append((key, ex))
 
 
 class FakeSignalWire:
-    def __init__(self, tts_error=None):
-        self.tts = []
+    def __init__(self):
         self.ended = []
-        self.tts_error = tts_error
-
-    def play_tts(self, call_sid, text, **_kwargs):
-        self.tts.append((call_sid, text))
-        if self.tts_error is not None:
-            raise self.tts_error
-        return {'ok': True}
 
     def end_call(self, call_sid):
         self.ended.append(call_sid)
@@ -132,14 +136,20 @@ def _seed(*, max_wait=120, from_number='+15555550123'):
 @pytest.fixture()
 def wiring(monkeypatch):
     """Neutralise everything outside the unit: SignalWire REST, Redis, the
-    queue-service dequeue, Socket.IO sleeps and emits."""
+    queue-service dequeue, Socket.IO sleeps/emits, and the background-task
+    spawner (captured so tests can run the teardown synchronously)."""
     api = FakeSignalWire()
     monkeypatch.setattr(signalwire_api, 'get_signalwire_api', lambda: api)
 
     slept = []
+    spawned = []
     from app import socketio
     monkeypatch.setattr(socketio, 'sleep', lambda seconds: slept.append(seconds))
     monkeypatch.setattr(socketio, 'emit', lambda *a, **k: None)
+    monkeypatch.setattr(
+        socketio, 'start_background_task',
+        lambda fn, *args: spawned.append((fn, args)),
+    )
 
     dequeued = []
     from app.services.queue_service import QueueService
@@ -147,18 +157,68 @@ def wiring(monkeypatch):
         QueueService, 'remove_call_from_all_queues',
         lambda self, call_id: dequeued.append(call_id) or 1,
     )
-    # reap_call resolves its own Redis client; it only uses it for the dequeue
-    # and agent-release, both harmless with the stub above.
-    monkeypatch.setattr(redis_service, 'get_redis_client', lambda: FakeQueueZset([]))
+    monkeypatch.setattr(redis_service, 'get_redis_client', lambda: FakeRedis())
 
-    return {'api': api, 'slept': slept, 'dequeued': dequeued}
+    return {'api': api, 'slept': slept, 'dequeued': dequeued, 'spawned': spawned}
 
 
-def _run_loop(hold_app, workspace, zset, monkeypatch, interval=30):
-    monkeypatch.setattr(redis_service, 'get_redis_client', lambda: zset)
-    queue_dispatch._announcement_loop(
-        hold_app, CALL_SID, QUEUE_SLUG, interval, workspace.id,
+def _use_zset(monkeypatch, fake_redis):
+    monkeypatch.setattr(redis_service, 'get_redis_client', lambda: fake_redis)
+    return fake_redis
+
+
+def _cycle(cycle=2):
+    """One decision of the hold state machine."""
+    return queue_dispatch.hold_cycle_swml(CALL_SID, QUEUE_SLUG, cycle, BASE_URL)
+
+
+# --- SWML document probes ---------------------------------------------------
+
+def _verbs(doc):
+    return doc['sections']['main']
+
+
+def _play_urls(doc):
+    urls = []
+    for verb in _verbs(doc):
+        if isinstance(verb, dict) and 'play' in verb:
+            p = verb['play']
+            if 'urls' in p:
+                urls.extend(p['urls'])
+            if 'url' in p:
+                urls.append(p['url'])
+    return urls
+
+
+def _spoken(doc):
+    return ' '.join(
+        u[len('say:'):] for u in _play_urls(doc)
+        if isinstance(u, str) and u.startswith('say:')
     )
+
+
+def _transfer_dest(doc):
+    for verb in _verbs(doc):
+        if isinstance(verb, dict) and 'transfer' in verb:
+            return verb['transfer']['dest']
+    return None
+
+
+def _joins_conference(doc):
+    return any(isinstance(v, dict) and 'join_conference' in v for v in _verbs(doc))
+
+
+def _hangs_up(doc):
+    return 'hangup' in _verbs(doc)
+
+
+def _run_spawned_teardown(wiring, hold_app):
+    """Execute the captured release teardown synchronously (its sleep is
+    stubbed by the wiring fixture)."""
+    assert wiring['spawned'], 'expected a release teardown to be scheduled'
+    fn, args = wiring['spawned'][-1]
+    assert fn is queue_dispatch._release_teardown
+    fn(*args)
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +241,9 @@ def test_hold_cap_is_none_for_a_missing_queue(hold_app):
 
 
 def test_hold_cap_does_not_read_another_workspaces_queue(hold_app):
-    """Slugs repeat across workspaces; a greenlet has no request context, so
-    the ORM auto-scope is inactive and the filter has to be explicit."""
+    """Slugs repeat across workspaces; the hold endpoint runs with no request
+    context, so the ORM auto-scope is inactive and the filter must be
+    explicit."""
     workspace, _call = _seed(max_wait=90)
     other = Workspace(name='Other tenant')
     db.session.add(other)
@@ -205,20 +266,100 @@ def test_waited_seconds_keys_off_the_preserved_enqueue_clock():
 
 
 # ---------------------------------------------------------------------------
-# The loop terminates
+# Cycle documents: what the caller hears while holding
 # ---------------------------------------------------------------------------
 
-def test_loop_exits_and_offers_a_callback_once_the_cap_is_exceeded(
+def test_cycle_announces_position_and_keeps_holding_below_the_cap(
     hold_app, wiring, monkeypatch,
 ):
     workspace, call = _seed(max_wait=120)
-    # Enough scripted replies that an unbounded loop would keep going.
-    zset = FakeQueueZset([[_entry(waited_seconds=180)] for _ in range(50)])
+    _use_zset(monkeypatch, FakeRedis([_entry(waited_seconds=30)]))
 
-    _run_loop(hold_app, workspace, zset, monkeypatch)
+    doc = _cycle(cycle=2)
 
-    # It stopped on the first pass rather than draining the replies.
-    assert zset.calls == 1
+    spoken = _spoken(doc)
+    assert 'number 1 in the queue' in spoken
+    assert 'Please continue holding' in spoken
+    # Music between announcements, then back to the hold endpoint for the
+    # next decision — never a hangup mid-hold.
+    assert any('hold-music' in u for u in _play_urls(doc))
+    dest = _transfer_dest(doc)
+    assert dest and f'/api/queues/{QUEUE_SLUG}/hold' in dest and 'n=3' in dest
+    assert not _hangs_up(doc)
+
+    assert db.session.query(Callback).count() == 0
+    db.session.refresh(call)
+    assert call.status == 'waiting'
+    assert call.end_reason is None
+
+
+def test_first_cycle_skips_the_announcement(hold_app, wiring, monkeypatch):
+    """The entry greeting said the position seconds ago — cycle 1 is music
+    only, so the caller doesn't hear their position twice back-to-back."""
+    workspace, _call = _seed(max_wait=120)
+    _use_zset(monkeypatch, FakeRedis([_entry(waited_seconds=2)]))
+
+    doc = _cycle(cycle=1)
+
+    assert _spoken(doc) == ''
+    assert any('hold-music' in u for u in _play_urls(doc))
+    assert 'n=2' in (_transfer_dest(doc) or '')
+
+
+def test_cycle_lands_on_the_cap_instead_of_overshooting(
+    hold_app, wiring, monkeypatch,
+):
+    """When less than one full segment remains before the cap, the cycle pads
+    with silence sized to the remainder so the promise fires on time."""
+    workspace, _call = _seed(max_wait=120)
+    _use_zset(monkeypatch, FakeRedis([_entry(waited_seconds=100)]))
+
+    doc = _cycle(cycle=3)
+
+    silence = [u for u in _play_urls(doc) if str(u).startswith('silence:')]
+    assert silence, f'expected a silence tail, got {_play_urls(doc)}'
+    assert float(silence[0].split(':', 1)[1]) <= 20 - 5 + 0.01
+    assert not any('hold-music' in str(u) for u in _play_urls(doc))
+    assert _transfer_dest(doc)
+
+
+def test_cycle_heartbeats_so_the_watchdog_keeps_off(hold_app, wiring, monkeypatch):
+    workspace, _call = _seed(max_wait=120)
+    zset = _use_zset(monkeypatch, FakeRedis([_entry(waited_seconds=30)]))
+
+    _cycle(cycle=2)
+
+    assert zset.heartbeats and zset.heartbeats[0][0] == f'call_heartbeat:{CALL_SID}'
+
+
+def test_redis_outage_keeps_the_caller_cycling(hold_app, wiring, monkeypatch):
+    """A Redis blip must read as 'unknown', not 'gone' — the caller keeps
+    hearing music (no position claim we can't back) and the next fetch
+    retries the decision."""
+    workspace, call = _seed(max_wait=120)
+    _use_zset(monkeypatch, FakeRedis(zrange_error=RuntimeError('redis down')))
+
+    doc = _cycle(cycle=4)
+
+    assert _spoken(doc) == ''
+    assert any('hold-music' in u for u in _play_urls(doc))
+    assert _transfer_dest(doc)
+    assert not _hangs_up(doc)
+    db.session.refresh(call)
+    assert call.status == 'waiting'
+
+
+# ---------------------------------------------------------------------------
+# The cap is enforced: durable promise, audible release
+# ---------------------------------------------------------------------------
+
+def test_release_claims_mints_and_promises_once_the_cap_is_exceeded(
+    hold_app, wiring, monkeypatch,
+):
+    workspace, call = _seed(max_wait=120)
+    _use_zset(monkeypatch, FakeRedis([_entry(waited_seconds=180)]))
+
+    doc = _cycle(cycle=5)
 
     callback = db.session.query(Callback).one()
     assert callback.phone_number == '+15555550123'
@@ -230,140 +371,76 @@ def test_loop_exits_and_offers_a_callback_once_the_cap_is_exceeded(
     assert 'hold timeout' in (callback.notes or '')
     assert callback.workspace_id == workspace.id
 
-    # The caller was told, and told the truth.
-    assert len(wiring['api'].tts) == 1
-    _sid, spoken = wiring['api'].tts[0]
+    # The caller is told, truthfully, in the SAME document that hangs up —
+    # the promise is durable before any audio that mentions it can play.
+    spoken = _spoken(doc)
     assert 'callback list' in spoken
-    # Not the position announcement — we never say "you are number N in the
-    # queue, please continue holding" on the pass that takes them off hold.
     assert 'in the queue' not in spoken
+    assert _hangs_up(doc)
+    assert _transfer_dest(doc) is None
 
-    # The line was released and the call torn down.
-    assert wiring['api'].ended == [CALL_SID]
+    # Dequeued before the goodbye plays; row already classified.
     assert CALL_SID in wiring['dequeued']
+    db.session.refresh(call)
+    assert call.end_reason == queue_dispatch.END_REASON_CALLBACK_SCHEDULED
+
+    # The delayed teardown closes the row and keeps the classification.
+    _run_spawned_teardown(wiring, hold_app)
+    assert wiring['api'].ended == [CALL_SID]
     db.session.refresh(call)
     assert call.status == 'ended'
     assert call.ended_at is not None
     assert call.end_reason == queue_dispatch.END_REASON_CALLBACK_SCHEDULED
 
 
-def test_loop_keeps_announcing_position_below_the_cap(
-    hold_app, wiring, monkeypatch,
-):
-    workspace, call = _seed(max_wait=120)
-    # Pass 1: still inside the cap → position announcement. Pass 2: gone from
-    # the queue (an agent took them) → the loop's original exit.
-    zset = FakeQueueZset([[_entry(waited_seconds=30)], []])
-
-    _run_loop(hold_app, workspace, zset, monkeypatch)
-
-    assert zset.calls == 2
-    assert db.session.query(Callback).count() == 0
-    assert len(wiring['api'].tts) == 1
-    assert 'number 1 in the queue' in wiring['api'].tts[0][1]
-    assert wiring['api'].ended == []
-    db.session.refresh(call)
-    assert call.status == 'waiting'
-    assert call.end_reason is None
-
-
-def test_loop_sleep_lands_on_the_cap_instead_of_overshooting(
-    hold_app, wiring, monkeypatch,
-):
-    workspace, _call = _seed(max_wait=45)
-    zset = FakeQueueZset([[_entry(waited_seconds=30)], []])
-
-    _run_loop(hold_app, workspace, zset, monkeypatch, interval=30)
-
-    # Initial landing delay is clamped to the cap, then the post-announcement
-    # sleep is shortened to the 15s remaining rather than another full 30s.
-    assert wiring['slept'] == [30, 15]
-
-
-def test_loop_gives_up_after_consecutive_tts_failures(
-    hold_app, wiring, monkeypatch,
-):
-    """A leg that has gone away without a webhook fails every announcement;
-    the loop used to log those forever."""
-    workspace, _call = _seed(max_wait=0)  # cap disabled — TTS is the only exit
-    wiring['api'].tts_error = RuntimeError('call not found')
-    zset = FakeQueueZset([[_entry(waited_seconds=10)] for _ in range(50)])
-
-    _run_loop(hold_app, workspace, zset, monkeypatch)
-
-    assert zset.calls == queue_dispatch.MAX_CONSECUTIVE_TTS_FAILURES
-    assert db.session.query(Callback).count() == 0
-
-
-def test_loop_stops_at_the_hard_ceiling_when_the_cap_is_disabled(
-    hold_app, wiring, monkeypatch,
-):
-    workspace, call = _seed(max_wait=0)
-    monkeypatch.setattr(queue_dispatch, 'HOLD_LOOP_CEILING_SECONDS', 60)
-    zset = FakeQueueZset([[_entry(waited_seconds=10)] for _ in range(50)])
-
-    _run_loop(hold_app, workspace, zset, monkeypatch, interval=30)
-
-    # 30s of announcements per pass → the third pass trips the 60s ceiling.
-    assert zset.calls == 3
-    assert len(wiring['api'].tts) == 2
-    # A disabled cap must not silently start scheduling callbacks.
-    assert db.session.query(Callback).count() == 0
-    db.session.refresh(call)
-    assert call.status == 'waiting'
-
-
-# ---------------------------------------------------------------------------
-# The fallback doesn't lie and doesn't stomp on other paths
-# ---------------------------------------------------------------------------
-
-def test_fallback_loses_to_an_agent_who_just_took_the_call(
+def test_release_loses_to_an_agent_who_just_took_the_call(
     hold_app, wiring, monkeypatch,
 ):
     """Push-dispatch runs in another greenlet and can claim the call between
-    the cap check and the teardown. It must win."""
+    the cap check and the release. It must win — and the caller's document
+    becomes the conference join, not a goodbye."""
     workspace, call = _seed(max_wait=120)
     agent = db.session.query(User).one()
     call.assigned_agent_id = agent.id
     call.status = 'assigned'
     db.session.commit()
+    _use_zset(monkeypatch, FakeRedis([_entry(waited_seconds=180)]))
 
-    queue_dispatch._offer_callback_and_release(
-        CALL_SID, QUEUE_SLUG, workspace.id, 180, 120,
-    )
+    doc = _cycle(cycle=5)
 
+    assert _joins_conference(doc)
+    assert 'joining you now' in _spoken(doc)
     assert db.session.query(Callback).count() == 0
-    assert wiring['api'].tts == []
-    assert wiring['api'].ended == []
     db.session.refresh(call)
     assert call.status == 'assigned'
     assert call.end_reason is None
 
 
-def test_fallback_does_not_promise_a_callback_without_a_dialable_number(
+def test_release_does_not_promise_a_callback_without_a_dialable_number(
     hold_app, wiring, monkeypatch,
 ):
     workspace, call = _seed(max_wait=120, from_number=None)
+    _use_zset(monkeypatch, FakeRedis([_entry(waited_seconds=180)]))
 
-    queue_dispatch._offer_callback_and_release(
-        CALL_SID, QUEUE_SLUG, workspace.id, 180, 120,
-    )
+    doc = _cycle(cycle=5)
 
     assert db.session.query(Callback).count() == 0
     # Still bounded — but the announcement makes no promise it can't keep.
-    _sid, spoken = wiring['api'].tts[0]
+    spoken = _spoken(doc)
     assert 'callback' not in spoken.lower()
     assert 'try your call again' in spoken
-    assert wiring['api'].ended == [CALL_SID]
+    assert _hangs_up(doc)
+
+    _run_spawned_teardown(wiring, hold_app)
     db.session.refresh(call)
     assert call.status == 'ended'
 
 
-def test_fallback_reuses_a_pending_callback_instead_of_minting_a_second(
+def test_release_reuses_a_pending_callback_instead_of_minting_a_second(
     hold_app, wiring, monkeypatch,
 ):
-    """A returned-to-queue caller starts a fresh greenlet; one call must not
-    end up with two live promises."""
+    """A redelivered release (or a re-enqueued caller) must not end up with
+    two live promises for one call."""
     workspace, call = _seed(max_wait=120)
     existing = Callback(
         workspace_id=workspace.id,
@@ -376,17 +453,123 @@ def test_fallback_reuses_a_pending_callback_instead_of_minting_a_second(
     )
     db.session.add(existing)
     db.session.commit()
+    _use_zset(monkeypatch, FakeRedis([_entry(waited_seconds=180)]))
 
-    queue_dispatch._offer_callback_and_release(
-        CALL_SID, QUEUE_SLUG, workspace.id, 180, 120,
-    )
+    doc = _cycle(cycle=5)
 
     assert db.session.query(Callback).count() == 1
     # It still counts as a promise, so the caller hears the callback wording.
-    assert 'callback list' in wiring['api'].tts[0][1]
+    assert 'callback list' in _spoken(doc)
     db.session.refresh(call)
     assert call.end_reason == queue_dispatch.END_REASON_CALLBACK_SCHEDULED
 
+
+def test_ceiling_bounds_a_disabled_cap_without_promising(
+    hold_app, wiring, monkeypatch,
+):
+    """An admin-disabled cap must not mean 'cycle forever' — and it must not
+    silently start scheduling callbacks either."""
+    workspace, call = _seed(max_wait=0)
+    _use_zset(monkeypatch, FakeRedis([
+        _entry(waited_seconds=queue_dispatch.HOLD_LOOP_CEILING_SECONDS + 60),
+    ]))
+
+    doc = _cycle(cycle=80)
+
+    assert db.session.query(Callback).count() == 0
+    assert 'callback' not in _spoken(doc).lower()
+    assert _hangs_up(doc)
+    assert CALL_SID in wiring['dequeued']
+
+
+# ---------------------------------------------------------------------------
+# Other decision branches
+# ---------------------------------------------------------------------------
+
+def test_dispatched_caller_is_sent_into_the_conference(
+    hold_app, wiring, monkeypatch,
+):
+    workspace, call = _seed(max_wait=120)
+    agent = db.session.query(User).one()
+    call.assigned_agent_id = agent.id
+    call.status = 'assigned'
+    db.session.commit()
+    # Dispatch dequeues, so the zset no longer holds the caller.
+    _use_zset(monkeypatch, FakeRedis([]))
+
+    doc = _cycle(cycle=3)
+
+    assert 'joining you now' in _spoken(doc)
+    assert _joins_conference(doc)
+    join = next(v for v in _verbs(doc) if isinstance(v, dict) and 'join_conference' in v)
+    assert join['join_conference']['name'] == f'interaction-{CALL_SID}'
+    assert db.session.query(Callback).count() == 0
+
+
+def test_redelivered_release_speaks_the_promise_again(
+    hold_app, wiring, monkeypatch,
+):
+    """A crash between claim and response must not strand the caller: the
+    durable state (end_reason + pending Callback) decides the wording."""
+    workspace, call = _seed(max_wait=120)
+    call.end_reason = queue_dispatch.END_REASON_CALLBACK_SCHEDULED
+    db.session.add(Callback(
+        workspace_id=workspace.id,
+        call_id=call.id,
+        queue_id=QUEUE_SLUG,
+        phone_number='+15555550123',
+        requested_at=datetime.utcnow(),
+        expires_at=datetime.utcnow() + timedelta(hours=24),
+    ))
+    db.session.commit()
+    _use_zset(monkeypatch, FakeRedis([]))
+
+    doc = _cycle(cycle=6)
+
+    assert 'callback list' in _spoken(doc)
+    assert _hangs_up(doc)
+    assert wiring['spawned'], 'teardown must be (re)scheduled on redelivery'
+
+
+def test_ended_call_gets_a_plain_hangup(hold_app, wiring, monkeypatch):
+    workspace, call = _seed(max_wait=120)
+    call.status = 'ended'
+    call.ended_at = datetime.utcnow()
+    db.session.commit()
+    _use_zset(monkeypatch, FakeRedis([]))
+
+    doc = _cycle(cycle=2)
+
+    assert _hangs_up(doc)
+    assert _spoken(doc) == ''
+    assert db.session.query(Callback).count() == 0
+
+
+def test_unknown_call_gets_a_plain_hangup(hold_app, wiring):
+    doc = queue_dispatch.hold_cycle_swml('no-such-call', QUEUE_SLUG, 2, BASE_URL)
+    assert _hangs_up(doc)
+
+
+def test_vanished_queue_entry_releases_without_a_promise(
+    hold_app, wiring, monkeypatch,
+):
+    """Not queued, not assigned, not ended: routing lost the caller. Release
+    honestly instead of cycling music forever."""
+    workspace, call = _seed(max_wait=120)
+    _use_zset(monkeypatch, FakeRedis([]))
+
+    doc = _cycle(cycle=4)
+
+    spoken = _spoken(doc)
+    assert 'try your call again' in spoken
+    assert 'callback' not in spoken.lower()
+    assert _hangs_up(doc)
+    assert wiring['spawned']
+
+
+# ---------------------------------------------------------------------------
+# Teardown keeps the classification
+# ---------------------------------------------------------------------------
 
 def test_reap_call_keeps_a_preset_end_reason(hold_app, wiring):
     """The teardown must not relabel a hold-timeout release as an abandon."""

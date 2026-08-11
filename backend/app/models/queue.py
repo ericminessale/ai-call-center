@@ -46,7 +46,7 @@ class Queue(WorkspaceScoped, db.Model):
     # The "_ai_fallback" in the name is historical: the original design was
     # to hand the leg back to `ai_agent_route`, which needs a mid-conference
     # SWML redirect this stack has no working primitive for (see
-    # _offer_callback_and_release). Kept as-is because it's part of the
+    # queue_dispatch._claim_hold_release). Kept as-is because it's part of the
     # /api/admin/queues request contract; the UI labels it for what it does.
     max_wait_before_ai_fallback = db.Column(db.Integer, default=120)
 

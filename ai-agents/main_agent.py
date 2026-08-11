@@ -600,13 +600,33 @@ def attach_knowledge_search(agent, collection_override=None):
     if not collection:
         return
 
+    # Tool description and empty-result text are the LLM's routing table for
+    # this tool, so agents may override both (e.g. the sales specialist points
+    # catalog/pricing questions at the live shop tools instead). The defaults
+    # keep the historic behavior, except the miss message: "No information
+    # found" left the model free to improvise — several 2026-08-10 harness
+    # calls turned it into "I can't access pricing" or a fabricated product.
+    # A miss must prescribe the next move, never just report the miss.
+    description = getattr(agent, '_kb_tool_description', None) or (
+        "Search the knowledge base for relevant information. Use this when "
+        "the customer asks questions about products, services, "
+        "troubleshooting, or anything you need to look up."
+    )
+    no_results_message = getattr(agent, '_kb_no_results_message', None) or (
+        "No knowledge-base entry matched '{query}'. Tell the caller you "
+        "don't have that detail on hand — never say you 'can't access' "
+        "information — and offer to connect them with a specialist who can "
+        "help. Do not invent an answer."
+    )
+
     try:
         agent.add_skill("native_vector_search", {
             "tool_name": "search_knowledge",
             "backend": "pgvector",
             "connection_string": DATABASE_URL,
             "collection_name": collection,
-            "description": "Search the knowledge base for relevant information. Use this when the customer asks questions about products, services, troubleshooting, or anything you need to look up.",
+            "description": description,
+            "no_results_message": no_results_message,
             "count": 5,
             "build_index": False,
             # Per-tool fillers (filler policy: opt-in only — no language-level
@@ -2505,6 +2525,25 @@ class SalesAISpecialist(CallCenterAgent):
         # applies to new calls without a restart.
         self._kb_agent_id = 'sales-ai'
         self._kb_fallback_collection = 'sales_knowledge'
+        # Catalog facts — what we sell, prices, stock, the most popular
+        # product — live in the shop tools (mcp_demoshop_*), not the document
+        # KB. Route selection there, and make a KB miss redirect instead of
+        # letting the model announce it "can't access pricing" (the
+        # 2026-08-10 fred_returning_caller flap).
+        self._kb_tool_description = (
+            "Search company documents for product specs, feature details, "
+            "policies, or comparisons. NOT for what we sell, prices, stock, "
+            "or which product is most popular — the shop catalog tools "
+            "answer those with live data."
+        )
+        self._kb_no_results_message = (
+            "No document matched '{query}'. Do NOT tell the caller you can't "
+            "access information. If they asked what we sell, which product "
+            "is most popular, or a price, call the product catalog tool "
+            "(mcp_demoshop_list_products) and answer from its data. For "
+            "anything else, say you don't have that detail on hand and "
+            "offer to connect a human sales rep."
+        )
         self._mcp_agent_id = 'sales-ai'  # MCP gateways attach per-request (callback), not at boot
         self._inbound_caller_memory = True  # R1: consume call-context contact block
 
@@ -2532,6 +2571,9 @@ class SalesAISpecialist(CallCenterAgent):
             bullets=[
                 "Keep responses to one or two sentences unless explaining something specific",
                 "Lead with the answer, then add detail if needed",
+                "When you give a price, name the product and its price together in your very "
+                "first sentence — callers often jump in after one sentence, and that first "
+                "sentence must stand alone as a complete answer",
                 "Never list more than three things at once — offer to go deeper on any of them",
                 "Ask one question at a time"
             ]
@@ -2550,11 +2592,19 @@ class SalesAISpecialist(CallCenterAgent):
             "Approach",
             body="How to handle the conversation:",
             bullets=[
-                "Start by understanding their situation — what problem are they trying to solve?",
-                "Ask about their current setup, team size, or use case to tailor your recommendations",
+                "If the caller asks a direct factual question — a price, what we sell, "
+                "what's most popular, availability — answer it first, in one short "
+                "sentence, before any discovery questions. A researching caller should "
+                "never have to wait through qualifying questions for a simple fact",
+                "What we sell, prices, stock, and 'most popular' come from the product "
+                "catalog tool (mcp_demoshop_list_products) — answer from its live data, "
+                "never from memory or guesswork",
+                "Beyond the quick facts, understand their situation — what problem are "
+                "they trying to solve?",
+                "Ask about their current setup, team size, or use case to tailor your "
+                "recommendations — after their question is answered, one question at a time",
                 "Match their needs to specific products or features",
-                "Give honest, straightforward pricing guidance when asked",
-                "Use the search_knowledge tool to find specific product details when needed"
+                "Use the search_knowledge tool for document details the catalog doesn't cover"
             ]
         )
 

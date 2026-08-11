@@ -54,7 +54,8 @@ CREATE TABLE products (
     sku         TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     price_cents INTEGER NOT NULL,
-    in_stock    INTEGER NOT NULL DEFAULT 0   -- units on hand
+    in_stock    INTEGER NOT NULL DEFAULT 0,  -- units on hand
+    units_sold  INTEGER NOT NULL DEFAULT 0   -- lifetime sales: ranks "most popular"
 );
 
 CREATE TABLE orders (
@@ -121,15 +122,17 @@ CUSTOMERS = [
 ]
 
 PRODUCTS = [
-    # sku, name, price_cents, in_stock
-    ("HDPH-001",  "Wireless Over-Ear Headphones",        14999, 42),
-    ("HDPH-002",  "True Wireless Earbuds",                7999, 0),   # out of stock
-    ("CABL-USBC", "USB-C Charging Cable, 2m",             1299, 318),
-    ("STND-LAP",  "Adjustable Laptop Stand",              4999, 17),
-    ("KEYB-MECH", "Mechanical Keyboard, Tactile",        12900, 8),
-    ("MOUS-ERG",  "Ergonomic Vertical Mouse",             6499, 0),   # out of stock
-    ("WBCM-4K",   "4K Webcam, Auto-focus",                9900, 23),
-    ("HUB-USB",   "7-Port USB Hub w/ Power",              3499, 60),
+    # sku, name, price_cents, in_stock, units_sold
+    # units_sold ranks popularity; the AI's "most popular product" answer is
+    # whichever row leads this ranking, so keep exactly one clear leader.
+    ("HDPH-001",  "Wireless Over-Ear Headphones",        14999, 42,  1284),
+    ("HDPH-002",  "True Wireless Earbuds",                7999, 0,    946),  # out of stock
+    ("CABL-USBC", "USB-C Charging Cable, 2m",             1299, 318,  812),
+    ("STND-LAP",  "Adjustable Laptop Stand",              4999, 17,   401),
+    ("KEYB-MECH", "Mechanical Keyboard, Tactile",        12900, 8,    377),
+    ("MOUS-ERG",  "Ergonomic Vertical Mouse",             6499, 0,    289),  # out of stock
+    ("WBCM-4K",   "4K Webcam, Auto-focus",                9900, 23,   512),
+    ("HUB-USB",   "7-Port USB Hub w/ Power",              3499, 60,   244),
 ]
 
 # Orders are written in chronological seed groups so we can reference
@@ -168,10 +171,11 @@ def _populate(cur: sqlite3.Cursor) -> dict[str, int]:
         )
 
     # Products
-    for sku, name, price_cents, in_stock in PRODUCTS:
+    for sku, name, price_cents, in_stock, units_sold in PRODUCTS:
         cur.execute(
-            "INSERT INTO products (sku, name, price_cents, in_stock) VALUES (?, ?, ?, ?)",
-            (sku, name, price_cents, in_stock),
+            "INSERT INTO products (sku, name, price_cents, in_stock, units_sold)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (sku, name, price_cents, in_stock, units_sold),
         )
 
     # Orders + items + returns (where applicable)
@@ -187,7 +191,7 @@ def _populate(cur: sqlite3.Cursor) -> dict[str, int]:
         } else None
 
         # Compute total from product prices.
-        prices = {sku: price for sku, _, price, _ in PRODUCTS}
+        prices = {sku: price for sku, _, price, _, _ in PRODUCTS}
         total = sum(prices[sku] * qty for sku, qty in items)
 
         cur.execute(
@@ -219,6 +223,24 @@ def _populate(cur: sqlite3.Cursor) -> dict[str, int]:
     }
 
 
+def _schema_current() -> bool:
+    """True when the existing DB matches the schema this seed writes.
+
+    Checked column by column only where it matters: today the sole schema
+    delta worth detecting is ``products.units_sold`` (added for the
+    most-popular-product ranking). Extend the check when SCHEMA next changes.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT)
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(products)")}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False  # unreadable/corrupt — reseed
+    return "units_sold" in cols
+
+
 def seed(force: bool = False) -> dict[str, Any]:
     """Create + populate the DB. Returns a summary dict.
 
@@ -228,8 +250,18 @@ def seed(force: bool = False) -> dict[str, Any]:
     """
     existed = os.path.exists(DB_PATH)
     if existed and not force:
-        print(f"DemoShop DB already exists at {DB_PATH}; skipping seed.", flush=True)
-        return {'seeded': False, 'reason': 'db_exists', 'db_path': DB_PATH}
+        if _schema_current():
+            print(f"DemoShop DB already exists at {DB_PATH}; skipping seed.", flush=True)
+            return {'seeded': False, 'reason': 'db_exists', 'db_path': DB_PATH}
+        # A DB from before a schema change (e.g. products.units_sold) would
+        # crash the tools that expect the new column. This is disposable demo
+        # data — on the hosted demo the nightly cron wipes it anyway — so a
+        # schema upgrade just means "reseed".
+        print(
+            f"DemoShop DB at {DB_PATH} predates the current schema; re-seeding.",
+            flush=True,
+        )
+        force = True
 
     print(
         f"{'Re-seeding' if existed else 'Seeding'} DemoShop DB at {DB_PATH}…",

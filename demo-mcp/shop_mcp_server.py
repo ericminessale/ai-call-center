@@ -16,6 +16,7 @@ Tools exposed:
   - list_recent_orders        a customer's recent orders (most recent first)
   - track_shipment            carrier + tracking + a synthetic in-transit timeline
   - start_return              kick off an RMA against an order
+  - list_products             the catalog with prices, best sellers first (sales calls)
   - check_inventory           stock level for a SKU (sales calls)
 """
 
@@ -275,6 +276,59 @@ def start_return(order_id: int, reason: str) -> dict:
     }
 
 
+def _availability(in_stock: int) -> str:
+    return (
+        "in stock" if in_stock > 5
+        else "low stock" if in_stock > 0
+        else "out of stock"
+    )
+
+
+@mcp.tool()
+def list_products() -> dict:
+    """What we sell: the product catalog with prices, stock, and which product
+    is our most popular (best seller). Use this whenever a caller asks what
+    products we offer, which product is most popular or best-selling, what
+    something costs, or about pricing in general — it returns live catalog
+    data, so never guess at products or prices.
+
+    Returns ``most_popular`` (the best seller, by lifetime units sold) plus
+    ``products``, the full lineup ranked best sellers first.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT sku, name, price_cents, in_stock, units_sold
+                 FROM products
+             ORDER BY units_sold DESC, sku""",
+        ).fetchall()
+    products = [
+        {
+            "sku": r["sku"],
+            "name": r["name"],
+            "price": _format_money(r["price_cents"]),
+            "availability": _availability(r["in_stock"]),
+            "units_sold": r["units_sold"],
+        }
+        for r in rows
+    ]
+    if not products:
+        return {"found": False, "error": "catalog is empty"}
+    top = products[0]
+    return {
+        "found": True,
+        "most_popular": top,
+        "products": products,
+        # The AI reads this with the data. Callers interrupt long answers, so
+        # the price must land in the first breath, not the third sentence.
+        "answer_guidance": (
+            "If the caller asked about the most popular product or its price, "
+            f"your FIRST sentence must name product and price together — "
+            f"'Our most popular product is the {top['name']} at {top['price']}.' "
+            "Elaborate only after that sentence."
+        ),
+    }
+
+
 @mcp.tool()
 def check_inventory(sku: str) -> dict:
     """Stock level for a given SKU. Useful on sales calls.
@@ -295,11 +349,7 @@ def check_inventory(sku: str) -> dict:
         "name": row["name"],
         "price": _format_money(row["price_cents"]),
         "in_stock": in_stock,
-        "availability": (
-            "in stock" if in_stock > 5
-            else "low stock" if in_stock > 0
-            else "out of stock"
-        ),
+        "availability": _availability(in_stock),
     }
 
 

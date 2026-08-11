@@ -225,6 +225,14 @@ def create_app():
     # internally — registering it on every deployment is safe.
     app.register_blueprint(demo_bp, url_prefix='/api')
 
+    # Synthetic-caller test harness (driven by testing/run_scenario.py).
+    # Operator opt-in — with the flag unset the blueprint is never imported,
+    # so a standard deployment carries none of these routes.
+    if os.getenv('TESTING_HARNESS_ENABLED', '').strip().lower() in ('1', 'true', 'yes'):
+        from app.api.testing_harness import harness_bp
+        app.register_blueprint(harness_bp, url_prefix='/api/testing')
+        app.logger.info("Testing harness enabled at /api/testing")
+
     # Initialize tap audio relay WebSocket routes
     from app.services.tap_relay import init_tap_relay
     init_tap_relay(app)

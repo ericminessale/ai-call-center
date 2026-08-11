@@ -1815,9 +1815,6 @@ def configure_triage_queues(agent, queues, caller=None):
         )
 
     dept_list_text = "\n".join(queue_descriptions)
-    route_instructions = "\n".join(
-        [f"- {q['display_name']}-related: switch to the '{q['slug']}' context" for q in queues]
-    )
 
     dept_names = [q['display_name'] for q in queues]
     if len(dept_names) > 1:
@@ -1903,12 +1900,16 @@ def configure_triage_queues(agent, queues, caller=None):
     greeting_goal += language_clause
     triage_ctx.add_step("greeting") \
         .add_section("Goal", greeting_goal) \
-        .add_section("Handling Eager Callers",
-            "If the caller gives you their name AND mentions what they need in the same breath, "
-            "great — note both. You can skip asking about the department in the next step.") \
+        .add_section("Routing From Here",
+            "The moment you know which department fits — whether the caller volunteered it "
+            "with their name, described a need that clearly belongs somewhere, or confirmed "
+            "a topic you offered — call route_to_department with the department and a short "
+            "note of what they need. Never tell a caller you'll connect them without calling "
+            "it: saying 'let me connect you' does nothing on its own.\n"
+            "Departments:\n" + dept_list_text) \
         .set_step_criteria(greeting_criteria) \
         .set_valid_steps(["route_department"]) \
-        .set_functions(["report_sentiment", "set_caller_language"])
+        .set_functions(["report_sentiment", "set_caller_language", "route_to_department"])
 
     # Step 2: Determine department
     triage_ctx.add_step("route_department") \
@@ -1919,10 +1920,13 @@ def configure_triage_queues(agent, queues, caller=None):
             f"Ask naturally which area they need help with: {dept_menu}.") \
         .add_section("Departments", dept_list_text) \
         .add_section("Routing",
-            "Once you know the department, move to that context seamlessly:\n" + route_instructions) \
+            "Once you know the department, call route_to_department with the department and "
+            "a short note of what the caller needs. That call is what moves them — never "
+            "announce a connection you haven't started, and never leave a caller waiting on "
+            "a promise.") \
         .set_step_criteria("Customer has indicated which department they need") \
         .set_valid_contexts(queue_slugs) \
-        .set_functions(["report_sentiment", "set_caller_language"])
+        .set_functions(["report_sentiment", "set_caller_language", "route_to_department"])
 
     # ============================================================
     # DYNAMIC QUEUE CONTEXTS - One per configured queue
@@ -1944,20 +1948,33 @@ def configure_triage_queues(agent, queues, caller=None):
                 f"Briefly ask what they need help with so you can pass useful context "
                 "to the specialist. One question is enough — don't interrogate them.") \
             .add_section("If They Already Told You",
-                "If the caller already described their issue during the greeting, "
-                "you have what you need. Move on to offering transfer options.") \
+                "If the caller's request is already known — they described it during the "
+                "greeting, or the route_to_department result states it — you have what "
+                "you need. Do NOT ask again; move straight on to offering transfer options.") \
             .set_step_criteria("You have a basic understanding of what the caller needs help with") \
             .set_valid_steps(["offer_transfer"]) \
-            .set_functions(["report_sentiment", "set_caller_language"])
+            .set_functions(["report_sentiment", "route_to_department",
+                            "set_caller_language"])
 
         # Step 2: Offer transfer choice
         queue_ctx.add_step("offer_transfer") \
             .add_section("Goal",
-                f"Offer to connect them with a {display.lower()} specialist, "
-                "or let them know our AI assistant can help right away. Let them choose.") \
+                f"Offer BOTH options in ONE short question: a human {display.lower()} "
+                "specialist, or our AI assistant who can answer right away. Never offer "
+                "just one of them — a caller saying 'yes' to a single option is how "
+                "misroutes happen. Let them choose.") \
             .add_section("Handling Questions",
                 "If they ask you a question about their issue, acknowledge it and "
                 "let them know a specialist can help with that. Then offer the transfer options.") \
+            .add_section("If They Won't Choose",
+                "Offer the choice ONCE. If instead of clearly picking they repeat their "
+                "question, press for an answer, tell you to just help, answer with a bare "
+                "'yes'/'okay', or get cut off mid-answer, take that as wanting the fastest "
+                "help there is: call transfer_to_ai_specialist right away — our AI assistant "
+                "can answer immediately, while a human specialist means hold time. Only use "
+                "transfer_to_human when they clearly asked for a person. Never re-ask the "
+                "human-or-AI question, and never promise a connection you aren't executing "
+                "in the same breath.") \
             .add_section("Transferring",
                 "Once they choose:\n"
                 "- Human specialist: use the transfer_to_human tool\n"
@@ -1966,7 +1983,8 @@ def configure_triage_queues(agent, queues, caller=None):
             .set_step_criteria("Customer has chosen human or AI assistance") \
             .set_valid_steps([]) \
             .set_functions(["transfer_to_human", "transfer_to_ai_specialist",
-                            "report_sentiment", "set_caller_language"])
+                            "report_sentiment", "route_to_department",
+                            "set_caller_language"])
 
 
 class CallCenterAgent(AgentBase):
@@ -2207,7 +2225,9 @@ class CallCenterTriageAgent(CallCenterAgent):
             "Your only job is to greet callers, learn their name, figure out which department they need, "
             "and connect them. All questions, troubleshooting, and advice are handled by the specialists "
             "you transfer to. If a caller asks you a question or describes a problem, acknowledge it briefly "
-            "and move toward getting them connected."
+            "and move toward getting them connected. Words alone never connect anyone: only the routing "
+            "and transfer tools do. Never say you're connecting or transferring a caller unless you are "
+            "invoking the tool that does it right then."
         )
 
         self.prompt_add_section(
@@ -2237,6 +2257,104 @@ class CallCenterTriageAgent(CallCenterAgent):
 
     # set_caller_language lives on CallCenterAgent (base) — every agent can
     # record a language switch, not just triage.
+
+    @AgentBase.tool(
+        name="route_to_department",
+        description=(
+            "Move the caller into the flow for the department that handles what they "
+            "need. Call it the MOMENT the department is clear — whether the caller "
+            "stated it, described a need that obviously belongs there (like a pricing "
+            "question belonging to sales), or confirmed a topic you offered — even if "
+            "the usual intake questions were skipped. Never tell a caller you'll "
+            "connect or transfer them without calling this. NOT for reaching a "
+            "specialist: from inside a department flow, use transfer_to_human or "
+            "transfer_to_ai_specialist instead."
+        ),
+        parameters={
+            "department": {
+                "type": "string",
+                "description": "Department slug from the Departments list (e.g., 'sales', 'support')",
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "What the caller needs, briefly, in their own words "
+                    "(e.g., 'price of the most popular product')"
+                ),
+            },
+        },
+        # No fillers — the department shift is the same persona, one continuous
+        # person (see the filler policy note in __init__); the change_context
+        # internal fillers cover any gap.
+    )
+    def route_to_department(self, args, raw_data):
+        """Code-enforced routing into a queue context (PGI: prompts propose,
+        code decides).
+
+        Step/context advancement is otherwise model-driven against
+        step_criteria, and the transfer tools exist only inside the queue
+        contexts. A caller whose conversation shape skips the intake ritual
+        (e.g. a recognized returning caller whose topic was confirmed by the
+        greeting, then pressed for an answer) used to strand the model in
+        greeting/route_department — verbally promising a transfer it could
+        not execute from there. This tool makes routing an action: validate
+        the department against the live queue map, then FORCE the context
+        change with swml_change_context (which bypasses valid_contexts and
+        lands on the queue's first step). The result text rides the
+        conversation into the new context, so the queue steps know the
+        caller's request without re-asking.
+        """
+        global_data = raw_data.get('global_data', {})
+        queue_map = getattr(self, '_queue_ai_map', {}) or {}
+        requested = (args.get('department') or '').strip().lower()
+        reason = (args.get('reason') or '').strip()
+
+        # Tolerate display-name-ish input ("Sales", "technical support desk").
+        slug = requested if requested in queue_map else next(
+            (cand for cand in queue_map if cand in requested), None)
+
+        if not slug:
+            options = ', '.join(sorted(queue_map)) or 'none configured'
+            return FunctionResult(
+                f"UNKNOWN_DEPARTMENT: '{requested}' is not one of our departments. "
+                f"Valid departments: {options}. Pick the one that fits what the "
+                "caller needs and call route_to_department again."
+            )
+
+        if global_data.get('routed_department') == slug:
+            # Re-routing to the SAME department would reset the queue flow to
+            # its first step; bounce the model forward instead. A different
+            # department passes through — that's a legitimate correction.
+            return FunctionResult(
+                f"ALREADY_ROUTED: the caller is already in the {slug} flow. "
+                "Offer the connection options, or execute their choice with "
+                "transfer_to_human / transfer_to_ai_specialist."
+            )
+
+        if reason:
+            guidance = (
+                "They have already explained what they need — do NOT ask again. "
+                "Go straight to the connection choice, BOTH options in ONE short "
+                "question: a human specialist, or the AI assistant who can answer "
+                "immediately. If their answer is unclear, interrupted, or they "
+                "just repeat their question, use transfer_to_ai_specialist."
+            )
+        else:
+            guidance = (
+                "Ask briefly what they need help with, then offer the "
+                "connection choice — both options in one short question."
+            )
+        result = FunctionResult(
+            f"ROUTED to {slug}. The caller's request: "
+            f"{reason or 'not stated yet'}. {guidance}"
+        )
+        result.update_global_data({
+            'routed_department': slug,
+            'department': slug,
+            'reason': reason,
+        })
+        result.swml_change_context(slug)
+        return result
 
     @AgentBase.tool(
         name="transfer_to_human",

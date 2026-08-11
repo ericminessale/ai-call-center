@@ -63,6 +63,10 @@ services:
       SWML_BASIC_AUTH_USER: ${SWML_BASIC_AUTH_USER}
       SWML_BASIC_AUTH_PASSWORD: ${SWML_BASIC_AUTH_PASSWORD}
 
+      # Synthetic-caller test harness (testing/run_scenario.py) — off unless
+      # the operator opts in via .env.
+      TESTING_HARNESS_ENABLED: ${TESTING_HARNESS_ENABLED:-false}
+
       # Security — NO committed fallbacks (DEPLOY-C2). A default here would
       # defeat the _require_env fail-fast in app/__init__.py: an operator who
       # forgot to set these would boot with a publicly-known JWT signing key,

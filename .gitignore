@@ -71,3 +71,7 @@ tmp/
 temp/
 *.tmp
 nul
+
+# Synthetic-caller test runner artifacts (testing/run_scenario.py)
+testing/results/
+testing/.state.json

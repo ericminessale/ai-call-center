@@ -323,6 +323,54 @@ def test_post_prompt_never_persists_junk_assessment(lang_app):
     assert Contact.query.get(contact.id).preferred_language is None
 
 
+def test_post_prompt_backfill_restarts_live_transcription(lang_app, monkeypatch):
+    """AI→AI chain: the triage session's post-prompt lands while the
+    specialist is still mid-conversation — the back-fill must flip live
+    transcription to the learned language for the rest of the call."""
+    flask_app, ws, _wso, user, _contact = lang_app
+    call = _call(ws, user, sid='call-lang-5')
+
+    restarts = []
+    import app.services.call_language as cl
+    monkeypatch.setattr(
+        cl, 'restart_ai_leg_transcription',
+        lambda c, base_url: restarts.append(c.id) or True,
+    )
+    import app.utils.url_utils as uu
+    monkeypatch.setattr(uu, 'get_base_url', lambda: 'http://test')
+
+    # transferred_to_ai outcome leaves the call ai_active (live)
+    resp = _post_prompt(flask_app, call,
+                        global_data={'caller_language': 'es-ES'},
+                        parsed={'outcome': 'transferred_to_ai'})
+
+    assert resp.status_code == 200
+    assert Call.query.get(call.id).caller_language == 'es-ES'
+    assert restarts == [call.id]
+
+
+def test_post_prompt_backfill_skips_restart_when_call_just_closed(
+        lang_app, monkeypatch):
+    flask_app, ws, _wso, user, _contact = lang_app
+    call = _call(ws, user, sid='call-lang-6')
+
+    restarts = []
+    import app.services.call_language as cl
+    monkeypatch.setattr(
+        cl, 'restart_ai_leg_transcription',
+        lambda c, base_url: restarts.append(c.id) or True,
+    )
+
+    # Empty outcome + no assigned agent/conference → the handler itself
+    # closes the call; a closed call must not get a fresh transcribe session.
+    resp = _post_prompt(flask_app, call,
+                        global_data={'caller_language': 'es-ES'})
+
+    assert resp.status_code == 200
+    assert Call.query.get(call.id).caller_language == 'es-ES'
+    assert restarts == []
+
+
 def test_post_prompt_does_not_overwrite_existing_column(lang_app):
     flask_app, ws, _wso, user, _contact = lang_app
     call = _call(ws, user, sid='call-lang-4', caller_language='en-US')

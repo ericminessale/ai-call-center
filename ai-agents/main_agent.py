@@ -2278,6 +2278,35 @@ class CallCenterTriageAgent(CallCenterAgent):
     # set_caller_language lives on CallCenterAgent (base) — every agent can
     # record a language switch, not just triage.
 
+    def _require_caller_language(self, raw_data):
+        """One-shot PGI gate for the triage exit tools: no caller leaves
+        triage without a recorded language.
+
+        The greeting step_criteria ASKS the model to call
+        set_caller_language, but criteria are advisory and the model
+        provably skips them (maria_language_memory rows 29 and 47: a
+        Spanish-only call where the tool never fired and the transcript
+        stayed garbled en-US start to finish). Routing/transfer are the
+        structural chokepoints every handled call passes through, so gate
+        them: the first exit attempt without a language bounces with a
+        prescriptive error telling the model to record the language and
+        retry. ONE bounce only — a model that still refuses must not be
+        able to strand the caller, so the second attempt passes (the
+        post-prompt back-fill then still fixes the record, at the cost of
+        this one call's transcription language).
+        """
+        global_data = raw_data.get('global_data', {}) or {}
+        if global_data.get('caller_language') or global_data.get('language_gate_bounced'):
+            return None
+        result = FunctionResult(
+            "LANGUAGE_NOT_SET: silently call set_caller_language with the "
+            "BCP-47 code of the language this caller has been speaking "
+            "(e.g. 'en-US', 'es-ES', 'fr-FR'), then call this tool again "
+            "with the same arguments."
+        )
+        result.update_global_data({'language_gate_bounced': True})
+        return result
+
     @AgentBase.tool(
         name="route_to_department",
         description=(
@@ -2324,6 +2353,10 @@ class CallCenterTriageAgent(CallCenterAgent):
         conversation into the new context, so the queue steps know the
         caller's request without re-asking.
         """
+        gate = self._require_caller_language(raw_data)
+        if gate is not None:
+            return gate
+
         global_data = raw_data.get('global_data', {})
         queue_map = getattr(self, '_queue_ai_map', {}) or {}
         requested = (args.get('department') or '').strip().lower()
@@ -2393,6 +2426,9 @@ class CallCenterTriageAgent(CallCenterAgent):
     )
     def transfer_to_human(self, args, raw_data):
         """Triage agent's transfer — department comes from caller intent."""
+        gate = self._require_caller_language(raw_data)
+        if gate is not None:
+            return gate
         urgency = args.get("urgency", "medium")
         urgency_map = {'high': 2, 'medium': 5, 'low': 8}
         return self._transfer_to_human_queue(
@@ -2426,6 +2462,9 @@ class CallCenterTriageAgent(CallCenterAgent):
     )
     def transfer_to_ai_specialist(self, args, raw_data):
         """Transfer to AI specialist agent"""
+        gate = self._require_caller_language(raw_data)
+        if gate is not None:
+            return gate
         customer_name = args.get("customer_name", "")
         reason = args.get("reason", "")
         department = args.get("department", "support").lower()

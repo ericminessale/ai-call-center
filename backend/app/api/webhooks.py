@@ -1553,6 +1553,7 @@ def post_prompt():
             # assessment, both gated through normalize_language (PGI: model
             # output is unverified input).
             from app.services.call_language import normalize_language
+            back_filled_language = None
             if not call.caller_language:
                 learned_language = (
                     normalize_language(merged_context.get('caller_language'))
@@ -1560,6 +1561,7 @@ def post_prompt():
                 )
                 if learned_language:
                     call.caller_language = learned_language
+                    back_filled_language = learned_language
                     logger.info(
                         f"post_prompt: seeded caller_language={learned_language} "
                         f"for call {call.id}"
@@ -1693,6 +1695,26 @@ def post_prompt():
 
             db.session.commit()
             logger.info(f"✓ Updated call {call.id} with post_prompt data (status: {call.status})")
+
+            # If the language back-fill just learned the language of a call
+            # that is STILL live (AI→AI transfer chains: the triage session's
+            # post-prompt lands while the specialist is mid-conversation),
+            # restart transcription now so the rest of the call transcribes
+            # in the right language instead of staying garbled en-US.
+            # Post-outcome-routing status guard: a call this handler just
+            # closed, or parked 'waiting' for a human, is not restarted.
+            if back_filled_language and call.status in ('answered', 'ai_active'):
+                try:
+                    from app.services.call_language import (
+                        restart_ai_leg_transcription,
+                    )
+                    from app.utils.url_utils import get_base_url
+                    restart_ai_leg_transcription(call, base_url=get_base_url())
+                except Exception as e:
+                    logger.warning(
+                        f"post_prompt: transcription language restart failed "
+                        f"(non-fatal) for call {call.id}: {e}"
+                    )
 
             # F-04: memory finalization runs AFTER the outcome routing above
             # — an AI-only call this handler itself just closed (the path

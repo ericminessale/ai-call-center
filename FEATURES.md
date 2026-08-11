@@ -104,6 +104,8 @@ Five AI agents ship out-of-box; all are Python-defined using the SignalWire Agen
 ### Knowledge base (RAG)
 
 - Per-agent document collections backed by PostgreSQL + **pgvector**.
+- **Seeded out-of-box** — the sales and support collections ship with example documents (product specs, comparisons, policies, troubleshooting guides) for the same fictional shop the bundled DemoShop MCP gateway sells, so the specialists can answer real questions on the first call. First boot embeds them automatically; no manual reindex step. Replace them with your own content in Settings → Knowledge Base — the seed runs once and never overwrites or restores what you change.
+- Deliberately no prices in the seeded documents: what we sell, what it costs and what's in stock come from the live catalog tool, so the documents can't go stale against it.
 - Upload documents via the admin UI; trigger reindex to regenerate embeddings.
 - AI agents query their bound collection at runtime via SWAIG function calls.
 - Assignments are dynamic — reindex a collection and agents pick up new content on the next conversation, no restart needed.
@@ -298,8 +300,8 @@ The Settings tab is the complete configuration surface. Admin-only.
 ### Knowledge Base
 
 - Document Collections: create, edit, delete.
-- Documents within a collection: create, edit, delete.
-- Reindex a collection to regenerate embeddings after content changes.
+- Documents within a collection: create, edit, delete — seeded with example content on first boot.
+- Reindex ("Publish changes") to regenerate embeddings after content changes. The **Published** badge means a document is embedded and findable by the AI, not merely saved.
 
 ### External Tools (MCP Gateway integrations)
 

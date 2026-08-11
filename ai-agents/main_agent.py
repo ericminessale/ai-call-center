@@ -129,6 +129,22 @@ EMBEDDING_DIM = 384
 # the chunks_<name> table identifier (psycopg2 can't parameterize idents).
 _COLLECTION_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
 
+# Cosine-similarity floor for search_knowledge results. Nearest-neighbour
+# search ALWAYS returns its k nearest rows, however far away they are — so
+# without a floor an off-topic question ("what time do you close?", "how do
+# I file my taxes?") comes back as five confident-looking knowledge-base
+# excerpts, under a preamble telling the model to answer from them. That is
+# fabrication fuel, and it also means the no-results guidance — which tells
+# the model to offer a human instead of guessing — could never fire.
+#
+# Measured against the seeded product KB (2026-08-11, all-MiniLM-L6-v2):
+# on-topic questions scored 0.49-0.69, clearly off-topic ones 0.05-0.31.
+# The gap is real but not wide, so this sits nearer the noise: a marginal
+# excerpt the model can ignore costs less than wrongly telling a caller we
+# have nothing. Re-measure if the embedding model changes — the scale of
+# these numbers is model-specific, not universal.
+KB_MIN_SCORE = 0.30
+
 # Global embedding model (loaded lazily)
 _embedding_model = None
 
@@ -568,22 +584,38 @@ def fetch_call_context(call_db_id, ctk=None):
 
 
 def attach_knowledge_search(agent, collection_override=None):
-    """Attach native_vector_search to the per-request ephemeral agent.
+    """Register search_knowledge on the per-request ephemeral agent.
 
     Called from the dynamic-config callback, which the SDK runs on a fresh
     ephemeral copy for BOTH SWML renders and SWAIG executions — so the tool
     is registered with the current collection at execution time too.
 
-    The skill must NOT also be attached at boot: _create_ephemeral_copy
-    re-loads boot skills into each copy first, and with a duplicate tool
-    name the stale boot binding wins (add_skill treats the re-registration
-    as an expected duplicate and keeps the first one).
+    The tool must NOT also be registered at boot: _create_ephemeral_copy
+    re-loads boot registrations into each copy first, so a boot-registered
+    search_knowledge would make this define_tool raise "already exists" —
+    caught below — leaving every call bound to the boot collection.
 
     Agents opt in by setting ``_kb_agent_id`` (assignment slug) and
     optionally ``_kb_fallback_collection`` in __init__.
     ``collection_override`` is the per-call tenant assignment from
     call-context (physical collection name); without it the template
     cache / fallback applies.
+
+    This used to be ``add_skill("native_vector_search")``, and that skill
+    could not answer a single question against our collections. It picks
+    the query-time embedding model from ``SearchEngine.config
+    .get('embedding_model')``, but the SDK's own pgvector backend
+    publishes that value under the key ``model_name`` — so the lookup
+    always returned None and the query fell through to the SDK default,
+    all-mpnet-base-v2 at 768 dimensions. Our chunk tables are written by
+    do_reindex with all-MiniLM-L6-v2 at 384. Every call raised
+    ``different vector dimensions 384 and 768`` inside the skill, which
+    swallowed it into "I encountered an issue while searching".
+
+    So we query through :func:`do_search` instead — the same function that
+    already backs search_caller_history, using the same model that wrote
+    the index. That also removes the hidden dependency on an SDK default
+    matching ours, which is what made this silent in the first place.
     """
     agent_id = getattr(agent, '_kb_agent_id', None)
     if not agent_id:
@@ -619,27 +651,62 @@ def attach_knowledge_search(agent, collection_override=None):
         "help. Do not invent an answer."
     )
 
+    def _miss(query):
+        # str.format on an agent-authored template: a stray brace in an
+        # override would raise mid-call and surface to the caller as a
+        # failed tool. The unformatted text is still usable guidance.
+        try:
+            return FunctionResult(no_results_message.format(query=query))
+        except Exception:
+            return FunctionResult(no_results_message)
+
+    def _handle_search_knowledge(args, raw_data):
+        query = (args.get('query') or '').strip()
+        if not query:
+            return FunctionResult("Please provide a search query.")
+        try:
+            results = do_search(collection, query, 5, DATABASE_URL)
+        except Exception as exc:
+            print(f"search_knowledge failed for {collection}: {exc}", flush=True)
+            # Same shape as a miss on purpose: the model's next move should
+            # be to offer a human, not to tell the caller our database is
+            # down. An empty index and a broken index look identical to the
+            # caller, and both are our problem, not theirs.
+            return _miss(query)
+        results = [r for r in results if r.get('score', 0) >= KB_MIN_SCORE]
+        if not results:
+            return _miss(query)
+        lines = []
+        for r in results:
+            section = r.get('section') or r.get('filename') or ''
+            prefix = f"[{section}] " if section else ""
+            lines.append(f"- {prefix}{r['content']}")
+        return FunctionResult(
+            "Knowledge base results (answer from these — do not invent "
+            "details they don't contain):\n" + "\n".join(lines)
+        )
+
     try:
-        agent.add_skill("native_vector_search", {
-            "tool_name": "search_knowledge",
-            "backend": "pgvector",
-            "connection_string": DATABASE_URL,
-            "collection_name": collection,
-            "description": description,
-            "no_results_message": no_results_message,
-            "count": 5,
-            "build_index": False,
+        agent.define_tool(
+            name="search_knowledge",
+            description=description,
+            parameters={
+                "query": {
+                    "type": "string",
+                    "description": "What to look up, in the caller's own terms",
+                }
+            },
+            handler=_handle_search_knowledge,
+            required=["query"],
             # Per-tool fillers (filler policy: opt-in only — no language-level
             # function_fillers anywhere). A KB lookup is a real 1-2s wait where
-            # the persona plausibly speaks; SkillBase merges swaig_fields into
-            # the tool definition it registers.
-            "swaig_fields": {
-                "fillers": [
-                    "Let me check on that for you.",
-                    "One moment while I look that up.",
-                ],
-            },
-        })
+            # the persona plausibly speaks. define_tool takes language-keyed
+            # fillers, unlike the @AgentBase.tool decorator's bare list.
+            fillers={"en-US": [
+                "Let me check on that for you.",
+                "One moment while I look that up.",
+            ]},
+        )
         # Runs on every request — only log when the binding actually changes.
         if _kb_last_logged.get(agent_id) != collection:
             _kb_last_logged[agent_id] = collection

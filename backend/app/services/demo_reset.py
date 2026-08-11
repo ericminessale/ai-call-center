@@ -139,15 +139,24 @@ def reap_workspace(ws: Workspace) -> dict[str, Any]:
       2. seat release + verify-binding clears per member (user rows still
          exist here);
       3. DB rows in dependency order, config layer, users, workspace row;
-      4. Redis ``ws:{id}:*`` pattern delete (queue state, outbound cap);
-      5. a ``demo:reset`` nudge to the workspace room so any lingering tab
+      4. the workspace's pgvector chunk tables (its cloned KB collections
+         and its caller-memory index) — these are per-workspace TABLES,
+         not rows, so nothing above touches them;
+      5. Redis ``ws:{id}:*`` pattern delete (queue state, outbound cap);
+      6. a ``demo:reset`` nudge to the workspace room so any lingering tab
          (cookie-resume in another window) reloads to the landing page.
     """
+    from app.services.kb_index import drop_chunk_tables, workspace_chunk_tables
     from app.services.seat_lease import release_seat_for_user
 
     counts: dict[str, Any] = {'workspace': ws.public_id}
     ws_id = ws.id
     public_id = ws.public_id
+    # Read the chunk-table names NOW: they're derived from
+    # document_collections.physical_name, and the deletes below remove
+    # those rows. Dropping happens after the commit, so a reap that
+    # rolls back doesn't leave a live workspace with no search index.
+    chunk_tables = workspace_chunk_tables(ws_id)
 
     bump_workspace_epoch(public_id)
     end_session(public_id)
@@ -234,6 +243,7 @@ def reap_workspace(ws: Workspace) -> dict[str, Any]:
         counts['error'] = str(exc)
         return counts
 
+    counts['chunk_tables'] = drop_chunk_tables(chunk_tables)
     counts['redis_keys'] = _delete_workspace_redis_keys(ws_id)
 
     try:

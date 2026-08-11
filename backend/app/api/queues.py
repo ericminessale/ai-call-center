@@ -207,8 +207,16 @@ def route_call_to_queue(queue_id):
             merged_ai_context = {**(call.ai_context_dict or {}), **context}
             call.ai_context = json.dumps(merged_ai_context)
 
-        # Persist caller's language so the agent UI + auto-start hooks can read it
-        call.caller_language = caller_language
+        # Persist caller's language so the agent UI + auto-start hooks can
+        # read it — but ONLY when the AI actually reported one. Stamping the
+        # 'en-US' routing default here presented a guess as fact: it blocked
+        # the post-prompt seeder (fills empty columns only) and flowed a
+        # fabricated en-US into Contact.preferred_language for callers whose
+        # language the tool never captured.
+        from app.services.call_language import normalize_language
+        learned_language = normalize_language(global_data.get('caller_language'))
+        if learned_language:
+            call.caller_language = learned_language
 
         # Ensure call is marked as 'waiting' in queue
         if call.status not in ['waiting', 'assigned', 'active', 'ended']:
@@ -623,6 +631,7 @@ def direct_inbound_queue(queue_slug):
         # Redis enqueue, queue_update emit, immediate dispatch + agent
         # notification, announcement loop, and SWML build.
         from app.services.call_transport import build_ingress_swml
+        from app.services.call_language import derive_call_language
         swml_response = build_ingress_swml(
             call=call,
             queue_slug=queue_slug,
@@ -634,7 +643,10 @@ def direct_inbound_queue(queue_slug):
             },
             base_url=get_base_url(),
             routing_strategy=queue.routing_strategy if queue else 'round_robin',
-            caller_language='en-US',
+            # No AI triage ran, so the contact's documented language is the
+            # best signal we have — drives agent language-matching AND the
+            # live_transcribe lang for this leg.
+            caller_language=derive_call_language(call),
             priority=5,
             start_live_transcribe=True,
         )

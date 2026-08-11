@@ -1542,6 +1542,31 @@ def post_prompt():
                 merged_context['session_summaries'] = sessions
             call.ai_context = json.dumps(merged_context)
 
+            # Per-call language safety net (maria_language_memory row 29):
+            # the enqueue path only runs when a call routes to a HUMAN queue,
+            # so AI-only calls ended with caller_language NULL even when the
+            # set_caller_language tool had put 'es-ES' into global_data. The
+            # tool now write-throughs in real time (/api/calls/<id>/caller-
+            # language), but post-prompt still back-fills for the paths where
+            # that POST failed or the tool never fired at all — preferring
+            # the tool-written global_data value over the post-prompt LLM's
+            # assessment, both gated through normalize_language (PGI: model
+            # output is unverified input).
+            from app.services.call_language import normalize_language
+            back_filled_language = None
+            if not call.caller_language:
+                learned_language = (
+                    normalize_language(merged_context.get('caller_language'))
+                    or normalize_language(ai_assessment.get('caller_language'))
+                )
+                if learned_language:
+                    call.caller_language = learned_language
+                    back_filled_language = learned_language
+                    logger.info(
+                        f"post_prompt: seeded caller_language={learned_language} "
+                        f"for call {call.id}"
+                    )
+
             # Prose summary: first writer keeps the field; later AI sessions
             # append a labeled section instead of being dropped (G10).
             if raw_summary:
@@ -1591,7 +1616,12 @@ def post_prompt():
                             ),
                             'caller_language': (
                                 call.caller_language
-                                or merged_context.get('caller_language')
+                                # Normalized: raw model output ('Spanish',
+                                # 'null') must not become the contact's
+                                # durable preferred_language.
+                                or normalize_language(
+                                    merged_context.get('caller_language')
+                                )
                             ),
                         },
                     ):
@@ -1665,6 +1695,26 @@ def post_prompt():
 
             db.session.commit()
             logger.info(f"✓ Updated call {call.id} with post_prompt data (status: {call.status})")
+
+            # If the language back-fill just learned the language of a call
+            # that is STILL live (AI→AI transfer chains: the triage session's
+            # post-prompt lands while the specialist is mid-conversation),
+            # restart transcription now so the rest of the call transcribes
+            # in the right language instead of staying garbled en-US.
+            # Post-outcome-routing status guard: a call this handler just
+            # closed, or parked 'waiting' for a human, is not restarted.
+            if back_filled_language and call.status in ('answered', 'ai_active'):
+                try:
+                    from app.services.call_language import (
+                        restart_ai_leg_transcription,
+                    )
+                    from app.utils.url_utils import get_base_url
+                    restart_ai_leg_transcription(call, base_url=get_base_url())
+                except Exception as e:
+                    logger.warning(
+                        f"post_prompt: transcription language restart failed "
+                        f"(non-fatal) for call {call.id}: {e}"
+                    )
 
             # F-04: memory finalization runs AFTER the outcome routing above
             # — an AI-only call this handler itself just closed (the path

@@ -259,9 +259,13 @@ def update_transcription(call_sid):
         base_url = get_base_url()
 
         if action == 'start':
-            # Start transcription
+            # Start transcription — in the call's known language, not a
+            # hardwired en-US (non-English speech garbles otherwise).
+            from app.services.call_language import derive_call_language
             webhook_url = signed_webhook_url(f"{base_url}/api/webhooks/transcription")
-            sw_api.start_transcription(call_sid, webhook_url)
+            sw_api.start_transcription(
+                call_sid, webhook_url, lang=derive_call_language(call)
+            )
         elif action == 'stop':
             # Stop transcription
             sw_api.stop_transcription(call_sid)
@@ -1181,6 +1185,79 @@ def report_sentiment(call_db_id):
 
     except Exception as e:
         logger.error(f"Failed to process sentiment update: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@calls_bp.route('/<call_db_id>/caller-language', methods=['POST'])
+@require_internal_auth
+def update_caller_language(call_db_id):
+    """PGI write-through from the AI's set_caller_language SWAIG tool.
+
+    Before this endpoint, Call.caller_language was only ever written on the
+    human-queue enqueue path — AI-only calls (the maria_language_memory
+    scenario, row 29) ended with the column NULL even though the tool fired
+    and global_data carried 'es-ES'. The tool now POSTs here the moment it
+    runs, so the per-call column is code-written, in real time, on every
+    path.
+
+    Side effect: if the (normalized) language differs from what live
+    transcription was started with, the caller-leg session is restarted in
+    the new language — a single-language session pinned to en-US turns
+    Spanish speech into phonetic garbage (see services/call_language.py).
+
+    Request body: {"language": "es-ES"}   // BCP-47, model-emitted → gated
+    """
+    from app.services.call_language import (
+        derive_call_language, normalize_language, restart_ai_leg_transcription,
+    )
+    try:
+        data = request.get_json() or {}
+        language = normalize_language(data.get('language'))
+        if not language:
+            # Model-emitted junk ('Spanish', 'null', …) — reject, never persist.
+            return jsonify({'error': 'language must be a BCP-47 code'}), 400
+
+        call = Call.query.get(int(call_db_id))
+        if not call:
+            return jsonify({'error': 'Call not found'}), 404
+
+        if call.needs_translation:
+            # A human started live-translate and asserted from_lang
+            # (call_control.py) — the AI must not fight that assertion.
+            return jsonify({
+                'success': True,
+                'caller_language': call.caller_language,
+                'skipped': 'human live-translate owns the language',
+            }), 200
+
+        # What transcription is currently running as (same derivation every
+        # start site uses) — decides whether a restart is worth a session gap.
+        previous_effective = derive_call_language(call)
+
+        if call.caller_language != language:
+            call.caller_language = language
+            db.session.commit()
+            logger.info(
+                f"caller-language: call {call.id} -> {language} (from AI tool)"
+            )
+
+        restarted = False
+        if language != previous_effective and call.status not in Call.TERMINAL_STATUSES:
+            restarted = restart_ai_leg_transcription(call, base_url=get_base_url())
+
+        # Agent desktop shows the language in the call header / translate
+        # panel — let it refresh without polling.
+        from app.services.callcenter_socketio import emit_call_update
+        emit_call_update(call)
+
+        return jsonify({
+            'success': True,
+            'caller_language': language,
+            'transcription_restarted': restarted,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to update caller language: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 

@@ -1737,7 +1737,12 @@ WRAP_UP_POST_PROMPT_FIELDS = (
     '|sales-opportunity|technical-issue|no-answer|wrong-number|spam|abandoned'
     '|other — pick the best fit for the call\'s BUSINESS outcome", '
     '"post_mortem": "2-3 sentence assessment for the agent reviewing this '
-    'call: what the caller wanted, how it ended, any recommended follow-up"'
+    'call: what the caller wanted, how it ended, any recommended follow-up", '
+    # Safety net for calls where set_caller_language never fired: the
+    # post-prompt webhook seeds Call.caller_language from this (normalized
+    # + shape-validated in code) only when the column is still empty.
+    '"caller_language": "BCP-47 code of the language the CALLER mainly '
+    'spoke, e.g. en-US, es-ES, fr-FR"'
 )
 
 
@@ -1968,7 +1973,8 @@ def configure_triage_queues(agent, queues, caller=None):
                 "you need. Do NOT ask again; move straight on to offering transfer options.") \
             .set_step_criteria("You have a basic understanding of what the caller needs help with") \
             .set_valid_steps(["offer_transfer"]) \
-            .set_functions(["report_sentiment", "route_to_department"])
+            .set_functions(["report_sentiment", "route_to_department",
+                            "set_caller_language"])
 
         # Step 2: Offer transfer choice
         queue_ctx.add_step("offer_transfer") \
@@ -1997,7 +2003,8 @@ def configure_triage_queues(agent, queues, caller=None):
             .set_step_criteria("Customer has chosen human or AI assistance") \
             .set_valid_steps([]) \
             .set_functions(["transfer_to_human", "transfer_to_ai_specialist",
-                            "report_sentiment", "route_to_department"])
+                            "report_sentiment", "route_to_department",
+                            "set_caller_language"])
 
 
 class CallCenterAgent(AgentBase):
@@ -2040,9 +2047,14 @@ class CallCenterAgent(AgentBase):
         # Standard fields every queue transfer includes.
         context_data.setdefault('department', department)
         context_data.setdefault('preferred_handling', 'human')
-        context_data.setdefault(
-            'caller_language', global_data.get('caller_language', 'en-US')
-        )
+        # Only forward a language we actually LEARNED (set_caller_language
+        # wrote it into global_data). Defaulting 'en-US' here presented a
+        # guess as fact — /route persisted it onto Call.caller_language and
+        # from there it seeped into Contact.preferred_language.
+        if global_data.get('caller_language'):
+            context_data.setdefault(
+                'caller_language', global_data['caller_language']
+            )
 
         context_b64 = base64.urlsafe_b64encode(
             json.dumps(context_data).encode()
@@ -2066,6 +2078,64 @@ class CallCenterAgent(AgentBase):
             },
             "transfer": "true",
         })
+        return result
+
+    @AgentBase.tool(
+        name="set_caller_language",
+        description=(
+            "Silently record the language the caller is speaking (BCP-47 code). "
+            "Call this as soon as you detect or confirm their language, and call "
+            "it AGAIN any time the caller switches languages mid-call. "
+            "Used to route them to language-matched agents and to transcribe "
+            "the call in the right language."
+        ),
+        parameters={
+            "language": {
+                "type": "string",
+                "description": "BCP-47 code: 'en-US', 'es-ES', 'fr-FR', 'de-DE', 'pt-BR', etc.",
+            }
+        },
+        # No fillers — must be silent so it doesn't interrupt the conversation
+    )
+    def set_caller_language(self, args, raw_data):
+        """Record the caller's language: in global_data (flows with the call
+        through transfers) AND via a write-through POST to the backend.
+
+        The write-through is the PGI half (base class so ALL agents have it —
+        a caller can reveal or switch language during a specialist session
+        too): the backend persists Call.caller_language the moment the tool
+        fires — the column used to depend on the human-enqueue path copying
+        global_data, which AI-only calls never run — and restarts live
+        transcription in the new language, since a live_transcribe session
+        is pinned to the single lang it was started with.
+        """
+        language = (args.get("language") or "en-US").strip()
+
+        global_data = raw_data.get('global_data', {})
+        call_db_id = global_data.get('call_db_id')
+        if call_db_id:
+            def post_language():
+                try:
+                    import requests as http_requests
+                    backend_url = os.getenv('BACKEND_URL', 'http://backend:5000')
+                    url = f"{backend_url}/api/calls/{call_db_id}/caller-language"
+                    http_requests.post(url, json={'language': language},
+                                       auth=_internal_auth(), timeout=5)
+                except Exception as exc:
+                    # Non-fatal: the post-prompt seeder still back-fills the
+                    # column from global_data at session end; only the
+                    # mid-call transcription restart is lost.
+                    print(f"caller-language POST failed (non-fatal): {exc}", flush=True)
+            threading.Thread(target=post_language, daemon=True).start()
+
+        # Return a NON-EMPTY result. An empty FunctionResult("") tells the engine
+        # the turn has nothing to say, so it ends the turn and the AI's next line
+        # (e.g. "Which department?") is generated but never spoken — the call
+        # stalls into dead air. report_sentiment (the other silent tool) returns
+        # "ok" for exactly this reason; mirror it. "ok" is a function return to
+        # the model, not spoken to the caller.
+        result = FunctionResult("ok")
+        result.update_global_data({"caller_language": language})
         return result
 
 
@@ -2193,7 +2263,8 @@ class CallCenterTriageAgent(CallCenterAgent):
                 "If the caller starts in Spanish, switch to Spanish and call set_caller_language('es-ES')",
                 "If the caller starts in French, switch to French and call set_caller_language('fr-FR')",
                 "If you can't tell, just ask once: 'Which language do you prefer — English, Spanish, or French?'",
-                "Call this tool ONCE per call, no fillers, no acknowledgment to the caller",
+                "Call it silently — no fillers, no acknowledgment to the caller",
+                "If the caller SWITCHES languages mid-call, follow them and call set_caller_language again with the new code",
             ]
         )
 
@@ -2204,32 +2275,36 @@ class CallCenterTriageAgent(CallCenterAgent):
 
         # Tools registered via @AgentBase.tool() decorators below
 
-    @AgentBase.tool(
-        name="set_caller_language",
-        description=(
-            "Silently record the caller's preferred language (BCP-47 code). "
-            "Call this once after detecting or confirming what language the caller speaks. "
-            "Used by routing to prefer language-matched agents."
-        ),
-        parameters={
-            "language": {
-                "type": "string",
-                "description": "BCP-47 code: 'en-US', 'es-ES', 'fr-FR', 'de-DE', 'pt-BR', etc.",
-            }
-        },
-        # No fillers — must be silent so it doesn't interrupt the conversation
-    )
-    def set_caller_language(self, args, raw_data):
-        """Persist caller's language preference into global_data so it flows with the call."""
-        language = (args.get("language") or "en-US").strip()
-        # Return a NON-EMPTY result. An empty FunctionResult("") tells the engine
-        # the turn has nothing to say, so it ends the turn and the AI's next line
-        # (e.g. "Which department?") is generated but never spoken — the call
-        # stalls into dead air. report_sentiment (the other silent tool) returns
-        # "ok" for exactly this reason; mirror it. "ok" is a function return to
-        # the model, not spoken to the caller.
-        result = FunctionResult("ok")
-        result.update_global_data({"caller_language": language})
+    # set_caller_language lives on CallCenterAgent (base) — every agent can
+    # record a language switch, not just triage.
+
+    def _require_caller_language(self, raw_data):
+        """One-shot PGI gate for the triage exit tools: no caller leaves
+        triage without a recorded language.
+
+        The greeting step_criteria ASKS the model to call
+        set_caller_language, but criteria are advisory and the model
+        provably skips them (maria_language_memory rows 29 and 47: a
+        Spanish-only call where the tool never fired and the transcript
+        stayed garbled en-US start to finish). Routing/transfer are the
+        structural chokepoints every handled call passes through, so gate
+        them: the first exit attempt without a language bounces with a
+        prescriptive error telling the model to record the language and
+        retry. ONE bounce only — a model that still refuses must not be
+        able to strand the caller, so the second attempt passes (the
+        post-prompt back-fill then still fixes the record, at the cost of
+        this one call's transcription language).
+        """
+        global_data = raw_data.get('global_data', {}) or {}
+        if global_data.get('caller_language') or global_data.get('language_gate_bounced'):
+            return None
+        result = FunctionResult(
+            "LANGUAGE_NOT_SET: silently call set_caller_language with the "
+            "BCP-47 code of the language this caller has been speaking "
+            "(e.g. 'en-US', 'es-ES', 'fr-FR'), then call this tool again "
+            "with the same arguments."
+        )
+        result.update_global_data({'language_gate_bounced': True})
         return result
 
     @AgentBase.tool(
@@ -2278,6 +2353,10 @@ class CallCenterTriageAgent(CallCenterAgent):
         conversation into the new context, so the queue steps know the
         caller's request without re-asking.
         """
+        gate = self._require_caller_language(raw_data)
+        if gate is not None:
+            return gate
+
         global_data = raw_data.get('global_data', {})
         queue_map = getattr(self, '_queue_ai_map', {}) or {}
         requested = (args.get('department') or '').strip().lower()
@@ -2347,6 +2426,9 @@ class CallCenterTriageAgent(CallCenterAgent):
     )
     def transfer_to_human(self, args, raw_data):
         """Triage agent's transfer — department comes from caller intent."""
+        gate = self._require_caller_language(raw_data)
+        if gate is not None:
+            return gate
         urgency = args.get("urgency", "medium")
         urgency_map = {'high': 2, 'medium': 5, 'low': 8}
         return self._transfer_to_human_queue(
@@ -2380,6 +2462,9 @@ class CallCenterTriageAgent(CallCenterAgent):
     )
     def transfer_to_ai_specialist(self, args, raw_data):
         """Transfer to AI specialist agent"""
+        gate = self._require_caller_language(raw_data)
+        if gate is not None:
+            return gate
         customer_name = args.get("customer_name", "")
         reason = args.get("reason", "")
         department = args.get("department", "support").lower()

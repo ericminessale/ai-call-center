@@ -375,9 +375,13 @@ def detach_sidecar_from_call(call) -> None:
     # degrades to "no transcription until next call" rather than breaking
     # detach itself.
     try:
+        from app.services.call_language import derive_call_language
         base_url = get_base_url()
         webhook_url = signed_webhook_url(f"{base_url}/api/webhooks/transcription")
-        api.start_transcription(call.signalwire_call_sid, webhook_url)
+        api.start_transcription(
+            call.signalwire_call_sid, webhook_url,
+            lang=derive_call_language(call),
+        )
         logger.info(
             f"AI Coach post-detach: restored live_transcribe on "
             f"{call.signalwire_call_sid}"

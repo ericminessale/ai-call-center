@@ -143,6 +143,28 @@ def route_call_to_queue(queue_id):
         # /initial-call before the AI transferred here); the new-row path
         # below is the clone-and-own shape plus a verify-first backstop.
         call = Call.query.filter_by(signalwire_call_sid=call_id).first() if call_id else None
+
+        # PGI guard: never enqueue a call the backend already knows is over.
+        # A terminal row here means this /route hit is stale — a replayed
+        # transfer, a webhook raced past the teardown, or an AI session
+        # acting after its call died. Enqueueing it parks a dead call in the
+        # queue: dashboards show a phantom waiting caller, the announcement
+        # loop TTSes into nothing, and the hold timeout eventually mints a
+        # callback promise nobody heard. Refuse with a plain hangup instead.
+        if call is not None and (
+            call.status in Call.TERMINAL_STATUSES or call.ended_at is not None
+        ):
+            logger.warning(
+                f"/route refused for call {call_id} (db id {call.id}): call is "
+                f"already terminal (status={call.status!r}, "
+                f"end_reason={call.end_reason!r}) — returning hangup SWML "
+                f"instead of enqueueing into '{queue_id}'"
+            )
+            return jsonify({
+                "version": "1.0.0",
+                "sections": {"main": ["hangup"]},
+            })
+
         created_call_here = call is None
         if not call:
             route_ws_binding = None

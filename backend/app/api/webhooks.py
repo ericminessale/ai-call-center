@@ -1681,10 +1681,22 @@ def post_prompt():
                         f"status untouched ({call.status})"
                     )
                 elif 'human' in outcome:
-                    call.status = 'waiting'
+                    # PGI: the outcome field is MODEL output — never drive
+                    # call state from it. When a human transfer really
+                    # happened, /route (concurrent with this post-prompt)
+                    # sets status='waiting' + queue_id + conference_name
+                    # itself, so writing 'waiting' here was redundant at
+                    # best. At worst the model mislabels an AI-specialist
+                    # handoff as "transferred_to_human" (observed: call 44,
+                    # 2026-08-11 — tool trail shows transfer_to_ai_specialist,
+                    # no /route hit) and this branch parked a never-queued
+                    # call in a phantom 'waiting', which the next session's
+                    # close then classified 'abandoned_in_queue'. Leave
+                    # status to hard state; record the claim in the log only.
                     logger.info(
-                        f"Call {call_id} AI session ended — set to 'waiting' "
-                        f"for human pickup"
+                        f"Call {call_id} AI session ended, model reports "
+                        f"human handoff — leaving status to hard state "
+                        f"({call.status}); /route owns the 'waiting' flip"
                     )
                 elif not call.assigned_agent_id and not call.conference_name:
                     call.update_status('ended')

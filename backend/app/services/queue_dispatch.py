@@ -731,12 +731,19 @@ def enqueue_and_build_swml(
     if start_live_transcribe:
         # Persists across the conference join so transcripts continue to flow
         # to /api/webhooks/transcription throughout the call.
+        #
+        # lang: the caller's known language (threaded in by /route from
+        # global_data, by /direct-inbound from the call/contact). Only
+        # matters on the /direct-inbound path in practice — when an AI agent
+        # transfers here a session is already running on this leg and the
+        # re-start below is a no-op.
+        from app.services.call_language import normalize_language
         main_section.append({
             "live_transcribe": {
                 "action": {
                     "start": {
                         "webhook": signed_webhook_url(f"{base_url}/api/webhooks/transcription"),
-                        "lang": "en-US",
+                        "lang": normalize_language(caller_language) or 'en-US',
                         "live_events": True,
                         "ai_summary": True,
                         # Steer the end-of-session summary toward a CRM wrap-up note.

@@ -326,32 +326,23 @@ def initial_call():
     # A/B calls without the component to confirm — costs the live transcript
     # panel on those calls only. Default true = normal behavior.
     if SystemConfig.get('diagnostics.live_transcribe_enabled', 'true').strip().lower() == 'true':
+        # Params (incl. the no-ai_summary rule for this leg and the VAD
+        # tuning) live in call_language.ai_leg_transcribe_start_params —
+        # shared with the mid-call language restart so the two can't drift.
+        # lang: transcription is pinned to ONE language per session, so start
+        # in the best language we can KNOW right now (per-call fact, else the
+        # contact's documented language — the same language the agent will
+        # OPEN the call in). set_caller_language's write-through restarts the
+        # session if the AI detects a different one mid-call.
+        from app.services.call_language import (
+            ai_leg_transcribe_start_params, derive_call_language,
+        )
         post_answer.append({
             "live_transcribe": {
                 "action": {
-                    "start": {
-                        "webhook": signed_webhook_url(f"{base_url}/api/webhooks/transcription"),
-                        "lang": "en-US",
-                        "live_events": True,
-                        # NO ai_summary on the AI leg. The AI post-prompt
-                        # (agent.summary -> /api/webhooks/post-prompt) already
-                        # summarizes the AI triage and seeds the wrap-up note; the
-                        # END-of-call summary comes from the conference/human leg's
-                        # live_transcribe (queue_dispatch.py) and is APPENDED to it.
-                        # Enabling ai_summary here too produced a duplicate AI-leg
-                        # fragment that overwrote the whole-call note (last-write-wins).
-                        # For AI-only calls (no human transfer) the post-prompt IS
-                        # the whole-call summary.
-                        "direction": ["remote-caller", "local-caller"],
-                        # VAD endpointing: ms of silence before an utterance is
-                        # finalized. SignalWire default is 300ms, which splits
-                        # on normal mid-sentence pauses (breaths, "um", reading
-                        # a number) and newlines one sentence into several.
-                        # Raise it so a sentence stays one line. Tune via grep
-                        # vad_silence_ms (set in both swml.py starts + the REST
-                        # start_transcription); bump higher if still splitting.
-                        "vad_silence_ms": 800,
-                    }
+                    "start": ai_leg_transcribe_start_params(
+                        base_url, derive_call_language(call)
+                    )
                 }
             }
         })
@@ -676,6 +667,12 @@ def start_transcription():
 
     base_url = get_base_url()
 
+    # Transcribe in the call's known language (per-call fact, else the
+    # contact's documented language) — a single-language session pinned to
+    # en-US turns non-English speech into phonetic garbage.
+    from app.services.call_language import derive_call_language
+    lang = derive_call_language(call) if call else 'en-US'
+
     return jsonify({
         "version": "1.0.0",
         "sections": {
@@ -686,7 +683,7 @@ def start_transcription():
                         "action": {
                             "start": {
                                 "webhook": signed_webhook_url(f"{base_url}/api/webhooks/transcription"),
-                                "lang": "en-US",
+                                "lang": lang,
                                 "live_events": True,
                                 "partial_events": False,
                                 "direction": ["remote-caller"],

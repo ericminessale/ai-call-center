@@ -915,31 +915,57 @@ class SignalWireAPI:
         """Resume a held call."""
         return self._call_command(call_id, "calling.unhold")
 
+    def _play_media(self, call_id, media_items):
+        """POST to the per-call ``/play`` endpoint (the documented REST play
+        API): ``POST {api_url}/{call_id}/play`` with ``{"play": [...]}``.
+
+        The previous implementation sent a ``calling.play`` command envelope
+        to the bare collection endpoint. SignalWire answered 200 and played
+        NOTHING — the same silently-accepted-imaginary-payload class as the
+        ``media`` param-key bug below, and the reason no caller ever heard a
+        queue position announcement or the hold-timeout callback promise
+        (caught 2026-08-11 by the hank_hold_callback synthetic scenario:
+        the DB said 'promise made', the caller heard hold music then dead
+        air).
+        """
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': self.auth_header,
+        }
+        response = requests.post(
+            f"{self.api_url}/{call_id}/play",
+            json={"play": media_items},
+            headers=headers,
+        )
+        if 200 <= response.status_code < 300:
+            try:
+                return response.json()
+            except ValueError:
+                return {}
+        logger.error(
+            f"play on call {call_id} failed: {response.status_code} - "
+            f"{response.text[:300]}"
+        )
+        raise Exception(f"play failed: {response.status_code}")
+
     def play_audio(self, call_id, url):
         """Play an audio file into an active call.
 
-        Param key MUST be ``play`` (matches the command suffix
-        ``calling.play``). Earlier versions of this helper used ``media``
-        — SignalWire's REST endpoint silently accepted the request but never
-        emitted audio, which was the silent root cause of every "TTS
-        doesn't work in conferences" bug we hit.
+        Param key MUST be ``play`` (historical: an earlier version used
+        ``media`` — SignalWire silently accepted the request but never
+        emitted audio).
         """
-        return self._call_command(call_id, "calling.play", {
-            "control_id": str(uuid.uuid4()),
-            "play": [{"type": "audio", "url": url}],
-        })
+        return self._play_media(call_id, [{"type": "audio", "url": url}])
 
     def play_tts(self, call_id, text, voice="en-US-Neural2-F"):
-        """Play text-to-speech into an active call. See ``play_audio`` for
-        the ``play`` vs ``media`` param-key gotcha — same fix applies here.
+        """Play text-to-speech into an active call. See ``_play_media`` for
+        why this uses the per-call /play endpoint, not a command envelope.
 
-        Note: calling.play may fail on AI-managed calls since the ai verb
-        owns the audio pipeline. Works on human-agent or conference calls.
+        Note: playback may fail on AI-managed calls since the ai verb owns
+        the audio pipeline. Works on human-agent or conference calls.
         """
-        return self._call_command(call_id, "calling.play", {
-            "control_id": str(uuid.uuid4()),
-            "play": [{"type": "tts", "text": text, "language": "en-US", "gender": "female"}],
-        })
+        return self._play_media(call_id, [{"type": "tts", "text": text}])
 
     def start_recording(self, call_id, stereo=False, direction="both"):
         """Start recording an active call. Returns control_id for stopping."""

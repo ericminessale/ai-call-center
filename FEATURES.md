@@ -187,14 +187,14 @@ Agents navigate between focused views:
 
 All of the following operate on calls the agent is *on*:
 
-- **Hold** — conference-aware. Plays a "please hold" TTS announcement to the caller, then mutes and deafens the agent's conference member (audio cut both directions). Caller stays connected to the conference.
+- **Hold** — deferred. SignalWire doesn't expose participant-level hold on the REST surface yet; the endpoint returns 501 and the button is hidden until the platform ships it (RE-AUDIT-01).
 - **Record** — on-demand manual recording start/stop. AI calls auto-record via SWML by default; this control is for pausing/resuming the human-side flow. Button state hydrates from the backend so it reflects reality on mount.
-- **TTS** — speak a synthesized message into the call. Useful for canned greetings or reading back data hands-free.
+- **TTS soundboard** — removed. REST audio injection into a live leg is non-functional on this SignalWire space (verified live 2026-08-11: every `calling.play` variant returns 200 without producing audio); the endpoint returns 501. Caller-audible system audio rides SWML documents instead (queue hold cycle, return-to-queue announcement).
 - **DTMF keypad** — send touch-tone digits when a caller has been transferred to an external IVR that expects keypad input.
 - **Live Translate toggle** — start or stop bidirectional real-time speech translation mid-call. Language picker lets the agent change the source or target pair without tearing down the session (stop + restart internally, since `live_translate` has no `update` action).
 - **Request Backup** — queues another agent into the current conference. Uses the queue routing system to find an available agent.
 - **Escalate to Supervisor** — adds a supervisor to the conference with optional whisper (coach-only audio).
-- **Return to Queue** — bounce the call back to a queue (same or different) with a reason code. Return count is tracked per call for analytics; the SLA clock is *not* reset (the caller's wait is their wait), and a soft cap of 2 returns forces escalation instead of infinite hot-potato.
+- **Return to Queue** — bounce the call back to a queue (same or different) with a reason code. The caller hears a handoff announcement ("let me connect you with someone better suited") and re-enters the hold queue — position announcements, re-dispatch and the hold-cap callback promise all apply, via the same SWML hold cycle first-time waiters use. Return count is tracked per call for analytics; the SLA clock is *not* reset (the caller's wait is their wait), and a soft cap of 2 returns forces escalation instead of infinite hot-potato.
 
 ### Observer actions (for calls you're NOT on)
 
@@ -387,7 +387,7 @@ Every inbound SignalWire webhook is logged as a `WebhookEvent` row and browsable
 
 ## Observability
 
-- **Event stream per call** — real-time feed of every lifecycle event (transfer, recording, monitor start/stop, translate start/stop, hold, TTS injection, agent join/leave) with color-coded types.
+- **Event stream per call** — real-time feed of every lifecycle event (transfer, recording, monitor start/stop, translate start/stop, agent join/leave) with color-coded types.
 - **Socket.IO push updates** — contact updates, call updates, queue updates, sentiment updates, authenticated events — all streamed to the frontend in real time.
 - **Structured backend logs** — every SignalWire REST call logs its full request and response bodies. Errors include call IDs, user IDs, and SignalWire status codes for quick triage.
 

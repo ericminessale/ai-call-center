@@ -180,18 +180,27 @@ def return_call_to_queue(call_id):
     can't resolve, caller asked for someone else.
 
     Flow:
-      1. Announce TTS to caller ("Let me connect you with someone better
-         suited — hold for just a moment").
+      1. End the agent's CallLeg with reason='returned_to_queue' (this is
+         a real handoff — different from hold which preserves the leg).
       2. Mark Call.status='waiting', clear assigned_agent_id, increment
          return_count, save last_return_reason.
       3. Free the agent's Redis status from busy → available.
-      4. End the agent's CallLeg with reason='returned_to_queue' (this is
-         a real handoff — different from hold which preserves the leg).
-      5. Re-enqueue the call in the original queue's zset with original
+      4. Re-enqueue the call in the original queue's zset with original
          priority + preserved ai_context (so the next agent doesn't have
          to re-triage).
-      6. Tell the frontend to SDK-hangup, same pattern as Hold.
-      7. Soft-cap at 2 returns — if this would be the third return, refuse
+      5. Tell the frontend to SDK-hangup, same pattern as Hold. The
+         agent's conference member carries end_on_exit, so their exit ends
+         the conference; the caller's leg then resumes its own SWML and
+         fetches /api/queues/after-conference, which speaks the handoff
+         announcement and drops them into the SWML hold cycle (position
+         announcements, re-dispatch, hold cap). That fetch is the ONLY
+         channel the caller provably hears — the REST TTS this flow used
+         to attempt was a silent no-op on this space (verified live
+         2026-08-11), and the old post-conference inline ``hangup``
+         disconnected the returned caller outright. The waiting state
+         MUST be committed before this response returns: the sdk_hangup
+         it triggers is what makes the caller's leg fetch the decision.
+      6. Soft-cap at 2 returns — if this would be the third return, refuse
          and tell the agent to escalate to a supervisor instead.
 
     SLA: the caller's wait clock continues from original call-received
@@ -246,22 +255,15 @@ def return_call_to_queue(call_id):
     user = request.current_user
 
     try:
-        sw_api = get_signalwire_api()
+        # No REST announcement here — it never worked (silent no-op on this
+        # space). The caller hears the handoff from their own SWML: when the
+        # agent's SDK hangup ends the conference, the caller's leg fetches
+        # /api/queues/after-conference, which speaks the announcement and
+        # re-enters the hold cycle. Everything committed below must land
+        # BEFORE this request returns, because the response is what triggers
+        # that hangup.
 
-        # 1. Caller announcement. Best-effort — state transitions take
-        # priority over the announcement.
-        try:
-            sw_api.play_tts(
-                call.signalwire_call_sid,
-                "Let me connect you with someone better suited. "
-                "Please hold for just a moment.",
-            )
-        except Exception as tts_err:
-            logger.warning(
-                f"return_to_queue {call_id}: announcement TTS failed (continuing): {tts_err}"
-            )
-
-        # 2. Mark the agent's CallLeg as completed — this is a real
+        # 1. Mark the agent's CallLeg as completed — this is a real
         # handoff, not a hold pause. Reason captures the intent for
         # supervisor-side reporting.
         agent_leg = CallLeg.query.filter_by(
@@ -279,13 +281,13 @@ def return_call_to_queue(call_id):
         if agent_leg:
             agent_leg.end_leg(reason=f'returned_to_queue:{reason}')
 
-        # 3. Mark agent's ConferenceParticipant as 'left'. (No on_hold
+        # 2. Mark agent's ConferenceParticipant as 'left'. (No on_hold
         # bypass — this leave SHOULD be a teardown.)
         agent_participant = _find_agent_participant(call, user.id)
         if agent_participant:
             agent_participant.leave()
 
-        # 4. Reset call back to 'waiting'. Increment counter, save reason.
+        # 3. Reset call back to 'waiting'. Increment counter, save reason.
         # IMPORTANT: ai_context stays — the next agent sees the same
         # collected context, no re-triage. answered_at also stays —
         # SLA clock is original-to-now per the 2p spec.
@@ -312,14 +314,14 @@ def return_call_to_queue(call_id):
         )
         db.session.commit()
 
-        # 5. Free the agent's Redis status.
+        # 4. Free the agent's Redis status.
         try:
             from app.services.queue_service import QueueService
             qs = QueueService(get_redis_client(), workspace_id=call.workspace_id)
             agent_state = qs.get_agent_status(str(user.id))
             if agent_state and agent_state.get('current_call_id') == call.signalwire_call_sid:
                 qs.set_agent_status(str(user.id), 'available')
-            # 6. Re-enqueue. Preserves AI-collected priority + context for
+            # 5. Re-enqueue. Preserves AI-collected priority + context for
             # the next agent.
             qs.enqueue_call(
                 call_id=call.signalwire_call_sid,
@@ -333,7 +335,7 @@ def return_call_to_queue(call_id):
             # Don't bail — agent is already off the call. Manual recovery
             # is fine; better than leaving the agent stuck busy.
 
-        # 7. Notify dashboards. queue_update fires the assignment banner
+        # 6. Notify dashboards. queue_update fires the assignment banner
         # for whoever's next, AND clears it from the supervisor's
         # active-calls view since we're back to waiting.
         from app.services.callcenter_socketio import emit_call_update
@@ -376,49 +378,35 @@ def return_call_to_queue(call_id):
 @call_control_bp.route('/<call_id>/play', methods=['POST'])
 @require_auth
 def play_into_call(call_id):
-    """Play audio or TTS into an active call.
+    """Play audio or TTS into an active call — NOT SUPPORTED on this space.
 
-    RE-AUDIT-04 (2026-06-03): ownership gate. The customer hears
-    whatever this endpoint plays, so unauthenticated cross-agent use
-    is a privacy + abuse vector — any logged-in user could fire TTS
-    into another agent's live call by guessing the call_id. Now
-    restricted to the assigned agent + supervisor/admin.
+    2026-08-11: every REST audio-injection shape was tested live against a
+    held leg with transcript verification, and none produce audio. The
+    ``calling.play`` command envelope returns 200 and plays nothing (a 200
+    from /api/calling/calls means "call exists", not "command executed" —
+    unknown commands are silently ignored) and the documented per-call
+    ``/play`` path 404s. So for its entire life this endpoint reported
+    success while the caller heard nothing — the agent-facing TTS
+    soundboard it powered was removed from the frontend in the same commit.
+
+    Audio a caller actually hears rides an SWML document their leg fetches
+    (the hold-cycle / after-conference pattern in
+    ``queue_dispatch``) or the ``ai`` verb on AI-handled calls. Neither fits
+    an arbitrary speak-now-into-a-live-bridged-call feature, so this is
+    501, not a workaround — same honest disposition as /hold (RE-AUDIT-01)
+    and queue transfer (LIFE-02).
     """
-    call = find_call(call_id)
-    if not call:
-        return jsonify({'error': 'Call not found'}), 404
-
-    owner_check = _require_call_ownership(call, request.current_user)
-    if owner_check:
-        return owner_check
-
-    data = request.get_json() or {}
-    play_type = data.get('type', 'tts')
-
-    try:
-        sw_api = get_signalwire_api()
-
-        if play_type == 'audio':
-            url = data.get('url')
-            if not url:
-                return jsonify({'error': 'url is required for audio playback'}), 400
-            result = sw_api.play_audio(call.signalwire_call_sid, url)
-            event_data = {'action': 'play_audio', 'url': url}
-        else:
-            text = data.get('text')
-            if not text:
-                return jsonify({'error': 'text is required for TTS'}), 400
-            voice = data.get('voice', 'en-US-Neural2-F')
-            result = sw_api.play_tts(call.signalwire_call_sid, text, voice)
-            event_data = {'action': 'play_tts', 'text': text, 'voice': voice}
-
-        event_data['agent'] = request.current_user.email
-        emit_call_event(call.id, 'play', event_data, call.signalwire_call_sid)
-
-        return jsonify({'success': True, 'call_id': call.id, 'type': play_type, 'result': result}), 200
-    except Exception as e:
-        logger.error(f"Failed to play into call {call_id}: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+    return jsonify({
+        'error': 'Play-into-call not supported',
+        'detail': (
+            'REST audio injection into a live call leg is non-functional '
+            'on this SignalWire space (verified live 2026-08-11): '
+            'calling.play variants return 200 without producing audio and '
+            'the per-call /play path 404s. Caller-audible audio must ride '
+            'an SWML document the leg fetches — see the queue hold cycle — '
+            'or the AI verb on AI-handled calls.'
+        ),
+    }), 501
 
 
 @call_control_bp.route('/<call_id>/record/start', methods=['POST'])

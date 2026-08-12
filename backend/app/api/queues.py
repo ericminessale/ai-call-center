@@ -467,9 +467,13 @@ def direct_inbound_queue(queue_slug):
       push-dispatch hook fires the SAME notification path — no /route polling
       needed.
 
-    Phase 2 (separate task): periodic per-caller TTS announcements via
-    `play_tts` on the participant + DTMF collection for IVR (callback / AI
-    specialist / continue holding).
+    Waiting-caller audio (position announcements, the hold-cap callback
+    promise) rides the SWML hold cycle (``queue_dispatch.hold_cycle_swml``)
+    — the only channel a parked leg provably hears on this space. A future
+    DTMF IVR on hold (callback / AI specialist / keep holding) belongs in
+    those cycle documents as an SWML ``prompt``, NOT in REST play: every
+    REST audio-injection shape was verified a silent no-op on live legs
+    (2026-08-11).
     """
     try:
         logger.info(f"Direct inbound call → queue '{queue_slug}'")
@@ -729,6 +733,51 @@ def hold_cycle(queue_slug):
             f"hold_cycle failed for call {call_sid!r} in '{queue_slug}' "
             f"(cycle {cycle}): {e}"
         )
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {"main": [
+                {"play": {"url": (
+                    "say:We're sorry, we're having trouble connecting you. "
+                    "Please try your call again later. Goodbye."
+                )}},
+                "hangup",
+            ]}
+        })
+
+
+@queues_bp.route('/after-conference', methods=['POST'])
+@require_webhook_auth
+def after_conference():
+    """Decision document for a caller leg whose interaction conference just
+    ended under it.
+
+    This is the ``transfer`` target that follows every caller-side
+    ``join_conference`` (queue entry SWML and the hold cycle's join
+    document). The agent's conference member joins with ``end_on_exit``, so
+    the agent leaving — return-to-queue, end of call, browser death — ends
+    the conference and the caller's leg fetches this. All state logic lives
+    in ``queue_dispatch.after_conference_swml``: a returned-to-queue caller
+    hears the handoff announcement and re-enters the SWML hold cycle;
+    everyone else gets the hangup the old inline verb served.
+
+    Same never-5xx discipline as /hold: SignalWire must ALWAYS receive a
+    playable document — a 5xx here strands a live caller in dead air.
+
+    Auth: signed URL (``signed_webhook_url``) + ``require_webhook_auth`` —
+    both callback auth schemes accepted, same as the other queue webhooks.
+    """
+    from app.services import queue_dispatch
+
+    call_sid = request.args.get('call_sid')
+    if not call_sid:
+        data = request.json or {}
+        call_sid = (data.get('call') or {}).get('call_id') or data.get('call_id')
+
+    try:
+        swml = queue_dispatch.after_conference_swml(call_sid, get_base_url())
+        return jsonify(swml)
+    except Exception as e:
+        logger.error(f"after_conference failed for call {call_sid!r}: {e}")
         return jsonify({
             "version": "1.0.0",
             "sections": {"main": [

@@ -1273,7 +1273,32 @@ def conference_status_callback(conference_name):
             # If customer left, end the call leg and update call status.
             if participant.participant_type == 'customer':
                 call = Call.find_by_sid(participant_call_sid)
-                if call:
+                if call and call.status == 'waiting' and call.assigned_agent_id is None:
+                    # Returned to queue: the agent's exit ended the
+                    # conference under the caller BY DESIGN (the agent's
+                    # member joins with end_on_exit), and call_control
+                    # committed the return BEFORE the agent's browser hung
+                    # up. This leave is the handoff working, not the call
+                    # ending — the caller's leg is fetching
+                    # /api/queues/after-conference right now to re-enter
+                    # the hold cycle. Completing here would tear down a
+                    # caller we just promised another agent to. Instead,
+                    # verify shortly that the leg actually survived; if it
+                    # never checks in, the delayed task closes the row
+                    # (no call-state webhook ever will — SWML-parked legs
+                    # don't deliver one).
+                    from app.services.queue_dispatch import (
+                        schedule_return_verify,
+                    )
+                    schedule_return_verify(
+                        participant_call_sid, call.workspace_id,
+                    )
+                    logger.info(
+                        f"Customer {participant_call_sid} left conference "
+                        f"{conference_name} while returned-to-queue — "
+                        f"scheduled survival verify instead of completing"
+                    )
+                elif call:
                     # End the active call leg for this conference
                     active_leg = CallLeg.query.filter_by(
                         call_id=call.id,

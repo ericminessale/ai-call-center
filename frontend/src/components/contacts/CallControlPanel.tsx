@@ -2,9 +2,9 @@
  * CallControlPanel — participant controls for a call the user is currently on.
  *
  * Renders self actions (mute lives on the header) and participant actions
- * (hold, record, TTS, DTMF, translate, request-backup, escalate). Demonstrates
- * SignalWire's real-time call control: calls are stateful objects you command
- * by UUID.
+ * (record, DTMF, translate, request-backup, escalate, return-to-queue).
+ * Demonstrates SignalWire's real-time call control: calls are stateful
+ * objects you command by UUID.
  *
  * Observer actions (Listen / Whisper / Barge) deliberately do NOT live here —
  * they apply to calls you are NOT on. See ObserverControls and the architecture
@@ -14,9 +14,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import {
   Circle,
-  Volume2,
   Hash,
-  Send,
   Users,
   ShieldAlert,
   ChevronDown,
@@ -85,8 +83,6 @@ export default function CallControlPanel({
   // gate on these flags instead of branching on transport directly.
   const caps = useCallCapabilities(call);
   const [showDtmfPad, setShowDtmfPad] = useState(false);
-  const [showTtsInput, setShowTtsInput] = useState(false);
-  const [ttsText, setTtsText] = useState('');
   const [isLoading, setIsLoading] = useState<string | null>(null); // track which action is loading
   const [expanded, setExpanded] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -184,21 +180,6 @@ export default function CallControlPanel({
     }
   }, [callId, isRecording, onRecordingChange]);
 
-  const handlePlayTts = useCallback(async () => {
-    if (!ttsText.trim()) return;
-    setIsLoading('tts');
-    clearError();
-    try {
-      await callControlApi.playTts(callId, ttsText.trim());
-      setTtsText('');
-      setShowTtsInput(false);
-    } catch (e: any) {
-      setError(e.response?.data?.error || 'Failed to play TTS');
-    } finally {
-      setIsLoading(null);
-    }
-  }, [callId, ttsText]);
-
   const handleDtmf = useCallback(async (digit: string) => {
     clearError();
     try {
@@ -282,7 +263,6 @@ export default function CallControlPanel({
     } else {
       // Open picker to choose languages first
       setShowTranslatePicker((s) => !s);
-      setShowTtsInput(false);
       setShowDtmfPad(false);
     }
   }, [translateActive, handleStopTranslate]);
@@ -340,7 +320,7 @@ export default function CallControlPanel({
 
   const dtmfButtons = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'];
 
-  // Every primary control inside this panel (Hold, Record, TTS, DTMF,
+  // Every primary control inside this panel (Hold, Record, DTMF,
   // Translate, Backup, Escalate) is gated on `isHumanCall` AND a capability
   // check. Rendering the panel header when nothing will render produces a
   // Call-Controls dropdown that's permanently empty — confusing UX.
@@ -348,7 +328,6 @@ export default function CallControlPanel({
   // the panel header at all.
   const showHold = isHumanCall && (caps.canHold || caps.canUnhold);
   const showRecord = isHumanCall;  // recording perm gated server-side
-  const showTts = isHumanCall;     // calling.play works on any human leg
   const showDtmf = isHumanCall && caps.canSendDtmfCaller;
   const showTranslate = isHumanCall && caps.canLiveTranslate;
   // Backup/Escalate add a second agent to the conference — multi-party only.
@@ -358,7 +337,7 @@ export default function CallControlPanel({
   const showEscalate = isHumanCall && caps.isMultiPartyCapable && isInConference && !isSupervisor;
 
   const hasAnyVisibleControl =
-    showHold || showRecord || showTts || showDtmf || showTranslate
+    showHold || showRecord || showDtmf || showTranslate
     || showBackup || showEscalate;
   if (!hasAnyVisibleControl) return null;
 
@@ -420,28 +399,20 @@ export default function CallControlPanel({
               </button>
             )}
 
-            {/* TTS toggle - only for human agent calls (AI verb owns audio pipeline) */}
-            {showTts && (
-              <button
-                onClick={() => { setShowTtsInput(!showTtsInput); setShowDtmfPad(false); }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
-                  showTtsInput
-                    ? 'bg-canvas-hover text-ink border-rule-strong'
-                    : 'bg-canvas-raised hover:bg-canvas-hover text-ink-muted hover:text-ink border-rule-strong'
-                }`}
-                title="Speak a synthesized message into the call. Useful for canned greetings or reading back data hands-free."
-              >
-                <Volume2 className="w-3.5 h-3.5" />
-                TTS
-              </button>
-            )}
+            {/* TTS soundboard removed (2026-08-11) — REST audio injection
+                into a live leg is non-functional on this SignalWire space
+                (every calling.play variant returns 200 without producing
+                audio; the per-call /play path 404s). The backend endpoint
+                now returns 501; see call_control.play_into_call for the
+                verification record. The button reported success while the
+                caller heard nothing, which is worse than not shipping it. */}
 
             {/* DTMF toggle — bridge mode unlocks this (calling.send_digits on
                 caller leg). Conference mode hides until SWML ships per-
                 participant DTMF; see CALL_TRANSPORT.md capability matrix. */}
             {showDtmf && (
               <button
-                onClick={() => { setShowDtmfPad(!showDtmfPad); setShowTtsInput(false); }}
+                onClick={() => setShowDtmfPad(!showDtmfPad)}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
                   showDtmfPad
                     ? 'bg-canvas-hover text-ink border-rule-strong'
@@ -583,29 +554,6 @@ export default function CallControlPanel({
                   {isLoading === 'return' ? 'Returning…' : 'Return to queue'}
                 </button>
               </div>
-            </div>
-          )}
-
-          {/* TTS Input */}
-          {showTtsInput && (
-            <div className="flex items-center gap-2 p-2 bg-gray-800 rounded-lg border border-gray-700">
-              <input
-                type="text"
-                value={ttsText}
-                onChange={(e) => setTtsText(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handlePlayTts()}
-                placeholder="Type a message to speak into the call..."
-                className="flex-1 px-3 py-1.5 bg-gray-700 border border-gray-600 rounded text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
-                autoFocus
-              />
-              <button
-                onClick={handlePlayTts}
-                disabled={!ttsText.trim() || isLoading === 'tts'}
-                className="flex items-center gap-1 px-3 py-1.5 bg-sw-fuchsia hover:bg-sw-fuchsia/90 text-white rounded text-sm font-medium transition-colors disabled:opacity-50"
-              >
-                <Send className="w-3.5 h-3.5" />
-                {isLoading === 'tts' ? '...' : 'Speak'}
-              </button>
             </div>
           )}
 

@@ -692,11 +692,9 @@ export const callControlApi = {
   unhold: (callId: number | string) =>
     api.post<{ success: boolean; call_id: number; status: string }>(`/api/call-control/${callId}/unhold`),
 
-  // Play audio/TTS into call
-  playTts: (callId: number | string, text: string, voice?: string) =>
-    api.post<{ success: boolean; call_id: number }>(`/api/call-control/${callId}/play`, { type: 'tts', text, voice }),
-  playAudio: (callId: number | string, url: string) =>
-    api.post<{ success: boolean; call_id: number }>(`/api/call-control/${callId}/play`, { type: 'audio', url }),
+  // (playTts/playAudio removed 2026-08-11 — REST audio injection into a live
+  // leg is non-functional on this space; the backend /play endpoint now 501s.
+  // See call_control.play_into_call for the rationale.)
 
   // Recording
   startRecording: (callId: number | string) =>

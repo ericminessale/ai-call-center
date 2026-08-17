@@ -331,6 +331,46 @@ def _emit_swaig_tool_call(entry, *, source, call=None):
             )
             return False
 
+        # Persist BEFORE emitting. A live socket event is only observable
+        # while someone has the call open, and the always-on producer
+        # (/post-prompt) fires at the end of the AI session — for an AI-only
+        # call that is the moment the desktop tears the panel down. Without a
+        # row, the default-path telemetry would exist solely as a packet
+        # nobody was mounted to receive. Best-effort: never fail the webhook.
+        # Gated on the RESOLVED row, not on `call_id` — the fallback id comes
+        # from the model's own global_data and is neither guaranteed to be an
+        # integer nor to name a live row. WebhookEvent.call_id is an FK and
+        # log_event commits, so a bad value would raise at flush and leave the
+        # session poisoned for the rest of post_prompt. Losing a telemetry row
+        # for an unresolvable call is the cheaper failure.
+        if call is not None:
+            try:
+                WebhookEvent.log_event(
+                    event_type='ai_tool_call',
+                    payload={
+                        'function_name': function_name,
+                        'arguments': arguments,
+                        'source': source,
+                        'call_sid': call_sid,
+                        # The platform's own invocation clock — the same field
+                        # the cross-source dedupe keys on, so a persisted row
+                        # can be reconciled against a live event.
+                        'epoch_time': entry.get('epoch_time'),
+                    },
+                    call_id=call.id,
+                )
+            except Exception as e:
+                # Roll back explicitly: log_event commits, so a failure here
+                # leaves the session in a failed state and every later write
+                # in this handler would raise on it.
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+                logger.warning(
+                    f"ai_tool_call persist failed ({source}, non-fatal): {e}"
+                )
+
         from app.services.callcenter_socketio import emit_ai_tool_call
         emit_ai_tool_call(
             call_id,
@@ -1928,14 +1968,19 @@ def post_prompt():
                 call_id=call.id
             )
 
-            # Emit call_update so frontend sees the status change
-            from app.services.callcenter_socketio import emit_call_update
-            emit_call_update(call)
-
             # Event Stream `ai_tool_call` backfill. The platform lists every
             # tool the model invoked this session, with parsed arguments, in
             # swaig_log — and post_prompt fires unconditionally, so this is
             # the source that needs no flags on either deployment shape.
+            #
+            # ORDER IS LOAD-BEARING: this runs BEFORE the emit_call_update
+            # below. On a call this handler just closed (AI-only, no separate
+            # call-status webhook), that update carries a terminal status —
+            # and the desktop drops terminal calls from activeCalls, which
+            # unmounts the very panel these events render in. Emitted after,
+            # they arrive at a dead component. Each one is also persisted (see
+            # _emit_swaig_tool_call) so Call Detail can show them once the
+            # live panel is gone either way.
             swaig_log = data.get('swaig_log')
             if isinstance(swaig_log, list):
                 emitted = sum(
@@ -1948,6 +1993,10 @@ def post_prompt():
                         f"post_prompt: emitted {emitted} ai_tool_call "
                         f"event(s) for call {call.id}"
                     )
+
+            # Emit call_update so frontend sees the status change
+            from app.services.callcenter_socketio import emit_call_update
+            emit_call_update(call)
 
             # Only emit call_ended if the call is actually ended/completed
             # If status is 'waiting', the call is still active and should stay in the queue

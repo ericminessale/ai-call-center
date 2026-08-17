@@ -29,6 +29,12 @@ import {
 import { useSocketContext } from '../../contexts/SocketContext';
 
 interface CallEvent {
+  /**
+   * Stable per-emit id. A viewer with a call open belongs to both the call
+   * room and its workspace room, so the backend's single logical event is
+   * delivered to this socket twice; we render the first and drop the echo.
+   */
+  event_id?: string;
   call_id: number | string;
   /**
    * SignalWire call SID. Backend emits carry both ids: `call_id` is the DB id
@@ -140,6 +146,12 @@ export default function CallEventStream({ callId, callSid, maxEvents = 100 }: Ca
       if (!eventIds.some(id => wanted.includes(id))) return;
 
       setEvents(prev => {
+        // Drop the room echo. Deliberately inside the state updater rather
+        // than a ref: both copies can arrive before a re-render, and `prev`
+        // is the only view of the list that is guaranteed current.
+        if (event.event_id && prev.some(e => e.event_id === event.event_id)) {
+          return prev;
+        }
         const updated = [...prev, event];
         // Keep only the most recent events
         return updated.slice(-maxEvents);

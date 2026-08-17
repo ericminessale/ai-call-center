@@ -1657,12 +1657,36 @@ def get_call_timeline(call_id):
         row['agentName'] = agents.get(segment.agent_id)
         segment_rows.append(row)
 
+    # AI tool invocations. These are broadcast live on the Event Stream while
+    # a call is open, but the always-on producer (/post-prompt swaig_log)
+    # fires as the AI session ends — for an AI-only call, the same moment the
+    # desktop unmounts that panel. Serving the persisted rows here is what
+    # makes the default path observable at all after hangup.
+    from app.models import WebhookEvent
+    tool_events = (
+        WebhookEvent.query
+        .filter_by(call_id=call.id, event_type='ai_tool_call')
+        .order_by(WebhookEvent.created_at.asc())
+        .all()
+    )
+    tool_rows = []
+    for event in tool_events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        tool_rows.append({
+            'id': event.id,
+            'functionName': payload.get('function_name'),
+            'arguments': payload.get('arguments') or {},
+            'source': payload.get('source'),
+            'at': event.created_at.isoformat() if event.created_at else None,
+        })
+
     return jsonify({
         'callId': call.id,
         'signalwireCallId': call.signalwire_call_sid,
         'transport': call.transport,
         'queueAttempts': attempt_rows,
         'handlingSegments': segment_rows,
+        'aiToolCalls': tool_rows,
     })
 
 

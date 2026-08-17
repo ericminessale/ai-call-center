@@ -12,6 +12,7 @@ from app.models.user import SUPERVISORY_ROLES
 from app.services.redis_service import get_redis_client
 import json
 import logging
+import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -92,6 +93,13 @@ def emit_call_event(call_id, event_type, data, call_sid=None):
             database id.
     """
     event = {
+        # Identity for the SAME logical event across the two emits below. A
+        # viewer with a call open sits in BOTH the call room and its workspace
+        # room, so it receives this object twice — consumers dedupe on this id
+        # rather than rendering the call's whole event stream doubled. (The
+        # double delivery predates the dual-id filter; it was simply invisible
+        # while the filter matched nothing.)
+        'event_id': str(uuid.uuid4()),
         'call_id': call_id,
         # Both ids ride the payload so a consumer can filter on whichever
         # one it holds. Backend producers key `call_id` by DB id (the

@@ -400,15 +400,24 @@ class _CallQuery:
         return self._call
 
 
-def _run_post_prompt(monkeypatch, payload, call):
+def _run_post_prompt(monkeypatch, payload, call, trace=None, persisted=None):
     """Drive the real handler, stubbing only persistence and transport.
 
     Calls ``__wrapped__`` to skip @require_webhook_auth so the test doesn't
     depend on WEBHOOK_AUTH env state.
+
+    Pass ``trace`` to capture the ORDER of socket emits (the tool events have
+    to precede the terminal call_update, or the panel they render in is gone
+    before they arrive), and ``persisted`` to capture WebhookEvent rows.
     """
     from flask import Flask
 
     events = []
+
+    def _log_event(**kwargs):
+        if persisted is not None:
+            persisted.append(kwargs)
+
     monkeypatch.setattr(webhooks, 'capture_webhook_payload',
                         lambda *a, **kw: None)
     monkeypatch.setattr(webhooks, 'Call',
@@ -417,7 +426,7 @@ def _run_post_prompt(monkeypatch, payload, call):
         session=SimpleNamespace(commit=lambda: None, rollback=lambda: None,
                                 query=lambda _model: _CallQuery(call))))
     monkeypatch.setattr(webhooks, 'WebhookEvent',
-                        SimpleNamespace(log_event=lambda **kw: None))
+                        SimpleNamespace(log_event=_log_event))
     # Caller-memory finalization runs just before the emit block and is not
     # itself under test — it would drive the whole digest/index/stats path
     # against a SimpleNamespace.
@@ -426,16 +435,127 @@ def _run_post_prompt(monkeypatch, payload, call):
                         lambda _call: None)
     monkeypatch.setattr(webhooks, 'socketio',
                         SimpleNamespace(emit=lambda *a, **kw: None))
+    def _emit_call_update(_call):
+        if trace is not None:
+            trace.append('call_update')
+
+    def _emit_call_event(*args, **_kwargs):
+        events.append(args)
+        if trace is not None:
+            trace.append(args[1])
+
     monkeypatch.setattr(callcenter_socketio, 'emit_call_update',
-                        lambda _call: None)
+                        _emit_call_update)
     monkeypatch.setattr(callcenter_socketio, 'emit_call_event',
-                        lambda *a, **kw: events.append(a))
+                        _emit_call_event)
 
     app = Flask(__name__)
     with app.test_request_context('/api/webhooks/post-prompt', json=payload):
         response = webhooks.post_prompt.__wrapped__()
 
     return response, events
+
+
+def test_tool_events_precede_the_terminal_call_update(monkeypatch):
+    """Ordering is the whole feature on the default path.
+
+    /post-prompt is the only always-on producer and it fires as the AI session
+    ends. For an AI-only call this handler has already set status='ended', so
+    the call_update it emits makes the desktop drop the call from activeCalls
+    — which unmounts CallEventStream. Emitted after that update, every tool
+    event arrives at a component that no longer exists.
+    """
+    trace = []
+    _response, events = _run_post_prompt(
+        monkeypatch,
+        {'call_id': CALL_SID, 'swaig_log': [swaig_envelope()]},
+        fake_call(status='ended'),
+        trace=trace,
+    )
+
+    assert len(events) == 1
+    assert trace.index('ai_tool_call') < trace.index('call_update')
+
+
+def test_tool_calls_are_persisted_for_call_detail(monkeypatch):
+    """A socket event nobody is mounted to receive is not observability.
+
+    The persisted row is what Call Detail reads back after hangup, so it has
+    to carry enough to render without the live event: name, arguments, and
+    which producer it came from.
+    """
+    persisted = []
+    _response, _events = _run_post_prompt(
+        monkeypatch,
+        {'call_id': CALL_SID, 'swaig_log': [swaig_envelope()]},
+        fake_call(),
+        persisted=persisted,
+    )
+
+    tool_rows = [row for row in persisted
+                 if row.get('event_type') == 'ai_tool_call']
+    assert len(tool_rows) == 1
+    assert tool_rows[0]['call_id'] == 132
+    assert tool_rows[0]['payload']['function_name'] == 'transfer_to_human'
+    assert tool_rows[0]['payload']['arguments']['urgency'] == 'high'
+    assert tool_rows[0]['payload']['source'] == 'post_prompt'
+
+
+def test_persist_is_skipped_when_the_call_row_never_resolved(monkeypatch):
+    """The fallback id comes from the model's own global_data.
+
+    WebhookEvent.call_id is an FK and log_event commits, so writing an
+    unresolvable id would raise at flush and poison the session for the rest
+    of post_prompt. Dropping the row is the cheaper failure — but the live
+    event still goes out.
+    """
+    persisted = []
+    events = []
+    # The /debug-events shape: a tool call can reach us before the Call row
+    # exists, leaving only the id the model reported in global_data.
+    monkeypatch.setattr(webhooks, 'Call',
+                        SimpleNamespace(find_by_sid=lambda _sid: None))
+    monkeypatch.setattr(webhooks, 'WebhookEvent', SimpleNamespace(
+        log_event=lambda **kw: persisted.append(kw)))
+    monkeypatch.setattr(callcenter_socketio, 'emit_call_event',
+                        lambda *a, **kw: events.append(a))
+
+    assert webhooks._emit_swaig_tool_call(
+        swaig_envelope(), source='debug_events',
+    ) is True
+
+    assert persisted == []
+    assert len(events) == 1, 'the live event must still go out'
+
+
+def test_every_event_carries_a_unique_id_for_room_dedupe(monkeypatch):
+    """A viewer sits in BOTH the call room and its workspace room, so the one
+    logical event is delivered twice. Consumers dedupe on this id.
+    """
+    emissions = []
+    monkeypatch.setattr(callcenter_socketio.socketio, 'emit',
+                        lambda *a, **kw: emissions.append((a, kw)))
+    monkeypatch.setattr(callcenter_socketio, 'Call', SimpleNamespace(
+        query=SimpleNamespace(get=lambda _id: fake_call()),
+        find_by_sid=lambda _sid: fake_call(),
+    ))
+
+    callcenter_socketio.emit_call_event(
+        132, 'ai_tool_call', {'function_name': 'x'}, CALL_SID,
+    )
+
+    payloads = [args[1] for args, _kwargs in emissions]
+    assert len(payloads) == 2, 'expected the call-room and workspace-room emits'
+    # Same logical event -> ONE id, so the receiver can drop the echo.
+    assert payloads[0]['event_id'] == payloads[1]['event_id']
+    assert payloads[0]['event_id']
+
+    # ...and a genuinely separate invocation must not collide with it.
+    emissions.clear()
+    callcenter_socketio.emit_call_event(
+        132, 'ai_tool_call', {'function_name': 'x'}, CALL_SID,
+    )
+    assert emissions[0][0][1]['event_id'] != payloads[0]['event_id']
 
 
 def test_post_prompt_emits_one_ai_tool_call_per_swaig_log_entry(monkeypatch):

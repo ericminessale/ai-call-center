@@ -406,10 +406,22 @@ export interface HandlingSegmentTimeline {
   details: Record<string, unknown>;
 }
 
+/** One persisted AI tool invocation, as served by the timeline endpoint. */
+export interface AIToolCallTimeline {
+  id: number;
+  functionName: string | null;
+  arguments: Record<string, any>;
+  /** Which webhook produced it: 'post_prompt' (always on) or 'debug_events'. */
+  source?: string | null;
+  at: string | null;
+}
+
 export interface CallTimelineResponse {
   callId: number;
   signalwireCallId: string;
   transport?: 'conference' | 'bridge' | null;
   queueAttempts: QueueAttemptTimeline[];
   handlingSegments: HandlingSegmentTimeline[];
+  /** Optional: absent on responses served before this field existed. */
+  aiToolCalls?: AIToolCallTimeline[];
 }

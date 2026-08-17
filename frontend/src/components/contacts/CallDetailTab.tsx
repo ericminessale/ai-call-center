@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { PhoneIncoming, PhoneOutgoing, Mic, Play, Download, User } from 'lucide-react';
+import { PhoneIncoming, PhoneOutgoing, Mic, Play, Download, User, Bot } from 'lucide-react';
 import { Interaction, CallLeg } from '../../types/callcenter';
 import type { CallTimelineResponse } from '../../types/callcenter';
 import api, { callsApi } from '../../services/api';
@@ -97,6 +97,9 @@ export function CallDetailTab({
   const hasMeasuredJourney = !!timeline && (
     timeline.queueAttempts.length > 0 || timeline.handlingSegments.length > 0
   );
+  // Optional on the response — an older backend, or a call that predates the
+  // persistence, simply has none.
+  const aiToolCalls = timeline?.aiToolCalls ?? [];
 
   return (
     /* Flows naturally; the parent tab pane (overflow-y-auto) does the scrolling
@@ -277,6 +280,38 @@ export function CallDetailTab({
                 showHeading={false}
                 callEnded={!!interaction.endedAt || ['completed', 'ended', 'failed', 'abandoned', 'no_answer', 'missed', 'canceled'].includes(interaction.status || '')}
               />
+            </div>
+          )}
+
+          {/* AI tool calls. The Event Stream renders these live, but only
+              while the call is open — and the always-on producer emits them
+              as the AI session ends, which for an AI-only call is when that
+              panel goes away. This is where they are actually readable. */}
+          {aiToolCalls.length > 0 && (
+            <div className="border border-rule rounded-lg bg-canvas-raised p-3">
+              <div className="flex items-center gap-1.5 mb-2">
+                <Bot className="w-3.5 h-3.5 text-purple-400" />
+                <span className="text-[12.5px] font-semibold text-ink">AI tool calls</span>
+                <span className="text-[11px] text-ink-subtle">({aiToolCalls.length})</span>
+              </div>
+              <ul className="space-y-1.5">
+                {aiToolCalls.map(tool => {
+                  const args = Object.entries(tool.arguments || {});
+                  return (
+                    <li key={tool.id} className="text-[12px]">
+                      <span className="mono text-ink">{tool.functionName || 'unknown'}</span>
+                      {args.length > 0 && (
+                        <span className="text-ink-subtle">
+                          {' '}
+                          {args
+                            .map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
+                            .join(', ')}
+                        </span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
             </div>
           )}
 

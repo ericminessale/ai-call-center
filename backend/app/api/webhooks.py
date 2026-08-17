@@ -280,6 +280,78 @@ def _tool_call_already_emitted(call_ref, function_name, epoch_time) -> bool:
         return False
 
 
+def _persist_tool_call(call, *, function_name, arguments, source, epoch_time,
+                       call_sid, ai_session_id):
+    """Durably record one invocation. Returns True when a row was written.
+
+    Deliberately does NOT consult :func:`_tool_call_already_emitted`. That
+    Redis claim answers "has the socket event gone out?", and letting it gate
+    persistence too loses rows outright: /debug-events can fire before the Call
+    row exists, in which case it emits, claims the key, and has no FK to write
+    against — and the later /post-prompt entry, which DOES have the resolved
+    row, then stands down at the claim and never persists. A transient write
+    failure had the same shape, with no retry. Two questions, two answers.
+
+    Idempotence is therefore its own check, against the rows themselves rather
+    than a cache: ``(function_name, epoch_time)`` within the call, using the
+    platform's invocation clock so the model calling one function twice still
+    yields two rows. A missed match costs a duplicate row in a panel; a false
+    match loses the invocation, so this errs toward writing.
+
+    ``call`` must be the resolved row: WebhookEvent.call_id is an FK and
+    log_event commits, so the id echoed in the model's global_data — not
+    guaranteed to be an integer or to name a live row — would raise at flush
+    and poison the session for the rest of the handler.
+    """
+    if call is None:
+        return False
+    try:
+        if epoch_time is not None:
+            existing = (
+                WebhookEvent.query
+                .filter_by(call_id=call.id, event_type='ai_tool_call')
+                .all()
+            )
+            for row in existing:
+                payload = row.payload if isinstance(row.payload, dict) else {}
+                if (payload.get('function_name') == function_name
+                        and payload.get('epoch_time') == epoch_time):
+                    return False
+
+        WebhookEvent.log_event(
+            event_type='ai_tool_call',
+            payload={
+                'function_name': function_name,
+                'arguments': arguments,
+                'source': source,
+                'call_sid': call_sid,
+                # The platform's own invocation clock — also what the emit
+                # dedupe keys on, so a row can be reconciled with a live event.
+                'epoch_time': epoch_time,
+                # WHICH AI session invoked it. One Call row spans several
+                # (triage hands off to a specialist, each with its own
+                # post_prompt), and without this a consumer cannot tell an
+                # early triage tool from one the final session logged — which
+                # is exactly the distinction that proves the terminal
+                # session's backfill landed.
+                'ai_session_id': ai_session_id,
+            },
+            call_id=call.id,
+        )
+        return True
+    except Exception as e:
+        # log_event commits, so a failure leaves the session in a failed state
+        # and every later write in this handler would raise on it.
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            f"ai_tool_call persist failed ({source}, non-fatal): {e}"
+        )
+        return False
+
+
 def _emit_swaig_tool_call(entry, *, source, call=None):
     """Emit one ``ai_tool_call`` Event Stream event for a SWAIG invocation.
 
@@ -319,57 +391,40 @@ def _emit_swaig_tool_call(entry, *, source, call=None):
         if call_id is None and call_sid is None:
             return False
 
+        # PERSIST FIRST, and unconditionally — the durable row is the only
+        # thing that outlives the call, and it must not depend on whether some
+        # other producer already put a packet on the wire. A live socket event
+        # is observable only while someone has the call open, and the always-on
+        # producer (/post-prompt) fires as the AI session ends, which for an
+        # AI-only call is the moment the desktop tears that panel down.
+        post_data = entry.get('post_data') if isinstance(entry, dict) else None
+        ai_session_id = (
+            post_data.get('ai_session_id') if isinstance(post_data, dict)
+            else None
+        )
+        epoch_time = entry.get('epoch_time')
+        _persist_tool_call(
+            call,
+            function_name=function_name,
+            arguments=arguments,
+            source=source,
+            epoch_time=epoch_time,
+            call_sid=call_sid,
+            ai_session_id=ai_session_id,
+        )
+
+        # Only NOW the socket dedupe, which governs the live emit alone.
         # Keyed on the sid in preference to the DB id: /debug-events can fire
         # before the Call row resolves, and the sid is the one identifier both
         # paths always agree on for the same call.
         if _tool_call_already_emitted(
-            call_sid or call_id, function_name, entry.get('epoch_time'),
+            call_sid or call_id, function_name, epoch_time,
         ):
             logger.debug(
                 f"ai_tool_call {function_name} for call {call_sid or call_id} "
                 f"already emitted by another source — skipping ({source})"
             )
             return False
-
-        # Persist BEFORE emitting. A live socket event is only observable
-        # while someone has the call open, and the always-on producer
-        # (/post-prompt) fires at the end of the AI session — for an AI-only
-        # call that is the moment the desktop tears the panel down. Without a
-        # row, the default-path telemetry would exist solely as a packet
-        # nobody was mounted to receive. Best-effort: never fail the webhook.
-        # Gated on the RESOLVED row, not on `call_id` — the fallback id comes
-        # from the model's own global_data and is neither guaranteed to be an
-        # integer nor to name a live row. WebhookEvent.call_id is an FK and
-        # log_event commits, so a bad value would raise at flush and leave the
-        # session poisoned for the rest of post_prompt. Losing a telemetry row
-        # for an unresolvable call is the cheaper failure.
-        if call is not None:
-            try:
-                WebhookEvent.log_event(
-                    event_type='ai_tool_call',
-                    payload={
-                        'function_name': function_name,
-                        'arguments': arguments,
-                        'source': source,
-                        'call_sid': call_sid,
-                        # The platform's own invocation clock — the same field
-                        # the cross-source dedupe keys on, so a persisted row
-                        # can be reconciled against a live event.
-                        'epoch_time': entry.get('epoch_time'),
-                    },
-                    call_id=call.id,
-                )
-            except Exception as e:
-                # Roll back explicitly: log_event commits, so a failure here
-                # leaves the session in a failed state and every later write
-                # in this handler would raise on it.
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-                logger.warning(
-                    f"ai_tool_call persist failed ({source}, non-fatal): {e}"
-                )
 
         from app.services.callcenter_socketio import emit_ai_tool_call
         emit_ai_tool_call(

@@ -425,8 +425,12 @@ def _run_post_prompt(monkeypatch, payload, call, trace=None, persisted=None):
     monkeypatch.setattr(webhooks, 'db', SimpleNamespace(
         session=SimpleNamespace(commit=lambda: None, rollback=lambda: None,
                                 query=lambda _model: _CallQuery(call))))
-    monkeypatch.setattr(webhooks, 'WebhookEvent',
-                        SimpleNamespace(log_event=_log_event))
+    # `query` backs the persistence idempotence check; no pre-existing rows.
+    monkeypatch.setattr(webhooks, 'WebhookEvent', SimpleNamespace(
+        log_event=_log_event,
+        query=SimpleNamespace(filter_by=lambda **kw: SimpleNamespace(
+            all=lambda: [])),
+    ))
     # Caller-memory finalization runs just before the emit block and is not
     # itself under test — it would drive the whole digest/index/stats path
     # against a SimpleNamespace.
@@ -526,6 +530,106 @@ def test_persist_is_skipped_when_the_call_row_never_resolved(monkeypatch):
 
     assert persisted == []
     assert len(events) == 1, 'the live event must still go out'
+
+
+def test_emit_dedupe_never_suppresses_the_durable_row(monkeypatch):
+    """The regression that motivated splitting the two.
+
+    /debug-events can see an invocation before the Call row exists: it emits,
+    claims the Redis key, and has no FK to persist against. If that claim also
+    gated persistence, the later /post-prompt entry — which DOES hold the
+    resolved row — would stand down and the durable row would be lost for
+    good, leaving Call Detail empty on the always-on path.
+    """
+    persisted = []
+    claimed = set()
+
+    def _claim(call_ref, function_name, epoch_time):
+        key = (call_ref, function_name, epoch_time)
+        if key in claimed:
+            return True
+        claimed.add(key)
+        return False
+
+    monkeypatch.setattr(webhooks, '_tool_call_already_emitted', _claim)
+    monkeypatch.setattr(webhooks, 'WebhookEvent', SimpleNamespace(
+        query=SimpleNamespace(filter_by=lambda **kw: SimpleNamespace(
+            all=lambda: list(persisted))),
+        log_event=lambda **kw: persisted.append(
+            SimpleNamespace(payload=kw['payload'])),
+    ))
+    monkeypatch.setattr(callcenter_socketio, 'emit_call_event',
+                        lambda *a, **kw: None)
+
+    # 1. debug-events arrives first, with no Call row to resolve.
+    monkeypatch.setattr(webhooks, 'Call',
+                        SimpleNamespace(find_by_sid=lambda _sid: None))
+    webhooks._emit_swaig_tool_call(swaig_envelope(), source='debug_events')
+    assert persisted == [], 'nothing to persist against without the row'
+
+    # 2. post-prompt arrives later holding the resolved row. The emit is
+    #    correctly suppressed as a duplicate — the ROW must not be.
+    webhooks._emit_swaig_tool_call(
+        swaig_envelope(), source='post_prompt', call=fake_call(),
+    )
+    assert len(persisted) == 1
+    assert persisted[0].payload['function_name'] == 'transfer_to_human'
+
+
+def test_persistence_is_idempotent_on_its_own_terms(monkeypatch):
+    """Two producers, one invocation, one row — without leaning on Redis.
+
+    Keyed on (function, epoch_time) so the model calling the same function
+    twice still yields two rows.
+    """
+    persisted = []
+    monkeypatch.setattr(webhooks, '_tool_call_already_emitted',
+                        lambda *a, **kw: False)
+    monkeypatch.setattr(webhooks, 'WebhookEvent', SimpleNamespace(
+        query=SimpleNamespace(filter_by=lambda **kw: SimpleNamespace(
+            all=lambda: list(persisted))),
+        log_event=lambda **kw: persisted.append(
+            SimpleNamespace(payload=kw['payload'])),
+    ))
+    monkeypatch.setattr(callcenter_socketio, 'emit_call_event',
+                        lambda *a, **kw: None)
+
+    for source in ('debug_events', 'post_prompt'):
+        webhooks._emit_swaig_tool_call(
+            swaig_envelope(), source=source, call=fake_call(),
+        )
+    assert len(persisted) == 1, 'the same invocation must not double-persist'
+
+    # A genuinely separate invocation of the same function does get its own.
+    webhooks._emit_swaig_tool_call(
+        swaig_envelope(epoch_time=1782495999), source='post_prompt',
+        call=fake_call(),
+    )
+    assert len(persisted) == 2
+
+
+def test_persisted_row_records_which_ai_session_invoked_it(monkeypatch):
+    """One Call spans triage + specialist sessions; without this a consumer
+    cannot tell an early triage tool from the terminal session's own."""
+    persisted = []
+    monkeypatch.setattr(webhooks, '_tool_call_already_emitted',
+                        lambda *a, **kw: False)
+    monkeypatch.setattr(webhooks, 'WebhookEvent', SimpleNamespace(
+        query=SimpleNamespace(filter_by=lambda **kw: SimpleNamespace(
+            all=lambda: list(persisted))),
+        log_event=lambda **kw: persisted.append(
+            SimpleNamespace(payload=kw['payload'])),
+    ))
+    monkeypatch.setattr(callcenter_socketio, 'emit_call_event',
+                        lambda *a, **kw: None)
+
+    webhooks._emit_swaig_tool_call(
+        swaig_envelope(), source='post_prompt', call=fake_call(),
+    )
+
+    assert persisted[0].payload['ai_session_id'] == (
+        'd99688d7-ea6f-43f9-8232-27a525714498'
+    )
 
 
 def test_every_event_carries_a_unique_id_for_room_dedupe(monkeypatch):

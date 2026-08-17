@@ -314,6 +314,7 @@ def call_report():
                 'function_name': (e.payload or {}).get('function_name'),
                 'arguments': (e.payload or {}).get('arguments') or {},
                 'source': (e.payload or {}).get('source'),
+                'ai_session_id': (e.payload or {}).get('ai_session_id'),
                 'at': e.created_at.isoformat() if e.created_at else None,
             }
             for e in tool_events
@@ -323,6 +324,29 @@ def call_report():
         # assertion vocabulary has no list-membership operator.
         report['tool_call_names'] = ','.join(
             t['function_name'] or '' for t in report['tool_calls']
+        )
+        # ONE Call row spans several AI sessions: triage hands off to a
+        # specialist, and each fires its own post_prompt. A bare "any tool
+        # persisted" check is therefore satisfiable by the early triage
+        # session alone — which is NOT evidence that the final session's
+        # backfill landed, and the final session is the one whose post_prompt
+        # races the panel teardown. Counting distinct sessions is what lets a
+        # scenario tell those apart.
+        sessions = []
+        for t in report['tool_calls']:
+            sid = t['ai_session_id']
+            if sid and sid not in sessions:
+                sessions.append(sid)
+        report['tool_call_sessions'] = sessions
+        report['tool_call_session_count'] = len(sessions)
+        # Names from the LAST session that persisted anything. Read with
+        # tool_call_session_count: on its own it cannot prove the terminal
+        # session persisted (if that session wrote nothing, this reports the
+        # previous one instead) — the count is what exposes the difference.
+        last_session = sessions[-1] if sessions else None
+        report['tool_call_last_session_names'] = ','.join(
+            t['function_name'] or '' for t in report['tool_calls']
+            if last_session and t['ai_session_id'] == last_session
         )
         if contact is not None:
             # Queue-scenario ground truth: the durable promise minted by a

@@ -355,7 +355,14 @@ def poll_report(cfg: Config, since_iso: str, gates: dict, timeout_s: int = 150):
     """Poll /call-report until the awaited artifacts exist.
 
     Gates: summary (post-prompt landed), digest (caller memory finalized),
-    transcript (any rows). Returns the last report seen even on timeout.
+    transcript (any rows), tools (at least one ai_tool_call row persisted).
+    Returns the last report seen even on timeout.
+
+    `tools` is a separate gate from `summary` because post_prompt writes the
+    summary BEFORE it persists tool calls (and commits in between), so a
+    summary-only gate can freeze a report mid-handler with an empty
+    tool_calls list — an intermittent failure of the tool assertions that
+    has nothing to do with the feature.
     """
     deadline = time.time() + timeout_s
     report = None
@@ -372,6 +379,8 @@ def poll_report(cfg: Config, since_iso: str, gates: dict, timeout_s: int = 150):
             if gates.get('digest') and not contact.get('interaction_digest'):
                 ok = False
             if gates.get('transcript') and not report.get('transcript'):
+                ok = False
+            if gates.get('tools') and not report.get('tool_calls'):
                 ok = False
             if ok:
                 return report

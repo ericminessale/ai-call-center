@@ -2074,6 +2074,74 @@ def configure_triage_queues(agent, queues, caller=None):
                             "set_caller_language"])
 
 
+# ---------------------------------------------------------------------------
+# "Did the caller actually ask for a person?" — checked in code, from the
+# platform's own transcript, because the prompt version of this rule does not
+# hold.
+#
+# The offer_transfer step already tells the model, in as many words, that a
+# caller who gets "cut off mid-answer" wants the AI assistant and that
+# transfer_to_human is only for someone who "clearly asked for a person". On a
+# live call (2026-08-17) Sam asked "human specialist or the AI assistant?", the
+# caller began "I would prefer" — three words, no choice in them yet — and Sam
+# answered "It sounds like you prefer to speak with human specialist" and
+# transferred. The caller said "No." twice on the way to the hold queue. The
+# call ended as a callback and he never reached the specialist.
+#
+# So the rule moves into the tool. `swaig_post_conversation` puts the real
+# conversation in every tool's post_data, which means this check reads what the
+# caller SAID rather than what the model concluded they meant.
+# ---------------------------------------------------------------------------
+
+# Asking for a person takes many forms; note that naming the machine ("I don't
+# want a robot") is one of them, which is why bot words appear here.
+_HUMAN_REQUEST_TERMS = (
+    'human', 'person', 'people', 'agent', 'representative', 'rep',
+    'someone', 'somebody', 'operator', 'real', 'live', 'actual',
+    'robot', 'bot', 'machine', 'computer',
+)
+
+
+def _last_caller_utterance(raw_data) -> str:
+    """The caller's most recent words per the platform's own call_log."""
+    if not isinstance(raw_data, dict):
+        return ''
+    log = raw_data.get('call_log') or raw_data.get('raw_call_log') or []
+    if not isinstance(log, list):
+        return ''
+    for entry in reversed(log):
+        if not isinstance(entry, dict) or entry.get('role') != 'user':
+            continue
+        content = entry.get('content')
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ''
+
+
+def _human_request_evidence(raw_data) -> str:
+    """Did the caller's own last turn clearly ask for a person?
+
+    Returns 'CONFIRMED', 'ABSENT', or 'UNAVAILABLE'.
+
+    UNAVAILABLE — no call_log at all — must be treated as permission, not
+    refusal. Any deployment where swaig_post_conversation isn't honoured would
+    otherwise reroute every genuine request for a human, which is a far worse
+    failure than the one this guards against.
+    """
+    utterance = _last_caller_utterance(raw_data)
+    if not utterance:
+        return 'UNAVAILABLE'
+    words = {
+        token
+        for token in ''.join(
+            char if char.isalnum() else ' ' for char in utterance.lower()
+        ).split()
+    }
+    if words & set(_HUMAN_REQUEST_TERMS):
+        return 'CONFIRMED'
+    return 'ABSENT'
+
+
 class CallCenterAgent(AgentBase):
     """Project-wide base for every agent class in this file.
 
@@ -2259,6 +2327,11 @@ class CallCenterTriageAgent(CallCenterAgent):
             "end_of_speech_timeout": 800,
             "ai_volume": 0,
             "enable_text_normalization": "both",
+            # Puts call_log/raw_call_log in every SWAIG tool's post_data, so a
+            # tool can check what the caller ACTUALLY said instead of trusting
+            # the model's reading of it. transfer_to_human depends on this —
+            # see _caller_asked_for_a_human.
+            "swaig_post_conversation": True,
         })
         # Observability: debug telemetry is wired through the BACKEND instead —
         # set DEBUG_WEBHOOK_ENABLED=true and see capture_base_url(), which points
@@ -2496,6 +2569,23 @@ class CallCenterTriageAgent(CallCenterAgent):
         gate = self._require_caller_language(raw_data)
         if gate is not None:
             return gate
+
+        # The caller has to have asked for a person. Sending someone to the
+        # human queue on a guess costs them the conversation: they wait on
+        # hold, and past the cap the call ends as a callback. Routing to the
+        # AI assistant instead costs nothing that can't be undone — it answers
+        # immediately and can still escalate_to_human at any point. Given that
+        # asymmetry, an unclear answer resolves to the AI, which is exactly
+        # what the offer_transfer step already documents.
+        if _human_request_evidence(raw_data) == 'ABSENT':
+            print(
+                "transfer_to_human: no explicit request for a person in the "
+                f"caller's last turn ({_last_caller_utterance(raw_data)!r}) — "
+                "routing to the AI specialist instead",
+                flush=True,
+            )
+            return self.transfer_to_ai_specialist(args, raw_data)
+
         urgency = args.get("urgency", "medium")
         urgency_map = {'high': 2, 'medium': 5, 'low': 8}
         return self._transfer_to_human_queue(

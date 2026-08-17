@@ -160,6 +160,191 @@ def _trigger_kb_auto_search_if_enabled(call, call_sid_str):
     )
 
 
+# ---------------------------------------------------------------------------
+# SWAIG tool-call telemetry -> Event Stream (`ai_tool_call`)
+#
+# The platform reports every AI tool invocation in ONE envelope shape, and it
+# reaches us from two places:
+#   - /post-prompt  -> ``data['swaig_log']``, the whole session's tool calls.
+#     ALWAYS ON: the agents set post_prompt_url unconditionally in their
+#     dynamic-config callback (ai-agents/main_agent.py:918), so this is the
+#     path that works on a clone-and-own install with nothing switched on.
+#   - /debug-events -> ``data['swaig_call']``, live as each tool fires, but
+#     only while an operator has DEBUG_WEBHOOK_ENABLED=true.
+# Same fields either way, so they share one parser. Both shapes were verified
+# against captured live payloads (backend/captures/postprompt.jsonl and
+# debug-events.jsonl) before this was written.
+#
+# Deliberately NOT gated on demo mode — a cloner's Event Stream needs this
+# exactly as much as the hosted demo does.
+#
+# Coverage note: agent-local tools (``search_knowledge`` via
+# native_vector_search, and the MCP-gateway skills) execute inside the agents
+# container and never touch the backend during a call, so the swaig_log
+# backfill is the only place they show up at all. That is a property of where
+# those tools run, not a gap in this parser.
+# ---------------------------------------------------------------------------
+
+def _swaig_tool_call_fields(entry):
+    """Pull ``(function_name, arguments, call_db_id, call_sid)`` out of a SWAIG
+    invocation envelope.
+
+    Live shape, trimmed to the fields we read::
+
+        {"command_name": "transfer_to_human",
+         "command_arg": "{\"department\": \"support\"}",
+         "post_data": {"function": "transfer_to_human",
+                       "argument": {"parsed": [{"department": "support"}],
+                                    "raw": "{\"department\": \"support\"}"},
+                       "call_id": "<signalwire sid>",
+                       "global_data": {"call_db_id": "132"},
+                       "meta_data": {"call_db_id": "132"}}}
+
+    Defensive on every field, for the same reason /queue-status and
+    /sidecar/events are: SWAIG payload naming has moved across releases.
+    """
+    if not isinstance(entry, dict):
+        return None, {}, None, None
+
+    post_data = entry.get('post_data')
+    if not isinstance(post_data, dict):
+        post_data = {}
+
+    function_name = entry.get('command_name') or post_data.get('function')
+
+    # Arguments: prefer the platform's own parsed form, fall back to the raw
+    # JSON string it echoes next to it.
+    arguments = {}
+    argument = post_data.get('argument')
+    parsed = argument.get('parsed') if isinstance(argument, dict) else None
+    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+        arguments = parsed[0]
+    else:
+        raw = argument.get('raw') if isinstance(argument, dict) else None
+        raw = raw or entry.get('command_arg')
+        if isinstance(raw, dict):
+            arguments = raw
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                decoded = json.loads(raw)
+            except (ValueError, TypeError):
+                # Keep the unparseable text rather than silently dropping the
+                # arguments — a garbled arg list is itself worth seeing.
+                decoded = None
+            arguments = decoded if isinstance(decoded, dict) else {'raw': raw}
+
+    call_db_id = None
+    for source in (post_data.get('global_data'), post_data.get('meta_data')):
+        if isinstance(source, dict) and source.get('call_db_id'):
+            call_db_id = source['call_db_id']
+            break
+
+    return function_name, arguments, call_db_id, post_data.get('call_id')
+
+
+# Cross-path dedupe window. With debug telemetry on, ONE invocation reaches us
+# twice: live from /debug-events mid-call, then again in the /post-prompt
+# swaig_log backfill at hangup. The window has to span a whole call, and
+# call_watchdog tolerates an 'active' call for 4h, so 6h covers it with room.
+_TOOL_EMIT_DEDUPE_TTL_SECONDS = 6 * 60 * 60
+
+
+def _tool_call_already_emitted(call_ref, function_name, epoch_time) -> bool:
+    """True when another webhook path already emitted this exact invocation.
+
+    Both envelopes carry the platform's own ``epoch_time`` for the invocation,
+    so ``(call, function, epoch_time)`` identifies it across paths without us
+    inventing an identity — and it stays distinct when the model calls the same
+    function twice in one session. The key is claimed with ``SET NX``, so
+    whichever path arrives first emits and the other stands down; no ordering
+    assumption between the two webhooks.
+
+    Fails OPEN — emit — when there's no Redis or no ``epoch_time`` to key on. A
+    duplicated row in the panel is cosmetic; a silently dropped tool call makes
+    the Event Stream look broken, which is the bug this whole path fixes.
+    """
+    if not epoch_time:
+        return False
+    try:
+        from app.services.redis_service import get_redis_client
+        redis_client = get_redis_client()
+        if redis_client is None:
+            return False
+        key = f'aitool_emit:{call_ref}:{function_name}:{epoch_time}'
+        claimed = redis_client.set(
+            key, '1', nx=True, ex=_TOOL_EMIT_DEDUPE_TTL_SECONDS,
+        )
+        return not claimed
+    except Exception as e:
+        logger.debug(f"ai_tool_call dedupe check failed (emitting anyway): {e}")
+        return False
+
+
+def _emit_swaig_tool_call(entry, *, source, call=None):
+    """Emit one ``ai_tool_call`` Event Stream event for a SWAIG invocation.
+
+    Pass ``call`` when the caller already resolved the row (/post-prompt has
+    it) to skip the sid lookup. Returns True when an event went out.
+
+    Deduped across sources (see :func:`_tool_call_already_emitted`) so turning
+    ``DEBUG_WEBHOOK_ENABLED`` on doesn't render every tool twice — the live
+    /debug-events event and the /post-prompt backfill describe the same
+    invocation, and with debug on the demo BOTH arrive.
+
+    Best-effort throughout: this is telemetry for a demo panel and must never
+    be able to fail the webhook that carries it.
+    """
+    # The SDK's Contexts/Steps navigation tools ride this same log flagged
+    # `native: true` and carry no post_data — `next_step` and
+    # `change_context`. They are workflow plumbing, not a tool the AI
+    # "used", and emitting them buries the real calls in the panel (a
+    # 5-tool session logs 8 entries, 3 of them navigation). Verified across
+    # every captured session: native:true is exactly those two, and every
+    # real tool call carries post_data instead.
+    if isinstance(entry, dict) and entry.get('native') is True:
+        return False
+
+    try:
+        function_name, arguments, call_db_id, payload_sid = (
+            _swaig_tool_call_fields(entry)
+        )
+        if not function_name:
+            return False
+
+        # Prefer the resolved row's ids — those are what the dashboards key on.
+        if call is None and payload_sid:
+            call = Call.find_by_sid(payload_sid)
+        call_id = call.id if call is not None else call_db_id
+        call_sid = call.signalwire_call_sid if call is not None else payload_sid
+        if call_id is None and call_sid is None:
+            return False
+
+        # Keyed on the sid in preference to the DB id: /debug-events can fire
+        # before the Call row resolves, and the sid is the one identifier both
+        # paths always agree on for the same call.
+        if _tool_call_already_emitted(
+            call_sid or call_id, function_name, entry.get('epoch_time'),
+        ):
+            logger.debug(
+                f"ai_tool_call {function_name} for call {call_sid or call_id} "
+                f"already emitted by another source — skipping ({source})"
+            )
+            return False
+
+        from app.services.callcenter_socketio import emit_ai_tool_call
+        emit_ai_tool_call(
+            call_id,
+            function_name,
+            arguments=arguments,
+            call_sid=call_sid,
+            source=source,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"ai_tool_call emit failed ({source}, non-fatal): {e}")
+        return False
+
+
 @webhooks_bp.route('/call-status', methods=['POST'])
 @require_webhook_auth
 def call_status():
@@ -1747,6 +1932,23 @@ def post_prompt():
             from app.services.callcenter_socketio import emit_call_update
             emit_call_update(call)
 
+            # Event Stream `ai_tool_call` backfill. The platform lists every
+            # tool the model invoked this session, with parsed arguments, in
+            # swaig_log — and post_prompt fires unconditionally, so this is
+            # the source that needs no flags on either deployment shape.
+            swaig_log = data.get('swaig_log')
+            if isinstance(swaig_log, list):
+                emitted = sum(
+                    1 for entry in swaig_log
+                    if _emit_swaig_tool_call(entry, source='post_prompt',
+                                             call=call)
+                )
+                if emitted:
+                    logger.info(
+                        f"post_prompt: emitted {emitted} ai_tool_call "
+                        f"event(s) for call {call.id}"
+                    )
+
             # Only emit call_ended if the call is actually ended/completed
             # If status is 'waiting', the call is still active and should stay in the queue
             if call.status in ('ended', 'completed'):
@@ -1795,7 +1997,9 @@ def debug_events():
     At debug_webhook_level=2 the platform POSTs many events per call (LLM
     request/response, step/context changes, fillers, conversation_add), so we
     deliberately keep this light: stream each event to
-    captures/debug-events.jsonl and skip all DB work. Inspect the file after a
+    captures/debug-events.jsonl and skip DB work on all of them except the
+    handful of ``swaig_call`` (tool invocation) events, which additionally
+    emit an ``ai_tool_call`` to the live Event Stream. Inspect the file after a
     test call to see exactly what the agent did, turn by turn — e.g. a burst of
     step_change/filler events is the "skips to the final step + spams fillers"
     symptom, and the llm_request/llm_response pair shows why the model jumped.
@@ -1804,11 +2008,23 @@ def debug_events():
         data = request.get_json(silent=True)
         if data is None:
             data = request.form.to_dict() if request.form else {}
-        event_type = data.get('label') or data.get('action') or 'unknown'
-        call_id = data.get('call_id')
+        # The event NAME is the payload's own non-`call_info` key
+        # (`swaig_call`, `llm_response`, `conversation_add`, ...). There is no
+        # 'label'/'action' field — both read None on every captured payload,
+        # so this log line was a hardcoded "unknown" before.
+        call_info = data.get('call_info') or {}
+        event_type = next((k for k in data if k != 'call_info'), 'unknown')
+        call_id = data.get('call_id') or call_info.get('call_id')
         # Stream only — the "latest single event" isn't useful; the sequence is.
         capture_webhook_payload('debug-events', data, latest=False)
         logger.info(f"DEBUG EVENT [{event_type}] call={call_id}")
+
+        # A `swaig_call` IS a tool invocation — surface it on the live Event
+        # Stream. Only ~6 of ~290 events per call are swaig_calls, so the one
+        # sid lookup each costs does not reintroduce the per-event DB work
+        # this handler deliberately avoids.
+        if isinstance(data.get('swaig_call'), dict):
+            _emit_swaig_tool_call(data['swaig_call'], source='debug_events')
         return jsonify({'status': 'ok'}), 200
     except Exception as e:
         logger.error(f"Error processing debug webhook: {e}")

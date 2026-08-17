@@ -86,10 +86,19 @@ def emit_call_event(call_id, event_type, data, call_sid=None):
         call_id: Database call ID
         event_type: Category (state_change, hold, record, play, dtmf, monitor, conference, ai_tool_call, sentiment, transcription)
         data: Event-specific payload dict
-        call_sid: Optional SignalWire call SID for room targeting
+        call_sid: Optional SignalWire call SID. Targets the call-specific
+            room, rides the payload so sid-keyed consumers can filter on
+            it, and backs up workspace resolution when call_id is not a
+            database id.
     """
     event = {
         'call_id': call_id,
+        # Both ids ride the payload so a consumer can filter on whichever
+        # one it holds. Backend producers key `call_id` by DB id (the
+        # workspace resolution below depends on that), but the contact view
+        # mounts CallEventStream with the SignalWire sid — so a sid-keyed
+        # consumer matched nothing at all until this field existed.
+        'call_sid': call_sid,
         'event_type': event_type,
         'data': data,
         'timestamp': datetime.utcnow().isoformat(),
@@ -108,11 +117,44 @@ def emit_call_event(call_id, event_type, data, call_sid=None):
     from app.services.ws_rooms import workspace_room
     try:
         owner_call = Call.query.get(int(call_id)) if str(call_id).isdigit() else None
+        # Producers that only hold the SignalWire sid (SWAIG/AI telemetry)
+        # would otherwise fall through to the default workspace's room —
+        # which in hosted mode is platform operators only, so the visitor
+        # who owns the call would never see their own call's events.
+        if owner_call is None and call_sid:
+            owner_call = Call.find_by_sid(str(call_sid))
     except Exception:
         owner_call = None
     ws_id = owner_call.workspace_id if owner_call is not None else None
     socketio.emit('call_event', event, room=workspace_room(ws_id))
     logger.debug(f"Call event emitted: {event_type} for call {call_id}")
+
+
+def emit_ai_tool_call(call_id, function_name, arguments=None, call_sid=None,
+                      source=None):
+    """Emit an ``ai_tool_call`` event for one SWAIG/AI tool invocation.
+
+    A thin shape-fixing wrapper over :func:`emit_call_event` so every producer
+    of this category agrees on the payload. ``function_name`` is the field the
+    frontend renders (``CallEventStream.tsx`` reads ``data.function_name``);
+    ``arguments`` carries the parsed tool arguments alongside it.
+
+    Args:
+        call_id: Database call ID (keeps the workspace resolution above working).
+        function_name: The SWAIG function the model invoked, verbatim. Never
+            synthesize one — an inferred name here reads as fact in the UI.
+        arguments: Parsed argument dict, when the producer has one.
+        call_sid: SignalWire call SID, for room targeting + sid-keyed consumers.
+        source: Producer tag ('post_prompt' / 'debug_events') so a duplicate is
+            attributable when debug telemetry is switched on alongside.
+    """
+    data = {
+        'function_name': function_name,
+        'arguments': arguments if isinstance(arguments, dict) else {},
+    }
+    if source:
+        data['source'] = source
+    emit_call_event(call_id, 'ai_tool_call', data, call_sid)
 
 
 @socketio.on('agent_status')

@@ -278,6 +278,17 @@ def start_return(order_id: int, reason: str) -> dict:
     }
 
 
+# Conversational filler that would otherwise dilute the match ratio — a caller
+# saying "tell me about the wireless earbuds" should score on the two words
+# that identify a product, not on five that identify nothing.
+_FILLER_WORDS = frozenset({
+    "the", "and", "for", "with", "about", "your", "our", "you", "please",
+    "tell", "have", "some", "any", "one", "this", "that", "does",
+    "cost", "much", "price", "priced", "buy", "want", "need", "looking",
+    "what", "which", "there", "got", "sell", "carry", "offer",
+})
+
+
 def _tokenize(text: str) -> set:
     """Words of a product name, punctuation folded to spaces.
 
@@ -407,14 +418,23 @@ def find_product(name: str) -> dict:
     # "True Wireless Earbuds" and "usb c cable" finds "USB-C Charging Cable".
     matches = [r for r in rows if query in r["name"].lower()]
     if not matches:
-        query_tokens = {t for t in _tokenize(query) if len(t) > 2}
+        query_tokens = {
+            t for t in _tokenize(query)
+            if len(t) > 2 and t not in _FILLER_WORDS
+        }
         scored = []
         for row in rows:
-            overlap = query_tokens & {
-                t for t in _tokenize(row["name"].lower()) if len(t) > 2
-            }
-            if overlap:
-                scored.append((len(overlap), row))
+            name_tokens = {t for t in _tokenize(row["name"].lower()) if len(t) > 2}
+            overlap = query_tokens & name_tokens
+            # A single shared word is NOT a match. "Smart Home Hub" overlaps
+            # "7-Port USB Hub w/ Power" on "hub" alone, and answering that with
+            # a real product at a real price is worse than answering "we don't
+            # carry it" — it destroys the not-in-catalog signal this tool
+            # exists to give, and hands the model a confident wrong answer.
+            # Requiring half the caller's words keeps "wireless earbuds" (2/2)
+            # and "laptop stand" (2/2) while rejecting "smart home hub" (1/3).
+            if overlap and len(overlap) / len(query_tokens) >= 0.5:
+                scored.append((len(overlap) / len(query_tokens), row))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         if scored:
             best = scored[0][0]

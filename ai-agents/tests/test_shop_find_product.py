@@ -133,6 +133,31 @@ def test_punctuated_names_still_match_spoken_words(shop):
     assert result['product']['availability'] == 'out of stock'
 
 
+def test_one_shared_word_is_not_a_match(shop):
+    """Caught on a live call: 'Smart Home Hub' matched '7-Port USB Hub w/
+    Power' on the word 'hub' alone, so the tool answered an invented product
+    with a real one at a real price. That is worse than saying we don't carry
+    it — it destroys the not-in-catalog signal this tool exists to give."""
+    result = _call(shop.find_product)('Smart Home Hub')
+
+    assert result['found'] is False
+    assert result['reason'] == 'NOT_IN_CATALOG'
+
+
+@pytest.mark.parametrize('spoken,expected', [
+    ('wireless earbuds', 'True Wireless Earbuds'),
+    ('tell me about the usb c cable', 'USB-C Charging Cable, 2m'),
+    ('what does the 4k webcam cost', '4K Webcam, Auto-focus'),
+])
+def test_filler_words_do_not_dilute_a_real_match(shop, spoken, expected):
+    """The ratio threshold must not punish callers for speaking in sentences."""
+    result = _call(shop.find_product)(spoken)
+
+    assert result['found'] is True, spoken
+    assert result.get('multiple_matches') is not True
+    assert result['product']['name'] == expected
+
+
 def test_an_ambiguous_name_asks_instead_of_picking(shop):
     """'headphones' could be either audio product; guessing one is the same
     failure in miniature."""

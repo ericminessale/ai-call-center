@@ -2646,9 +2646,12 @@ class SalesAISpecialist(CallCenterAgent):
             "No document matched '{query}'. Do NOT tell the caller you can't "
             "access information. If they asked what we sell, which product "
             "is most popular, or a price, call the product catalog tool "
-            "(mcp_demoshop_list_products) and answer from its data. For "
-            "anything else, say you don't have that detail on hand and "
-            "offer to connect a human sales rep."
+            "(mcp_demoshop_list_products) and answer from its data. If they "
+            "named a specific product, call mcp_demoshop_find_product with "
+            "that name — it confirms the price or tells you we don't carry "
+            "it, and either answer is better than a transfer. Escalate only "
+            "after the catalog tools have failed to answer; a document miss "
+            "alone is not a reason to hand the call to a human."
         )
         self._mcp_agent_id = 'sales-ai'  # MCP gateways attach per-request (callback), not at boot
         self._inbound_caller_memory = True  # R1: consume call-context contact block
@@ -2705,6 +2708,10 @@ class SalesAISpecialist(CallCenterAgent):
                 "What we sell, prices, stock, and 'most popular' come from the product "
                 "catalog tool (mcp_demoshop_list_products) — answer from its live data, "
                 "never from memory or guesswork",
+                "When the caller names a particular product, look it up with "
+                "mcp_demoshop_find_product before you say anything about it — that tool "
+                "also tells you when we don't carry it, which is a real answer worth "
+                "giving, not a reason to transfer",
                 "Beyond the quick facts, understand their situation — what problem are "
                 "they trying to solve?",
                 "Ask about their current setup, team size, or use case to tailor your "

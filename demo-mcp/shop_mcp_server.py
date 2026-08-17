@@ -17,6 +17,8 @@ Tools exposed:
   - track_shipment            carrier + tracking + a synthetic in-transit timeline
   - start_return              kick off an RMA against an order
   - list_products             the catalog with prices, best sellers first (sales calls)
+  - find_product              one product BY NAME, or an authoritative "we don't
+                              carry that" plus the real catalog (sales calls)
   - check_inventory           stock level for a SKU (sales calls)
 """
 
@@ -276,6 +278,21 @@ def start_return(order_id: int, reason: str) -> dict:
     }
 
 
+def _tokenize(text: str) -> set:
+    """Words of a product name, punctuation folded to spaces.
+
+    Callers say "usb c cable" for "USB-C Charging Cable, 2m"; splitting on
+    whitespace alone leaves "usb-c" as one token and never matches.
+    """
+    return {
+        token
+        for token in "".join(
+            char if char.isalnum() else " " for char in text.lower()
+        ).split()
+        if token
+    }
+
+
 def _availability(in_stock: int) -> str:
     return (
         "in stock" if in_stock > 5
@@ -314,17 +331,135 @@ def list_products() -> dict:
     if not products:
         return {"found": False, "error": "catalog is empty"}
     top = products[0]
+    names = ", ".join(p["name"] for p in products)
     return {
         "found": True,
         "most_popular": top,
         "products": products,
-        # The AI reads this with the data. Callers interrupt long answers, so
-        # the price must land in the first breath, not the third sentence.
+        "catalog_is_complete": True,
+        # The AI reads this with the data. Two jobs: land the price in the
+        # first breath (callers interrupt long answers), and CLOSE THE SET.
+        # The previous version said only "elaborate after that sentence",
+        # which invited elaboration without bounding it — and a live call
+        # took the invitation, offering a "Bluetooth portable speaker" and a
+        # "fitness tracker" that this company has never sold. Naming the
+        # closed set beside the data is what the model actually reads.
         "answer_guidance": (
             "If the caller asked about the most popular product or its price, "
             f"your FIRST sentence must name product and price together — "
             f"'Our most popular product is the {top['name']} at {top['price']}.' "
-            "Elaborate only after that sentence."
+            f"These {len(products)} products are the ONLY ones we sell: {names}. "
+            "When you elaborate, suggest alternatives, or offer the caller a "
+            "choice, every product you name must come from that list — never "
+            "invent or assume one. If they ask about something not on it, use "
+            "find_product to confirm and tell them we don't carry it."
+        ),
+    }
+
+
+def _catalog_names(rows) -> str:
+    return ", ".join(r["name"] for r in rows)
+
+
+@mcp.tool()
+def find_product(name: str) -> dict:
+    """Look up ONE product the caller named — its price, stock, and whether we
+    carry it at all. Use this the moment a caller mentions a specific product
+    ("what does the fitness tracker cost?", "do you have wireless earbuds?",
+    "tell me about the headphones"), including when you are not sure the
+    product exists. It answers from live catalog data, and it will tell you
+    plainly when we do not sell the thing they named.
+
+    Returns ``found: false`` with the real catalog when nothing matches — that
+    is the authoritative answer, not a reason to give up or transfer.
+    """
+    query = (name or "").strip().lower()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT sku, name, price_cents, in_stock, units_sold
+                 FROM products
+             ORDER BY units_sold DESC, sku""",
+        ).fetchall()
+
+    if not rows:
+        return {"found": False, "error": "catalog is empty"}
+
+    def _describe(row):
+        return {
+            "sku": row["sku"],
+            "name": row["name"],
+            "price": _format_money(row["price_cents"]),
+            "availability": _availability(row["in_stock"]),
+        }
+
+    if not query:
+        return {
+            "found": False,
+            "reason": "NO_NAME_GIVEN",
+            "catalog": [r["name"] for r in rows],
+            "answer_guidance": (
+                "Ask the caller which product they mean. We sell only: "
+                f"{_catalog_names(rows)}."
+            ),
+        }
+
+    # Substring first, then a token overlap so "wireless earbuds" still finds
+    # "True Wireless Earbuds" and "usb c cable" finds "USB-C Charging Cable".
+    matches = [r for r in rows if query in r["name"].lower()]
+    if not matches:
+        query_tokens = {t for t in _tokenize(query) if len(t) > 2}
+        scored = []
+        for row in rows:
+            overlap = query_tokens & {
+                t for t in _tokenize(row["name"].lower()) if len(t) > 2
+            }
+            if overlap:
+                scored.append((len(overlap), row))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        if scored:
+            best = scored[0][0]
+            matches = [row for score, row in scored if score == best]
+
+    if not matches:
+        # The catalog IS the answer. Handing the model the real lineup here is
+        # what stops an invented product from becoming a dead end: without it
+        # the only moves left are a doc search that misses and a transfer to a
+        # human, which parks the call and costs the caller the conversation.
+        return {
+            "found": False,
+            "reason": "NOT_IN_CATALOG",
+            "asked_for": name,
+            "catalog": [r["name"] for r in rows],
+            "answer_guidance": (
+                f"We do NOT sell '{name}' — it is not a product this company "
+                "offers, so do not describe it, price it, or promise to look "
+                "it up. Tell the caller plainly that we don't carry it, then "
+                "name the closest thing we do sell. Our complete catalog is: "
+                f"{_catalog_names(rows)}. This is the full answer; there is no "
+                "need to search documents or transfer the call for it."
+            ),
+        }
+
+    if len(matches) > 1:
+        return {
+            "found": True,
+            "multiple_matches": True,
+            "products": [_describe(r) for r in matches],
+            "answer_guidance": (
+                "Several products match. Name them with their prices and ask "
+                "which one they mean. Mention only these."
+            ),
+        }
+
+    product = _describe(matches[0])
+    return {
+        "found": True,
+        "product": product,
+        "answer_guidance": (
+            f"Your FIRST sentence must give product and price together — "
+            f"'The {product['name']} is {product['price']}.' It is "
+            f"{product['availability']}. Add detail only after that sentence, "
+            "and only about this product."
         ),
     }
 

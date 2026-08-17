@@ -295,6 +295,35 @@ def call_report():
             ],
             'contact': None,
         }
+
+        # AI tool invocations, as persisted for Call Detail. This is the only
+        # ground truth for them that outlives the call: they are broadcast on
+        # the live Event Stream, but the always-on producer (/post-prompt
+        # swaig_log) fires as the AI session ends, so on an AI-only call the
+        # panel is already gone. A scenario asserting on these is asserting
+        # exactly what a human would see after hanging up.
+        from app.models import WebhookEvent
+        tool_events = (
+            WebhookEvent.query
+            .filter_by(call_id=call.id, event_type='ai_tool_call')
+            .order_by(WebhookEvent.created_at.asc())
+            .all()
+        )
+        report['tool_calls'] = [
+            {
+                'function_name': (e.payload or {}).get('function_name'),
+                'arguments': (e.payload or {}).get('arguments') or {},
+                'source': (e.payload or {}).get('source'),
+                'at': e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in tool_events
+            if isinstance(e.payload, dict)
+        ]
+        # Joined for the harness's string ops (contains/contains_any) — the
+        # assertion vocabulary has no list-membership operator.
+        report['tool_call_names'] = ','.join(
+            t['function_name'] or '' for t in report['tool_calls']
+        )
         if contact is not None:
             # Queue-scenario ground truth: the durable promise minted by a
             # hold timeout (or an explicit callback request) for this caller.

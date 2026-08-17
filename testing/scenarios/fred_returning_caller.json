@@ -47,6 +47,13 @@
     {"label": "call 1: contact first name learned from the conversation",
      "target": "report1.contact.first_name", "op": "contains", "value": "fred", "level": "soft"},
     {"label": "call 2: injected context carried the contact name",
-     "target": "report2.call.ai_context.contact_name", "op": "contains", "value": "fred", "level": "soft"}
+     "target": "report2.call.ai_context.contact_name", "op": "contains", "value": "fred", "level": "soft"},
+    {"label": "call 1: AI tool invocations persisted (survive the AI-only hangup)",
+     "target": "report1.tool_calls", "op": "non_empty", "level": "hard"},
+    {"label": "call 2: AI tool invocations persisted on the returning call too",
+     "target": "report2.tool_calls", "op": "non_empty", "level": "hard"},
+    {"label": "call 1: persisted tool set names a real triage tool",
+     "target": "report1.tool_call_names", "op": "contains_any",
+     "value": ["route_to_department", "transfer_to_human", "set_caller_language", "search_knowledge"], "level": "soft"}
   ]
 }

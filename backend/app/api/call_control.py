@@ -20,6 +20,51 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# Call states in which an agent is genuinely occupied. Used when deciding
+# whether a Redis status that disagrees with the call being returned is stale
+# drift (free the agent) or a newer real assignment (leave them busy).
+ACTIVE_AGENT_CALL_STATUSES = ('assigned', 'active', 'answered', 'on_hold')
+
+
+def release_agent_after_return(qs, released_agent_id, returning_sid) -> bool:
+    """Put an agent back to available after their call was returned to queue,
+    unless they have since been given a different live call. Returns True when
+    the agent was freed.
+
+    Two failure modes sit on either side of this. Freeing only when Redis
+    still tracks THIS call meant any drift — a missed status write, a Redis
+    restart, a takeover — left the agent marked busy with no call, invisible
+    to dispatch for the rest of their shift. Freeing unconditionally is the
+    opposite error: between two overlapping returns the agent can already have
+    been dispatched a new call, and clearing that hands them a second one.
+
+    So the DB arbitrates. A tracked call that is still live and still assigned
+    to this agent is authoritative and they stay busy; anything else is stale
+    and they go back to available.
+    """
+    agent_state = qs.get_agent_status(str(released_agent_id))
+    tracked = (agent_state or {}).get('current_call_id')
+
+    if tracked and tracked != returning_sid:
+        other = Call.find_by_sid(tracked)
+        if (other is not None
+                and other.assigned_agent_id == released_agent_id
+                and other.ended_at is None
+                and other.status in ACTIVE_AGENT_CALL_STATUSES):
+            logger.info(
+                f"return_to_queue: agent {released_agent_id} is already on call "
+                f"{tracked} (status={other.status}) — leaving them busy"
+            )
+            return False
+        logger.warning(
+            f"return_to_queue: agent {released_agent_id} Redis status tracked "
+            f"stale call {tracked!r} while returning {returning_sid!r} — "
+            "freeing anyway"
+        )
+
+    qs.set_agent_status(str(released_agent_id), 'available')
+    return True
+
 call_control_bp = Blueprint('call_control', __name__)
 
 
@@ -303,6 +348,12 @@ def return_call_to_queue(call_id):
             priority=context.get('priority', 5),
         )
 
+        # WHO to release. `user` is the requester, which is not always the
+        # agent who held the call — a supervisor can return someone else's.
+        # Freeing the requester in that case leaves the real agent busy with
+        # no call, which is the very state this step exists to prevent.
+        released_agent_id = call.assigned_agent_id or user.id
+
         call.status = 'waiting'
         call.assigned_agent_id = None
         call.assigned_at = None
@@ -318,24 +369,9 @@ def return_call_to_queue(call_id):
         try:
             from app.services.queue_service import QueueService
             qs = QueueService(get_redis_client(), workspace_id=call.workspace_id)
-            # Free the agent UNCONDITIONALLY. This used to only fire when
-            # Redis still agreed about which call the agent was on, which
-            # meant any drift — a missed status write, a Redis restart, a
-            # takeover that moved the call — left them marked busy with no
-            # call, invisible to dispatch, for the rest of their shift. The
-            # DB has already released the call by this point, so the agent
-            # IS free; refusing to say so because a cache disagrees gets the
-            # answer backwards. The mismatch is worth knowing about, so it is
-            # logged rather than silently swallowed.
-            agent_state = qs.get_agent_status(str(user.id))
-            tracked = (agent_state or {}).get('current_call_id')
-            if agent_state and tracked != call.signalwire_call_sid:
-                logger.warning(
-                    f"return_to_queue: agent {user.id} Redis status tracked "
-                    f"call {tracked!r} but is returning {call.signalwire_call_sid!r} "
-                    "— freeing anyway"
-                )
-            qs.set_agent_status(str(user.id), 'available')
+            release_agent_after_return(
+                qs, released_agent_id, call.signalwire_call_sid,
+            )
             # 5. Re-enqueue. Preserves AI-collected priority + context for
             # the next agent.
             qs.enqueue_call(

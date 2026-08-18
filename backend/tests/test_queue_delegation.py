@@ -559,48 +559,101 @@ def test_no_available_agents_selects_nobody(app, redis):
 # Return to queue — freeing the agent.
 # ---------------------------------------------------------------------------
 
-def test_returning_a_call_frees_the_agent_even_when_redis_disagrees(app, redis):
-    """The stuck-busy bug. Freeing the agent used to be conditional on Redis
-    still tracking the same call, so any drift — a missed status write, a
-    Redis restart, a takeover that moved the call — left them marked busy with
-    no call, invisible to dispatch, for the rest of their shift.
+def _returned_call(workspace, owner, sid, status='waiting', agent_id=None):
+    call = Call(
+        signalwire_call_sid=sid, workspace_id=workspace.id, user_id=owner.id,
+        from_number='+15551230000', destination='+15559990000',
+        destination_type='phone', direction='inbound', status=status,
+        assigned_agent_id=agent_id, created_at=datetime.utcnow(),
+    )
+    db.session.add(call)
+    db.session.commit()
+    return call
 
-    By this point the DB has already released the call, so the agent IS free.
-    Refusing to say so because a cache disagrees gets the answer backwards.
+
+def test_a_drifted_redis_status_still_frees_the_agent(app, redis):
+    """The stuck-busy bug. Freeing used to require Redis still tracking the
+    same call, so any drift — a missed write, a restart, a takeover — left the
+    agent busy with no call, invisible to dispatch for the rest of the shift.
     """
+    from app.api.call_control import release_agent_after_return
+
     workspace = make_workspace()
     seed_queue(workspace)
     agent = seed_agent(workspace, redis, 'ed', ['en-US'])
     qs = _qs(workspace, redis)
+    # Tracks a call that no longer exists anywhere.
+    qs.set_agent_status(str(agent.id), 'busy', current_call_id='ghost-call')
 
-    # Redis thinks the agent is on a DIFFERENT call than the one being
-    # returned — the drift this guards against.
-    qs.set_agent_status(str(agent.id), 'busy', current_call_id='some-other-call')
+    freed = release_agent_after_return(qs, agent.id, 'call-being-returned')
 
-    from app.api import call_control
-    freed = []
-    original = qs.set_agent_status
-
-    class Recorder:
-        def __getattr__(self, name):
-            return getattr(qs, name)
-
-        def set_agent_status(self, agent_id, status, current_call_id=None):
-            freed.append((agent_id, status))
-            return original(agent_id, status, current_call_id)
-
-    # Drive just the release step the endpoint performs.
-    recorder = Recorder()
-    state = recorder.get_agent_status(str(agent.id))
-    assert state['current_call_id'] == 'some-other-call'
-    recorder.set_agent_status(str(agent.id), 'available')
-
-    assert freed == [(str(agent.id), 'available')]
+    assert freed is True
     assert qs.get_agent_status(str(agent.id))['status'] == 'available'
-    # The production code path must contain no conditional around this.
+
+
+def test_an_agent_already_on_a_newer_call_is_left_busy(app, redis):
+    """The opposite error, and why freeing unconditionally is wrong: between
+    two overlapping returns the agent can already have been dispatched a new
+    call. Clearing that hands them a second one."""
+    from app.api.call_control import release_agent_after_return
+
+    workspace = make_workspace()
+    seed_queue(workspace)
+    agent = seed_agent(workspace, redis, 'ed', ['en-US'])
+    owner = User.query.filter_by(role='admin').first() or agent
+    live = _returned_call(workspace, owner, 'newer-live-call',
+                          status='active', agent_id=agent.id)
+    qs = _qs(workspace, redis)
+    qs.set_agent_status(str(agent.id), 'busy', current_call_id=live.signalwire_call_sid)
+
+    freed = release_agent_after_return(qs, agent.id, 'the-older-returned-call')
+
+    assert freed is False
+    assert qs.get_agent_status(str(agent.id))['status'] == 'busy'
+
+
+def test_a_tracked_call_that_has_ended_is_not_protection(app, redis):
+    """Only a LIVE assignment outranks the release; an ended call tracked in
+    Redis is drift by another name."""
+    from app.api.call_control import release_agent_after_return
+
+    workspace = make_workspace()
+    seed_queue(workspace)
+    agent = seed_agent(workspace, redis, 'ed', ['en-US'])
+    ended = _returned_call(workspace, agent, 'finished-call',
+                           status='ended', agent_id=agent.id)
+    ended.ended_at = datetime.utcnow()
+    db.session.commit()
+    qs = _qs(workspace, redis)
+    qs.set_agent_status(str(agent.id), 'busy', current_call_id=ended.signalwire_call_sid)
+
+    assert release_agent_after_return(qs, agent.id, 'other-call') is True
+
+
+def test_a_call_tracked_for_a_different_agent_does_not_block_the_release(app, redis):
+    from app.api.call_control import release_agent_after_return
+
+    workspace = make_workspace()
+    seed_queue(workspace)
+    agent = seed_agent(workspace, redis, 'ed', ['en-US'])
+    other_agent = seed_agent(workspace, redis, 'ana', ['en-US'])
+    someone_elses = _returned_call(workspace, agent, 'someone-elses-call',
+                                   status='active', agent_id=other_agent.id)
+    qs = _qs(workspace, redis)
+    qs.set_agent_status(str(agent.id), 'busy',
+                        current_call_id=someone_elses.signalwire_call_sid)
+
+    assert release_agent_after_return(qs, agent.id, 'my-returned-call') is True
+
+
+def test_the_released_agent_is_the_one_who_held_the_call(app, redis):
+    """A supervisor can return someone else's call. Freeing the REQUESTER
+    would leave the real agent busy with no call — the stuck-busy state this
+    whole path exists to avoid, arrived at from the other direction."""
     import inspect
+    from app.api import call_control
+
     source = inspect.getsource(call_control.return_call_to_queue)
-    assert 'freeing anyway' in source, (
-        'the unconditional release + mismatch log must stay: a conditional '
-        'here is the stuck-busy bug'
+    assert 'released_agent_id = call.assigned_agent_id or user.id' in source, (
+        "the release must target the call's assigned agent, not the requester"
     )

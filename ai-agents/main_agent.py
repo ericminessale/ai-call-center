@@ -870,7 +870,15 @@ def attach_mcp_gateways(agent, call_ctx=None):
         if failed_at and time.time() - failed_at < _MCP_FAIL_TTL_SECONDS:
             continue
         try:
-            agent.add_skill("mcp_gateway", config)
+            # The SDK only understands object-shaped services; a bare string
+            # in services_filter makes register_tools raise and takes the
+            # whole gateway down with it. Normalize on a COPY so the stored
+            # config (and the cache key derived from it) stays as configured.
+            skill_config = dict(config)
+            normalized_services = _normalized_services(config)
+            if normalized_services:
+                skill_config['services'] = normalized_services
+            agent.add_skill("mcp_gateway", skill_config)
             attached.append(entry)
             with _mcp_fail_lock:
                 _mcp_setup_failures.pop(gateway_url, None)
@@ -920,6 +928,7 @@ def attach_mcp_gateways(agent, call_ctx=None):
 
 _PRELOAD_TTL_SECONDS = 60
 _preload_cache: dict = {}
+_preload_inflight: dict = {}
 _preload_lock = threading.Lock()
 
 
@@ -942,7 +951,7 @@ def _preload_cache_key(entry, config, tool_name):
         entry.get('id'),
         entry.get('name'),
         config.get('gateway_url'),
-        tuple(_configured_service_names(config)),
+        json.dumps(_normalized_services(config), sort_keys=True),
         hashlib.sha256(secret.encode()).hexdigest()[:16],
         tool_name,
     )
@@ -960,21 +969,46 @@ def _gateway_auth(config):
     return None, headers
 
 
-def _configured_service_names(config):
-    """Service names from the SDK's ``services`` param.
+def _normalized_services(config):
+    """``services`` as a list of ``{"name", "tools"}`` dicts.
 
-    Accepts BOTH documented shapes — bare strings and
-    ``{"name": ..., "tools": [...]}`` objects (McpGatewayConfig.services_filter
-    stores either). Interpolating the dict straight into a URL produced a path
-    containing a stringified Python object and a silent preload failure.
+    McpGatewayConfig.services_filter stores bare strings OR objects, but the
+    SDK skill only handles the object form — register_tools calls
+    ``service_config.get("name")`` on each entry, so a bare string raises
+    AttributeError, the whole gateway is caught as "failed to attach", and the
+    agent silently loses both its MCP tools and this preload. Normalizing
+    once, here, is what keeps a documented config shape from disabling the
+    feature it configures.
     """
-    names = []
+    normalized = []
     for service in config.get('services') or []:
         if isinstance(service, str) and service:
-            names.append(service)
+            normalized.append({'name': service, 'tools': '*'})
         elif isinstance(service, dict) and service.get('name'):
-            names.append(service['name'])
-    return names
+            entry = dict(service)
+            entry.setdefault('tools', '*')
+            normalized.append(entry)
+    return normalized
+
+
+def _service_exposes_tool(service, tool_name):
+    """Whether the ADMIN's filter lets this service offer ``tool_name``.
+
+    The gateway exposing a tool is not permission to call it: ``{"name":
+    "catalog", "tools": ["lookup_order"]}`` is an operator deciding this agent
+    may not use anything else. Preloading list_products anyway would walk
+    straight past that decision.
+    """
+    tools = service.get('tools', '*')
+    if tools == '*' or tools is None:
+        return True
+    if isinstance(tools, str):
+        return tools == tool_name
+    return tool_name in tools
+
+
+def _configured_service_names(config):
+    return [s['name'] for s in _normalized_services(config)]
 
 
 def _resolve_service_for_tool(config, tool_name):
@@ -986,14 +1020,25 @@ def _resolve_service_for_tool(config, tool_name):
     """
     import requests
 
-    names = _configured_service_names(config)
-    if len(names) == 1:
-        return names[0]
+    services = _normalized_services(config)
+    if services:
+        # Only services the operator's filter actually permits this tool on.
+        permitted = [s for s in services if _service_exposes_tool(s, tool_name)]
+        if not permitted:
+            return None
+        if len(permitted) == 1:
+            return permitted[0]['name']
+        names = [s['name'] for s in permitted]
+    else:
+        names = []
 
     gateway_url = (config.get('gateway_url') or '').rstrip('/')
     auth, headers = _gateway_auth(config)
     timeout = config.get('request_timeout', 5)
     if not names:
+        # Nothing configured: ask the gateway which services exist. Discovery
+        # answers "which service owns this tool", never "may I use it" — that
+        # question was already answered above.
         resp = requests.get(f"{gateway_url}/services", auth=auth,
                             headers=headers, timeout=timeout)
         resp.raise_for_status()
@@ -1100,9 +1145,29 @@ def preload_mcp_context(agent, entries):
         config = entry.get('config') or {}
         cache_key = _preload_cache_key(entry, config, tool_name)
         now = time.time()
+        # Single-flight. The lock alone only covered lookup and storage, not
+        # the gateway request between them, so every concurrent miss made its
+        # own call — "one timeout per window" held for one caller at a time
+        # and nowhere else. Losers wait for the winner's result instead.
         with _preload_lock:
             cached = _preload_cache.get(cache_key)
-        if cached and now - cached[0] < _PRELOAD_TTL_SECONDS:
+            fresh = cached and now - cached[0] < _PRELOAD_TTL_SECONDS
+            leader = None
+            if not fresh:
+                leader = _preload_inflight.get(cache_key)
+                if leader is None:
+                    leader = threading.Event()
+                    _preload_inflight[cache_key] = leader
+                    owner = True
+                else:
+                    owner = False
+        if not fresh and not owner:
+            # Bounded: a wedged leader must not hold up a SWML render.
+            leader.wait(timeout=config.get('request_timeout', 5) + 1)
+            with _preload_lock:
+                cached = _preload_cache.get(cache_key)
+            fresh = bool(cached)
+        if fresh:
             section = cached[1]
         else:
             try:
@@ -1113,6 +1178,8 @@ def preload_mcp_context(agent, entries):
                 # the skill's own health check already paid.
                 with _preload_lock:
                     _preload_cache[cache_key] = (now, '')
+                    _preload_inflight.pop(cache_key, None)
+                leader.set()
                 print(
                     f"Catalog preload skipped for {_PRELOAD_TTL_SECONDS}s "
                     f"({tool_name} via {config.get('gateway_url')!r}): {e}",
@@ -1122,6 +1189,8 @@ def preload_mcp_context(agent, entries):
             section = _format_catalog_section(result or {})
             with _preload_lock:
                 _preload_cache[cache_key] = (now, section)
+                _preload_inflight.pop(cache_key, None)
+            leader.set()
         if section:
             agent.prompt_add_section(
                 getattr(agent, '_preload_section_title', 'Product Catalog'),
@@ -2352,23 +2421,28 @@ def configure_triage_queues(agent, queues, caller=None):
 # Spanish caller who asks for "una persona" to the AI.
 _HUMAN_TERMS = frozenset({
     # English
-    'human', 'person', 'people', 'agent', 'representative', 'rep',
-    'someone', 'somebody', 'operator', 'live', 'actual',
+    'human', 'humans', 'person', 'people', 'agent', 'agents',
+    'representative', 'representatives', 'rep', 'someone', 'somebody',
+    'operator', 'operators', 'live', 'actual', 'real',
     # Spanish
-    'persona', 'humano', 'humana', 'agente', 'representante', 'alguien',
-    'operador', 'operadora',
+    'persona', 'personas', 'humano', 'humana', 'humanos', 'agente',
+    'agentes', 'representante', 'representantes', 'alguien', 'operador',
+    'operadora',
     # French
-    'humain', 'humaine', 'personne', 'conseiller', 'conseillere',
-    'representant', 'representante', 'quelquun', 'operateur',
+    'humain', 'humaine', 'humains', 'personne', 'personnes', 'conseiller',
+    'conseillere', 'conseillers', 'representant', 'representants',
+    'quelquun', 'operateur',
 })
 
-# Naming the machine is a request for a person only when it's NEGATED — "I
+# Naming the machine is a request for a person only when it's REJECTED — "I
 # don't want a robot" wants a human, "the AI is fine" does not. Polarity does
-# that work, so these live here rather than in the human list.
+# that work, so these live here rather than in the human list. 'ia' is the
+# Spanish and French abbreviation and is what those callers actually say.
 _AI_TERMS = frozenset({
-    'ai', 'bot', 'robot', 'machine', 'computer', 'automated', 'assistant',
-    'asistente', 'automatico', 'automatica', 'maquina', 'artificial',
-    'virtuel', 'virtuelle', 'machinerie', 'ordinateur',
+    'ai', 'ia', 'bot', 'robot', 'machine', 'computer', 'automated',
+    'assistant', 'asistente', 'automatico', 'automatica', 'maquina',
+    'artificial', 'inteligencia', 'artificielle', 'virtuel', 'virtuelle',
+    'ordinateur', 'automate',
 })
 
 _NEGATORS = frozenset({
@@ -2377,38 +2451,37 @@ _NEGATORS = frozenset({
     'pas', 'ne', 'non', 'sans', 'jamais', 'aucun', 'aucune',
 })
 
-# Clause boundaries. Negation is scoped to its own clause so "I do not want a
-# human, use the AI" doesn't let the leading "not" flip the second half.
+# "the AI rather THAN a person" — whatever follows is the option being turned
+# down, not the one being chosen. Without this the sentence reads as a request
+# for a human, which is the opposite of what was said.
+_REJECTION_MARKERS = frozenset({'than', 'instead', 'lugar', 'vez', 'lieu'})
+
+# Clause boundaries. Each clause is scored on its own so a correction ("I
+# wanted a human before, BUT use the AI now") isn't decided by the clause the
+# caller is walking back.
 _CLAUSE_SPLIT = re.compile(r'[,;.!?]| but | pero | mais | and | y | et ')
+
+# Word-initial elision: l'agent, d'un, qu'il. Folding the apostrophe away
+# glues these into "lagent", which matches nothing. English contractions are
+# the opposite case — "don't" must become "dont" to read as a negator — and
+# the two are told apart by position: the elided article is its own word.
+_ELISION = re.compile(r"\b(l|d|j|n|m|t|s|c|qu)'")
 
 
 def _fold(text: str) -> str:
-    """Lowercase, strip accents, drop punctuation.
-
-    Accent folding is not cosmetic here: without it "préfère un conseiller
-    humain" tokenizes to accented forms that match nothing.
-
-    Apostrophes are DELETED rather than turned into spaces, which is the
-    difference between "don't" reading as a negator and reading as the two
-    meaningless tokens "don" and "t" — and likewise between "quelqu'un" being
-    a person and being nothing at all.
-    """
+    """Lowercase, strip accents, split elisions, drop punctuation."""
     import unicodedata
     decomposed = unicodedata.normalize('NFKD', text.lower())
     stripped = ''.join(c for c in decomposed if not unicodedata.combining(c))
+    stripped = _ELISION.sub(r' ', stripped)
     for apostrophe in ("'", '’', 'ʼ', '`'):
         stripped = stripped.replace(apostrophe, '')
     return ''.join(c if c.isalnum() else ' ' for c in stripped)
 
 
 def _clauses(text: str):
-    """Split into clauses BEFORE folding.
-
-    Order matters: _fold turns punctuation into spaces, so folding first
-    erases the very commas this splits on — and "I do not want a human, use
-    the AI" collapses into one clause where the leading negator governs
-    everything.
-    """
+    """Split into clauses BEFORE folding — _fold turns the commas this splits
+    on into spaces."""
     return [_fold(part) for part in _CLAUSE_SPLIT.split(text.lower())]
 
 
@@ -2429,9 +2502,20 @@ def _last_caller_utterance(raw_data) -> str:
 
 
 def _human_request_evidence(raw_data) -> str:
-    """Did the caller's own last turn clearly ask for a person?
+    """Did the caller's own last turn end up asking for a person?
 
     Returns 'CONFIRMED', 'ABSENT', or 'UNAVAILABLE'.
+
+    Scores the WHOLE utterance and lets the last explicit choice win, because
+    a spoken sentence routinely mentions both options before settling on one:
+
+        "I would rather use the AI than talk to a person"   -> AI
+        "I wanted a human before, but use the AI now"       -> AI
+        "I do not want a human use the AI"                  -> AI
+        "no quiero la IA"                                   -> human
+
+    Returning on the first human-shaped word got every one of those wrong, in
+    the direction that parks the caller on hold.
 
     UNAVAILABLE — no call_log at all — must be treated as permission, not
     refusal. Any deployment where swaig_post_conversation isn't honoured would
@@ -2442,20 +2526,45 @@ def _human_request_evidence(raw_data) -> str:
     if not utterance:
         return 'UNAVAILABLE'
 
-    # Per clause, because polarity is what separates "I don't want a human"
-    # from "I want a human", and a clause is the scope a negator governs.
+    decision = None
     for clause in _clauses(utterance):
         tokens = clause.split()
-        negated = False
-        for token in tokens:
+        pending_negation = False
+        after_rejection = False
+        previous_target_index = None
+        previous_positive = True
+
+        for index, token in enumerate(tokens):
             if token in _NEGATORS:
-                negated = True
+                pending_negation = True
                 continue
-            if token in _HUMAN_TERMS and not negated:
-                return 'CONFIRMED'          # "put me through to a person"
-            if token in _AI_TERMS and negated:
-                return 'CONFIRMED'          # "I don't want a robot"
-    return 'ABSENT'
+            if token in _REJECTION_MARKERS:
+                after_rejection = True
+                continue
+
+            if token in _HUMAN_TERMS:
+                target = 'human'
+            elif token in _AI_TERMS:
+                target = 'ai'
+            else:
+                continue
+
+            if previous_target_index == index - 1:
+                # Adjacent words describing ONE thing — "conseiller humain",
+                # "a real person". The second must not read as a fresh,
+                # unnegated mention and cancel the negation on the first.
+                positive = previous_positive
+            else:
+                positive = not (pending_negation or after_rejection)
+            pending_negation = False
+            previous_target_index = index
+            previous_positive = positive
+
+            # Wanting a human and refusing the machine both mean "person";
+            # refusing a human and accepting the machine both mean "AI".
+            decision = 'human' if (target == 'human') == positive else 'ai'
+
+    return 'CONFIRMED' if decision == 'human' else 'ABSENT'
 
 
 class CallCenterAgent(AgentBase):

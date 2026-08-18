@@ -193,3 +193,52 @@ def test_raw_call_log_is_accepted_as_a_fallback():
     ]}
 
     assert main_agent._human_request_evidence(raw) == 'CONFIRMED'
+
+
+# ---------------------------------------------------------------------------
+# Second audit round: word polarity is not intent. A spoken sentence routinely
+# names both options before settling on one, and returning on the first
+# human-shaped word got every one of these backwards — toward the hold queue.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('said', [
+    # Comparison: the option after "than" is the one being turned down.
+    'I would rather use the AI than talk to a person',
+    'I would rather have the assistant than an agent',
+    # Correction: the caller changes their mind mid-sentence.
+    'I wanted a human before, but use the AI now',
+    # No punctuation — ASR often returns none at all, so clause splitting
+    # cannot be the only thing holding negation in place.
+    'I do not want a human use the AI',
+    'no quiero una persona quiero la IA',
+])
+def test_the_last_explicit_choice_wins(said):
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == 'ABSENT', said
+
+
+@pytest.mark.parametrize('said,expected', [
+    # French elision: folding the apostrophe away glues l'agent into "lagent".
+    ("Je veux parler à l'agent", 'CONFIRMED'),
+    ("Je voudrais parler à l'humain", 'CONFIRMED'),
+    # "IA" is what Spanish and French speakers actually say for AI.
+    ('No quiero la IA', 'CONFIRMED'),
+    ("Je ne veux pas de l'IA", 'CONFIRMED'),
+    ('Prefiero la IA', 'ABSENT'),
+])
+def test_localized_forms_are_read_correctly(said, expected):
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == expected, said
+
+
+def test_adjacent_words_describe_one_thing():
+    """"conseiller humain" is a single noun phrase. Reading the second word as
+    a fresh, unnegated mention cancels the negation on the first and flips the
+    answer."""
+    raw = call_log(('user', 'Je ne veux pas de conseiller humain'))
+    assert main_agent._human_request_evidence(raw) == 'ABSENT'
+
+    raw = call_log(('user', 'not the AI please, a real person'))
+    assert main_agent._human_request_evidence(raw) == 'CONFIRMED'

@@ -291,3 +291,88 @@ def test_sales_specialist_actually_opts_in():
 
     assert agent._preload_mcp_tool == 'list_products'
     assert agent._preload_section_title == 'Product Catalog'
+
+
+# ---------------------------------------------------------------------------
+# Second audit round.
+# ---------------------------------------------------------------------------
+
+def test_bare_string_services_reach_the_sdk_as_objects():
+    """The SDK's register_tools calls service_config.get("name") on every
+    entry, so a bare string — a shape our own config explicitly accepts —
+    raises, the gateway is recorded as failed, and the agent loses its MCP
+    tools AND this preload. Normalization has to happen before add_skill, not
+    only inside the preload resolver."""
+    seen = {}
+
+    class Agent:
+        _mcp_agent_id = 'sales-ai'
+
+        def add_skill(self, _name, config):
+            seen['services'] = config.get('services')
+
+    main_agent._mcp_setup_failures.clear()
+    main_agent.attach_mcp_gateways(Agent(), {'workspace_id': 1, 'mcp_gateways': [{
+        'name': 'Shop', 'bound_agent_ids': ['sales-ai'],
+        'config': {'gateway_url': 'http://gw:8100', 'services': ['catalog']},
+    }]})
+
+    assert seen['services'] == [{'name': 'catalog', 'tools': '*'}]
+
+
+def test_the_operator_tool_filter_is_not_bypassed():
+    """A gateway exposing a tool is not permission to call it. If the filter
+    says this agent may only use lookup_order, preloading list_products walks
+    straight past that decision."""
+    excluded = {'gateway_url': 'https://gw.example',
+                'services': [{'name': 'catalog', 'tools': ['lookup_order']}]}
+    permitted = {'gateway_url': 'https://gw.example',
+                 'services': [{'name': 'catalog', 'tools': ['list_products']}]}
+
+    assert main_agent._resolve_service_for_tool(excluded, 'list_products') is None
+    assert main_agent._resolve_service_for_tool(permitted, 'list_products') == 'catalog'
+
+
+def test_the_cache_key_tracks_the_tool_filter():
+    """Two configs differing only in what they permit are not the same answer."""
+    base = {'gateway_url': 'https://gw.example'}
+    a = main_agent._preload_cache_key(
+        {'id': 1}, dict(base, services=[{'name': 'catalog', 'tools': ['list_products']}]),
+        'list_products')
+    b = main_agent._preload_cache_key(
+        {'id': 1}, dict(base, services=[{'name': 'catalog', 'tools': ['lookup_order']}]),
+        'list_products')
+
+    assert a != b
+
+
+def test_concurrent_misses_make_one_gateway_call(monkeypatch):
+    """The lock covered lookup and storage but not the request between them,
+    so every simultaneous miss made its own call. Under call-center
+    concurrency that is N timeouts, not one."""
+    import threading
+    import time as _time
+
+    calls = []
+    barrier = threading.Barrier(4)
+
+    def slow(*_args, **_kwargs):
+        calls.append(1)
+        _time.sleep(0.3)
+        return CATALOG
+
+    monkeypatch.setattr(main_agent, '_call_mcp_tool', slow)
+    main_agent._preload_inflight.clear()
+
+    def worker():
+        barrier.wait()
+        main_agent.preload_mcp_context(
+            FakeAgent(_preload_mcp_tool='list_products'), ENTRIES)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(calls) == 1

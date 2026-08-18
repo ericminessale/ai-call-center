@@ -817,6 +817,16 @@ def get_template_mcp_gateways(agent_id):
     return _mcp_cache['map'].get(agent_id, [])
 
 
+def _resolve_mcp_entries(agent_id, call_ctx):
+    """Which gateway rows apply to this agent on this call, and where from."""
+    if call_ctx is not None and call_ctx.get('mcp_gateways') is not None:
+        return [
+            g for g in call_ctx['mcp_gateways']
+            if agent_id in (g.get('bound_agent_ids') or [])
+        ], f"workspace {call_ctx.get('workspace_id')}"
+    return get_template_mcp_gateways(agent_id), 'template'
+
+
 def attach_mcp_gateways(agent, call_ctx=None):
     """Register the agent's MCP gateway skills on the ephemeral copy.
 
@@ -833,17 +843,9 @@ def attach_mcp_gateways(agent, call_ctx=None):
     """
     agent_id = getattr(agent, '_mcp_agent_id', None)
     if not agent_id:
-        return
+        return []
 
-    if call_ctx is not None and call_ctx.get('mcp_gateways') is not None:
-        entries = [
-            g for g in call_ctx['mcp_gateways']
-            if agent_id in (g.get('bound_agent_ids') or [])
-        ]
-        source = f"workspace {call_ctx.get('workspace_id')}"
-    else:
-        entries = get_template_mcp_gateways(agent_id)
-        source = 'template'
+    entries, source = _resolve_mcp_entries(agent_id, call_ctx)
 
     import time
     for entry in entries:
@@ -884,6 +886,146 @@ def attach_mcp_gateways(agent, call_ctx=None):
                 f"(negative-cached {_MCP_FAIL_TTL_SECONDS}s): {e}",
                 flush=True,
             )
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Preloaded reference data — putting ground truth IN the prompt, because
+# having a tool available is not the same as the model choosing to call it.
+#
+# Live call 78 (2026-08-17): asked "what products do you offer and what do
+# they cost", the sales specialist answered "the smart home hub for two
+# hundred dollars, wireless earbuds for one hundred fifty dollars, and a
+# fitness tracker for seventy five dollars" — WITHOUT calling any catalog
+# tool. Two of those products have never existed; the third's price was
+# wrong. It then repeated the invented $200 even after find_product returned
+# a different product and price, because once a number is in the
+# conversation the model defends it.
+#
+# Typed tool returns are necessary but not sufficient: they only help if the
+# model calls the tool BEFORE committing to an answer. The catalog is small,
+# it's the single most common sales question, and it is authoritative — so it
+# belongs in the context, where there is no gap to invent into.
+#
+# Opt-in per agent (``_preload_mcp_tool``) rather than assumed, because
+# DemoShop is the bundled demo: a cloner points these agents at their own MCP
+# server and names their own catalog tool, or sets nothing and loses nothing.
+# ---------------------------------------------------------------------------
+
+_PRELOAD_TTL_SECONDS = 60
+_preload_cache: dict = {}
+_preload_lock = threading.Lock()
+
+
+def _call_mcp_tool(config, tool_name, arguments=None):
+    """Invoke one tool on an MCP gateway over its HTTP API.
+
+    Reads the same config the SDK skill gets (McpGatewayConfig.to_skill_config):
+    gateway_url, auth_user/auth_password or auth_token, services, and the
+    deliberately short request_timeout that keeps a dead gateway from stalling
+    a SWML render.
+    """
+    import requests
+
+    gateway_url = (config.get('gateway_url') or '').rstrip('/')
+    if not gateway_url:
+        return None
+    services = config.get('services') or []
+    service = services[0] if services else 'demoshop'
+
+    auth = None
+    headers = {'Content-Type': 'application/json'}
+    if config.get('auth_token'):
+        headers['Authorization'] = f"Bearer {config['auth_token']}"
+    elif config.get('auth_user') is not None:
+        auth = (config.get('auth_user') or '', config.get('auth_password') or '')
+
+    resp = requests.post(
+        f"{gateway_url}/services/{service}/call",
+        json={
+            'tool': tool_name,
+            'arguments': arguments or {},
+            # Read-only and shared; the gateway keys sessions by this.
+            'session_id': 'agent-context-preload',
+        },
+        auth=auth,
+        headers=headers,
+        timeout=config.get('request_timeout', 5),
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    result = payload.get('result', payload)
+    if isinstance(result, str):
+        result = json.loads(result)
+    return result
+
+
+def _format_catalog_section(catalog) -> str:
+    """The catalog as the model should read it: closed, priced, quotable."""
+    products = catalog.get('products') or []
+    if not products:
+        return ''
+    most_popular = (catalog.get('most_popular') or {}).get('name')
+    lines = []
+    for product in products:
+        line = f"- {product.get('name')} — {product.get('price')}"
+        availability = product.get('availability')
+        if availability:
+            line += f" ({availability})"
+        if most_popular and product.get('name') == most_popular:
+            line += "  ← most popular / best seller"
+        lines.append(line)
+    return (
+        "This is the COMPLETE live catalog — every product this company "
+        "sells, with its current price:\n\n"
+        + "\n".join(lines)
+        + "\n\nQuote these prices exactly as written. Never name, describe, "
+        "or price a product that is not on this list — not when listing "
+        "options, not when suggesting alternatives, not when offering the "
+        "caller a choice. If someone asks about anything else, tell them we "
+        "don't carry it and name the nearest thing we do sell. Use "
+        "find_product for stock or details on a specific item."
+    )
+
+
+def preload_mcp_context(agent, entries):
+    """Inject an agent's declared reference tool output into its prompt.
+
+    Best-effort and cached: a gateway that is slow or down costs the call
+    nothing but the absent section, and the model still has the tools.
+    """
+    tool_name = getattr(agent, '_preload_mcp_tool', None)
+    if not tool_name or not entries:
+        return False
+
+    for entry in entries:
+        config = entry.get('config') or {}
+        cache_key = (config.get('gateway_url'), tool_name)
+        now = time.time()
+        with _preload_lock:
+            cached = _preload_cache.get(cache_key)
+        if cached and now - cached[0] < _PRELOAD_TTL_SECONDS:
+            section = cached[1]
+        else:
+            try:
+                result = _call_mcp_tool(config, tool_name)
+            except Exception as e:
+                print(
+                    f"Catalog preload skipped ({tool_name} via "
+                    f"{config.get('gateway_url')!r}): {e}",
+                    flush=True,
+                )
+                continue
+            section = _format_catalog_section(result or {})
+            with _preload_lock:
+                _preload_cache[cache_key] = (now, section)
+        if section:
+            agent.prompt_add_section(
+                getattr(agent, '_preload_section_title', 'Product Catalog'),
+                section,
+            )
+            return True
+    return False
 
 
 def _admin_request_authorized(request) -> bool:
@@ -1224,7 +1366,16 @@ def capture_base_url(query_params, body_params, headers, agent):
 
     # MCP gateway skills — per-request since Phase 4 (boot registration
     # removed; see attach_mcp_gateways for the duplicate-skip rationale).
-    attach_mcp_gateways(agent, tenant_ctx)
+    mcp_entries = attach_mcp_gateways(agent, tenant_ctx)
+
+    # ...and, for agents that declare one, that gateway's reference data
+    # straight into the prompt. Having the catalog tool available did not
+    # stop the specialist inventing products and prices — see
+    # preload_mcp_context.
+    try:
+        preload_mcp_context(agent, mcp_entries)
+    except Exception as e:
+        print(f"Warning: context preload failed (non-fatal): {e}", flush=True)
 
     # Triage only: rebuild the queue-shaped config (contexts, routing map,
     # hints, post-prompt enum) from the workspace's queues.
@@ -2744,6 +2895,12 @@ class SalesAISpecialist(CallCenterAgent):
             "alone is not a reason to hand the call to a human."
         )
         self._mcp_agent_id = 'sales-ai'  # MCP gateways attach per-request (callback), not at boot
+        # The catalog rides IN the prompt, not just behind a tool. "What do
+        # you sell and what does it cost" is the most common question on this
+        # line, and a model that has to elect a tool call to answer it will
+        # sometimes answer from nothing instead — with prices.
+        self._preload_mcp_tool = 'list_products'
+        self._preload_section_title = 'Product Catalog'
         self._inbound_caller_memory = True  # R1: consume call-context contact block
 
         self.set_post_prompt(

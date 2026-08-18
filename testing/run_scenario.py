@@ -484,14 +484,14 @@ def check(op: str, actual, expected) -> bool:
         return isinstance(actual, str) and any(
             str(e).lower() in actual.lower() for e in expected)
     if op == 'not_contains_any':
-        # A hallucination guard: the assertion is that these strings are
-        # ABSENT from what the agent said. Missing text counts as passing —
-        # if the transcript never arrived, the words weren't spoken either,
-        # and the transcript itself is asserted separately.
-        if actual is None:
-            return True
-        return isinstance(actual, str) and not any(
-            str(e).lower() in actual.lower() for e in expected)
+        # A hallucination guard, so absence of evidence must NOT read as
+        # evidence of absence. An empty or missing transcript means nothing
+        # was examined, and a guard that goes green on nothing is worse than
+        # no guard: the await gate returns the last report on timeout, so a
+        # run could pass this while never having seen what the agent said.
+        if not actual or not isinstance(actual, str):
+            return False
+        return not any(str(e).lower() in actual.lower() for e in expected)
     raise ValueError(f"unknown assertion op {op!r}")
 
 

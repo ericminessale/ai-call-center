@@ -1134,8 +1134,10 @@ def _format_catalog_section(catalog) -> str:
 def preload_mcp_context(agent, entries):
     """Inject an agent's declared reference tool output into its prompt.
 
-    Best-effort and cached: a gateway that is slow or down costs the call
-    nothing but the absent section, and the model still has the tools.
+    Best-effort throughout: this is an optional head start, never a
+    prerequisite. A gateway that is slow, down, or answering in a shape we
+    don't understand costs the call the section and nothing else — the model
+    still has every tool it always had.
     """
     tool_name = getattr(agent, '_preload_mcp_tool', None)
     if not tool_name or not entries:
@@ -1144,53 +1146,7 @@ def preload_mcp_context(agent, entries):
     for entry in entries:
         config = entry.get('config') or {}
         cache_key = _preload_cache_key(entry, config, tool_name)
-        now = time.time()
-        # Single-flight. The lock alone only covered lookup and storage, not
-        # the gateway request between them, so every concurrent miss made its
-        # own call — "one timeout per window" held for one caller at a time
-        # and nowhere else. Losers wait for the winner's result instead.
-        with _preload_lock:
-            cached = _preload_cache.get(cache_key)
-            fresh = cached and now - cached[0] < _PRELOAD_TTL_SECONDS
-            leader = None
-            if not fresh:
-                leader = _preload_inflight.get(cache_key)
-                if leader is None:
-                    leader = threading.Event()
-                    _preload_inflight[cache_key] = leader
-                    owner = True
-                else:
-                    owner = False
-        if not fresh and not owner:
-            # Bounded: a wedged leader must not hold up a SWML render.
-            leader.wait(timeout=config.get('request_timeout', 5) + 1)
-            with _preload_lock:
-                cached = _preload_cache.get(cache_key)
-            fresh = bool(cached)
-        if fresh:
-            section = cached[1]
-        else:
-            try:
-                result = _call_mcp_tool(config, tool_name)
-            except Exception as e:
-                # Cache the FAILURE too. Without this a dead or slow gateway
-                # costs every sales render another timeout, on top of the one
-                # the skill's own health check already paid.
-                with _preload_lock:
-                    _preload_cache[cache_key] = (now, '')
-                    _preload_inflight.pop(cache_key, None)
-                leader.set()
-                print(
-                    f"Catalog preload skipped for {_PRELOAD_TTL_SECONDS}s "
-                    f"({tool_name} via {config.get('gateway_url')!r}): {e}",
-                    flush=True,
-                )
-                continue
-            section = _format_catalog_section(result or {})
-            with _preload_lock:
-                _preload_cache[cache_key] = (now, section)
-                _preload_inflight.pop(cache_key, None)
-            leader.set()
+        section = _preloaded_section(cache_key, config, tool_name)
         if section:
             agent.prompt_add_section(
                 getattr(agent, '_preload_section_title', 'Product Catalog'),
@@ -1198,6 +1154,60 @@ def preload_mcp_context(agent, entries):
             )
             return True
     return False
+
+
+def _preloaded_section(cache_key, config, tool_name):
+    """The cached section for this key, fetching it once across threads.
+
+    Single-flight: the lock alone covered lookup and storage but not the
+    gateway request between them, so every concurrent miss made its own call.
+    """
+    now = time.time()
+    with _preload_lock:
+        cached = _preload_cache.get(cache_key)
+        if cached and now - cached[0] < _PRELOAD_TTL_SECONDS:
+            return cached[1]
+        leader = _preload_inflight.get(cache_key)
+        owner = leader is None
+        if owner:
+            leader = threading.Event()
+            _preload_inflight[cache_key] = leader
+
+    if not owner:
+        # Bounded, because a wedged leader must not hold up a SWML render.
+        leader.wait(timeout=config.get('request_timeout', 5) + 1)
+        with _preload_lock:
+            cached = _preload_cache.get(cache_key)
+        # On timeout: take whatever is there, stale or not, and otherwise go
+        # without. Starting our own fetch here would make every follower a
+        # second owner and reintroduce the pile-up single-flight exists to
+        # prevent — and discovery can legitimately outlast one request_timeout
+        # since it may issue several sequential requests before the call.
+        return cached[1] if cached else ''
+
+    # Owner. try/finally, not try/except: the formatter runs on whatever the
+    # tool returned, and a custom preload tool answering with an unexpected
+    # shape raised THERE, outside the handler, leaving the event unset and the
+    # key in _preload_inflight forever. Every later render then waited the
+    # full timeout and repeated the failure.
+    section = ''
+    try:
+        section = _format_catalog_section(_call_mcp_tool(config, tool_name) or {})
+    except Exception as e:
+        print(
+            f"Catalog preload skipped for {_PRELOAD_TTL_SECONDS}s "
+            f"({tool_name} via {config.get('gateway_url')!r}): {e}",
+            flush=True,
+        )
+        section = ''
+    finally:
+        with _preload_lock:
+            # Cache the failure as well as the success, so a dead gateway
+            # costs one attempt per window rather than one per render.
+            _preload_cache[cache_key] = (now, section)
+            _preload_inflight.pop(cache_key, None)
+        leader.set()
+    return section
 
 
 def _admin_request_authorized(request) -> bool:
@@ -2446,15 +2456,23 @@ _AI_TERMS = frozenset({
 })
 
 _NEGATORS = frozenset({
-    'not', 'dont', 'doesnt', 'cant', 'wont', 'no', 'never', 'nor',
+    'not', 'no', 'never', 'nor', 'neither',
+    # Contractions, post-fold (the apostrophe is gone by the time we look).
+    'dont', 'doesnt', 'didnt', 'cant', 'cannot', 'wont', 'wouldnt',
+    'shouldnt', 'couldnt', 'isnt', 'arent', 'wasnt', 'werent', 'havent',
+    'hasnt', 'hadnt', 'aint',
     'sin', 'nunca', 'tampoco',
     'pas', 'ne', 'non', 'sans', 'jamais', 'aucun', 'aucune',
 })
 
-# "the AI rather THAN a person" — whatever follows is the option being turned
-# down, not the one being chosen. Without this the sentence reads as a request
-# for a human, which is the opposite of what was said.
-_REJECTION_MARKERS = frozenset({'than', 'instead', 'lugar', 'vez', 'lieu'})
+# "the AI rather THAN a person", "the AI OVER a human" — whatever follows is
+# the option being turned down. Deliberately NOT 'rather' on its own: "I would
+# rather have a human" is a request, and only the "rather than" pairing is a
+# rejection, which 'than' already catches.
+_REJECTION_MARKERS = frozenset({
+    'than', 'instead', 'over', 'versus', 'vs', 'opposed',
+    'plutot', 'lieu', 'lugar', 'vez',
+})
 
 # Clause boundaries. Each clause is scored on its own so a correction ("I
 # wanted a human before, BUT use the AI now") isn't decided by the clause the
@@ -2526,7 +2544,7 @@ def _human_request_evidence(raw_data) -> str:
     if not utterance:
         return 'UNAVAILABLE'
 
-    decision = None
+    decisions = []
     for clause in _clauses(utterance):
         tokens = clause.split()
         pending_negation = False
@@ -2562,9 +2580,21 @@ def _human_request_evidence(raw_data) -> str:
 
             # Wanting a human and refusing the machine both mean "person";
             # refusing a human and accepting the machine both mean "AI".
-            decision = 'human' if (target == 'human') == positive else 'ai'
+            decisions.append(
+                'human' if (target == 'human') == positive else 'ai')
 
-    return 'CONFIRMED' if decision == 'human' else 'ABSENT'
+    # Unanimous or nothing. The marker and negator lists above are finite, and
+    # a comparative they don't know ("the AI over a person") reads as two
+    # opposite signals rather than one — so when the utterance disagrees with
+    # itself, treat it as what it is: not a clear request for a person.
+    # This is the same asymmetry the rest of the gate runs on. Routing to the
+    # AI is recoverable in-conversation via escalate_to_human; routing to a
+    # human is a hold queue and, past the cap, a callback. Being wrong toward
+    # the AI costs a sentence, so an unrecognised phrasing degrades into the
+    # cheap failure instead of the expensive one.
+    if not decisions or len(set(decisions)) > 1:
+        return 'ABSENT'
+    return 'CONFIRMED' if decisions[0] == 'human' else 'ABSENT'
 
 
 class CallCenterAgent(AgentBase):

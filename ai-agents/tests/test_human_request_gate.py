@@ -242,3 +242,45 @@ def test_adjacent_words_describe_one_thing():
 
     raw = call_log(('user', 'not the AI please, a real person'))
     assert main_agent._human_request_evidence(raw) == 'CONFIRMED'
+
+
+# ---------------------------------------------------------------------------
+# Third audit round. The marker and negator lists are finite, so correctness
+# cannot depend on having enumerated every comparative — see the mixed-signal
+# rule these pin.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('said', [
+    "Je préfère l'IA plutôt qu'une personne",
+    'I prefer the AI over a human',
+    'AI versus a person',
+    'the assistant as opposed to an agent',
+    "I wouldn't want a human",
+    "I didn't ask for a person",
+    "I haven't got time for a person",
+])
+def test_comparisons_and_contractions_choose_the_ai(said):
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == 'ABSENT', said
+
+
+def test_an_unrecognised_comparative_degrades_to_the_cheap_failure():
+    """The point of the mixed-signal rule: a phrasing whose comparative we do
+    NOT know still names both options, which reads as two opposite signals.
+    That must resolve to the AI (recoverable) rather than the hold queue."""
+    raw = call_log(('user', 'the AI, ahead of a person'))  # 'ahead' is unknown
+
+    assert main_agent._human_request_evidence(raw) == 'ABSENT'
+
+
+@pytest.mark.parametrize('said', [
+    'I would rather have a human',      # 'rather' alone is NOT a rejection
+    'I want a human not the AI',        # both signals agree: human
+    'rather than the AI, a person',
+])
+def test_agreeing_signals_still_reach_a_human(said):
+    """The rule must not swallow genuine requests that mention both options."""
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == 'CONFIRMED', said

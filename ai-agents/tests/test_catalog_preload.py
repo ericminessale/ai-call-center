@@ -24,6 +24,7 @@ never take the call down with it when the gateway is unreachable.
 
 import os
 import sys
+import time
 
 import pytest
 
@@ -376,3 +377,61 @@ def test_concurrent_misses_make_one_gateway_call(monkeypatch):
         t.join()
 
     assert len(calls) == 1
+
+
+def test_an_unexpected_tool_shape_does_not_wedge_the_key(monkeypatch):
+    """The formatter ran outside the handler, so a custom preload tool
+    answering with an unexpected shape raised after ownership was claimed —
+    leaving the event unset and the key in _preload_inflight forever. Every
+    later render then waited the full timeout and repeated the failure."""
+    monkeypatch.setattr(main_agent, '_call_mcp_tool', lambda *a, **kw: [1, 2, 3])
+    main_agent._preload_inflight.clear()
+
+    assert main_agent.preload_mcp_context(
+        FakeAgent(_preload_mcp_tool='list_products'), ENTRIES) is False
+
+    assert main_agent._preload_inflight == {}, 'in-flight key must be released'
+    # ...and the failure is cached, so the next render doesn't repeat it.
+    calls = []
+    monkeypatch.setattr(main_agent, '_call_mcp_tool',
+                        lambda *a, **kw: calls.append(1) or CATALOG)
+    main_agent.preload_mcp_context(
+        FakeAgent(_preload_mcp_tool='list_products'), ENTRIES)
+    assert calls == []
+
+
+def test_a_timed_out_follower_goes_without_rather_than_refetching(monkeypatch):
+    """Service discovery can issue several sequential requests, so a valid
+    leader may outlive one request_timeout. A follower that then starts its
+    own fetch becomes a second owner and rebuilds the pile-up single-flight
+    exists to prevent. Preloading is optional; going without is correct."""
+    import threading
+
+    calls = []
+    release = threading.Event()
+
+    def _slow(*_args, **_kwargs):
+        calls.append(1)
+        release.wait(timeout=5)
+        return CATALOG
+
+    monkeypatch.setattr(main_agent, '_call_mcp_tool', _slow)
+    main_agent._preload_cache.clear()
+    main_agent._preload_inflight.clear()
+
+    # Leader takes the key and stalls past the follower's patience.
+    entries = [{'id': 1, 'name': 'Shop', 'config': {
+        'gateway_url': 'http://gw:8100', 'request_timeout': 0}}]
+    leader = threading.Thread(
+        target=main_agent.preload_mcp_context,
+        args=(FakeAgent(_preload_mcp_tool='list_products'), entries))
+    leader.start()
+    time.sleep(0.2)
+
+    follower = FakeAgent(_preload_mcp_tool='list_products')
+    assert main_agent.preload_mcp_context(follower, entries) is False
+    assert follower.sections == []
+    assert len(calls) == 1, 'the follower must not start a second fetch'
+
+    release.set()
+    leader.join(timeout=5)

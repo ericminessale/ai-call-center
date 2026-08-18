@@ -62,6 +62,8 @@
      "value": ["mcp_demoshop_find_product", "mcp_demoshop_list_products", "search_knowledge", "mcp_demoshop"], "level": "soft"},
     {"label": "call 1: specialist consulted the catalog for the product it was asked about",
      "target": "report1.tool_call_names", "op": "contains", "value": "mcp_demoshop_find_product", "level": "soft"},
+    {"label": "call 1: the agent's side of the call was actually captured",
+     "target": "report1.derived.ai_text", "op": "non_empty", "level": "hard"},
     {"label": "call 1: AI-05 regression - no invented products on the call",
      "target": "report1.derived.ai_text", "op": "not_contains_any",
      "value": ["fitness tracker", "portable speaker", "bluetooth speaker", "smart watch", "smartwatch"], "level": "hard"},

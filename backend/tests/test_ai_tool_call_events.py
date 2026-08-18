@@ -880,3 +880,30 @@ def test_post_response_wins_when_both_are_present():
     )
 
     assert 'immediate' in webhooks._tool_response_excerpt(entry)
+
+
+def test_the_answer_survives_a_large_action_block():
+    """A transfer envelope carries an `action` block alongside the sentence
+    the caller heard. Serializing the whole envelope and truncating meant the
+    excerpt could record routing metadata and lose the answer — and passed
+    earlier only because JSON key order happened to put `response` first."""
+    entry = swaig_envelope(delayed_post_response={
+        'action': [{'set_global_data': {'filler': 'x' * 2000}}],
+        'response': 'I will connect you with a representative right now.',
+    })
+    entry.pop('post_response', None)
+
+    excerpt = webhooks._tool_response_excerpt(entry)
+
+    assert excerpt == 'I will connect you with a representative right now.'
+    # ...and the caller's own details do not ride along into the row.
+    assert 'set_global_data' not in excerpt
+
+
+def test_a_json_string_response_is_still_unwrapped():
+    """MCP results arrive as JSON text inside `response`; the scenario asserts
+    on NOT_IN_CATALOG, so this must stay readable."""
+    entry = swaig_envelope(post_response={
+        'response': '{"found": false, "reason": "NOT_IN_CATALOG"}'})
+
+    assert 'NOT_IN_CATALOG' in webhooks._tool_response_excerpt(entry)

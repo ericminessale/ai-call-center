@@ -302,11 +302,22 @@ def _tool_response_excerpt(entry, limit=400):
     if response is None:
         return None
     if isinstance(response, dict):
+        # Take the envelope's own ``response`` member whatever it holds. Only
+        # unwrapping JSON-looking strings left plain-text answers buried in
+        # the whole envelope — and a transfer envelope also carries an
+        # ``action`` block big enough to push the answer past the truncation
+        # limit, so the excerpt could record the routing metadata and lose the
+        # sentence the caller actually heard. Dropping the action block also
+        # keeps global_data (customer name, reason) out of this row.
         inner = response.get('response')
-        if isinstance(inner, str) and inner.strip().startswith(('{', '[')):
-            try:
-                response = json.loads(inner)
-            except (ValueError, TypeError):
+        if isinstance(inner, str):
+            stripped = inner.strip()
+            if stripped.startswith(('{', '[')):
+                try:
+                    response = json.loads(stripped)
+                except (ValueError, TypeError):
+                    response = inner
+            else:
                 response = inner
     try:
         text = response if isinstance(response, str) else json.dumps(response)

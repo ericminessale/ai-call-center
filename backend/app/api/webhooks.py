@@ -283,14 +283,22 @@ def _tool_call_already_emitted(call_ref, function_name, epoch_time) -> bool:
 def _tool_response_excerpt(entry, limit=400):
     """A short, readable form of what the tool returned.
 
-    ``post_response`` is the platform's echo of the tool's own return value.
-    MCP results arrive as a JSON string nested inside it, so unwrap one level
-    when possible — an escaped blob is unreadable in a panel and unassertable
-    in a test.
+    ``post_response`` is the platform's echo of the tool's own return value —
+    but a tool that answers asynchronously reports through
+    ``delayed_post_response`` instead, and then post_response is absent
+    entirely. Every captured ``transfer_to_human`` uses the delayed shape, so
+    reading only the first field silently dropped the answer for exactly the
+    tools whose answer says where the call went.
+
+    MCP results arrive as a JSON string nested inside either field, so unwrap
+    one level when possible — an escaped blob is unreadable in a panel and
+    unassertable in a test.
     """
     if not isinstance(entry, dict):
         return None
     response = entry.get('post_response')
+    if response is None:
+        response = entry.get('delayed_post_response')
     if response is None:
         return None
     if isinstance(response, dict):

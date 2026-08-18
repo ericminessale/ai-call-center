@@ -852,3 +852,31 @@ def test_a_huge_tool_response_is_truncated():
     entry = {'post_response': {'response': 'x' * 5000}}
 
     assert len(webhooks._tool_response_excerpt(entry)) == 400
+
+
+def test_a_delayed_tool_response_is_captured_too():
+    """A tool that answers asynchronously reports through
+    ``delayed_post_response`` and carries no ``post_response`` at all. Every
+    captured transfer_to_human uses that shape, so reading only the first
+    field dropped the answer for precisely the tools whose answer says where
+    the call went."""
+    entry = swaig_envelope(delayed_post_response={
+        'response': "I'll connect you with a representative right now.",
+        'action': [{'set_global_data': {'urgency': 'high'}}],
+    })
+    entry.pop('post_response', None)
+
+    excerpt = webhooks._tool_response_excerpt(entry)
+
+    assert 'connect you with a representative' in excerpt
+
+
+def test_post_response_wins_when_both_are_present():
+    """Not expected in the wild, but the immediate answer is the tool's own
+    return; the delayed field is the fallback."""
+    entry = swaig_envelope(
+        post_response={'response': 'immediate'},
+        delayed_post_response={'response': 'delayed'},
+    )
+
+    assert 'immediate' in webhooks._tool_response_excerpt(entry)

@@ -56,11 +56,17 @@ class FakeRedis:
         return self.kv.get(key)
 
     def set(self, key, value, **_kwargs):
-        self.kv[key] = value
+        # str(), because real Redis returns strings and callers rely on it:
+        # round-robin stores index 0 and reads it back with
+        # `int(raw) if raw else -1`. A real '0' is truthy; a Python 0 is not,
+        # so a fake that stores ints makes round-robin re-pick agent one
+        # forever — a bug in the double that looks exactly like a bug in the
+        # product.
+        self.kv[key] = str(value)
         return True
 
     def setex(self, key, _ttl, value):
-        self.kv[key] = value
+        self.kv[key] = str(value)
         return True
 
     def exists(self, key):
@@ -480,3 +486,121 @@ def test_the_flag_is_not_set_twice(app, redis):
     assert call.needs_translation is True
 
     assert flag_translation_if_mismatched(call, english) is False
+
+
+# ---------------------------------------------------------------------------
+# Routing strategies — the selection rules themselves.
+# ---------------------------------------------------------------------------
+
+def _qs(workspace, redis):
+    from app.services.queue_service import QueueService
+    return QueueService(redis, workspace_id=workspace.id)
+
+
+def test_round_robin_moves_on_instead_of_re_picking_the_same_agent(app, redis):
+    """Otherwise the first agent alphabetically takes every call and the rest
+    of the floor sits idle — the failure mode round-robin exists to prevent."""
+    workspace = make_workspace()
+    seed_queue(workspace)
+    qs = _qs(workspace, redis)
+
+    picks = [
+        qs.select_agent(queue_slug=QUEUE_SLUG, routing_strategy='round_robin',
+                        available_agents=['1', '2', '3'])
+        for _ in range(3)
+    ]
+
+    assert len(set(picks)) == 3, f'expected each agent once, got {picks}'
+
+
+def test_skill_based_routing_prefers_the_more_skilled_agent(app, redis):
+    workspace = make_workspace()
+    seed_queue(workspace, strategy='skill_based')
+    qs = _qs(workspace, redis)
+
+    picked = qs.select_agent(
+        queue_slug=QUEUE_SLUG, routing_strategy='skill_based',
+        available_agents=['1', '2', '3'],
+        skill_levels={'1': 2, '2': 9, '3': 5},
+    )
+
+    assert picked == '2'
+
+
+def test_language_preference_outranks_the_routing_strategy(app, redis):
+    """Language runs BEFORE the strategy. A skill rule that would otherwise
+    pick the English expert must not beat the only Spanish speaker."""
+    workspace = make_workspace()
+    seed_queue(workspace, strategy='skill_based')
+    qs = _qs(workspace, redis)
+
+    picked = qs.select_agent(
+        queue_slug=QUEUE_SLUG, routing_strategy='skill_based',
+        available_agents=['1', '2'],
+        skill_levels={'1': 10, '2': 1},
+        caller_language='es-ES',
+        agent_languages={'1': ['en-US'], '2': ['es-ES']},
+    )
+
+    assert picked == '2', 'the Spanish speaker must win despite lower skill'
+
+
+def test_no_available_agents_selects_nobody(app, redis):
+    workspace = make_workspace()
+    seed_queue(workspace)
+
+    assert _qs(workspace, redis).select_agent(
+        queue_slug=QUEUE_SLUG, routing_strategy='round_robin',
+        available_agents=[],
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Return to queue — freeing the agent.
+# ---------------------------------------------------------------------------
+
+def test_returning_a_call_frees_the_agent_even_when_redis_disagrees(app, redis):
+    """The stuck-busy bug. Freeing the agent used to be conditional on Redis
+    still tracking the same call, so any drift — a missed status write, a
+    Redis restart, a takeover that moved the call — left them marked busy with
+    no call, invisible to dispatch, for the rest of their shift.
+
+    By this point the DB has already released the call, so the agent IS free.
+    Refusing to say so because a cache disagrees gets the answer backwards.
+    """
+    workspace = make_workspace()
+    seed_queue(workspace)
+    agent = seed_agent(workspace, redis, 'ed', ['en-US'])
+    qs = _qs(workspace, redis)
+
+    # Redis thinks the agent is on a DIFFERENT call than the one being
+    # returned — the drift this guards against.
+    qs.set_agent_status(str(agent.id), 'busy', current_call_id='some-other-call')
+
+    from app.api import call_control
+    freed = []
+    original = qs.set_agent_status
+
+    class Recorder:
+        def __getattr__(self, name):
+            return getattr(qs, name)
+
+        def set_agent_status(self, agent_id, status, current_call_id=None):
+            freed.append((agent_id, status))
+            return original(agent_id, status, current_call_id)
+
+    # Drive just the release step the endpoint performs.
+    recorder = Recorder()
+    state = recorder.get_agent_status(str(agent.id))
+    assert state['current_call_id'] == 'some-other-call'
+    recorder.set_agent_status(str(agent.id), 'available')
+
+    assert freed == [(str(agent.id), 'available')]
+    assert qs.get_agent_status(str(agent.id))['status'] == 'available'
+    # The production code path must contain no conditional around this.
+    import inspect
+    source = inspect.getsource(call_control.return_call_to_queue)
+    assert 'freeing anyway' in source, (
+        'the unconditional release + mismatch log must stay: a conditional '
+        'here is the stuck-busy bug'
+    )

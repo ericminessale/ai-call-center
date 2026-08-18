@@ -318,9 +318,24 @@ def return_call_to_queue(call_id):
         try:
             from app.services.queue_service import QueueService
             qs = QueueService(get_redis_client(), workspace_id=call.workspace_id)
+            # Free the agent UNCONDITIONALLY. This used to only fire when
+            # Redis still agreed about which call the agent was on, which
+            # meant any drift — a missed status write, a Redis restart, a
+            # takeover that moved the call — left them marked busy with no
+            # call, invisible to dispatch, for the rest of their shift. The
+            # DB has already released the call by this point, so the agent
+            # IS free; refusing to say so because a cache disagrees gets the
+            # answer backwards. The mismatch is worth knowing about, so it is
+            # logged rather than silently swallowed.
             agent_state = qs.get_agent_status(str(user.id))
-            if agent_state and agent_state.get('current_call_id') == call.signalwire_call_sid:
-                qs.set_agent_status(str(user.id), 'available')
+            tracked = (agent_state or {}).get('current_call_id')
+            if agent_state and tracked != call.signalwire_call_sid:
+                logger.warning(
+                    f"return_to_queue: agent {user.id} Redis status tracked "
+                    f"call {tracked!r} but is returning {call.signalwire_call_sid!r} "
+                    "— freeing anyway"
+                )
+            qs.set_agent_status(str(user.id), 'available')
             # 5. Re-enqueue. Preserves AI-collected priority + context for
             # the next agent.
             qs.enqueue_call(

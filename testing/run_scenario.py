@@ -505,6 +505,17 @@ def check(op: str, actual, expected) -> bool:
         if not actual or not isinstance(actual, str):
             return False
         return re.search(str(expected), actual, re.IGNORECASE | re.DOTALL) is not None
+    if op == 'not_matches':
+        # The inverse burden, and the reason it is the right one here:
+        # certifying that a DENIAL is well-formed means enumerating every way
+        # a sentence can decline something, and three rounds of review found a
+        # new phrasing each time. Detecting the HARM is a much smaller target
+        # — a nonexistent product only hurts a caller when it is presented as
+        # purchasable. Absence of text fails, as with the other guards: a
+        # transcript nobody captured proves nothing.
+        if not actual or not isinstance(actual, str):
+            return False
+        return re.search(str(expected), actual, re.IGNORECASE | re.DOTALL) is None
     if op == 'not_contains_any':
         # A hallucination guard, so absence of evidence must NOT read as
         # evidence of absence. An empty or missing transcript means nothing

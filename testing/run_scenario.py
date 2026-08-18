@@ -494,6 +494,17 @@ def check(op: str, actual, expected) -> bool:
     if op == 'contains_any':
         return isinstance(actual, str) and any(
             str(e).lower() in actual.lower() for e in expected)
+    if op == 'matches':
+        # Case-insensitive regex over the agent's words. Two independent
+        # `contains` checks cannot express "the denial was ABOUT this
+        # product" — "we sell a smart home hub, but we don't carry cameras"
+        # satisfies both a product check and a denial check while being the
+        # exact failure they were meant to catch. Keeping the denial and the
+        # product inside one clause is a same-sentence pattern, which is what
+        # a regex is for.
+        if not actual or not isinstance(actual, str):
+            return False
+        return re.search(str(expected), actual, re.IGNORECASE | re.DOTALL) is not None
     if op == 'not_contains_any':
         # A hallucination guard, so absence of evidence must NOT read as
         # evidence of absence. An empty or missing transcript means nothing

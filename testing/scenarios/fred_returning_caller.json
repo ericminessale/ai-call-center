@@ -64,6 +64,8 @@
      "target": "report1.tool_calls_text", "op": "contains", "value": "smart home hub", "level": "soft"},
     {"label": "call 1: IF it used the catalog tool, the catalog answered NOT_IN_CATALOG (informational)",
      "target": "report1.tool_calls_text", "op": "contains", "value": "NOT_IN_CATALOG", "level": "soft"},
+    {"label": "call 1: the agent addressed the product the caller actually asked about",
+     "target": "report1.derived.ai_text", "op": "contains", "value": "smart home hub", "level": "hard"},
     {"label": "call 1: the caller was told we don't carry the product we don't sell",
      "target": "report1.derived.ai_text", "op": "contains_any",
      "value": ["don't sell", "dont sell", "do not sell", "don't carry", "dont carry", "do not carry", "don't have", "dont have", "not something we"], "level": "hard"},

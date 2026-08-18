@@ -999,31 +999,17 @@ def enqueue_and_build_swml(
                         try:
                             from app.services.interaction_timeline import best_effort, record_queue_offered
                             best_effort(record_queue_offered, call, selected_user.id, claim_at)
-                            # Language-preference FALLBACK: select_agent
-                            # prefers agents who speak the caller's language
-                            # and silently widens to everyone when none do.
-                            # Nothing recorded that widening, so the fully
-                            # built auto-translate at conference join
-                            # (conferences._maybe_start_live_translate, which
-                            # reads exactly this flag) could never fire on the
-                            # one path that needs it. queue_service's own
-                            # docstring names this contract — "translation
-                            # will then start at conference join (caller is
-                            # responsible for setting needs_translation)" —
-                            # and no caller was setting it.
-                            spoken = (agent_languages or {}).get(
-                                str(selected_user.id)
-                            ) or []
-                            if caller_language and spoken and (
-                                caller_language not in spoken
-                            ):
-                                call.needs_translation = True
-                                logger.info(
-                                    f"Language fallback on call {call.id}: caller "
-                                    f"speaks {caller_language}, agent "
-                                    f"{selected_user.id} speaks {spoken} — "
-                                    "flagged for live translation"
-                                )
+                            # Language-preference fallback -> live
+                            # translation. Shared with the delayed
+                            # push-dispatch path so a caller who WAITS for an
+                            # agent gets the same treatment as one dispatched
+                            # on arrival; that is the common case here, since
+                            # waiting is what happens when no matching agent
+                            # was free.
+                            from app.services.call_language import (
+                                flag_translation_if_mismatched,
+                            )
+                            flag_translation_if_mismatched(call, selected_user)
                             db.session.commit()
                             db.session.refresh(call)
                         except Exception:

@@ -360,3 +360,123 @@ def test_a_second_dispatch_cannot_steal_an_assigned_call(app, redis):
     db.session.refresh(call)
 
     assert call.assigned_agent_id == owner, 'ownership must not move'
+
+
+# ---------------------------------------------------------------------------
+# The paths the first version of this fix missed.
+# ---------------------------------------------------------------------------
+
+def test_the_flag_reads_the_agent_row_not_the_supplied_map(app, redis):
+    """Production builds the language map with
+    QueueService.get_languages_for_agents, which substitutes ['en-US'] for an
+    agent who declared nothing. Taking that map at face value reads undeclared
+    as an explicit English declaration and starts a paid translation stream on
+    no evidence. The first version of this test built the map by hand and so
+    never saw it.
+    """
+    workspace = make_workspace()
+    seed_queue(workspace)
+    agent = User(
+        email='undeclared@test.co', name='undeclared', workspace_id=workspace.id,
+        role='agent', is_active=True, languages=[],
+        signalwire_address='/private/undeclared',
+    )
+    agent.set_password('x')
+    db.session.add(agent)
+    db.session.commit()
+    redis.sadd('agents:available', str(agent.id))
+    from app.services.queue_service import QueueService
+    qs = QueueService(redis, workspace_id=workspace.id)
+    redis.sadd(qs._ws_agents_key(QUEUE_SLUG), str(agent.id))
+
+    # Exactly what production would pass: [] widened to ['en-US'].
+    assert qs.get_languages_for_agents([str(agent.id)]) == {str(agent.id): ['en-US']}
+
+    call = Call(
+        signalwire_call_sid='call-map-fidelity', workspace_id=workspace.id,
+        user_id=agent.id, from_number='+15551230000',
+        destination='+15559990000', destination_type='phone',
+        direction='inbound', status='waiting', caller_language='es-ES',
+        created_at=datetime.utcnow(),
+    )
+    db.session.add(call)
+    db.session.commit()
+
+    queue_dispatch.enqueue_and_build_swml(
+        call=call, queue_slug=QUEUE_SLUG, context={}, base_url=BASE_URL,
+        routing_strategy='round_robin', caller_language='es-ES',
+        agent_languages=qs.get_languages_for_agents([str(agent.id)]),
+        skill_levels={}, priority=5, start_live_transcribe=False,
+    )
+    db.session.refresh(call)
+
+    assert call.assigned_agent_id == agent.id
+    assert call.needs_translation is False, 'undeclared is not English'
+
+
+def test_direct_inbound_flags_without_being_handed_a_language_map(app, redis):
+    """/direct-inbound calls build_ingress_swml with no agent_languages at all,
+    so a version of this that trusted the map could never flag anything on the
+    path a PSTN caller actually arrives on."""
+    workspace = make_workspace()
+    seed_queue(workspace)
+    english = seed_agent(workspace, redis, 'ed', ['en-US'])
+
+    call = Call(
+        signalwire_call_sid='call-direct-inbound', workspace_id=workspace.id,
+        user_id=english.id, from_number='+15551230000',
+        destination='+15559990000', destination_type='phone',
+        direction='inbound', status='waiting', caller_language='es-ES',
+        created_at=datetime.utcnow(),
+    )
+    db.session.add(call)
+    db.session.commit()
+
+    queue_dispatch.enqueue_and_build_swml(
+        call=call, queue_slug=QUEUE_SLUG, context={}, base_url=BASE_URL,
+        routing_strategy='round_robin', caller_language='es-ES',
+        agent_languages=None,           # the direct-inbound shape
+        skill_levels={}, priority=5, start_live_transcribe=False,
+    )
+    db.session.refresh(call)
+
+    assert call.assigned_agent_id == english.id
+    assert call.needs_translation is True
+
+
+def test_a_caller_who_waits_is_flagged_when_an_agent_finally_takes_it(app, redis):
+    """The delayed path, and the one that matters most: waiting happens
+    precisely BECAUSE no language-matched agent was free, so the caller who
+    waits is more likely to need translation, not less."""
+    from app.services.call_language import flag_translation_if_mismatched
+
+    workspace = make_workspace()
+    seed_queue(workspace)
+    english = seed_agent(workspace, redis, 'ed', ['en-US'], available=False)
+
+    call = arrive(workspace, caller_language='es-ES', sid='call-waited')
+    assert call.assigned_agent_id is None, 'nobody was available at arrival'
+    assert call.needs_translation is False
+
+    # ...an agent goes available later and push-dispatch claims the call.
+    flagged = flag_translation_if_mismatched(call, english)
+    db.session.commit()
+    db.session.refresh(call)
+
+    assert flagged is True
+    assert call.needs_translation is True
+
+
+def test_the_flag_is_not_set_twice(app, redis):
+    """Idempotent: both claim points can run for one call across a
+    return-to-queue, and re-flagging should be a no-op rather than churn."""
+    from app.services.call_language import flag_translation_if_mismatched
+
+    workspace = make_workspace()
+    seed_queue(workspace)
+    english = seed_agent(workspace, redis, 'ed', ['en-US'])
+
+    call = arrive(workspace, caller_language='es-ES', agents=[english])
+    assert call.needs_translation is True
+
+    assert flag_translation_if_mismatched(call, english) is False

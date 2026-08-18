@@ -229,3 +229,48 @@ def restart_ai_leg_transcription(call, base_url):
             "transcript stays in the previous language): %s", sid, e,
         )
         return False
+
+
+def flag_translation_if_mismatched(call, agent) -> bool:
+    """Mark a call for live translation when its agent can't speak the caller's
+    language. Returns True when the flag was set.
+
+    Called at every point a human agent is CLAIMED — immediate dispatch at
+    arrival and the delayed push-dispatch when someone later goes available.
+    Both matter: the delayed path is the common one precisely when no
+    language-matched agent was free, which is exactly the case this exists
+    for.
+
+    ``select_agent`` prefers agents who speak the caller's language and
+    silently widens to the whole pool when none do;
+    ``conferences._maybe_start_live_translate`` starts translation at
+    conference join for anything flagged here. This is the wire between them.
+
+    Reads ``agent.languages`` off the User row rather than a passed-in map on
+    purpose. The map that production builds
+    (``QueueService.get_languages_for_agents``) substitutes ``['en-US']`` for
+    an agent who has declared nothing, which would read as an explicit English
+    declaration and start a paid translation stream against a Spanish caller
+    on no evidence at all. Undeclared is not English.
+    """
+    if call is None or agent is None or call.needs_translation:
+        return False
+
+    caller_language = derive_call_language(call)
+    spoken = getattr(agent, 'languages', None)
+    # Undeclared -> no evidence of a mismatch, so no translation.
+    if not caller_language or not spoken:
+        return False
+
+    if normalize_language(caller_language) in {
+        normalize_language(code) for code in spoken if code
+    }:
+        return False
+
+    call.needs_translation = True
+    logger.info(
+        "Language fallback on call %s: caller speaks %s, agent %s speaks %s "
+        "— flagged for live translation",
+        call.id, caller_language, agent.id, spoken,
+    )
+    return True

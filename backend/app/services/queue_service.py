@@ -572,7 +572,22 @@ class QueueService:
                         'id': call.id,
                     },
                 )
-                if not claim.fetchone():
+                if claim.fetchone():
+                    # Same language-fallback wire as immediate dispatch. A
+                    # caller who waited is MORE likely to need it, not less:
+                    # waiting is what happens when nobody who speaks their
+                    # language was free.
+                    try:
+                        from app.services.call_language import (
+                            flag_translation_if_mismatched,
+                        )
+                        flag_translation_if_mismatched(call, agent_user)
+                    except Exception as e:
+                        logger.warning(
+                            f"Push-dispatch: translation flag failed on call "
+                            f"{call_sid} (non-fatal): {e}"
+                        )
+                else:
                     # Lost the race — another worker already claimed this
                     # call. Don't emit, don't mark agent busy. The agent
                     # stays available for the next call.

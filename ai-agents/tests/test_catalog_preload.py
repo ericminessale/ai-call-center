@@ -152,6 +152,135 @@ def test_the_gateway_is_not_hit_once_per_call(monkeypatch):
     assert len(calls) == 1
 
 
+def test_two_tenants_on_one_gateway_do_not_share_a_catalog(monkeypatch):
+    """This process serves every workspace. Keying the cache on (url, tool)
+    alone served whichever tenant rendered first to both — one tenant's
+    product list inside another tenant's prompt."""
+    tenant_a = [{'id': 1, 'name': 'Shop', 'config': {
+        'gateway_url': 'https://gw.example', 'auth_user': 'a',
+        'auth_password': 'secret-a'}}]
+    tenant_b = [{'id': 2, 'name': 'Shop', 'config': {
+        'gateway_url': 'https://gw.example', 'auth_user': 'b',
+        'auth_password': 'secret-b'}}]
+
+    catalogs = {
+        'a': {'products': [{'name': 'Tenant A Widget', 'price': '$1.00'}]},
+        'b': {'products': [{'name': 'Tenant B Gadget', 'price': '$2.00'}]},
+    }
+    monkeypatch.setattr(main_agent, '_call_mcp_tool',
+                        lambda config, *a, **kw: catalogs[config['auth_user']])
+
+    agent_a = FakeAgent(_preload_mcp_tool='list_products')
+    agent_b = FakeAgent(_preload_mcp_tool='list_products')
+    main_agent.preload_mcp_context(agent_a, tenant_a)
+    main_agent.preload_mcp_context(agent_b, tenant_b)
+
+    assert 'Tenant A Widget' in agent_a.sections[0][1]
+    assert 'Tenant B Gadget' in agent_b.sections[0][1]
+    assert 'Tenant A Widget' not in agent_b.sections[0][1]
+
+
+def test_the_cache_key_does_not_store_the_password():
+    """It is process-global and long-lived; a cache key is not a place to
+    keep a credential."""
+    key = main_agent._preload_cache_key(
+        {'id': 1, 'name': 'Shop'},
+        {'gateway_url': 'https://gw.example', 'auth_user': 'u',
+         'auth_password': 'hunter2'},
+        'list_products',
+    )
+
+    assert 'hunter2' not in repr(key)
+
+
+def test_a_failing_gateway_is_not_retried_on_every_render(monkeypatch):
+    """The skill's own health check already paid one timeout. Re-probing here
+    on every sales call adds a second one to each render."""
+    calls = []
+
+    def _boom(*_args, **_kwargs):
+        calls.append(1)
+        raise RuntimeError('timeout')
+
+    monkeypatch.setattr(main_agent, '_call_mcp_tool', _boom)
+    for _ in range(4):
+        main_agent.preload_mcp_context(
+            FakeAgent(_preload_mcp_tool='list_products'), ENTRIES,
+        )
+
+    assert len(calls) == 1, 'failures must be cached like successes'
+
+
+def test_only_successfully_attached_gateways_are_preloaded():
+    """attach_mcp_gateways returns what it ATTACHED, not what was configured
+    — otherwise preload re-probes exactly the gateways that just failed."""
+    class Agent:
+        _mcp_agent_id = 'sales-ai'
+
+        def add_skill(self, _name, config):
+            if 'dead' in config['gateway_url']:
+                raise RuntimeError('connection refused')
+
+    entries = [
+        {'name': 'dead', 'config': {'gateway_url': 'http://dead:8100'}},
+        {'name': 'live', 'config': {'gateway_url': 'http://live:8100'}},
+    ]
+    main_agent._mcp_setup_failures.clear()
+
+    attached = main_agent.attach_mcp_gateways(
+        Agent(), {'workspace_id': 1, 'mcp_gateways': [
+            dict(e, bound_agent_ids=['sales-ai']) for e in entries
+        ]},
+    )
+
+    assert [e['name'] for e in attached] == ['live']
+
+
+@pytest.mark.parametrize('services,expected', [
+    (['catalog'], 'catalog'),
+    ([{'name': 'catalog', 'tools': ['list_products']}], 'catalog'),
+])
+def test_both_documented_service_shapes_resolve(services, expected):
+    """services_filter stores bare strings OR {name, tools} objects. The
+    object form was interpolated into the URL as a stringified dict, so
+    filtered configs attached tools fine and silently lost preloading."""
+    assert main_agent._resolve_service_for_tool(
+        {'gateway_url': 'https://gw.example', 'services': services},
+        'list_products',
+    ) == expected
+
+
+def test_the_service_is_discovered_when_none_is_configured(monkeypatch):
+    """Assuming 'demoshop' silently disabled preloading for every cloner
+    running their own MCP server under any other name."""
+    import requests
+
+    class Resp:
+        ok = True
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            pass
+
+    def _get(url, **_kwargs):
+        if url.endswith('/services'):
+            return Resp({'inventory': {}, 'catalog': {}})
+        if url.endswith('/catalog/tools'):
+            return Resp({'tools': [{'name': 'list_products'}]})
+        return Resp({'tools': [{'name': 'something_else'}]})
+
+    monkeypatch.setattr(requests, 'get', _get)
+
+    assert main_agent._resolve_service_for_tool(
+        {'gateway_url': 'https://gw.example'}, 'list_products',
+    ) == 'catalog'
+
+
 def test_sales_specialist_actually_opts_in():
     """The wiring itself. Without this, every test above passes against a
     FakeAgent while the live specialist declares nothing and gets nothing —

@@ -93,6 +93,60 @@ def test_anything_that_is_not_a_request_for_a_person_reads_as_absent(said):
     assert main_agent._human_request_evidence(raw) == 'ABSENT', said
 
 
+@pytest.mark.parametrize('said', [
+    # Spanish — this agent answers in es-ES, so an English-only word list
+    # silently forced every Spanish caller asking for a person to the AI.
+    'Quiero hablar con una persona',
+    'Prefiero un agente humano',
+    'Me puede pasar con alguien por favor',
+    # French — likewise fr-FR. Accents must fold, or none of these match.
+    'Je préfère un conseiller humain',
+    'Je voudrais parler à une personne',
+    "Passez-moi quelqu'un s'il vous plaît",
+])
+def test_a_request_for_a_person_counts_in_every_language_the_agent_speaks(said):
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == 'CONFIRMED', said
+
+
+@pytest.mark.parametrize('said', [
+    'I do not want a human, use the AI',
+    "I don't need a person, the assistant is fine",
+    'No quiero una persona, prefiero el asistente',
+    'Je ne veux pas de conseiller humain',
+])
+def test_a_negated_request_for_a_person_is_not_a_request(said):
+    """Word presence is not intent. Reading 'human' here and transferring is
+    the precise misroute the gate exists to prevent, delivered by the gate."""
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == 'ABSENT', said
+
+
+@pytest.mark.parametrize('said', [
+    "I don't want to talk to a robot",
+    'No quiero un robot',
+    'not the AI please',
+])
+def test_refusing_the_machine_is_a_request_for_a_person(said):
+    """The mirror case: negation flips an AI word into a human request."""
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == 'CONFIRMED', said
+
+
+def test_negation_does_not_leak_across_clauses():
+    """'I do not want a human, use the AI' must not let the leading 'not'
+    reach the second clause and flip 'AI' into a human request."""
+    raw = call_log(('user', 'I do not want a human, use the AI'))
+    assert main_agent._human_request_evidence(raw) == 'ABSENT'
+
+    # ...and the converse still reads correctly.
+    raw = call_log(('user', "I don't like waiting, get me a person"))
+    assert main_agent._human_request_evidence(raw) == 'CONFIRMED'
+
+
 def test_only_the_callers_words_count_not_the_agents():
     """The offer itself contains 'human specialist'. Reading the wrong role
     would make every caller look like they asked for a person — the gate would

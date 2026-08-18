@@ -426,14 +426,25 @@ def find_product(name: str) -> dict:
         for row in rows:
             name_tokens = {t for t in _tokenize(row["name"].lower()) if len(t) > 2}
             overlap = query_tokens & name_tokens
-            # A single shared word is NOT a match. "Smart Home Hub" overlaps
-            # "7-Port USB Hub w/ Power" on "hub" alone, and answering that with
-            # a real product at a real price is worse than answering "we don't
-            # carry it" — it destroys the not-in-catalog signal this tool
-            # exists to give, and hands the model a confident wrong answer.
-            # Requiring half the caller's words keeps "wireless earbuds" (2/2)
-            # and "laptop stand" (2/2) while rejecting "smart home hub" (1/3).
-            if overlap and len(overlap) / len(query_tokens) >= 0.5:
+            # A single shared word is NOT a match, at ANY query length.
+            # "Smart Home Hub" overlaps "7-Port USB Hub w/ Power" on "hub"
+            # alone; answering that with a real product at a real price is
+            # worse than saying "we don't carry it", because it destroys the
+            # not-in-catalog signal this tool exists to give.
+            #
+            # A ratio alone doesn't express that: at two tokens, one overlap
+            # IS half, so "Smart Hub" and "Home Hub" both sailed through while
+            # the three-word form was correctly rejected. So the rule is a
+            # count, not a proportion — two shared words, unless the caller
+            # only gave one word to work with ("headphones", "hub"), in which
+            # case matching it is the best available reading of what they said.
+            if not overlap:
+                continue
+            enough = (
+                len(overlap) >= 2 if len(query_tokens) >= 2
+                else len(overlap) == 1
+            )
+            if enough:
                 scored.append((len(overlap) / len(query_tokens), row))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         if scored:

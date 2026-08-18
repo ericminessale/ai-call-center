@@ -133,6 +133,37 @@ def test_punctuated_names_still_match_spoken_words(shop):
     assert result['product']['availability'] == 'out of stock'
 
 
+@pytest.mark.parametrize('spoken', [
+    'Smart Home Hub',   # 1 of 3
+    'Smart Hub',        # 1 of 2 — exactly half, which a ratio rule allowed
+    'Home Hub',         # 1 of 2
+    'gaming headset',   # shares nothing meaningful
+])
+def test_one_shared_word_never_matches_at_any_query_length(shop, spoken):
+    """A proportional threshold could not express this: at two tokens one
+    overlap IS half, so 'Smart Hub' and 'Home Hub' resolved to a real hub at
+    a real price while the three-word form was correctly rejected — the same
+    false-product bug in a shorter sentence."""
+    fixture_hub = ('HUB-USB', '7-Port USB Hub w/ Power', 3499, 9, 244)
+    import sqlite3
+    conn = sqlite3.connect(os.environ['SHOP_DB_PATH'])
+    conn.execute('INSERT INTO products VALUES (?,?,?,?,?)', fixture_hub)
+    conn.commit()
+    conn.close()
+
+    result = _call(shop.find_product)(spoken)
+
+    assert result['found'] is False, spoken
+    assert result['reason'] == 'NOT_IN_CATALOG'
+
+
+def test_a_single_word_query_still_matches(shop):
+    """One word is all the caller gave; matching it is the best available
+    reading of what they said."""
+    assert _call(shop.find_product)('earbuds')['product']['name'] == \
+        'True Wireless Earbuds'
+
+
 def test_one_shared_word_is_not_a_match(shop):
     """Caught on a live call: 'Smart Home Hub' matched '7-Port USB Hub w/
     Power' on the word 'hub' alone, so the tool answered an invented product

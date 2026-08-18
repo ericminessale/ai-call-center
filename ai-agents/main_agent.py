@@ -848,6 +848,11 @@ def attach_mcp_gateways(agent, call_ctx=None):
     entries, source = _resolve_mcp_entries(agent_id, call_ctx)
 
     import time
+    # Only the gateways that actually came up. Callers (preload_mcp_context)
+    # must not re-probe a gateway whose health check just failed or that the
+    # negative cache is deliberately skipping — that turns one timeout per
+    # window back into two per render.
+    attached = []
     for entry in entries:
         name = entry.get('name', '<unnamed>')
         config = entry.get('config') or {}
@@ -866,6 +871,7 @@ def attach_mcp_gateways(agent, call_ctx=None):
             continue
         try:
             agent.add_skill("mcp_gateway", config)
+            attached.append(entry)
             with _mcp_fail_lock:
                 _mcp_setup_failures.pop(gateway_url, None)
             log_key = (agent_id, name, source)
@@ -886,7 +892,7 @@ def attach_mcp_gateways(agent, call_ctx=None):
                 f"(negative-cached {_MCP_FAIL_TTL_SECONDS}s): {e}",
                 flush=True,
             )
-    return entries
+    return attached
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +923,103 @@ _preload_cache: dict = {}
 _preload_lock = threading.Lock()
 
 
-def _call_mcp_tool(config, tool_name, arguments=None):
+def _preload_cache_key(entry, config, tool_name):
+    """Cache identity for one preload result.
+
+    This process serves every workspace, so the key has to name the TENANT
+    CONFIGURATION, not just the URL. Two workspaces can point at the same
+    hosted gateway with different credentials and get different catalogs;
+    keying on (url, tool) alone served whichever rendered first to both — one
+    tenant's product list inside another tenant's prompt.
+
+    Credentials are hashed rather than stored: this dict is process-global and
+    long-lived, and a cache key is not a place to keep a password.
+    """
+    secret = f"{config.get('auth_user') or ''}:" \
+             f"{config.get('auth_password') or ''}:" \
+             f"{config.get('auth_token') or ''}"
+    return (
+        entry.get('id'),
+        entry.get('name'),
+        config.get('gateway_url'),
+        tuple(_configured_service_names(config)),
+        hashlib.sha256(secret.encode()).hexdigest()[:16],
+        tool_name,
+    )
+
+
+def _gateway_auth(config):
+    """(auth tuple, headers) for a gateway config."""
+    headers = {'Content-Type': 'application/json'}
+    if config.get('auth_token'):
+        headers['Authorization'] = f"Bearer {config['auth_token']}"
+        return None, headers
+    if config.get('auth_user') is not None:
+        return (config.get('auth_user') or '',
+                config.get('auth_password') or ''), headers
+    return None, headers
+
+
+def _configured_service_names(config):
+    """Service names from the SDK's ``services`` param.
+
+    Accepts BOTH documented shapes — bare strings and
+    ``{"name": ..., "tools": [...]}`` objects (McpGatewayConfig.services_filter
+    stores either). Interpolating the dict straight into a URL produced a path
+    containing a stringified Python object and a silent preload failure.
+    """
+    names = []
+    for service in config.get('services') or []:
+        if isinstance(service, str) and service:
+            names.append(service)
+        elif isinstance(service, dict) and service.get('name'):
+            names.append(service['name'])
+    return names
+
+
+def _resolve_service_for_tool(config, tool_name):
+    """Which service on this gateway exposes ``tool_name``.
+
+    One configured service is taken at its word. Otherwise ask the gateway,
+    because assuming 'demoshop' silently disables preloading for every cloner
+    who runs their own MCP server under any other name.
+    """
+    import requests
+
+    names = _configured_service_names(config)
+    if len(names) == 1:
+        return names[0]
+
+    gateway_url = (config.get('gateway_url') or '').rstrip('/')
+    auth, headers = _gateway_auth(config)
+    timeout = config.get('request_timeout', 5)
+    if not names:
+        resp = requests.get(f"{gateway_url}/services", auth=auth,
+                            headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        listing = resp.json()
+        names = list(listing.keys()) if isinstance(listing, dict) else [
+            s.get('name') for s in listing if isinstance(s, dict)
+        ]
+
+    for name in names:
+        if not name:
+            continue
+        resp = requests.get(f"{gateway_url}/services/{name}/tools", auth=auth,
+                            headers=headers, timeout=timeout)
+        if not resp.ok:
+            continue
+        payload = resp.json()
+        tools = payload.get('tools', payload) if isinstance(payload, dict) else payload
+        exposed = {
+            t.get('name') for t in tools if isinstance(t, dict)
+        } if isinstance(tools, list) else set()
+        if tool_name in exposed:
+            return name
+    return None
+
+
+def _call_mcp_tool(config, tool_name, arguments=None, service=None):
     """Invoke one tool on an MCP gateway over its HTTP API.
 
     Reads the same config the SDK skill gets (McpGatewayConfig.to_skill_config):
@@ -930,16 +1032,12 @@ def _call_mcp_tool(config, tool_name, arguments=None):
     gateway_url = (config.get('gateway_url') or '').rstrip('/')
     if not gateway_url:
         return None
-    services = config.get('services') or []
-    service = services[0] if services else 'demoshop'
+    if service is None:
+        service = _resolve_service_for_tool(config, tool_name)
+    if not service:
+        return None
 
-    auth = None
-    headers = {'Content-Type': 'application/json'}
-    if config.get('auth_token'):
-        headers['Authorization'] = f"Bearer {config['auth_token']}"
-    elif config.get('auth_user') is not None:
-        auth = (config.get('auth_user') or '', config.get('auth_password') or '')
-
+    auth, headers = _gateway_auth(config)
     resp = requests.post(
         f"{gateway_url}/services/{service}/call",
         json={
@@ -1000,7 +1098,7 @@ def preload_mcp_context(agent, entries):
 
     for entry in entries:
         config = entry.get('config') or {}
-        cache_key = (config.get('gateway_url'), tool_name)
+        cache_key = _preload_cache_key(entry, config, tool_name)
         now = time.time()
         with _preload_lock:
             cached = _preload_cache.get(cache_key)
@@ -1010,9 +1108,14 @@ def preload_mcp_context(agent, entries):
             try:
                 result = _call_mcp_tool(config, tool_name)
             except Exception as e:
+                # Cache the FAILURE too. Without this a dead or slow gateway
+                # costs every sales render another timeout, on top of the one
+                # the skill's own health check already paid.
+                with _preload_lock:
+                    _preload_cache[cache_key] = (now, '')
                 print(
-                    f"Catalog preload skipped ({tool_name} via "
-                    f"{config.get('gateway_url')!r}): {e}",
+                    f"Catalog preload skipped for {_PRELOAD_TTL_SECONDS}s "
+                    f"({tool_name} via {config.get('gateway_url')!r}): {e}",
                     flush=True,
                 )
                 continue
@@ -2244,13 +2347,69 @@ def configure_triage_queues(agent, queues, caller=None):
 # caller SAID rather than what the model concluded they meant.
 # ---------------------------------------------------------------------------
 
-# Asking for a person takes many forms; note that naming the machine ("I don't
-# want a robot") is one of them, which is why bot words appear here.
-_HUMAN_REQUEST_TERMS = (
+# This agent answers in English, Spanish and French (see add_language), so the
+# gate has to read all three — an English-only word list silently forces every
+# Spanish caller who asks for "una persona" to the AI.
+_HUMAN_TERMS = frozenset({
+    # English
     'human', 'person', 'people', 'agent', 'representative', 'rep',
-    'someone', 'somebody', 'operator', 'real', 'live', 'actual',
-    'robot', 'bot', 'machine', 'computer',
-)
+    'someone', 'somebody', 'operator', 'live', 'actual',
+    # Spanish
+    'persona', 'humano', 'humana', 'agente', 'representante', 'alguien',
+    'operador', 'operadora',
+    # French
+    'humain', 'humaine', 'personne', 'conseiller', 'conseillere',
+    'representant', 'representante', 'quelquun', 'operateur',
+})
+
+# Naming the machine is a request for a person only when it's NEGATED — "I
+# don't want a robot" wants a human, "the AI is fine" does not. Polarity does
+# that work, so these live here rather than in the human list.
+_AI_TERMS = frozenset({
+    'ai', 'bot', 'robot', 'machine', 'computer', 'automated', 'assistant',
+    'asistente', 'automatico', 'automatica', 'maquina', 'artificial',
+    'virtuel', 'virtuelle', 'machinerie', 'ordinateur',
+})
+
+_NEGATORS = frozenset({
+    'not', 'dont', 'doesnt', 'cant', 'wont', 'no', 'never', 'nor',
+    'sin', 'nunca', 'tampoco',
+    'pas', 'ne', 'non', 'sans', 'jamais', 'aucun', 'aucune',
+})
+
+# Clause boundaries. Negation is scoped to its own clause so "I do not want a
+# human, use the AI" doesn't let the leading "not" flip the second half.
+_CLAUSE_SPLIT = re.compile(r'[,;.!?]| but | pero | mais | and | y | et ')
+
+
+def _fold(text: str) -> str:
+    """Lowercase, strip accents, drop punctuation.
+
+    Accent folding is not cosmetic here: without it "préfère un conseiller
+    humain" tokenizes to accented forms that match nothing.
+
+    Apostrophes are DELETED rather than turned into spaces, which is the
+    difference between "don't" reading as a negator and reading as the two
+    meaningless tokens "don" and "t" — and likewise between "quelqu'un" being
+    a person and being nothing at all.
+    """
+    import unicodedata
+    decomposed = unicodedata.normalize('NFKD', text.lower())
+    stripped = ''.join(c for c in decomposed if not unicodedata.combining(c))
+    for apostrophe in ("'", '’', 'ʼ', '`'):
+        stripped = stripped.replace(apostrophe, '')
+    return ''.join(c if c.isalnum() else ' ' for c in stripped)
+
+
+def _clauses(text: str):
+    """Split into clauses BEFORE folding.
+
+    Order matters: _fold turns punctuation into spaces, so folding first
+    erases the very commas this splits on — and "I do not want a human, use
+    the AI" collapses into one clause where the leading negator governs
+    everything.
+    """
+    return [_fold(part) for part in _CLAUSE_SPLIT.split(text.lower())]
 
 
 def _last_caller_utterance(raw_data) -> str:
@@ -2282,14 +2441,20 @@ def _human_request_evidence(raw_data) -> str:
     utterance = _last_caller_utterance(raw_data)
     if not utterance:
         return 'UNAVAILABLE'
-    words = {
-        token
-        for token in ''.join(
-            char if char.isalnum() else ' ' for char in utterance.lower()
-        ).split()
-    }
-    if words & set(_HUMAN_REQUEST_TERMS):
-        return 'CONFIRMED'
+
+    # Per clause, because polarity is what separates "I don't want a human"
+    # from "I want a human", and a clause is the scope a negator governs.
+    for clause in _clauses(utterance):
+        tokens = clause.split()
+        negated = False
+        for token in tokens:
+            if token in _NEGATORS:
+                negated = True
+                continue
+            if token in _HUMAN_TERMS and not negated:
+                return 'CONFIRMED'          # "put me through to a person"
+            if token in _AI_TERMS and negated:
+                return 'CONFIRMED'          # "I don't want a robot"
     return 'ABSENT'
 
 

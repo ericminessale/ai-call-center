@@ -280,8 +280,35 @@ def _tool_call_already_emitted(call_ref, function_name, epoch_time) -> bool:
         return False
 
 
+def _tool_response_excerpt(entry, limit=400):
+    """A short, readable form of what the tool returned.
+
+    ``post_response`` is the platform's echo of the tool's own return value.
+    MCP results arrive as a JSON string nested inside it, so unwrap one level
+    when possible — an escaped blob is unreadable in a panel and unassertable
+    in a test.
+    """
+    if not isinstance(entry, dict):
+        return None
+    response = entry.get('post_response')
+    if response is None:
+        return None
+    if isinstance(response, dict):
+        inner = response.get('response')
+        if isinstance(inner, str) and inner.strip().startswith(('{', '[')):
+            try:
+                response = json.loads(inner)
+            except (ValueError, TypeError):
+                response = inner
+    try:
+        text = response if isinstance(response, str) else json.dumps(response)
+    except (TypeError, ValueError):
+        text = str(response)
+    return text[:limit]
+
+
 def _persist_tool_call(call, *, function_name, arguments, source, epoch_time,
-                       call_sid, ai_session_id):
+                       call_sid, ai_session_id, response_excerpt=None):
     """Durably record one invocation. Returns True when a row was written.
 
     Deliberately does NOT consult :func:`_tool_call_already_emitted`. That
@@ -335,6 +362,7 @@ def _persist_tool_call(call, *, function_name, arguments, source, epoch_time,
                 # is exactly the distinction that proves the terminal
                 # session's backfill landed.
                 'ai_session_id': ai_session_id,
+                'response_excerpt': response_excerpt,
             },
             call_id=call.id,
         )
@@ -403,6 +431,13 @@ def _emit_swaig_tool_call(entry, *, source, call=None):
             else None
         )
         epoch_time = entry.get('epoch_time')
+        # What the tool ANSWERED, truncated. Without it a persisted row shows
+        # that a lookup happened but not what it found, so "the agent checked
+        # the catalog" cannot be told apart from "the agent checked the
+        # catalog and then contradicted it" — which is the failure this
+        # telemetry exists to catch. An excerpt, not the body: a panel row,
+        # not an archive.
+        response_excerpt = _tool_response_excerpt(entry)
         _persist_tool_call(
             call,
             function_name=function_name,
@@ -411,6 +446,7 @@ def _emit_swaig_tool_call(entry, *, source, call=None):
             epoch_time=epoch_time,
             call_sid=call_sid,
             ai_session_id=ai_session_id,
+            response_excerpt=response_excerpt,
         )
 
         # Only NOW the socket dedupe, which governs the live emit alone.

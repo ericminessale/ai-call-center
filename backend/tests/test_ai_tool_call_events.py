@@ -799,3 +799,56 @@ def test_debug_events_ignores_non_tool_telemetry(monkeypatch):
 
     assert response[1] == 200
     assert events == []
+
+
+def test_the_tool_result_is_persisted_alongside_the_call(monkeypatch):
+    """A row showing that a lookup happened, but not what it found, cannot
+    tell "checked the catalog" apart from "checked the catalog and then
+    contradicted it" — which is the failure this telemetry exists to catch."""
+    persisted = []
+    monkeypatch.setattr(webhooks, '_tool_call_already_emitted',
+                        lambda *a, **kw: False)
+    monkeypatch.setattr(webhooks, 'WebhookEvent', SimpleNamespace(
+        query=SimpleNamespace(filter_by=lambda **kw: SimpleNamespace(
+            all=lambda: list(persisted))),
+        log_event=lambda **kw: persisted.append(
+            SimpleNamespace(payload=kw['payload'])),
+    ))
+    monkeypatch.setattr(callcenter_socketio, 'emit_call_event',
+                        lambda *a, **kw: None)
+
+    entry = swaig_envelope(post_response={
+        'response': '{"found": false, "reason": "NOT_IN_CATALOG"}'})
+    webhooks._emit_swaig_tool_call(entry, source='post_prompt', call=fake_call())
+
+    excerpt = persisted[0].payload['response_excerpt']
+    assert 'NOT_IN_CATALOG' in excerpt
+    # Unwrapped one level: an escaped blob is unreadable in a panel and
+    # unassertable in a scenario.
+    assert '\\"' not in excerpt
+
+
+def test_a_tool_with_no_recorded_response_persists_cleanly(monkeypatch):
+    persisted = []
+    monkeypatch.setattr(webhooks, '_tool_call_already_emitted',
+                        lambda *a, **kw: False)
+    monkeypatch.setattr(webhooks, 'WebhookEvent', SimpleNamespace(
+        query=SimpleNamespace(filter_by=lambda **kw: SimpleNamespace(
+            all=lambda: list(persisted))),
+        log_event=lambda **kw: persisted.append(
+            SimpleNamespace(payload=kw['payload'])),
+    ))
+    monkeypatch.setattr(callcenter_socketio, 'emit_call_event',
+                        lambda *a, **kw: None)
+
+    webhooks._emit_swaig_tool_call(
+        swaig_envelope(), source='post_prompt', call=fake_call())
+
+    assert persisted[0].payload['response_excerpt'] is None
+
+
+def test_a_huge_tool_response_is_truncated():
+    """This is a panel row, not an archive."""
+    entry = {'post_response': {'response': 'x' * 5000}}
+
+    assert len(webhooks._tool_response_excerpt(entry)) == 400

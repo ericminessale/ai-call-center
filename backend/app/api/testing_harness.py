@@ -315,6 +315,7 @@ def call_report():
                 'arguments': (e.payload or {}).get('arguments') or {},
                 'source': (e.payload or {}).get('source'),
                 'ai_session_id': (e.payload or {}).get('ai_session_id'),
+                'response_excerpt': (e.payload or {}).get('response_excerpt'),
                 'at': e.created_at.isoformat() if e.created_at else None,
             }
             for e in tool_events
@@ -322,6 +323,19 @@ def call_report():
         ]
         # Joined for the harness's string ops (contains/contains_any) — the
         # assertion vocabulary has no list-membership operator.
+        # Name, arguments AND result in one assertable string. A scenario
+        # that can only see the tool NAME cannot tell "looked up the product
+        # the caller asked about and was told we don't sell it" from "looked
+        # up something else" — and that distinction is the whole point of
+        # asserting on a catalog lookup.
+        report['tool_calls_text'] = ' | '.join(
+            '{}({}) -> {}'.format(
+                t['function_name'] or '',
+                json.dumps(t['arguments'], sort_keys=True),
+                t['response_excerpt'] or '',
+            )
+            for t in report['tool_calls']
+        )
         report['tool_call_names'] = ','.join(
             t['function_name'] or '' for t in report['tool_calls']
         )

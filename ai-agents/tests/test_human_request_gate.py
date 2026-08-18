@@ -200,3 +200,43 @@ def test_folding_still_handles_elision_and_contractions():
     assert 'agent' in main_agent._fold("l'agent").split()
     assert 'dont' in main_agent._fold("I don't").split()
     assert 'quelquun' in main_agent._fold("quelqu'un").split()
+
+
+# ---------------------------------------------------------------------------
+# Round five: the presence vocabulary has to match the labels the OFFER uses,
+# and must not treat adjectives as people.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('said', [
+    'The specialist, please',      # the exact label the offer uses
+    'the human specialist',
+    'quiero un especialista',
+    'le specialiste',
+])
+def test_the_offered_label_counts_as_naming_an_option(said):
+    """The offer says "a human sales SPECIALIST, or our AI assistant". A
+    caller echoing that back named an option; reading it as naming nobody
+    overrode an explicit choice with an AI transfer."""
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == 'CONFIRMED', said
+
+
+@pytest.mark.parametrize('said', [
+    'Can you check live availability?',
+    'the actual price please',
+    'is that the real price',
+])
+def test_bare_adjectives_are_not_people(said):
+    """'live', 'actual' and 'real' standing alone turned ordinary product
+    questions into option-naming turns."""
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == 'ABSENT', said
+
+
+@pytest.mark.parametrize('said', ['a real person please', 'an actual human'])
+def test_those_adjectives_still_work_with_their_noun(said):
+    raw = call_log(('assistant', OFFER), ('user', said))
+
+    assert main_agent._human_request_evidence(raw) == 'CONFIRMED', said

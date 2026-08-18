@@ -355,7 +355,8 @@ def poll_report(cfg: Config, since_iso: str, gates: dict, timeout_s: int = 150):
     """Poll /call-report until the awaited artifacts exist.
 
     Gates: summary (post-prompt landed), digest (caller memory finalized),
-    transcript (any rows), tools (at least one ai_tool_call row persisted).
+    transcript (any rows), tools (ai_tool_call rows persisted — pass ``true``
+    for any, or a tool NAME to wait for that specific one).
     Returns the last report seen even on timeout.
 
     `tools` is a separate gate from `summary` because post_prompt writes the
@@ -380,8 +381,18 @@ def poll_report(cfg: Config, since_iso: str, gates: dict, timeout_s: int = 150):
                 ok = False
             if gates.get('transcript') and not report.get('transcript'):
                 ok = False
-            if gates.get('tools') and not report.get('tool_calls'):
-                ok = False
+            tools_gate = gates.get('tools')
+            if tools_gate:
+                names = report.get('tool_call_names') or ''
+                if not report.get('tool_calls'):
+                    ok = False
+                elif isinstance(tools_gate, str) and tools_gate not in names:
+                    # Naming the tool matters: triage persists its own calls
+                    # well before the specialist's post_prompt runs, so "any
+                    # tool row exists" can be true while the tool a hard
+                    # assertion is about has not landed yet. That is a false
+                    # failure on a correct call.
+                    ok = False
             if ok:
                 return report
         time.sleep(5)

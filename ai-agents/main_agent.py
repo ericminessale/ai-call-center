@@ -526,6 +526,15 @@ def get_active_queues():
 # call_db_id (health checks, direct pokes) run on the boot/template config,
 # which carries no tenant data.
 # ---------------------------------------------------------------------------
+# Returned when a call DOES name a workspace but we could not reach the
+# backend to find out which. Distinct from None ("no tenant context asked
+# for"), because the two must not be handled the same way: None means run on
+# the template config, and doing that for a real tenant call binds the DEFAULT
+# workspace's KB collection and MCP gateways — i.e. serves one workspace's
+# data, and its gateway credentials, to another. A transient backend blip is
+# exactly when that would happen.
+_CTX_UNAVAILABLE = object()
+
 _CTX_TTL_SECONDS = 30.0
 _ctx_cache = {}  # call_db_id(str) -> (payload_or_None, fetched_at)
 _ctx_cache_lock = threading.Lock()
@@ -574,8 +583,10 @@ def fetch_call_context(call_db_id, ctk=None):
             return None
         else:
             print(f"Warning: call-context for call {call_db_id} returned HTTP {resp.status_code}", flush=True)
+            payload = _CTX_UNAVAILABLE
     except Exception as e:
         print(f"Warning: call-context fetch failed for call {call_db_id}: {e}", flush=True)
+        payload = _CTX_UNAVAILABLE
     with _ctx_cache_lock:
         if len(_ctx_cache) > 512:
             _ctx_cache.clear()
@@ -1502,6 +1513,19 @@ def capture_base_url(query_params, body_params, headers, agent):
         call_db_id = gd.get('call_db_id')
         ctk = ctk or gd.get('ctk')
     tenant_ctx = fetch_call_context(call_db_id, ctk)
+    # Fail CLOSED when this call named a workspace we could not resolve. The
+    # template config is the default workspace's real KB collection and real
+    # MCP gateways (credentials included), so falling back to it during a
+    # backend blip hands one tenant's data to another. No tenant data at all
+    # is a degraded call; the wrong tenant's data is an incident.
+    tenant_unavailable = tenant_ctx is _CTX_UNAVAILABLE
+    if tenant_unavailable:
+        tenant_ctx = None
+        print(
+            f"call-context unavailable for call {call_db_id} — running "
+            "without KB or external tools rather than on template config",
+            flush=True,
+        )
 
     # Caller memory (R1, CONTEXT_AUDIT_2026-08-04): the backend's tiered
     # contact block. Only inbound agents opt in via _inbound_caller_memory —
@@ -1544,11 +1568,14 @@ def capture_base_url(query_params, body_params, headers, agent):
         kb_override = (tenant_ctx.get('kb_assignments') or {}).get(
             getattr(agent, '_kb_agent_id', None)
         )
-    attach_knowledge_search(agent, collection_override=kb_override)
+    if not tenant_unavailable:
+        attach_knowledge_search(agent, collection_override=kb_override)
 
     # MCP gateway skills — per-request since Phase 4 (boot registration
     # removed; see attach_mcp_gateways for the duplicate-skip rationale).
-    mcp_entries = attach_mcp_gateways(agent, tenant_ctx)
+    mcp_entries = (
+        [] if tenant_unavailable else attach_mcp_gateways(agent, tenant_ctx)
+    )
 
     # ...and, for agents that declare one, that gateway's reference data
     # straight into the prompt. Having the catalog tool available did not
@@ -2433,15 +2460,25 @@ _HUMAN_TERMS = frozenset({
     # English
     'human', 'humans', 'person', 'people', 'agent', 'agents',
     'representative', 'representatives', 'rep', 'someone', 'somebody',
-    'operator', 'operators', 'live', 'actual', 'real',
+    'operator', 'operators',
+    # The word the offer itself uses for the human option: "a human sales
+    # SPECIALIST, or our AI assistant". A caller echoing the label back —
+    # "the specialist, please" — has named an option, and reading that as
+    # naming nobody overrode an explicit choice with an AI transfer.
+    'specialist', 'specialists',
+    # Deliberately NOT 'live'/'actual'/'real'. Those are adjectives, not
+    # people, and standing alone they turned ordinary product questions
+    # ("can you check live availability?", "is that the real price") into
+    # option-naming turns. Every phrasing that matters carries a noun too:
+    # "a real person", "an actual human".
     # Spanish
     'persona', 'personas', 'humano', 'humana', 'humanos', 'agente',
     'agentes', 'representante', 'representantes', 'alguien', 'operador',
-    'operadora',
+    'operadora', 'especialista', 'especialistas',
     # French
     'humain', 'humaine', 'humains', 'personne', 'personnes', 'conseiller',
     'conseillere', 'conseillers', 'representant', 'representants',
-    'quelquun', 'operateur',
+    'quelquun', 'operateur', 'specialiste', 'specialistes',
 })
 
 # Naming the machine is a request for a person only when it's REJECTED — "I

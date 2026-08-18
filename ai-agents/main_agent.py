@@ -2465,20 +2465,6 @@ _NEGATORS = frozenset({
     'pas', 'ne', 'non', 'sans', 'jamais', 'aucun', 'aucune',
 })
 
-# "the AI rather THAN a person", "the AI OVER a human" — whatever follows is
-# the option being turned down. Deliberately NOT 'rather' on its own: "I would
-# rather have a human" is a request, and only the "rather than" pairing is a
-# rejection, which 'than' already catches.
-_REJECTION_MARKERS = frozenset({
-    'than', 'instead', 'over', 'versus', 'vs', 'opposed',
-    'plutot', 'lieu', 'lugar', 'vez',
-})
-
-# Clause boundaries. Each clause is scored on its own so a correction ("I
-# wanted a human before, BUT use the AI now") isn't decided by the clause the
-# caller is walking back.
-_CLAUSE_SPLIT = re.compile(r'[,;.!?]| but | pero | mais | and | y | et ')
-
 # Word-initial elision: l'agent, d'un, qu'il. Folding the apostrophe away
 # glues these into "lagent", which matches nothing. English contractions are
 # the opposite case — "don't" must become "dont" to read as a negator — and
@@ -2495,12 +2481,6 @@ def _fold(text: str) -> str:
     for apostrophe in ("'", '’', 'ʼ', '`'):
         stripped = stripped.replace(apostrophe, '')
     return ''.join(c if c.isalnum() else ' ' for c in stripped)
-
-
-def _clauses(text: str):
-    """Split into clauses BEFORE folding — _fold turns the commas this splits
-    on into spaces."""
-    return [_fold(part) for part in _CLAUSE_SPLIT.split(text.lower())]
 
 
 def _last_caller_utterance(raw_data) -> str:
@@ -2520,81 +2500,50 @@ def _last_caller_utterance(raw_data) -> str:
 
 
 def _human_request_evidence(raw_data) -> str:
-    """Did the caller's own last turn end up asking for a person?
+    """Did the caller's last turn name an option at all?
 
-    Returns 'CONFIRMED', 'ABSENT', or 'UNAVAILABLE'.
+    Returns 'CONFIRMED' (the turn talks about a person — leave the model's
+    routing alone), 'ABSENT' (no choice was expressed — apply the documented
+    default and route to the AI), or 'UNAVAILABLE' (no transcript; defer).
 
-    Scores the WHOLE utterance and lets the last explicit choice win, because
-    a spoken sentence routinely mentions both options before settling on one:
+    This deliberately does NOT decide WHICH option the caller picked. Earlier
+    versions tried, and review found five different ways for keyword-and-
+    polarity parsing to get that wrong — comparisons ("the AI over a human"),
+    corrections ("I wanted a human before, but..."), post-target negation ("a
+    human isn't what I want"), explanations that mention the rejected option
+    ("get me a person, the bot is useless"), and every phrasing in three
+    languages that nobody had enumerated yet. Each fix bought one sentence and
+    left the shape of the problem intact, because deciding intent from free
+    speech is not a job a word list can hold.
 
-        "I would rather use the AI than talk to a person"   -> AI
-        "I wanted a human before, but use the AI now"       -> AI
-        "I do not want a human use the AI"                  -> AI
-        "no quiero la IA"                                   -> human
+    So the gate answers only the question it was built for and can answer.
+    The bug it exists to stop was a caller who said "I would prefer" — cut off
+    mid-answer, no option named — being routed to a hold queue on a guess. A
+    turn with no option in it is that case, and the offer_transfer step already
+    documents the answer: the AI assistant, which is recoverable, rather than
+    a queue, which is not.
 
-    Returning on the first human-shaped word got every one of those wrong, in
-    the direction that parks the caller on hold.
-
-    UNAVAILABLE — no call_log at all — must be treated as permission, not
-    refusal. Any deployment where swaig_post_conversation isn't honoured would
-    otherwise reroute every genuine request for a human, which is a far worse
-    failure than the one this guards against.
+    When the caller DOES name a person, the model's reading stands. That is
+    strictly better than what this code was doing: it was overriding the model
+    with a worse parser, and the override could itself produce the expensive
+    misroute. If enforcing an explicit choice turns out to matter, the answer
+    is a structured one (a DTMF digit, or an enum the tool validates), not
+    more parsing.
     """
     utterance = _last_caller_utterance(raw_data)
     if not utterance:
         return 'UNAVAILABLE'
 
-    decisions = []
-    for clause in _clauses(utterance):
-        tokens = clause.split()
-        pending_negation = False
-        after_rejection = False
-        previous_target_index = None
-        previous_positive = True
-
-        for index, token in enumerate(tokens):
-            if token in _NEGATORS:
-                pending_negation = True
-                continue
-            if token in _REJECTION_MARKERS:
-                after_rejection = True
-                continue
-
-            if token in _HUMAN_TERMS:
-                target = 'human'
-            elif token in _AI_TERMS:
-                target = 'ai'
-            else:
-                continue
-
-            if previous_target_index == index - 1:
-                # Adjacent words describing ONE thing — "conseiller humain",
-                # "a real person". The second must not read as a fresh,
-                # unnegated mention and cancel the negation on the first.
-                positive = previous_positive
-            else:
-                positive = not (pending_negation or after_rejection)
-            pending_negation = False
-            previous_target_index = index
-            previous_positive = positive
-
-            # Wanting a human and refusing the machine both mean "person";
-            # refusing a human and accepting the machine both mean "AI".
-            decisions.append(
-                'human' if (target == 'human') == positive else 'ai')
-
-    # Unanimous or nothing. The marker and negator lists above are finite, and
-    # a comparative they don't know ("the AI over a person") reads as two
-    # opposite signals rather than one — so when the utterance disagrees with
-    # itself, treat it as what it is: not a clear request for a person.
-    # This is the same asymmetry the rest of the gate runs on. Routing to the
-    # AI is recoverable in-conversation via escalate_to_human; routing to a
-    # human is a hold queue and, past the cap, a callback. Being wrong toward
-    # the AI costs a sentence, so an unrecognised phrasing degrades into the
-    # cheap failure instead of the expensive one.
-    if not decisions or len(set(decisions)) > 1:
-        return 'ABSENT'
-    return 'CONFIRMED' if decisions[0] == 'human' else 'ABSENT'
+    tokens = set(_fold(utterance).split())
+    if tokens & _HUMAN_TERMS:
+        return 'CONFIRMED'
+    if tokens & _AI_TERMS:
+        # Only the machine was named. With no negator anywhere in the turn
+        # that reads as choosing it ("the AI is fine"); with one it may be a
+        # rejection ("not the AI"), and telling those apart is precisely the
+        # judgement this gate stopped making — so it defers instead.
+        return 'CONFIRMED' if tokens & _NEGATORS else 'ABSENT'
+    return 'ABSENT'
 
 
 class CallCenterAgent(AgentBase):

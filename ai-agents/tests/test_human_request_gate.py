@@ -9,20 +9,31 @@ Live failure this exists for (fred_returning_caller, call 76, 2026-08-17):
     [caller] No.
 
 Sam committed an irreversible routing decision on a three-word fragment that
-contained no choice yet, then ignored the correction. Fred spent the call on
-hold and left as a callback, never reaching the specialist.
+named no option yet, then ignored the correction. Fred spent the call on hold
+and left as a callback, never reaching the specialist.
 
-The offer_transfer step's prompt ALREADY says a caller "cut off mid-answer"
-wants the AI assistant and that transfer_to_human is only for someone who
-"clearly asked for a person" — and the model did the opposite anyway. That is
-the PGI point: a rule the model can violate is a proposal. So the rule reads
-the platform's own call_log instead of the model's interpretation of it.
+WHAT THIS GATE DOES, AND WHAT IT GAVE UP
+----------------------------------------
+It answers one question: did the caller's turn name an option at all? It does
+NOT decide which option they picked.
 
-Direction of failure is deliberate. Routing to the AI when the caller wanted a
-human is recoverable — the specialist can escalate_to_human mid-conversation.
-Routing to a human when they didn't ask parks them on hold and, past the cap,
-ends the call as a callback. So ambiguity resolves to the AI, and a missing
-call_log resolves to obeying the model.
+Earlier versions did try. Review found five distinct ways for keyword-and-
+polarity parsing to get that wrong: comparisons ("the AI over a human"),
+corrections ("I wanted a human before, but use the AI now"), post-target
+negation ("a human isn't what I want"), explanations naming the rejected
+option ("get me a person, the bot is useless"), and unenumerated phrasings
+across three languages. Each fix bought one sentence and left the shape of the
+problem standing -- and a wrong answer here produces the expensive misroute the
+gate was built to prevent, so the parser was capable of causing the very bug it
+was guarding against.
+
+The narrow version cannot do that. A turn naming a person is left to the
+model, which is where that judgement lived before this code existed. A turn
+naming nothing gets the documented default -- the AI assistant, recoverable via
+escalate_to_human, rather than a queue, which is not.
+
+If enforcing an explicit choice ever matters, the answer is a structured one
+(a DTMF digit, or an enum the tool validates), not more parsing.
 """
 
 import os
@@ -53,115 +64,102 @@ OFFER = (
 )
 
 
-def test_the_fragment_that_lost_the_call_is_not_a_request_for_a_human():
-    """'I would prefer' — the caller was still forming the sentence."""
-    raw = call_log(
-        ('assistant', OFFER),
-        ('user', 'I would prefer'),
-    )
-
-    assert main_agent._human_request_evidence(raw) == 'ABSENT'
-
+# ---------------------------------------------------------------------------
+# The case the gate exists for: no option named.
+# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize('said', [
-    'I would prefer to speak to a human',
-    "Can I talk to a person please",
-    'Put me through to an agent',
-    'I want a real representative',
-    "I don't want to talk to a robot",
-    'Is there someone I can speak with',
-    'operator',
+    'I would prefer',            # the exact fragment that lost call 76
+    'I would',
+    'yes',
+    'okay sure',
+    'um',
+    'whatever is fastest',
+    'I just need pricing',
 ])
-def test_a_genuine_request_for_a_person_still_routes_to_a_human(said):
-    """The gate must not eat legitimate transfers — including the ones phrased
-    by naming the machine rather than the human."""
+def test_a_turn_that_names_no_option_gets_the_documented_default(said):
     raw = call_log(('assistant', OFFER), ('user', said))
 
-    assert main_agent._human_request_evidence(raw) == 'CONFIRMED', said
+    assert main_agent._human_request_evidence(raw) == 'ABSENT', said
 
 
 @pytest.mark.parametrize('said', [
     'The AI is fine',
-    'whatever is fastest',
-    'yes',
-    'um',
-    'I just need pricing',
+    'the assistant please',
+    'Prefiero la IA',
 ])
-def test_anything_that_is_not_a_request_for_a_person_reads_as_absent(said):
+def test_naming_only_the_machine_reads_as_choosing_it(said):
+    """No negator anywhere in the turn, so there is nothing to weigh."""
     raw = call_log(('assistant', OFFER), ('user', said))
 
     assert main_agent._human_request_evidence(raw) == 'ABSENT', said
 
 
+# ---------------------------------------------------------------------------
+# The case the gate stays out of: a person was named.
+# ---------------------------------------------------------------------------
+
 @pytest.mark.parametrize('said', [
-    # Spanish — this agent answers in es-ES, so an English-only word list
-    # silently forced every Spanish caller asking for a person to the AI.
+    # Plain requests.
+    'I would prefer to speak to a human',
+    'Can I talk to a person please',
+    'Put me through to an agent',
+    'Is there someone I can speak with',
+    'operator',
+    # Spanish and French -- the agent answers in all three languages.
     'Quiero hablar con una persona',
     'Prefiero un agente humano',
     'Me puede pasar con alguien por favor',
-    # French — likewise fr-FR. Accents must fold, or none of these match.
-    'Je préfère un conseiller humain',
-    'Je voudrais parler à une personne',
-    "Passez-moi quelqu'un s'il vous plaît",
+    'Je prefere un conseiller humain',
+    "Je veux parler a l'agent",
+    "Passez-moi quelqu'un s'il vous plait",
+    # Phrasings that broke every previous parser. The gate no longer rules on
+    # them either way -- it declines to override the model, which is correct
+    # and, unlike its earlier guesses, cannot misroute anyone by itself.
+    "A human isn't what I want",
+    "The human option doesn't work for me",
+    'Get me a person because the bot is useless',
+    'I prefer the AI over a human',
+    'I wanted a human before, but use the AI now',
+    'I do not want a human, use the AI',
 ])
-def test_a_request_for_a_person_counts_in_every_language_the_agent_speaks(said):
+def test_a_turn_that_names_a_person_is_left_to_the_model(said):
     raw = call_log(('assistant', OFFER), ('user', said))
 
     assert main_agent._human_request_evidence(raw) == 'CONFIRMED', said
-
-
-@pytest.mark.parametrize('said', [
-    'I do not want a human, use the AI',
-    "I don't need a person, the assistant is fine",
-    'No quiero una persona, prefiero el asistente',
-    'Je ne veux pas de conseiller humain',
-])
-def test_a_negated_request_for_a_person_is_not_a_request(said):
-    """Word presence is not intent. Reading 'human' here and transferring is
-    the precise misroute the gate exists to prevent, delivered by the gate."""
-    raw = call_log(('assistant', OFFER), ('user', said))
-
-    assert main_agent._human_request_evidence(raw) == 'ABSENT', said
 
 
 @pytest.mark.parametrize('said', [
     "I don't want to talk to a robot",
-    'No quiero un robot',
     'not the AI please',
+    'No quiero la IA',
+    "Je ne veux pas de l'IA",
 ])
-def test_refusing_the_machine_is_a_request_for_a_person(said):
-    """The mirror case: negation flips an AI word into a human request."""
+def test_a_negated_machine_is_not_treated_as_choosing_it(said):
+    """"not the AI" names only the machine, but the negator means it may well
+    be a rejection -- the exact judgement this gate stopped making. It defers
+    rather than guessing, so refusing the machine can never be read as
+    choosing it."""
     raw = call_log(('assistant', OFFER), ('user', said))
 
     assert main_agent._human_request_evidence(raw) == 'CONFIRMED', said
 
 
-def test_negation_does_not_leak_across_clauses():
-    """'I do not want a human, use the AI' must not let the leading 'not'
-    reach the second clause and flip 'AI' into a human request."""
-    raw = call_log(('user', 'I do not want a human, use the AI'))
-    assert main_agent._human_request_evidence(raw) == 'ABSENT'
-
-    # ...and the converse still reads correctly.
-    raw = call_log(('user', "I don't like waiting, get me a person"))
-    assert main_agent._human_request_evidence(raw) == 'CONFIRMED'
-
+# ---------------------------------------------------------------------------
+# Reading the right turn, and failing safe.
+# ---------------------------------------------------------------------------
 
 def test_only_the_callers_words_count_not_the_agents():
     """The offer itself contains 'human specialist'. Reading the wrong role
-    would make every caller look like they asked for a person — the gate would
-    pass exactly when it needs to fire."""
-    raw = call_log(
-        ('assistant', OFFER),
-        ('user', 'I would prefer'),
-    )
+    would make every caller look like they named a person -- the gate would go
+    quiet exactly when it needs to fire."""
+    raw = call_log(('assistant', OFFER), ('user', 'I would prefer'))
 
     assert main_agent._last_caller_utterance(raw) == 'I would prefer'
     assert main_agent._human_request_evidence(raw) == 'ABSENT'
 
 
 def test_the_most_recent_caller_turn_wins():
-    """A caller who asks for a human after first saying something else."""
     raw = call_log(
         ('user', 'I have a question about pricing'),
         ('assistant', OFFER),
@@ -195,92 +193,10 @@ def test_raw_call_log_is_accepted_as_a_fallback():
     assert main_agent._human_request_evidence(raw) == 'CONFIRMED'
 
 
-# ---------------------------------------------------------------------------
-# Second audit round: word polarity is not intent. A spoken sentence routinely
-# names both options before settling on one, and returning on the first
-# human-shaped word got every one of these backwards — toward the hold queue.
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize('said', [
-    # Comparison: the option after "than" is the one being turned down.
-    'I would rather use the AI than talk to a person',
-    'I would rather have the assistant than an agent',
-    # Correction: the caller changes their mind mid-sentence.
-    'I wanted a human before, but use the AI now',
-    # No punctuation — ASR often returns none at all, so clause splitting
-    # cannot be the only thing holding negation in place.
-    'I do not want a human use the AI',
-    'no quiero una persona quiero la IA',
-])
-def test_the_last_explicit_choice_wins(said):
-    raw = call_log(('assistant', OFFER), ('user', said))
-
-    assert main_agent._human_request_evidence(raw) == 'ABSENT', said
-
-
-@pytest.mark.parametrize('said,expected', [
-    # French elision: folding the apostrophe away glues l'agent into "lagent".
-    ("Je veux parler à l'agent", 'CONFIRMED'),
-    ("Je voudrais parler à l'humain", 'CONFIRMED'),
-    # "IA" is what Spanish and French speakers actually say for AI.
-    ('No quiero la IA', 'CONFIRMED'),
-    ("Je ne veux pas de l'IA", 'CONFIRMED'),
-    ('Prefiero la IA', 'ABSENT'),
-])
-def test_localized_forms_are_read_correctly(said, expected):
-    raw = call_log(('assistant', OFFER), ('user', said))
-
-    assert main_agent._human_request_evidence(raw) == expected, said
-
-
-def test_adjacent_words_describe_one_thing():
-    """"conseiller humain" is a single noun phrase. Reading the second word as
-    a fresh, unnegated mention cancels the negation on the first and flips the
-    answer."""
-    raw = call_log(('user', 'Je ne veux pas de conseiller humain'))
-    assert main_agent._human_request_evidence(raw) == 'ABSENT'
-
-    raw = call_log(('user', 'not the AI please, a real person'))
-    assert main_agent._human_request_evidence(raw) == 'CONFIRMED'
-
-
-# ---------------------------------------------------------------------------
-# Third audit round. The marker and negator lists are finite, so correctness
-# cannot depend on having enumerated every comparative — see the mixed-signal
-# rule these pin.
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize('said', [
-    "Je préfère l'IA plutôt qu'une personne",
-    'I prefer the AI over a human',
-    'AI versus a person',
-    'the assistant as opposed to an agent',
-    "I wouldn't want a human",
-    "I didn't ask for a person",
-    "I haven't got time for a person",
-])
-def test_comparisons_and_contractions_choose_the_ai(said):
-    raw = call_log(('assistant', OFFER), ('user', said))
-
-    assert main_agent._human_request_evidence(raw) == 'ABSENT', said
-
-
-def test_an_unrecognised_comparative_degrades_to_the_cheap_failure():
-    """The point of the mixed-signal rule: a phrasing whose comparative we do
-    NOT know still names both options, which reads as two opposite signals.
-    That must resolve to the AI (recoverable) rather than the hold queue."""
-    raw = call_log(('user', 'the AI, ahead of a person'))  # 'ahead' is unknown
-
-    assert main_agent._human_request_evidence(raw) == 'ABSENT'
-
-
-@pytest.mark.parametrize('said', [
-    'I would rather have a human',      # 'rather' alone is NOT a rejection
-    'I want a human not the AI',        # both signals agree: human
-    'rather than the AI, a person',
-])
-def test_agreeing_signals_still_reach_a_human(said):
-    """The rule must not swallow genuine requests that mention both options."""
-    raw = call_log(('assistant', OFFER), ('user', said))
-
-    assert main_agent._human_request_evidence(raw) == 'CONFIRMED', said
+def test_folding_still_handles_elision_and_contractions():
+    """French elision must split (l'agent -> l agent) while English
+    contractions must fuse (don't -> dont), or the vocabulary matches nothing
+    in one language or the negator list misses in the other."""
+    assert 'agent' in main_agent._fold("l'agent").split()
+    assert 'dont' in main_agent._fold("I don't").split()
+    assert 'quelquun' in main_agent._fold("quelqu'un").split()

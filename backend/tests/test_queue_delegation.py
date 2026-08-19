@@ -1147,3 +1147,33 @@ def test_the_call_report_exposes_the_translation_decision():
     source = inspect.getsource(testing_harness.call_report)
     assert "'needs_translation': call.needs_translation" in source
     assert "'assigned_agent_id': call.assigned_agent_id" in source
+
+
+def test_seeding_a_second_queue_actually_activates_it(app, redis):
+    """set_agent_status rebuilds the activation sets only on a TRANSITION
+    into available, so seeding a second queue for an agent who is already
+    available wrote the assignment row and no Redis key — the caller routed
+    to that queue then found no candidates. Two live runs died on it while
+    the endpoint reported success.
+    """
+    import inspect
+    from app.api import testing_harness
+
+    source = inspect.getsource(testing_harness.seed_agent)
+    assert source.count('_rehydrate_queue_activations') >= 1, (
+        'seeding must rehydrate explicitly rather than relying on a status '
+        'transition that will not happen on the second call'
+    )
+
+
+def test_set_agent_status_only_rehydrates_on_transition(app, redis):
+    """Pins the behaviour the seeding fix works around, so if it ever becomes
+    unconditional the workaround can be removed deliberately."""
+    workspace = make_workspace()
+    seed_queue(workspace)
+    agent = seed_agent(workspace, redis, 'ed', ['en-US'], available=False)
+    qs = _qs(workspace, redis)
+
+    import inspect
+    source = inspect.getsource(qs.set_agent_status)
+    assert "previous_status != 'available'" in source

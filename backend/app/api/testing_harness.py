@@ -295,9 +295,17 @@ def seed_agent():
         db.session.commit()
 
         qs = QueueService(get_redis_client(), workspace_id=workspace_id)
-        # set_agent_status rehydrates the activation set from the assignment
-        # rows above, which is what makes them a candidate for this queue.
+        # Rehydrate EXPLICITLY. set_agent_status only rebuilds the activation
+        # sets on a TRANSITION into available (status == 'available' and
+        # previous != 'available'), so seeding a second queue for an agent who
+        # is already available silently did nothing: the assignment row
+        # existed, the Redis set did not, and the caller routed to that queue
+        # found no candidates. Two live runs died on exactly that, and this
+        # endpoint's own response said so — available_agents came back []
+        # for the second and third queue while reporting success.
+        qs._rehydrate_queue_activations(str(agent.id))
         qs.set_agent_status(str(agent.id), status)
+        qs._rehydrate_queue_activations(str(agent.id))
 
         logger.info(
             "seed-agent: %s (id=%s) languages=%s activated on '%s' status=%s",

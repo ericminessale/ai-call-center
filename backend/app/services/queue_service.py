@@ -534,6 +534,50 @@ class QueueService:
                 )
                 continue
 
+            # Language policy, from the other direction. Immediate dispatch
+            # asks "may I give this call to a mismatched agent?"; here an
+            # agent has just gone available and we ask the same question about
+            # the call at the head of the queue. Without this, wait_only and
+            # wait_then_translate held out at arrival and then handed the call
+            # to the first mismatched agent who came free seconds later —
+            # policy honoured on one path and ignored on the other, which is
+            # the drift this codebase keeps producing.
+            try:
+                from app.models import Queue as QueueModel
+                from app.services.call_language import (
+                    language_fallback_allowed, derive_call_language,
+                )
+                caller_language = derive_call_language(call)
+                spoken = agent_user.languages or []
+                if caller_language and spoken and caller_language not in spoken:
+                    queue_row = QueueModel.query.filter_by(
+                        slug=slug,
+                        workspace_id=call.workspace_id or DEFAULT_WORKSPACE_ID,
+                    ).first()
+                    waited = None
+                    enqueued_at = call_data.get('originally_received_at') or                         call_data.get('enqueued_at')
+                    if enqueued_at:
+                        try:
+                            waited = (
+                                datetime.utcnow()
+                                - datetime.fromisoformat(str(enqueued_at))
+                            ).total_seconds()
+                        except Exception:
+                            waited = None
+                    if not language_fallback_allowed(queue_row, waited_seconds=waited):
+                        logger.info(
+                            f"Push-dispatch: agent {agent_id} does not speak "
+                            f"{caller_language} and queue '{slug}' policy says "
+                            "keep waiting — leaving call %s queued", call_sid,
+                        )
+                        continue
+            except Exception as e:
+                # Never let the policy check cost a caller their dispatch.
+                logger.warning(
+                    f"Push-dispatch: language policy check failed on {call_sid} "
+                    f"(dispatching anyway): {e}"
+                )
+
             if not agent_user.signalwire_address:
                 logger.warning(
                     f"Push-dispatch: agent {agent_id} has no signalwire_address; "
@@ -777,7 +821,8 @@ class QueueService:
                      available_agents: List[str], skill_levels: Dict[str, int] = None,
                      call_priority: int = 5,
                      caller_language: Optional[str] = None,
-                     agent_languages: Optional[Dict[str, List[str]]] = None) -> Optional[str]:
+                     agent_languages: Optional[Dict[str, List[str]]] = None,
+                     allow_language_fallback: bool = True) -> Optional[str]:
         """Select the next agent based on the queue's routing strategy.
 
         Language preference runs *before* the strategy: agents whose `languages`
@@ -807,6 +852,19 @@ class QueueService:
                 a for a in available_agents
                 if caller_language in (agent_languages.get(a) or [])
             ]
+            if not matching and not allow_language_fallback:
+                # The queue's policy says hold out for a real speaker rather
+                # than settle for translation right now. Returning nobody
+                # leaves the caller in the queue, where the hold cycle and the
+                # existing hold cap still apply — so "wait" never means
+                # "wait forever", it means "wait until the cap turns this into
+                # a callback".
+                logger.info(
+                    f"No agents speak {caller_language} in queue "
+                    f"'{queue_slug}' and the policy declines to fall back — "
+                    "leaving the caller queued"
+                )
+                return None
             if matching:
                 candidate_pool = matching
                 logger.info(

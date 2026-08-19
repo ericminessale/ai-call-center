@@ -971,6 +971,30 @@ def enqueue_and_build_swml(
     try:
         available_agents = qs.get_available_agents(queue_slug)
         if available_agents:
+            # Build the map when the caller didn't supply one. /direct-inbound
+            # passes none, and select_agent skips its language-preference pass
+            # entirely on a falsy map — so on the path a PSTN caller actually
+            # arrives on, "prefer an agent who speaks their language" was not
+            # happening at all. The flag was fixed to read the User row; the
+            # SELECTION still needed the map.
+            if not agent_languages:
+                try:
+                    agent_languages = qs.get_languages_for_agents(available_agents)
+                except Exception as e:
+                    logger.warning(
+                        f"enqueue_and_build_swml: agent language lookup failed "
+                        f"(routing without language preference): {e}"
+                    )
+                    agent_languages = {}
+            # A caller who has JUST arrived has waited zero seconds, so any
+            # policy that holds out for a language match declines the fallback
+            # here and lets them queue. The delayed path re-asks with the real
+            # wait time as the caller sits in the hold cycle.
+            from app.models import Queue as QueueModel
+            from app.services.call_language import language_fallback_allowed
+            queue_row = QueueModel.query.filter_by(
+                slug=queue_slug, workspace_id=call.workspace_id,
+            ).first()
             agent_id_str = qs.select_agent(
                 queue_slug=queue_slug,
                 routing_strategy=routing_strategy,
@@ -979,6 +1003,9 @@ def enqueue_and_build_swml(
                 call_priority=priority,
                 caller_language=caller_language,
                 agent_languages=agent_languages or {},
+                allow_language_fallback=language_fallback_allowed(
+                    queue_row, waited_seconds=0,
+                ),
             )
             if agent_id_str:
                 try:

@@ -50,6 +50,27 @@ class Queue(WorkspaceScoped, db.Model):
     # /api/admin/queues request contract; the UI labels it for what it does.
     max_wait_before_ai_fallback = db.Column(db.Integer, default=120)
 
+    # What to do when nobody available speaks the caller's language. Routing
+    # always PREFERS a match; this decides what happens when there isn't one,
+    # which is a business call rather than a technical one — some floors would
+    # rather a caller wait for a real speaker, others would rather connect
+    # them now through translation.
+    LANGUAGE_FALLBACK_POLICIES = (
+        'translate_now',        # connect to anyone immediately + translate
+        'wait_then_translate',  # hold for a match, then translate (default)
+        'wait_only',            # hold for a match; the hold cap still applies
+        'ask_caller',           # offer the choice on hold — NOT IMPLEMENTED
+    )
+    language_fallback_policy = db.Column(
+        db.String(30), nullable=False, default='wait_then_translate',
+        server_default='wait_then_translate',
+    )
+    # How long wait_then_translate holds out for a language match before
+    # settling for translation. Ignored by the other policies.
+    language_wait_seconds = db.Column(
+        db.Integer, nullable=False, default=60, server_default='60',
+    )
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -73,6 +94,8 @@ class Queue(WorkspaceScoped, db.Model):
             'default_priority': self.default_priority,
             'sla_threshold_seconds': self.sla_threshold_seconds,
             'max_wait_before_ai_fallback': self.max_wait_before_ai_fallback,
+            'language_fallback_policy': self.language_fallback_policy,
+            'language_wait_seconds': self.language_wait_seconds,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }

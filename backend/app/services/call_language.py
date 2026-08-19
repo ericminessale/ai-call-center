@@ -311,3 +311,28 @@ def translation_notice(caller_language):
     code = normalize_language(caller_language) or 'en-US'
     return _TRANSLATION_NOTICE.get(code.split('-')[0].lower(),
                                    _TRANSLATION_NOTICE['en'])
+
+
+def language_fallback_allowed(queue, waited_seconds=None) -> bool:
+    """Whether routing may settle for an agent who does not speak the caller's
+    language, given the queue's policy and how long the caller has waited.
+
+    Split out from the dispatch paths because BOTH of them need it and they
+    have historically drifted: the flag, then the caller notice, each got
+    wired to immediate dispatch and missed the delayed one.
+
+    ``ask_caller`` deliberately behaves as ``wait_then_translate`` until the
+    prompt exists — an unimplemented policy must degrade to a sane one rather
+    than silently mean "never connect".
+    """
+    policy = getattr(queue, 'language_fallback_policy', None) or 'translate_now'
+
+    if policy == 'translate_now':
+        return True
+    if policy == 'wait_only':
+        return False
+    # wait_then_translate / ask_caller: hold out, but only for a while.
+    threshold = getattr(queue, 'language_wait_seconds', None)
+    if threshold is None:
+        threshold = 60
+    return (waited_seconds or 0) >= threshold

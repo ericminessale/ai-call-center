@@ -171,10 +171,17 @@ def make_workspace():
     return workspace
 
 
-def seed_queue(workspace, strategy='round_robin'):
+def seed_queue(workspace, strategy='round_robin',
+               language_policy='translate_now', language_wait_seconds=60):
+    """Queues default to translate_now HERE so the pre-policy tests keep
+    asserting what they were written for. Production defaults to
+    wait_then_translate — see the policy tests below, which set it
+    explicitly."""
     queue = Queue(
         workspace_id=workspace.id, slug=QUEUE_SLUG, display_name='Sales',
         routing_strategy=strategy, is_active=True,
+        language_fallback_policy=language_policy,
+        language_wait_seconds=language_wait_seconds,
     )
     db.session.add(queue)
     db.session.commit()
@@ -881,3 +888,89 @@ def test_the_translation_marker_outlives_the_call(app, redis):
         conferences._maybe_start_live_translate)
     assert 'TRANSLATE_STATE_TTL_SECONDS' in inspect.getsource(
         call_control.start_translate)
+
+
+# ---------------------------------------------------------------------------
+# language_fallback_policy — what happens when nobody speaks their language.
+# ---------------------------------------------------------------------------
+
+def test_translate_now_connects_immediately_and_flags(app, redis):
+    workspace = make_workspace()
+    seed_queue(workspace, language_policy='translate_now')
+    english = seed_agent(workspace, redis, 'ed', ['en-US'])
+
+    call = arrive(workspace, caller_language='es-ES', agents=[english],
+                  sid='policy-translate-now')
+
+    assert call.assigned_agent_id == english.id
+    assert call.needs_translation is True
+
+
+def test_wait_only_leaves_the_caller_queued_for_a_real_speaker(app, redis):
+    """The caller is not stranded: the queue's existing hold cap still runs,
+    so 'wait' resolves into a callback rather than forever."""
+    workspace = make_workspace()
+    seed_queue(workspace, language_policy='wait_only')
+    seed_agent(workspace, redis, 'ed', ['en-US'])
+
+    call = arrive(workspace, caller_language='es-ES', sid='policy-wait-only')
+
+    assert call.assigned_agent_id is None
+    assert call.status == 'waiting'
+    assert call.needs_translation is False
+
+
+def test_wait_only_still_connects_a_matching_agent(app, redis):
+    """Holding out is about the MISMATCH, not about queuing everyone."""
+    workspace = make_workspace()
+    seed_queue(workspace, language_policy='wait_only')
+    spanish = seed_agent(workspace, redis, 'ana', ['es-ES'])
+
+    call = arrive(workspace, caller_language='es-ES', agents=[spanish],
+                  sid='policy-wait-only-match')
+
+    assert call.assigned_agent_id == spanish.id
+    assert call.needs_translation is False
+
+
+def test_wait_then_translate_holds_out_at_arrival(app, redis):
+    """A caller who has just arrived has waited zero seconds, so the default
+    policy gives the floor a chance to free up a real speaker first."""
+    workspace = make_workspace()
+    seed_queue(workspace, language_policy='wait_then_translate',
+               language_wait_seconds=60)
+    seed_agent(workspace, redis, 'ed', ['en-US'])
+
+    call = arrive(workspace, caller_language='es-ES', sid='policy-wait-then')
+
+    assert call.assigned_agent_id is None
+
+
+@pytest.mark.parametrize('policy,waited,expected', [
+    ('translate_now', 0, True),
+    ('wait_only', 0, False),
+    ('wait_only', 9999, False),
+    ('wait_then_translate', 0, False),
+    ('wait_then_translate', 59, False),
+    ('wait_then_translate', 60, True),
+    ('wait_then_translate', 120, True),
+    # Unimplemented policy degrades to the sane one rather than meaning
+    # "never connect".
+    ('ask_caller', 0, False),
+    ('ask_caller', 120, True),
+])
+def test_the_policy_decision_table(app, policy, waited, expected):
+    from app.services.call_language import language_fallback_allowed
+
+    queue = Queue(slug='x', display_name='X', workspace_id=1,
+                  language_fallback_policy=policy, language_wait_seconds=60)
+
+    assert language_fallback_allowed(queue, waited_seconds=waited) is expected
+
+
+def test_a_missing_queue_row_still_connects_the_caller(app):
+    """Policy is a refinement, not a prerequisite. A call routed to a queue
+    with no row (or before the column existed) must not be held forever."""
+    from app.services.call_language import language_fallback_allowed
+
+    assert language_fallback_allowed(None, waited_seconds=0) is True

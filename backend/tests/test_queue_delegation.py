@@ -1095,3 +1095,17 @@ def test_creating_a_bridge_queue_without_a_policy_works(app):
     create = inspect.getsource(admin.create_queue)
     assert "'translate_now' if routing_transport == 'bridge'" in create
     assert "if 'language_fallback_policy' in data:" in create
+
+
+def test_hosted_mode_blocks_switching_to_bridge_not_editing_a_bridge_queue(app):
+    """Same presence-vs-change mistake as the language guard, in code that
+    predates it: SettingsPanel submits the unchanged routing_transport, so a
+    hosted workspace with a pre-existing bridge queue could not rename it."""
+    import inspect
+    from app.api import admin
+
+    update = inspect.getsource(admin.update_queue)
+    assert "queue.routing_transport != 'bridge'" in update, (
+        'the hosted guard must reject a TRANSITION to bridge, not a queue '
+        'that is already on it'
+    )

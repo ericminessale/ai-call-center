@@ -440,8 +440,17 @@ def update_queue(queue_id):
         # Hosted mode: bridge transport blocked until Phase 4 names the
         # NATIVE SignalWire queues per workspace (bare slug names are
         # shared install-wide — cross-workspace caller pops).
+        # Only a TRANSITION to bridge is blocked, not the continued existence
+        # of a queue already on it. SettingsPanel seeds editForm with the
+        # queue's current routing_transport and PUTs the whole form, so
+        # checking the submitted value alone refused every unrelated edit —
+        # a hosted workspace with a pre-existing bridge queue could not
+        # rename it. Same presence-vs-change mistake as the language guard
+        # below, and it predates it.
         from app.utils.demo_config import tenancy_mode_active
-        if data.get('routing_transport') == 'bridge' and tenancy_mode_active():
+        if (data.get('routing_transport') == 'bridge'
+                and queue.routing_transport != 'bridge'
+                and tenancy_mode_active()):
             return jsonify({
                 'error': 'Bridge transport is not available in hosted mode yet.',
                 'code': 'demo_blocked',

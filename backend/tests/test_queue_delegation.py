@@ -846,3 +846,20 @@ def test_the_ordinary_join_keeps_the_ordinary_announcement(app, redis):
     assert 'An agent is joining you now' in _greeting_of(
         queue_dispatch._join_conference_swml(call, BASE_URL)
     )
+
+
+def test_auto_started_translation_is_readable_by_the_status_endpoint(app, redis):
+    """The auto-start and the manual agent button write the same Redis key, so
+    they must write the same payload — /translate/status reads from_lang and
+    to_lang, and a different shape reports translation active with both
+    languages null."""
+    import inspect
+    from app.api import conferences, call_control
+
+    auto = inspect.getsource(conferences._maybe_start_live_translate)
+    manual = inspect.getsource(call_control.start_translate)
+    status = inspect.getsource(call_control.translate_status)
+
+    assert "'from_lang': from_lang, 'to_lang': to_lang" in auto
+    assert "'from_lang': from_lang, 'to_lang': to_lang" in manual
+    assert 'from_lang' in status

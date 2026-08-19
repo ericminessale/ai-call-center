@@ -73,9 +73,13 @@ def _maybe_start_live_translate(call, participant_call_sid):
             from app.services.redis_service import get_redis_client
             redis_client = get_redis_client()
             if redis_client:
+                # Same key AND same payload shape as the manual start in
+                # call_control.start_translate — /translate/status reads
+                # from_lang/to_lang, so inventing a shape here reports
+                # translation active with both languages null.
                 redis_client.setex(
-                    f'translate:{call.id}', 14400,
-                    json.dumps({'from': from_lang, 'to': to_lang}),
+                    f'translate:{call.id}', 7200,
+                    json.dumps({'from_lang': from_lang, 'to_lang': to_lang}),
                 )
         except Exception as mark_err:
             logger.warning(

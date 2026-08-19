@@ -177,8 +177,18 @@ def _join_conference_swml(call, base_url: str) -> Dict[str, Any]:
     conference_name = (
         call.conference_name or f"interaction-{call.signalwire_call_sid}"
     )
+    # The delayed path deserves the translation notice more than the
+    # immediate one, not less: waiting is what happens BECAUSE nobody who
+    # speaks the caller's language was free, so a caller who held is the most
+    # likely of all to be connected across a language gap.
+    if call.needs_translation:
+        from app.services.call_language import translation_notice
+        announcement = translation_notice(call.caller_language)
+    else:
+        announcement = PRE_JOIN_ANNOUNCEMENT
+
     return _swml_doc([
-        {"play": {"url": f"say:{PRE_JOIN_ANNOUNCEMENT}"}},
+        {"play": {"url": f"say:{announcement}"}},
         {"join_conference": {"name": conference_name, "end_on_exit": False}},
         {"transfer": {
             "dest": after_conference_url(base_url, call.signalwire_call_sid)

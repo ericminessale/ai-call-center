@@ -64,8 +64,48 @@ def _maybe_start_live_translate(call, participant_call_sid):
             f"Started live_translate on call {call.id} (sid={participant_call_sid}): "
             f"{from_lang} <-> {to_lang}"
         )
+        # Mark it ACTIVE the same way the manual agent button does, so
+        # /translate/status answers truthfully whichever path started it —
+        # 'we decided translation is needed' (needs_translation) and 'audio is
+        # actually being translated right now' are different claims, and by
+        # this point the caller has already been TOLD the second one.
+        try:
+            from app.services.redis_service import get_redis_client
+            redis_client = get_redis_client()
+            if redis_client:
+                redis_client.setex(
+                    f'translate:{call.id}', 14400,
+                    json.dumps({'from': from_lang, 'to': to_lang}),
+                )
+        except Exception as mark_err:
+            logger.warning(
+                f"live_translate started on call {call.id} but marking it "
+                f"active failed: {mark_err}"
+            )
     except Exception as e:
+        # The caller was already promised translation on the connecting
+        # greeting, and the agent's badge says the same. Neither can be
+        # un-told, so make the failure loud and visible rather than leaving
+        # both sides quietly assured of something that is not happening.
         logger.error(f"Failed to start live_translate for call {call.id}: {e}")
+        try:
+            from app.services.callcenter_socketio import emit_call_event
+            emit_call_event(call.id, 'translate', {
+                'active': False,
+                'error': str(e),
+                'from_lang': from_lang,
+                'to_lang': to_lang,
+                'message': (
+                    'Translation could not be started — the caller was told '
+                    'this call would be translated. Speak slowly or request a '
+                    'transfer to an agent who speaks their language.'
+                ),
+            }, call.signalwire_call_sid)
+        except Exception as emit_err:
+            logger.warning(
+                f"live_translate failure on call {call.id} could not be "
+                f"surfaced to the agent: {emit_err}"
+            )
 
 
 def build_whisper_text(context: dict) -> str:

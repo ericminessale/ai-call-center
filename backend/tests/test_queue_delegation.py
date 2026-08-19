@@ -811,3 +811,38 @@ def test_an_ordinary_connection_keeps_the_ordinary_greeting(app, redis):
                   sid='call-plain-greeting')
 
     assert call.needs_translation is False
+
+
+def test_a_caller_who_waited_also_hears_the_notice(app, redis):
+    """The delayed path deserves it MORE than the immediate one: holding is
+    what happens because nobody who speaks the caller's language was free, so
+    a caller who waited is the most likely of all to be connected across a
+    language gap. The first version of this notice only covered immediate
+    dispatch — the same delayed-path miss as the flag itself."""
+    workspace = make_workspace()
+    seed_queue(workspace)
+    owner = seed_agent(workspace, redis, 'ed', ['en-US'], available=False)
+
+    call = _returned_call(workspace, owner, 'waited-then-joined', status='waiting')
+    call.caller_language = 'es-ES'
+    call.needs_translation = True
+    call.conference_name = 'interaction-waited-then-joined'
+    db.session.commit()
+
+    document = queue_dispatch._join_conference_swml(call, BASE_URL)
+
+    assert 'traducirá' in _greeting_of(document)
+
+
+def test_the_ordinary_join_keeps_the_ordinary_announcement(app, redis):
+    workspace = make_workspace()
+    seed_queue(workspace)
+    owner = seed_agent(workspace, redis, 'ed', ['en-US'], available=False)
+
+    call = _returned_call(workspace, owner, 'plain-join', status='waiting')
+    call.conference_name = 'interaction-plain-join'
+    db.session.commit()
+
+    assert 'An agent is joining you now' in _greeting_of(
+        queue_dispatch._join_conference_swml(call, BASE_URL)
+    )

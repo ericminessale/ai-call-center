@@ -1,0 +1,54 @@
+{
+  "name": "nina_agent_answers",
+  "description": "The first scenario in which somebody ANSWERS. A caller asks for a human, an agent is available, and a synthetic agent leg joins the interaction conference through the real path the agent desktop uses: POST /api/conferences/prepare-join for a token, then a dial at the Fabric address that serves ['answer', join_conference]. Every scenario before this one stopped at the moment of handoff, which is where the call center actually begins. LIMITATION, deliberate and worth reading before trusting a result: the synthetic agent joins SILENT, because its leg originates from a PSTN number with no media source. So the caller hears the system's own announcements and then nothing. The bot's perception of 'did a human speak to me' is therefore NOT evidence here and is asserted only softly; the hard assertions are product state - the conference formed, the agent was assigned, a real agent leg exists.",
+  "setup": {
+    "_comment": "One English agent on every queue, for the same reason sofia seeds all three: which department triage picks is model behaviour, and a scenario about ANSWERING should not fail because routing chose a queue nobody was in.",
+    "agents": [
+      {"name": "answering-agent", "languages": ["en-US"], "queue_slug": "sales", "status": "available"},
+      {"name": "answering-agent", "languages": ["en-US"], "queue_slug": "support", "status": "available"},
+      {"name": "answering-agent", "languages": ["en-US"], "queue_slug": "billing", "status": "available"}
+    ]
+  },
+  "missions": [
+    {
+      "id": "nina-human",
+      "label": "call 1: caller asks for a human and an agent answers",
+      "await": {"summary": true, "transcript": true},
+      "temperature": 0.5,
+      "max_call_s": 240,
+      "answer_as_agent": {"name": "answering-agent", "wait_seconds": 90},
+      "persona": "You are Nina Patel, a customer calling a company. Wait to be greeted first. Your goals in order: (1) introduce yourself: 'Hi, this is Nina Patel.' (2) Say you have a question about your recent order. (3) IMPORTANT: when offered options, ask for a human: 'I'd rather speak with a real person, please.' If asked again, repeat it once: 'A person, please.' (4) After that, WAIT and stay on the line. You will hear the system tell you an agent is joining. Once connected you may hear NOTHING at all - that is expected in this test. Say 'Hello? Are you there?' once, wait, then say 'Hello?' one more time. (5) Be patient: stay on the line until you have heard FOUR hold announcements, or until roughly 16 exchanges have passed, then say goodbye and use end_call. RULES: do not hang up merely because the line is quiet after you are connected - the connection itself is what this call is testing. Never mention that you are an AI or a test. Style: short natural spoken sentences.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Keys exactly: mission (string, 'nina_agent_answers'), asked_for_a_person (boolean - did you ask to speak with a human), heard_connecting_announcement (boolean - were you told an agent was joining or connecting), reached (one of 'receptionist','sales_specialist','human_queue','human','other'), heard_a_human_speak (boolean - did a human actually say anything to you; false is an expected result in this test), silence_after_connect (boolean - true if you were connected and then heard nobody), turns (integer), notes (short string)."
+    }
+  ],
+  "assertions": [
+    {"label": "bot returned a structured verdict",
+     "target": "verdict1.parsed", "op": "truthy", "level": "hard"},
+    {"label": "the caller asked for a person",
+     "target": "verdict1.parsed.asked_for_a_person", "op": "truthy", "level": "hard"},
+
+    {"label": "CORE: a synthetic agent answered the call",
+     "target": "agent1.answered", "op": "eq", "value": true, "level": "hard"},
+    {"label": "CORE: it joined a real interaction conference",
+     "target": "agent1.conference_name", "op": "non_empty", "level": "hard"},
+    {"label": "CORE: a real agent leg was created on the SignalWire side",
+     "target": "agent1.agent_leg_id", "op": "non_empty", "level": "hard"},
+    {"label": "CORE: the call was assigned to that agent in the database",
+     "target": "report1.call.assigned_agent_id", "op": "truthy", "level": "hard"},
+
+    {"label": "the answered call and the reported call are the same call",
+     "target": "agent1.call_db_id", "op": "truthy", "level": "soft"},
+    {"label": "the caller was told an agent was joining",
+     "target": "report1.derived.ai_text", "op": "contains_any",
+     "value": ["agent is joining", "joining you now", "connect"], "level": "soft"},
+    {"label": "the bot heard the connecting announcement",
+     "target": "verdict1.parsed.heard_connecting_announcement", "op": "truthy", "level": "soft"},
+    {"label": "the caller reached the human path",
+     "target": "verdict1.parsed.reached", "op": "contains_any",
+     "value": ["human", "human_queue"], "level": "soft"},
+    {"label": "the call was handled by a human, not the AI (handler_type)",
+     "target": "report1.call.handler_type", "op": "contains", "value": "human", "level": "soft"},
+    {"label": "INFORMATIONAL: whether the bot heard anyone speak (a silent leg is expected)",
+     "target": "verdict1.parsed.heard_a_human_speak", "op": "truthy", "level": "soft"}
+  ]
+}

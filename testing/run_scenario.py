@@ -91,8 +91,12 @@ class Config:
             die("TEST_CALLER_NUMBER must differ from SIGNALWIRE_PHONE_NUMBER "
                 "(the bot cannot call from the number it is calling)")
         # Bot legs that have not yet produced a verdict; ended on exit so a
-        # wedged conversation can never outlive the runner.
+        # wedged conversation can never outlive the runner. Synthetic-agent
+        # legs land here too.
         self.active_legs = []
+        # Set once the run's demo workspace exists; the synthetic agent needs
+        # it to find the agent it is supposed to be.
+        self.workspace_id = None
 
     @property
     def sw_auth(self):
@@ -113,13 +117,49 @@ def log(msg: str):
 # ---------------------------------------------------------------------------
 
 def internal_get(cfg: Config, path: str, **kwargs):
+    kwargs.setdefault('timeout', 20)
     return requests.get(cfg.backend_local + path, auth=cfg.internal_auth,
-                        timeout=20, **kwargs)
+                        **kwargs)
 
 
 def internal_post(cfg: Config, path: str, **kwargs):
+    # setdefault rather than a fixed timeout: /answer-as-agent blocks while it
+    # waits for the caller to actually be dispatched, which is a hold cycle
+    # away and outlasts 20s by design.
+    kwargs.setdefault('timeout', 20)
     return requests.post(cfg.backend_local + path, auth=cfg.internal_auth,
-                         timeout=20, **kwargs)
+                         **kwargs)
+
+
+def answer_as_agent(cfg: Config, workspace_id, spec: dict) -> dict:
+    """Put a synthetic agent on the call while the caller bot is still talking.
+
+    Called on its own thread. The endpoint blocks until the caller is actually
+    dispatched — for a push-dispatched call that is a hold cycle away — and the
+    bot has to keep holding the line meanwhile, so this cannot run inline.
+    """
+    body = {'workspace_id': workspace_id}
+    for key in ('name', 'wait_seconds', 'call_sid'):
+        if key in spec:
+            body[key] = spec[key]
+    wait_s = int(body.get('wait_seconds') or 90)
+    try:
+        r = internal_post(cfg, '/api/testing/answer-as-agent', json=body,
+                          timeout=wait_s + 40)
+    except requests.RequestException as exc:
+        log(f"  answer-as-agent: request failed: {exc}")
+        return {'answered': False, 'reason': str(exc)}
+    try:
+        info = r.json()
+    except ValueError:
+        info = {'answered': False,
+                'reason': f'HTTP {r.status_code}: {r.text[:200]}'}
+    if info.get('answered'):
+        log(f"  synthetic agent joined conference {info.get('conference_name')}"
+            f" (leg {info.get('agent_leg_id')})")
+    else:
+        log(f"  synthetic agent did NOT answer: {info.get('reason')}")
+    return info
 
 
 def seed_agents(cfg: Config, scenario: dict, workspace_id) -> list:
@@ -468,6 +508,30 @@ def run_mission(cfg: Config, scenario_name: str, mission: dict) -> dict:
     leg_id = dial_bot(cfg, run_id, mission)
     cfg.active_legs.append(leg_id)
 
+    # A synthetic agent, if the scenario wants one on the other end. Started
+    # here rather than before the dial because there is nothing to answer until
+    # the caller exists, and run on a thread because answering means waiting
+    # for a dispatch that only happens once the bot has talked its way to the
+    # queue.
+    agent_spec = mission.get('answer_as_agent')
+    agent_box: dict = {}
+    agent_thread = None
+    if agent_spec:
+        agent_wait_s = int(agent_spec.get('wait_seconds') or 90)
+
+        def _answer():
+            agent_box.update(answer_as_agent(cfg, cfg.workspace_id, agent_spec))
+            agent_leg = agent_box.get('agent_leg_id')
+            if agent_leg:
+                # end_on_exit is true on the join, so this leg is also the
+                # conference's life support — it must be in the kill list.
+                cfg.active_legs.append(agent_leg)
+
+        agent_thread = threading.Thread(target=_answer, daemon=True)
+        agent_thread.start()
+        log(f"  synthetic agent standing by (waits up to {agent_wait_s}s "
+            "for a dispatch)")
+
     log("waiting for the bot's verdict (call in progress) ...")
     dialed_at = time.time()
     max_call_s = mission.get('max_call_s', 240)
@@ -495,6 +559,15 @@ def run_mission(cfg: Config, scenario_name: str, mission: dict) -> dict:
         log(f"  verdict in: parsed={'yes' if verdict.get('parsed') else 'NO'}"
             + (" (call was killed at max_call_s)" if killed else ""))
 
+    if agent_thread is not None:
+        # Its answer feeds the assertions, so collect it before reporting. The
+        # bound is the endpoint's own wait plus slack; it returns as soon as a
+        # dispatch lands, so this is normally instant by now.
+        agent_thread.join(timeout=int(agent_spec.get('wait_seconds') or 90) + 45)
+        if agent_thread.is_alive():
+            log("  WARNING: synthetic agent thread still running; "
+                "continuing without its result")
+
     gates = mission.get('await') or {}
     log(f"waiting for backend artifacts {sorted(gates) or '(none)'} ...")
     report = poll_report(cfg, since, gates)
@@ -507,7 +580,7 @@ def run_mission(cfg: Config, scenario_name: str, mission: dict) -> dict:
         report['derived'] = derived_fields(report)
 
     return {'run_id': run_id, 'bot_leg_id': leg_id, 'since': since,
-            'verdict': verdict, 'report': report}
+            'verdict': verdict, 'report': report, 'agent': agent_box}
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +698,7 @@ def main():
 
     state = _load_state()
     workspace_id = (state.get('workspace') or {}).get('id')
+    cfg.workspace_id = workspace_id
     agents = seed_agents(cfg, scenario, workspace_id)
 
     ctx = {'agents': agents}
@@ -633,6 +707,7 @@ def main():
             result = run_mission(cfg, scenario['name'], mission)
             ctx[f'verdict{i}'] = result['verdict']
             ctx[f'report{i}'] = result['report']
+            ctx[f'agent{i}'] = result.get('agent')
             ctx.setdefault('runs', []).append(
                 {k: result[k] for k in ('run_id', 'bot_leg_id', 'since')})
     finally:

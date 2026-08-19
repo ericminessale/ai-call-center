@@ -568,3 +568,220 @@ def call_report():
                 ),
             }
     return jsonify(report)
+
+
+# Statuses in which a dispatched call is worth answering. Mirrors
+# call_control.ACTIVE_AGENT_CALL_STATUSES plus 'connecting', which is where a
+# push-dispatched call sits between selection and the caller's next hold cycle.
+_ANSWERABLE_STATUSES = ('assigned', 'connecting', 'active', 'answered', 'on_hold')
+
+
+@harness_bp.route('/answer-as-agent', methods=['POST'])
+@require_internal_auth
+def answer_as_agent():
+    """Put a SYNTHETIC AGENT on a dispatched call - no browser, no WebRTC.
+
+    The agent desktop's audio leg is not special. It is whatever executes the
+    SWML that ``/api/conferences/agent-conference`` serves for a
+    ``conference_join`` token, and that document is just::
+
+        ["answer", {"join_conference": {"name": <conf>, ...}}]
+
+    Nothing in it is browser-shaped. Verified live 2026-08-19: a REST-created
+    call dialled at the Fabric address fetched and ran that document
+    (``POST /api/conferences/agent-conference 200`` in the nginx access log).
+
+    So a synthetic agent is the same two steps the real desktop takes:
+
+      1. ``POST /api/conferences/prepare-join``  as the agent, with a real JWT
+      2. dial ``<AGENT_CONFERENCE_RESOURCE>?token=<token>``
+
+    Step 1 goes over HTTP to this same backend instead of re-implementing the
+    token mint, so that endpoint's own authorization actually runs - including
+    the pinning that ignores a body-supplied ``agent_id``. Re-implementing it
+    here would test the harness rather than the product.
+
+    The leg joins SILENT: its origin is a PSTN number with no media source.
+    That still covers the conference bridge, assignment state, return-to-queue,
+    backup/escalate, the supervisor shapes and wrap-up. Giving the synthetic
+    agent a VOICE is a separate job - ``/api/conferences/ai/<name>/join``
+    already joins a talking AI into a conference and is the intended route.
+
+    Note ``join_conference.end_on_exit`` is true: when this leg hangs up, the
+    conference ends. Teardown order matters in a scenario.
+
+    Body:
+        workspace_id: the run's demo workspace (public uuid or integer pk)
+        name:         harness agent label, as passed to /seed-agent
+        wait_seconds: how long to wait for a dispatch (default 90, cap 100 -
+                      gunicorn's request timeout is 120)
+        call_sid:     optional; answer this specific call rather than
+                      whichever one is currently assigned
+    """
+    import os
+    import time
+
+    import requests as _requests
+
+    from app import db
+    from app.models import Call, User
+    from app.tenancy import workspace_context
+    from app.utils.jwt_utils import generate_tokens
+
+    data = request.get_json(silent=True) or {}
+    raw_workspace = data.get('workspace_id')
+    if not raw_workspace:
+        return jsonify({'error': 'workspace_id is required'}), 400
+
+    # Same dual-shape acceptance as /seed-agent: /api/demo/start hands the
+    # runner a public uuid, not the integer pk.
+    workspace_id = raw_workspace
+    if not isinstance(raw_workspace, int) and not str(raw_workspace).isdigit():
+        from app.services.workspace_session import resolve_workspace_id
+        workspace_id = resolve_workspace_id(str(raw_workspace))
+        if workspace_id is None:
+            return jsonify({'error': f'unknown workspace {raw_workspace!r}'}), 404
+    else:
+        workspace_id = int(raw_workspace)
+
+    name = (data.get('name') or 'harness-agent').strip()
+    email = (data.get('email') or f'{name}@harness.invalid').strip()
+    # This endpoint mints a JWT, which is a real credential. It may only ever
+    # do so for an agent the harness itself created - never an operator's
+    # account, whatever the body asks for.
+    if not email.endswith('@harness.invalid'):
+        return jsonify({
+            'error': 'refusing to mint a token for a non-harness user',
+        }), 403
+
+    try:
+        wait_seconds = min(int(data.get('wait_seconds') or 90), 100)
+    except (TypeError, ValueError):
+        wait_seconds = 90
+    want_sid = (data.get('call_sid') or '').strip() or None
+
+    with workspace_context(None):
+        agent = User.query.filter_by(
+            email=email, workspace_id=workspace_id,
+        ).first()
+        if agent is None:
+            return jsonify({
+                'error': f'no harness agent {email!r} in workspace {workspace_id}',
+            }), 404
+
+        agent_id = agent.id
+        workspace = agent.workspace
+        extra_claims = (
+            {'wsid': workspace.public_id} if workspace is not None else None
+        )
+
+        # Wait for the dispatch. A push-dispatched caller is only assigned when
+        # their hold cycle comes round, so this legitimately takes tens of
+        # seconds - polling here keeps that wait off the runner.
+        deadline = time.time() + wait_seconds
+        call = None
+        while True:
+            db.session.expire_all()
+            query = Call.query.filter(
+                Call.assigned_agent_id == agent_id,
+                Call.conference_name.isnot(None),
+                Call.status.in_(_ANSWERABLE_STATUSES),
+            )
+            if want_sid:
+                query = query.filter(Call.signalwire_call_sid == want_sid)
+            call = query.order_by(Call.id.desc()).first()
+            if call is not None or time.time() >= deadline:
+                break
+            time.sleep(2)
+
+        if call is None:
+            # 200, not an error: "nobody was dispatched to me" is a result a
+            # scenario may want to assert on, not a harness malfunction.
+            return jsonify({
+                'answered': False,
+                'reason': f'no call dispatched to this agent within {wait_seconds}s',
+                'agent_id': agent_id,
+            })
+
+        conference_name = call.conference_name
+        call_db_id = call.id
+        call_sid = call.signalwire_call_sid
+        tokens = generate_tokens(agent_id, extra_claims=extra_claims)
+
+    base = os.getenv('BACKEND_INTERNAL_URL', 'http://localhost:5000')
+
+    try:
+        prepared = _requests.post(
+            f'{base}/api/conferences/prepare-join',
+            timeout=20,
+            headers={'Authorization': f"Bearer {tokens['access_token']}"},
+            json={'conference_name': conference_name, 'call_id': str(call_db_id)},
+        )
+    except _requests.RequestException as exc:
+        return jsonify({'answered': False,
+                        'reason': f'prepare-join unreachable: {exc}'}), 502
+    if prepared.status_code >= 300:
+        return jsonify({
+            'answered': False,
+            'reason': f'prepare-join HTTP {prepared.status_code}: '
+                      f'{prepared.text[:200]}',
+        }), 502
+
+    dial_address = (prepared.json() or {}).get('dial_address')
+    if not dial_address:
+        return jsonify({'answered': False,
+                        'reason': 'prepare-join returned no dial_address'}), 502
+
+    space = os.getenv('SIGNALWIRE_SPACE')
+    project = os.getenv('SIGNALWIRE_PROJECT_ID')
+    api_token = os.getenv('SIGNALWIRE_API_TOKEN')
+    from_number = (os.getenv('SIGNALWIRE_FROM_NUMBER')
+                   or os.getenv('SIGNALWIRE_PHONE_NUMBER'))
+    if not all([space, project, api_token, from_number]):
+        return jsonify({
+            'answered': False,
+            'reason': 'SignalWire credentials or from-number not configured',
+        }), 500
+
+    # `url` is NOT what drives this leg - the Fabric resource supplies the
+    # document. But the Calling API refuses a dial carrying neither inline SWML
+    # nor a webhook url (422 inline_swml_or_swml_webhook_required) and then
+    # ignores what it was given: the 200 response echoes ``url: null``. The
+    # placeholder points at a real SWML document rather than a dead URL, so if
+    # that behaviour ever changes the failure is a legible out-of-service
+    # message instead of a silent dead leg.
+    placeholder_swml = f'{base}/api/swml/out-of-service'
+
+    try:
+        dialed = _requests.post(
+            f'https://{space}/api/calling/calls',
+            auth=(project, api_token), timeout=30,
+            json={'command': 'dial', 'params': {
+                'from': from_number,
+                'to': dial_address,
+                'url': placeholder_swml,
+            }},
+        )
+    except _requests.RequestException as exc:
+        return jsonify({'answered': False,
+                        'reason': f'dial failed: {exc}'}), 502
+    if dialed.status_code >= 300:
+        return jsonify({
+            'answered': False,
+            'reason': f'dial HTTP {dialed.status_code}: {dialed.text[:200]}',
+        }), 502
+
+    body = dialed.json() if dialed.content else {}
+    leg_id = body.get('id') or body.get('call_id')
+    logger.info(
+        'answer-as-agent: agent %s dialled into conference %s as leg %s',
+        agent_id, conference_name, leg_id,
+    )
+    return jsonify({
+        'answered': True,
+        'agent_id': agent_id,
+        'agent_leg_id': leg_id,
+        'call_sid': call_sid,
+        'call_db_id': call_db_id,
+        'conference_name': conference_name,
+    })

@@ -662,8 +662,70 @@ def test_returning_someone_elses_call_is_refused(app, redis):
     from app.api import call_control
 
     source = inspect.getsource(call_control.return_call_to_queue)
-    assert "call.assigned_agent_id != request.current_user.id" in source
+    assert "handler_id != request.current_user.id" in source
     assert "403" in source
     # The teardown that motivates the guard must still be requester-scoped;
     # if that ever changes, this guard can be revisited deliberately.
     assert "_find_agent_participant(call, user.id)" in source
+
+
+
+def test_the_handler_of_a_taken_over_call_is_still_resolvable(app, redis):
+    """assigned_agent_id is NULL after a human takes a call over from the AI —
+    the handler lives on an active human CallLeg and call.user_id. A guard
+    keyed only on assigned_agent_id skipped exactly those calls, letting
+    another supervisor requeue a caller out from under the agent talking to
+    them."""
+    from app.api.call_control import resolve_call_handler_id
+    from app.models import CallLeg
+
+    workspace = make_workspace()
+    seed_queue(workspace)
+    owner = seed_agent(workspace, redis, 'owner', ['en-US'])
+    taker = seed_agent(workspace, redis, 'taker', ['en-US'])
+
+    call = _returned_call(workspace, owner, 'taken-over-call', status='active')
+    assert call.assigned_agent_id is None
+
+    db.session.add(CallLeg(
+        call_id=call.id, workspace_id=workspace.id, user_id=taker.id,
+        leg_type='human_agent', leg_number=2, status='active',
+        transition_reason='takeover',
+    ))
+    db.session.commit()
+
+    assert resolve_call_handler_id(call) == taker.id
+
+
+def test_the_assigned_agent_still_wins_when_present(app, redis):
+    from app.api.call_control import resolve_call_handler_id
+
+    workspace = make_workspace()
+    seed_queue(workspace)
+    owner = seed_agent(workspace, redis, 'owner', ['en-US'])
+    agent = seed_agent(workspace, redis, 'ed', ['en-US'])
+    call = _returned_call(workspace, owner, 'plain-call', status='active',
+                          agent_id=agent.id)
+
+    assert resolve_call_handler_id(call) == agent.id
+
+
+def test_an_ended_human_leg_does_not_claim_the_call(app, redis):
+    """A completed takeover leg is history, not the current handler."""
+    from app.api.call_control import resolve_call_handler_id
+    from app.models import CallLeg
+
+    workspace = make_workspace()
+    seed_queue(workspace)
+    owner = seed_agent(workspace, redis, 'owner', ['en-US'])
+    gone = seed_agent(workspace, redis, 'gone', ['en-US'])
+    call = _returned_call(workspace, owner, 'stale-leg-call', status='active')
+
+    db.session.add(CallLeg(
+        call_id=call.id, workspace_id=workspace.id, user_id=gone.id,
+        leg_type='human_agent', leg_number=2, status='completed',
+        ended_at=datetime.utcnow(),
+    ))
+    db.session.commit()
+
+    assert resolve_call_handler_id(call) == owner.id

@@ -26,6 +26,32 @@ logger = logging.getLogger(__name__)
 ACTIVE_AGENT_CALL_STATUSES = ('assigned', 'active', 'answered', 'on_hold')
 
 
+def resolve_call_handler_id(call):
+    """The human currently holding this call, by the most reliable evidence.
+
+    ``assigned_agent_id`` is the normal answer, but it is NULL on a call a
+    human took over from the AI: initiate_takeover records the handler as an
+    active human CallLeg and on ``call.user_id`` instead. Anything keyed only
+    on assigned_agent_id therefore treats a taken-over call as unowned — which
+    let a different supervisor requeue a caller out from under the agent who
+    was actually talking to them.
+    """
+    if call.assigned_agent_id:
+        return call.assigned_agent_id
+
+    from app.models import CallLeg
+    leg = (
+        CallLeg.query
+        .filter_by(call_id=call.id, leg_type='human_agent', ended_at=None)
+        .filter(CallLeg.user_id.isnot(None))
+        .order_by(CallLeg.leg_number.desc())
+        .first()
+    )
+    if leg is not None:
+        return leg.user_id
+    return call.user_id
+
+
 def release_agent_after_return(qs, released_agent_id, returning_sid) -> bool:
     """Put an agent back to available after their call was returned to queue,
     unless they have since been given a different live call. Returns True when
@@ -285,7 +311,13 @@ def return_call_to_queue(call_id):
     # Refusing is the honest contract: remote return needs an agent-side
     # teardown channel (a socket instruction to drop their leg) that does not
     # exist yet. Supervisors retain takeover, monitor, whisper and barge.
-    if call.assigned_agent_id and call.assigned_agent_id != request.current_user.id:
+    #
+    # Resolved rather than read straight off assigned_agent_id: that column is
+    # NULL on a call a human took over from the AI, so a bare comparison
+    # skipped this guard entirely on exactly the calls a supervisor is most
+    # likely to be looking at.
+    handler_id = resolve_call_handler_id(call)
+    if handler_id and handler_id != request.current_user.id:
         return jsonify({
             'error': 'Only the agent handling this call can return it to the '
                      'queue. Use takeover to move the call instead.'
@@ -371,7 +403,7 @@ def return_call_to_queue(call_id):
         # agent who held the call — a supervisor can return someone else's.
         # Freeing the requester in that case leaves the real agent busy with
         # no call, which is the very state this step exists to prevent.
-        released_agent_id = call.assigned_agent_id or user.id
+        released_agent_id = handler_id or user.id
 
         call.status = 'waiting'
         call.assigned_agent_id = None

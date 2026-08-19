@@ -117,6 +117,38 @@ def internal_get(cfg: Config, path: str, **kwargs):
                         timeout=20, **kwargs)
 
 
+def internal_post(cfg: Config, path: str, **kwargs):
+    return requests.post(cfg.backend_local + path, auth=cfg.internal_auth,
+                         timeout=20, **kwargs)
+
+
+def seed_agents(cfg: Config, scenario: dict, workspace_id) -> list:
+    """Put human agents in the run's workspace before any call is placed.
+
+    Without this a scenario can only ever exercise the AI: there is nobody for
+    a caller asking for a person to reach, so the queue path, the language
+    fallback and every announcement that depends on an agent being dispatched
+    stay untested. None of it needs a browser — availability is a status write
+    and queue membership is a row.
+    """
+    seeds = (scenario.get('setup') or {}).get('agents') or []
+    if not seeds:
+        return []
+    created = []
+    for seed in seeds:
+        body = dict(seed)
+        body['workspace_id'] = workspace_id
+        r = internal_post(cfg, '/api/testing/seed-agent', json=body)
+        if r.status_code != 200:
+            die(f"seed-agent failed ({r.status_code}): {r.text[:200]}")
+        info = r.json()
+        created.append(info)
+        log(f"seeded agent {info['email']} languages={info['languages']} "
+            f"on '{info['queue_slug']}' ({info['status']}); "
+            f"available now: {info.get('available_agents')}")
+    return created
+
+
 def preflight(cfg: Config):
     log("preflight: backend health ...")
     r = requests.get(cfg.backend_local + '/health', timeout=10)
@@ -579,7 +611,11 @@ def main():
     heartbeat_stop = threading.Event()
     start_heartbeat(cfg, session, heartbeat_stop)
 
-    ctx = {}
+    state = _load_state()
+    workspace_id = (state.get('workspace') or {}).get('id')
+    agents = seed_agents(cfg, scenario, workspace_id)
+
+    ctx = {'agents': agents}
     try:
         for i, mission in enumerate(scenario['missions'], start=1):
             result = run_mission(cfg, scenario['name'], mission)

@@ -207,6 +207,97 @@ def get_verdict(run_id):
     return jsonify({'found': True, 'verdict': json.loads(raw)})
 
 
+@harness_bp.route('/seed-agent', methods=['POST'])
+@require_internal_auth
+def seed_agent():
+    """Put a human agent in a queue, available, with declared languages.
+
+    The missing half of the harness: it could always place a CALLER, and
+    never produce an agent for that caller to reach — so every scenario to
+    date stops at the AI. Nothing here needs a browser. Availability is a
+    Redis status and queue membership is a QueueAgentAssignment row; the
+    agent desktop is just one client of the same two operations. What still
+    needs a browser is the agent's AUDIO (a WebRTC leg) and anything drawn on
+    their screen — but routing decisions, the language fallback, and every
+    announcement the CALLER hears happen before an agent leg exists at all.
+
+    Body:
+        workspace_id: the run's demo workspace (from /api/demo/start)
+        queue_slug:   queue to activate them on
+        languages:    BCP-47 codes they speak, e.g. ["en-US"]
+        name:         optional label, defaults to 'harness-agent'
+        status:       optional, defaults to 'available'
+    """
+    from app import db
+    from app.models import Queue, QueueAgentAssignment, User
+    from app.services.queue_service import QueueService
+    from app.services.redis_service import get_redis_client
+    from app.tenancy import workspace_context
+
+    data = request.get_json(silent=True) or {}
+    workspace_id = data.get('workspace_id')
+    queue_slug = (data.get('queue_slug') or '').strip()
+    if not workspace_id or not queue_slug:
+        return jsonify({'error': 'workspace_id and queue_slug are required'}), 400
+
+    languages = data.get('languages') or ['en-US']
+    name = (data.get('name') or 'harness-agent').strip()
+    status = (data.get('status') or 'available').strip()
+    email = f"{name}@harness.invalid"
+
+    with workspace_context(None):
+        queue = Queue.query.filter_by(
+            slug=queue_slug, workspace_id=workspace_id,
+        ).first()
+        if queue is None:
+            return jsonify({
+                'error': f"queue '{queue_slug}' not found in workspace {workspace_id}",
+            }), 404
+
+        agent = User.query.filter_by(
+            email=email, workspace_id=workspace_id,
+        ).first()
+        if agent is None:
+            agent = User(email=email, name=name, workspace_id=workspace_id,
+                         role='agent', is_active=True)
+            agent.set_password('harness-not-a-login')
+            db.session.add(agent)
+        agent.languages = languages
+        # Immediate dispatch skips any selected agent without an address, so
+        # an agent seeded without one looks available and is never actually
+        # assigned — a silent no-op that would make a scenario lie.
+        agent.signalwire_address = agent.signalwire_address or f"/private/{name}"
+        db.session.commit()
+
+        assignment = QueueAgentAssignment.query.filter_by(
+            queue_id=queue.id, user_id=agent.id,
+        ).first()
+        if assignment is None:
+            assignment = QueueAgentAssignment(queue_id=queue.id, user_id=agent.id)
+            db.session.add(assignment)
+        assignment.is_activated = True
+        assignment.skill_level = data.get('skill_level', 5)
+        db.session.commit()
+
+        qs = QueueService(get_redis_client(), workspace_id=workspace_id)
+        # set_agent_status rehydrates the activation set from the assignment
+        # rows above, which is what makes them a candidate for this queue.
+        qs.set_agent_status(str(agent.id), status)
+
+        logger.info(
+            "seed-agent: %s (id=%s) languages=%s activated on '%s' status=%s",
+            email, agent.id, languages, queue_slug, status,
+        )
+        return jsonify({
+            'agent_id': agent.id,
+            'email': email,
+            'languages': languages,
+            'queue_slug': queue_slug,
+            'status': status,
+            'available_agents': qs.get_available_agents(queue_slug),
+        })
+
+
 @harness_bp.route('/call-report', methods=['GET'])
 @require_internal_auth
 def call_report():

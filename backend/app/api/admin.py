@@ -294,6 +294,28 @@ def list_queues():
         return jsonify({'error': str(e)}), 500
 
 
+def _reject_language_policy_on_bridge(transport, policy):
+    """Bridge cannot do language routing at all, so accepting a policy for a
+    bridge queue would store a setting that silently does nothing.
+
+    Not merely unenforced: the native queue pops the oldest caller so the
+    pairing is not ours to choose, AND bridge pickup never sets
+    needs_translation, so even the permissive policy connects a mismatched
+    pair with no translation. Refusing at config time beats discovering it
+    from a caller who could not be understood.
+    """
+    if transport == 'bridge' and policy and policy != 'translate_now':
+        return jsonify({
+            'error': (
+                'language_fallback_policy is not supported on bridge '
+                'transport — the native queue chooses which caller an agent '
+                'connects to, and bridge pickup never starts translation. '
+                'Use routing_transport="conference" for language routing.'
+            ),
+            'code': 'language_policy_unsupported_on_bridge',
+        }), 400
+    return None
+
 @admin_bp.route('/queues', methods=['POST'])
 @require_auth
 def create_queue():
@@ -354,6 +376,12 @@ def create_queue():
             return jsonify({
                 'error': 'language_wait_seconds must be between 0 and 3600'
             }), 400
+
+        rejected = _reject_language_policy_on_bridge(
+            routing_transport, language_policy,
+        )
+        if rejected:
+            return rejected
 
         queue = Queue(
             slug=slug,
@@ -427,6 +455,13 @@ def update_queue(queue_id):
                     'error': 'language_wait_seconds must be between 0 and 3600'
                 }), 400
             data['language_wait_seconds'] = seconds
+
+        rejected = _reject_language_policy_on_bridge(
+            data.get('routing_transport', queue.routing_transport),
+            data.get('language_fallback_policy', queue.language_fallback_policy),
+        )
+        if rejected:
+            return rejected
 
         for field in ['display_name', 'description', 'is_active', 'routing_strategy',
                       'routing_transport', 'ai_agent_route', 'default_priority',

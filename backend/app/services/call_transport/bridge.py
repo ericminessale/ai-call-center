@@ -145,8 +145,12 @@ def build_ingress_swml(
         # through _push_dispatch_bridge_pickup, which does not see this
         # decision at all.
         #
-        # So: say so, once, loudly, and route as before. The conference
-        # transport is where this policy lives.
+        # And note what "route as before" actually means here: bridge pickup
+        # never sets needs_translation, and _maybe_start_live_translate only
+        # runs on conference join — so a mismatched bridge pair is connected
+        # with no translation whatsoever. Not translate_now; no language
+        # handling at all. The admin API refuses the combination for this
+        # reason; this warning covers queues configured before that guard.
         try:
             from app.models import Queue as QueueModel
             queue_row = QueueModel.query.filter_by(
@@ -156,9 +160,13 @@ def build_ingress_swml(
             if policy and policy != 'translate_now':
                 logger.warning(
                     f"Queue '{queue_slug}' is set to language_fallback_policy="
-                    f"{policy}, which bridge transport cannot honour — the "
+                    f"{policy}, which bridge transport cannot honour. The "
                     "native queue pops the oldest caller, so the pairing is "
-                    "not ours to choose. This call routes as translate_now."
+                    "not ours to choose — and bridge pickup never sets "
+                    "needs_translation, so nothing starts translation either. "
+                    "This call connects with NO language matching and NO "
+                    "translation. Use conference transport for language "
+                    "routing."
                 )
         except Exception:
             pass

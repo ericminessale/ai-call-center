@@ -1037,3 +1037,32 @@ def test_push_dispatch_looks_past_a_call_it_cannot_take(app, redis):
     assert qs_module.PUSH_DISPATCH_SCAN_DEPTH > 1
     # Eligibility is decided per candidate inside the scan, not after it.
     assert '_agent_may_take_call' in source
+
+
+def test_a_language_policy_on_a_bridge_queue_is_refused(app):
+    """Storing a setting that silently does nothing is worse than refusing it.
+    Bridge cannot choose the pairing (the native queue pops the oldest caller)
+    and never sets needs_translation, so even the permissive policy connects a
+    mismatched pair with no translation."""
+    from app.api.admin import _reject_language_policy_on_bridge
+
+    assert _reject_language_policy_on_bridge('bridge', 'wait_only') is not None
+    assert _reject_language_policy_on_bridge('bridge', 'wait_then_translate') is not None
+    # translate_now is the no-op default and stays allowed; conference is fine.
+    assert _reject_language_policy_on_bridge('bridge', 'translate_now') is None
+    assert _reject_language_policy_on_bridge('conference', 'wait_only') is None
+
+
+def test_the_bridge_warning_does_not_claim_translation_happens():
+    """The first version of this warning said the call 'routes as
+    translate_now', which reads as 'connects and translates'. Bridge does
+    neither half."""
+    import inspect
+    from app.services.call_transport import bridge
+
+    source = inspect.getsource(bridge)
+    # Substring checks over source are brittle when a message is wrapped
+    # across string literals, so assert on a phrase that stays contiguous.
+    assert 'NO language matching' in source
+    assert 'no translation whatsoever' in source
+    assert 'routes as translate_now' not in source

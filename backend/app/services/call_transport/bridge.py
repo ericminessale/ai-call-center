@@ -129,24 +129,40 @@ def build_ingress_swml(
     # will pick them up on the next available transition).
     try:
         available_agents = qs.get_available_agents(queue_slug)
-        # Bridge transport gets the same language policy as conference. It
-        # was reaching select_agent with the default (fallback allowed), so a
-        # queue set to wait_only or wait_then_translate held out on the
-        # conference path and connected a mismatched agent instantly here —
-        # the same rule producing opposite behaviour depending on transport.
-        from app.models import Queue as QueueModel
-        from app.services.call_language import language_fallback_allowed
-        queue_row = QueueModel.query.filter_by(
-            slug=queue_slug, workspace_id=call.workspace_id,
-        ).first()
-        allow_fallback = language_fallback_allowed(queue_row, waited_seconds=0)
-        if not agent_languages and available_agents:
-            # Same gap as the conference path: an empty map makes
-            # select_agent skip language preference altogether.
-            try:
-                agent_languages = qs.get_languages_for_agents(available_agents)
-            except Exception:
-                agent_languages = {}
+        # LANGUAGE POLICY IS NOT ENFORCEABLE ON THIS TRANSPORT, and pretending
+        # otherwise is worse than not trying. Bridge parks callers in
+        # SignalWire's NATIVE queue and connects an agent by dialing them into
+        # `queue:<slug>`, which pops the OLDEST waiting caller — we never
+        # choose the pairing. A check made against the arriving call therefore
+        # approves an agent for one caller and hands them a different one: a
+        # Spanish wait_only caller at the head gets connected to the English
+        # agent we approved for the English caller who just arrived.
+        #
+        # Two more things would be needed even if that were solved: bridge has
+        # no hold cycle, so nothing re-evaluates wait_then_translate once the
+        # threshold passes (the caller would wait out the 30-minute native
+        # timeout instead of translating), and the delayed pickup path enters
+        # through _push_dispatch_bridge_pickup, which does not see this
+        # decision at all.
+        #
+        # So: say so, once, loudly, and route as before. The conference
+        # transport is where this policy lives.
+        try:
+            from app.models import Queue as QueueModel
+            queue_row = QueueModel.query.filter_by(
+                slug=queue_slug, workspace_id=call.workspace_id,
+            ).first()
+            policy = getattr(queue_row, 'language_fallback_policy', None)
+            if policy and policy != 'translate_now':
+                logger.warning(
+                    f"Queue '{queue_slug}' is set to language_fallback_policy="
+                    f"{policy}, which bridge transport cannot honour — the "
+                    "native queue pops the oldest caller, so the pairing is "
+                    "not ours to choose. This call routes as translate_now."
+                )
+        except Exception:
+            pass
+
         for candidate_id in (available_agents or []):
             # Reuse the same routing strategy the conference path uses.
             chosen = qs.select_agent(
@@ -157,7 +173,6 @@ def build_ingress_swml(
                 call_priority=priority,
                 caller_language=caller_language,
                 agent_languages=agent_languages or {},
-                allow_language_fallback=allow_fallback,
             )
             if not chosen:
                 continue

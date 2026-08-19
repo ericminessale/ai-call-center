@@ -1007,15 +1007,23 @@ def test_workspace_provisioning_clones_the_policy():
     assert 'language_wait_seconds=q.language_wait_seconds' in source
 
 
-def test_bridge_transport_applies_the_same_policy():
-    """The same queue setting must not mean different things depending on
-    which transport the call arrived over."""
+def test_bridge_transport_does_not_pretend_to_enforce_the_policy():
+    """Bridge parks callers in SignalWire's NATIVE queue and connects an
+    agent by dialing them into queue:<slug>, which pops the OLDEST caller — we
+    never choose the pairing. A check against the arriving call approves an
+    agent for one caller and hands them another, so an attempt at enforcement
+    here is not a partial win, it is a wrong answer delivered confidently.
+
+    The honest contract is a loud warning and translate_now behaviour.
+    """
     import inspect
     from app.services.call_transport import bridge
 
     source = inspect.getsource(bridge)
-    assert 'allow_language_fallback=allow_fallback' in source
-    assert 'get_languages_for_agents' in source
+    assert 'allow_language_fallback' not in source, (
+        'bridge cannot honour the policy; claiming to is worse than not'
+    )
+    assert 'cannot honour' in source, 'the limitation must be logged, not hidden'
 
 
 def test_push_dispatch_looks_past_a_call_it_cannot_take(app, redis):

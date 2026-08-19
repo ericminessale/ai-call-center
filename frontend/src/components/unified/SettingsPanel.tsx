@@ -1392,6 +1392,11 @@ function QueuesTab() {
                   <option value="wait_then_translate">Wait briefly for a match, then translate</option>
                   <option value="translate_now">Connect now with live translation</option>
                   <option value="wait_only">Only connect an agent who speaks it</option>
+                  {/* Backend-valid, so a queue configured by API can hold it.
+                      Without an option the select renders blank and the
+                      threshold — which this policy still uses while it
+                      degrades to wait-then-translate — disappears. */}
+                  <option value="ask_caller">Ask the caller (not built yet — waits, then translates)</option>
                 </select>
                 <p className="text-[11px] text-ink-dim mt-1">
                   {editForm.routing_transport === 'bridge'
@@ -1399,7 +1404,8 @@ function QueuesTab() {
                     : 'Callers are always routed to an agent who speaks their language when one is free. This is what happens when none is.'}
                 </p>
               </div>
-              {editForm.language_fallback_policy === 'wait_then_translate'
+              {(editForm.language_fallback_policy === 'wait_then_translate'
+                || editForm.language_fallback_policy === 'ask_caller')
                 && editForm.routing_transport !== 'bridge' && (
                 <div>
                   <label className="block kicker mb-1">Wait For A Match (seconds)</label>

@@ -21,6 +21,11 @@ export function mapCall(raw: any): Call {
     direction: raw.direction,
     destination: raw.destination,
 
+    // Translation state — both casings, since this shim exists precisely
+    // because the wire is inconsistent about them.
+    caller_language: raw.caller_language || raw.callerLanguage,
+    needs_translation: raw.needs_translation ?? raw.needsTranslation ?? false,
+
     // Contact linkage
     contact_id: raw.contact_id || raw.contactId,
 

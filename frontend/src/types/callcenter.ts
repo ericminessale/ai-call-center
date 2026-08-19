@@ -225,6 +225,12 @@ export interface Call {
   ai_summary?: string;  // Backend snake_case
   transferCount?: number;
 
+  // Language / translation. The backend has served both of these for weeks
+  // and nothing read them, so an agent on a translated call got the added
+  // latency with no indication why — and would talk over the caller.
+  caller_language?: string;
+  needs_translation?: boolean;
+
   // Handler information
   handler_type?: 'human' | 'ai';
   ai_agent_name?: string;

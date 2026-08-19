@@ -729,3 +729,85 @@ def test_an_ended_human_leg_does_not_claim_the_call(app, redis):
     db.session.commit()
 
     assert resolve_call_handler_id(call) == owner.id
+
+
+# ---------------------------------------------------------------------------
+# Telling the caller. The delay translation adds is indistinguishable from a
+# broken line unless somebody explains it.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('code,expected', [
+    ('es-ES', 'traducirá'),
+    ('es', 'traducirá'),
+    ('fr-FR', 'traduit'),
+    ('en-US', 'translated'),
+    ('de-DE', 'translated'),   # unsupported -> English beats silence
+    (None, 'translated'),
+])
+def test_the_notice_is_spoken_in_the_callers_language(code, expected):
+    """Announcing a translated line in English to a Spanish speaker tells the
+    one person in the conversation who cannot read it."""
+    from app.services.call_language import translation_notice
+
+    assert expected in translation_notice(code)
+
+
+def test_the_notice_says_it_is_a_real_person():
+    """Three things a caller needs, or they hang up on a working call: that
+    translation is happening, that the pause is expected, and that the other
+    party is human."""
+    from app.services.call_language import translation_notice
+
+    english = translation_notice('en-US')
+    assert 'translated' in english
+    assert 'pause' in english
+    assert 'real person' in english
+
+
+def _greeting_of(document):
+    for verb in document['sections']['main']:
+        if 'play' in verb and 'url' in verb['play']:
+            return verb['play']['url']
+    return None
+
+
+def test_a_translated_connection_greets_the_caller_about_it(app, redis):
+    workspace = make_workspace()
+    seed_queue(workspace)
+    english = seed_agent(workspace, redis, 'ed', ['en-US'])
+
+    call = Call(
+        signalwire_call_sid='call-notice', workspace_id=workspace.id,
+        user_id=english.id, from_number='+15551230000',
+        destination='+15559990000', destination_type='phone',
+        direction='inbound', status='waiting', caller_language='es-ES',
+        created_at=datetime.utcnow(),
+    )
+    db.session.add(call)
+    db.session.commit()
+
+    document = queue_dispatch.enqueue_and_build_swml(
+        call=call, queue_slug=QUEUE_SLUG, context={}, base_url=BASE_URL,
+        routing_strategy='round_robin', caller_language='es-ES',
+        agent_languages=None, skill_levels={}, priority=5,
+        start_live_transcribe=False,
+    )
+    db.session.refresh(call)
+
+    assert call.needs_translation is True
+    greeting = _greeting_of(document)
+    assert greeting is not None and greeting.startswith('say:')
+    assert 'traducirá' in greeting, 'the notice must be in the caller\'s language'
+
+
+def test_an_ordinary_connection_keeps_the_ordinary_greeting(app, redis):
+    """No notice when there is nothing to explain — a translation warning on a
+    same-language call is just noise that makes the caller doubt the line."""
+    workspace = make_workspace()
+    seed_queue(workspace)
+    english = seed_agent(workspace, redis, 'ed', ['en-US'])
+
+    call = arrive(workspace, caller_language='en-US', agents=[english],
+                  sid='call-plain-greeting')
+
+    assert call.needs_translation is False

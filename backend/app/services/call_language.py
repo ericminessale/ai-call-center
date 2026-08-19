@@ -274,3 +274,40 @@ def flag_translation_if_mismatched(call, agent) -> bool:
         call.id, caller_language, agent.id, spoken,
     )
     return True
+
+
+# Spoken in the CALLER's language, not the agent's — announcing a translated
+# line in English to a Spanish speaker tells the one person who cannot read it.
+# Only the languages this product's agents actually answer in (see
+# main_agent.add_language) are worth carrying; anything else falls back to
+# English, which is still better than silence.
+_TRANSLATION_NOTICE = {
+    'en': (
+        "Connecting you to an agent now. They speak a different language, so "
+        "this call will be translated for you both. You are speaking with a "
+        "real person, and there may be a short pause between replies."
+    ),
+    'es': (
+        "Le estamos comunicando con un agente. Habla otro idioma, así que "
+        "esta llamada se traducirá para ambos. Está hablando con una persona "
+        "real, y puede haber una breve pausa entre respuestas."
+    ),
+    'fr': (
+        "Nous vous mettons en relation avec un conseiller. Il parle une autre "
+        "langue, donc cet appel sera traduit pour vous deux. Vous parlez avec "
+        "une personne réelle, et il peut y avoir une courte pause entre les "
+        "réponses."
+    ),
+}
+
+
+def translation_notice(caller_language):
+    """What to tell a caller who is about to be connected through translation.
+
+    Three things, deliberately, because the alternative is a caller who thinks
+    the line is broken: that translation is happening, that the delay is
+    expected, and that the other party is a real person rather than a machine.
+    """
+    code = normalize_language(caller_language) or 'en-US'
+    return _TRANSLATION_NOTICE.get(code.split('-')[0].lower(),
+                                   _TRANSLATION_NOTICE['en'])

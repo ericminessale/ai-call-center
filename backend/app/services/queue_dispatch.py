@@ -1031,10 +1031,25 @@ def enqueue_and_build_swml(
                             queue_slug=queue_slug,
                             context=context,
                         )
-                        greeting = (
-                            "say:Connecting you to an agent now. "
-                            "They'll be joining you shortly, please hold."
-                        )
+                        if call.needs_translation:
+                            # The caller is about to be connected to someone
+                            # who does not speak their language. Say so, in
+                            # THEIR language, before the pause starts — an
+                            # unexplained delay between replies reads as a
+                            # broken line, and a caller who hangs up on a
+                            # working translation is worse off than one who
+                            # waited for a matching agent.
+                            from app.services.call_language import (
+                                translation_notice,
+                            )
+                            greeting = "say:" + translation_notice(
+                                call.caller_language
+                            )
+                        else:
+                            greeting = (
+                                "say:Connecting you to an agent now. "
+                                "They'll be joining you shortly, please hold."
+                            )
                         agent_dispatched = True
                     else:
                         # Lost race — another path claimed the call. Fall

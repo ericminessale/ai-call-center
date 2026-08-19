@@ -1398,6 +1398,8 @@ export function ContactDetailView({ contact, onContactUpdate, onContactDelete, a
             isOutboundCallInProgress={isOutboundCallInProgress}
             aiContext={connectedCustomer?.aiContext || (activeCallForContact as any)?.aiContext}
             sentiment={liveSentiment}
+            needsTranslation={(activeCallForContact as any)?.needs_translation}
+            callerLanguage={(activeCallForContact as any)?.caller_language}
           />
         )}
         {activeTab === 'history' && (

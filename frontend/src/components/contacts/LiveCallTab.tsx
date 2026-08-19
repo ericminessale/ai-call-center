@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { PhoneOutgoing, Bot, Mic, Send, AlertCircle, TrendingUp, TrendingDown, Minus, BookOpen, ChevronDown, Search, MessageSquare, HelpCircle } from 'lucide-react';
+import { PhoneOutgoing, Bot, Mic, Send, AlertCircle, TrendingUp, TrendingDown, Minus, BookOpen, ChevronDown, Search, MessageSquare, HelpCircle, Languages } from 'lucide-react';
 import { TranscriptionMessage } from '../../types/callcenter';
 import api from '../../services/api';
 import websocket from '../../services/websocket';
@@ -75,6 +75,12 @@ interface LiveCallTabProps {
   isOutboundCallInProgress?: boolean;
   aiContext?: AIContext;
   sentiment?: SentimentData | null;
+  /** Set when routing could not find an agent who speaks the caller's
+   *  language and started live translation instead. The agent needs to know:
+   *  translated turns arrive with a delay, and an agent who does not expect
+   *  it talks over the caller. */
+  needsTranslation?: boolean;
+  callerLanguage?: string;
 }
 
 function SentimentIndicator({ sentiment }: { sentiment: SentimentData }) {
@@ -94,6 +100,8 @@ function SentimentIndicator({ sentiment }: { sentiment: SentimentData }) {
 }
 
 export function LiveCallTab({
+  needsTranslation,
+  callerLanguage,
   transcription,
   isAICall,
   callSid,
@@ -414,6 +422,20 @@ export function LiveCallTab({
             </h3>
           </div>
           <div className="flex items-center gap-2">
+            {needsTranslation && (
+              <Chip
+                dot="warning"
+                title={
+                  `This caller speaks ${callerLanguage || 'another language'} and no agent ` +
+                  'who speaks it was available. The call is being translated in ' +
+                  'both directions, so expect a short delay before each reply — ' +
+                  'let the caller finish before you respond.'
+                }
+              >
+                <Languages className="w-3 h-3" />
+                <span>Translated{callerLanguage ? ` · ${callerLanguage}` : ''}</span>
+              </Chip>
+            )}
             {sentiment && <SentimentIndicator sentiment={sentiment} />}
             <Chip dot={status.dot}>{status.text}</Chip>
           </div>

@@ -272,6 +272,25 @@ def return_call_to_queue(call_id):
     if owner_check:
         return owner_check
 
+    # ...and beyond ownership, the requester must BE the agent on the call.
+    # _require_call_ownership also admits supervisors and admins, but every
+    # teardown step below is written in terms of the requester: it ends THEIR
+    # CallLeg, removes THEIR conference participant, and returns an
+    # SDK-hangup instruction to THEIR browser. A supervisor returning someone
+    # else's call therefore tore down nothing and left the agent connected —
+    # and once the release started correctly targeting the assigned agent,
+    # that agent would be marked available and handed a second call while
+    # still talking to the first caller.
+    #
+    # Refusing is the honest contract: remote return needs an agent-side
+    # teardown channel (a socket instruction to drop their leg) that does not
+    # exist yet. Supervisors retain takeover, monitor, whisper and barge.
+    if call.assigned_agent_id and call.assigned_agent_id != request.current_user.id:
+        return jsonify({
+            'error': 'Only the agent handling this call can return it to the '
+                     'queue. Use takeover to move the call instead.'
+        }), 403
+
     data = request.get_json() or {}
     reason = (data.get('reason') or '').strip()
     target_queue_slug = (data.get('target_queue_slug') or call.queue_id or '').strip()

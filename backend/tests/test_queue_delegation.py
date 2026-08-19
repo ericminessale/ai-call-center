@@ -646,14 +646,24 @@ def test_a_call_tracked_for_a_different_agent_does_not_block_the_release(app, re
     assert release_agent_after_return(qs, agent.id, 'my-returned-call') is True
 
 
-def test_the_released_agent_is_the_one_who_held_the_call(app, redis):
-    """A supervisor can return someone else's call. Freeing the REQUESTER
-    would leave the real agent busy with no call — the stuck-busy state this
-    whole path exists to avoid, arrived at from the other direction."""
+def test_returning_someone_elses_call_is_refused(app, redis):
+    """Every teardown step in the endpoint is written in terms of the
+    REQUESTER — their CallLeg, their conference participant, an SDK-hangup to
+    their browser. A supervisor returning another agent's call therefore tore
+    down nothing and left that agent connected; once the release correctly
+    targeted the assigned agent, they would also be marked available and
+    handed a second call mid-conversation.
+
+    Refusing is the honest contract until an agent-side teardown channel
+    exists. This asserts the guard, and names why it cannot simply be
+    deleted.
+    """
     import inspect
     from app.api import call_control
 
     source = inspect.getsource(call_control.return_call_to_queue)
-    assert 'released_agent_id = call.assigned_agent_id or user.id' in source, (
-        "the release must target the call's assigned agent, not the requester"
-    )
+    assert "call.assigned_agent_id != request.current_user.id" in source
+    assert "403" in source
+    # The teardown that motivates the guard must still be requester-scoped;
+    # if that ever changes, this guard can be revisited deliberately.
+    assert "_find_agent_participant(call, user.id)" in source

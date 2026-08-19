@@ -77,8 +77,9 @@ def _maybe_start_live_translate(call, participant_call_sid):
                 # call_control.start_translate — /translate/status reads
                 # from_lang/to_lang, so inventing a shape here reports
                 # translation active with both languages null.
+                from app.api.call_control import TRANSLATE_STATE_TTL_SECONDS
                 redis_client.setex(
-                    f'translate:{call.id}', 7200,
+                    f'translate:{call.id}', TRANSLATE_STATE_TTL_SECONDS,
                     json.dumps({'from_lang': from_lang, 'to_lang': to_lang}),
                 )
         except Exception as mark_err:

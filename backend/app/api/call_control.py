@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 # drift (free the agent) or a newer real assignment (leave them busy).
 ACTIVE_AGENT_CALL_STATUSES = ('assigned', 'active', 'answered', 'on_hold')
 
+# How long the `translate:<call_id>` marker lives. It has to outlast the call,
+# because it is what /translate/status reports and what the restart path
+# checks: expiring mid-call makes an actively translating call read as
+# inactive, and a restart attempt then skips the stop-before-start the SWML
+# docs require. Sized to call_watchdog's 4h tolerance for an active call —
+# the longest a call is expected to exist at all.
+TRANSLATE_STATE_TTL_SECONDS = 4 * 60 * 60
+
 
 def resolve_call_handler_id(call):
     """The human currently holding this call, by the most reliable evidence.
@@ -680,7 +688,7 @@ def start_translate(call_id):
         # Mark translation as on so the UI + future toggles know the state
         if redis_client:
             redis_client.setex(f'translate:{call.id}',
-                               7200,
+                               TRANSLATE_STATE_TTL_SECONDS,
                                json.dumps({'from_lang': from_lang, 'to_lang': to_lang}))
 
         # Persist on the Call so other agents (takeovers, supervisors) see it

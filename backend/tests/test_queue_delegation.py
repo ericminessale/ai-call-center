@@ -863,3 +863,21 @@ def test_auto_started_translation_is_readable_by_the_status_endpoint(app, redis)
     assert "'from_lang': from_lang, 'to_lang': to_lang" in auto
     assert "'from_lang': from_lang, 'to_lang': to_lang" in manual
     assert 'from_lang' in status
+
+
+def test_the_translation_marker_outlives_the_call(app, redis):
+    """The marker is what /translate/status reports and what the restart path
+    checks for. Expiring mid-call makes an actively translating call read as
+    inactive, and the restart then skips the stop-before-start that
+    live_translate requires."""
+    from app.api.call_control import TRANSLATE_STATE_TTL_SECONDS
+    from app.services import call_watchdog
+
+    assert TRANSLATE_STATE_TTL_SECONDS >= 4 * 60 * 60
+    # Both writers use the shared constant rather than a literal.
+    import inspect
+    from app.api import conferences, call_control
+    assert 'TRANSLATE_STATE_TTL_SECONDS' in inspect.getsource(
+        conferences._maybe_start_live_translate)
+    assert 'TRANSLATE_STATE_TTL_SECONDS' in inspect.getsource(
+        call_control.start_translate)

@@ -178,6 +178,10 @@ interface QueueConfig {
   default_priority: number;
   sla_threshold_seconds: number;
   max_wait_before_ai_fallback: number;
+  // What to do when nobody available speaks the caller's language. Routing
+  // always PREFERS a match; this decides what happens when there isn't one.
+  language_fallback_policy?: 'translate_now' | 'wait_then_translate' | 'wait_only' | 'ask_caller';
+  language_wait_seconds?: number;
   agent_count?: number;
 }
 
@@ -1122,6 +1126,8 @@ function QueuesTab() {
       default_priority: q.default_priority,
       sla_threshold_seconds: q.sla_threshold_seconds,
       max_wait_before_ai_fallback: q.max_wait_before_ai_fallback,
+      language_fallback_policy: q.language_fallback_policy || 'wait_then_translate',
+      language_wait_seconds: q.language_wait_seconds ?? 60,
       is_active: q.is_active,
     });
   };
@@ -1363,6 +1369,56 @@ function QueuesTab() {
                   told an agent will call back, and released. 0 disables the cap.
                 </p>
               </div>
+
+              {/* Language fallback. The backend has enforced this per queue
+                  since a7b8c9d0e1f2, and without these controls it was
+                  settable only by API — a tunable nobody can reach is a
+                  hardcoded default with extra steps. Bridge transport cannot
+                  honour it (the native queue chooses which caller an agent
+                  connects to), so the API rejects the combination and the
+                  control says so rather than letting someone set it and
+                  wonder why nothing happens. */}
+              <div>
+                <label className="block kicker mb-1">If No Agent Speaks Their Language</label>
+                <select
+                  value={editForm.language_fallback_policy || 'wait_then_translate'}
+                  onChange={e => setEditForm({
+                    ...editForm,
+                    language_fallback_policy: e.target.value as QueueConfig['language_fallback_policy'],
+                  })}
+                  disabled={editForm.routing_transport === 'bridge'}
+                  className="input"
+                >
+                  <option value="wait_then_translate">Wait briefly for a match, then translate</option>
+                  <option value="translate_now">Connect now with live translation</option>
+                  <option value="wait_only">Only connect an agent who speaks it</option>
+                </select>
+                <p className="text-[11px] text-ink-dim mt-1">
+                  {editForm.routing_transport === 'bridge'
+                    ? 'Not available on Bridge transport — the native queue decides which caller an agent connects to, so language cannot be matched. Switch to Conference to use this.'
+                    : 'Callers are always routed to an agent who speaks their language when one is free. This is what happens when none is.'}
+                </p>
+              </div>
+              {editForm.language_fallback_policy === 'wait_then_translate'
+                && editForm.routing_transport !== 'bridge' && (
+                <div>
+                  <label className="block kicker mb-1">Wait For A Match (seconds)</label>
+                  <input
+                    type="number" min={0} max={3600}
+                    value={editForm.language_wait_seconds ?? 60}
+                    onChange={e => setEditForm({
+                      ...editForm,
+                      language_wait_seconds: parseInt(e.target.value) || 0,
+                    })}
+                    className="input mono"
+                  />
+                  <p className="text-[11px] text-ink-dim mt-1">
+                    After this, the caller is connected to any available agent and
+                    told — in their own language — that the call is being translated.
+                    The hold cap above still applies.
+                  </p>
+                </div>
+              )}
 
               {/* Call transport: see CALL_TRANSPORT.md. Conference (current default)
                   supports multi-party — supervisor monitor, whisper, barge. Bridge

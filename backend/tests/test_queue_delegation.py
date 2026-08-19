@@ -1066,3 +1066,27 @@ def test_the_bridge_warning_does_not_claim_translation_happens():
     assert 'NO language matching' in source
     assert 'no translation whatsoever' in source
     assert 'routes as translate_now' not in source
+
+
+def test_an_unrelated_edit_to_a_bridge_queue_still_saves(app):
+    """The migration set EVERY queue to wait_then_translate, bridge included,
+    and the queue form does not submit the field. Checking the effective value
+    on every PUT therefore made existing bridge queues unsaveable — renaming
+    one would 400 on a policy the operator never touched."""
+    import inspect
+    from app.api import admin
+
+    update = inspect.getsource(admin.update_queue)
+    assert "if 'routing_transport' in data or 'language_fallback_policy' in data:" in update
+
+
+def test_creating_a_bridge_queue_without_a_policy_works(app):
+    """Two defaulted fields must not contradict each other: defaulting a
+    bridge queue to wait_then_translate and then rejecting it fails a request
+    on choices nobody made."""
+    import inspect
+    from app.api import admin
+
+    create = inspect.getsource(admin.create_queue)
+    assert "'translate_now' if routing_transport == 'bridge'" in create
+    assert "if 'language_fallback_policy' in data:" in create

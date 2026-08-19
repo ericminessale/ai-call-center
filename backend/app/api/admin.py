@@ -360,8 +360,15 @@ def create_queue():
         # Validated rather than trusted: an unknown policy string would make
         # language_fallback_allowed fall through to its wait branch and hold
         # callers for a threshold nobody configured.
-        language_policy = data.get('language_fallback_policy',
-                                   'wait_then_translate')
+        # The two defaults have to agree with each other. Bridge cannot do
+        # language routing at all, so defaulting a bridge queue to
+        # wait_then_translate and then rejecting it makes a perfectly valid
+        # create request fail on two defaults nobody chose.
+        language_policy = data.get(
+            'language_fallback_policy',
+            'translate_now' if routing_transport == 'bridge'
+            else 'wait_then_translate',
+        )
         if language_policy not in Queue.LANGUAGE_FALLBACK_POLICIES:
             return jsonify({
                 'error': 'language_fallback_policy must be one of '
@@ -377,11 +384,12 @@ def create_queue():
                 'error': 'language_wait_seconds must be between 0 and 3600'
             }), 400
 
-        rejected = _reject_language_policy_on_bridge(
-            routing_transport, language_policy,
-        )
-        if rejected:
-            return rejected
+        if 'language_fallback_policy' in data:
+            rejected = _reject_language_policy_on_bridge(
+                routing_transport, language_policy,
+            )
+            if rejected:
+                return rejected
 
         queue = Queue(
             slug=slug,
@@ -456,12 +464,19 @@ def update_queue(queue_id):
                 }), 400
             data['language_wait_seconds'] = seconds
 
-        rejected = _reject_language_policy_on_bridge(
-            data.get('routing_transport', queue.routing_transport),
-            data.get('language_fallback_policy', queue.language_fallback_policy),
-        )
-        if rejected:
-            return rejected
+        # Only when the request is CHANGING one of the two. The migration set
+        # every queue — bridge ones included — to wait_then_translate, and the
+        # queue form does not submit this field, so checking the effective
+        # value on every PUT made existing bridge queues unsaveable: renaming
+        # one would 400 on a policy the operator never touched.
+        if 'routing_transport' in data or 'language_fallback_policy' in data:
+            rejected = _reject_language_policy_on_bridge(
+                data.get('routing_transport', queue.routing_transport),
+                data.get('language_fallback_policy',
+                         queue.language_fallback_policy),
+            )
+            if rejected:
+                return rejected
 
         for field in ['display_name', 'description', 'is_active', 'routing_strategy',
                       'routing_transport', 'ai_agent_route', 'default_priority',

@@ -1077,7 +1077,12 @@ def test_an_unrelated_edit_to_a_bridge_queue_still_saves(app):
     from app.api import admin
 
     update = inspect.getsource(admin.update_queue)
-    assert "if 'routing_transport' in data or 'language_fallback_policy' in data:" in update
+    # Presence is not enough: SettingsPanel seeds editForm with the queue's
+    # current routing_transport and PUTs the whole form, so an unrelated
+    # rename still arrives carrying routing_transport unchanged.
+    assert "data['routing_transport'] != queue.routing_transport" in update
+    assert "data['language_fallback_policy'] != queue.language_fallback_policy" in update
+    assert 'transport_changed or policy_changed' in update
 
 
 def test_creating_a_bridge_queue_without_a_policy_works(app):

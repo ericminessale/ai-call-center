@@ -464,12 +464,23 @@ def update_queue(queue_id):
                 }), 400
             data['language_wait_seconds'] = seconds
 
-        # Only when the request is CHANGING one of the two. The migration set
-        # every queue — bridge ones included — to wait_then_translate, and the
-        # queue form does not submit this field, so checking the effective
-        # value on every PUT made existing bridge queues unsaveable: renaming
-        # one would 400 on a policy the operator never touched.
-        if 'routing_transport' in data or 'language_fallback_policy' in data:
+        # Only when a submitted VALUE actually differs from what is stored.
+        # Presence is not enough: SettingsPanel seeds editForm with the
+        # queue's current routing_transport and PUTs the whole form, so a
+        # rename arrives carrying routing_transport='bridge' unchanged. The
+        # migration also set every queue — bridge included — to
+        # wait_then_translate, so a presence check refused every edit to a
+        # bridge queue on a policy the operator never touched, and the UI
+        # could not save them at all.
+        transport_changed = (
+            'routing_transport' in data
+            and data['routing_transport'] != queue.routing_transport
+        )
+        policy_changed = (
+            'language_fallback_policy' in data
+            and data['language_fallback_policy'] != queue.language_fallback_policy
+        )
+        if transport_changed or policy_changed:
             rejected = _reject_language_policy_on_bridge(
                 data.get('routing_transport', queue.routing_transport),
                 data.get('language_fallback_policy',

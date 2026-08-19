@@ -2,13 +2,11 @@
   "name": "sofia_language_fallback",
   "description": "A Spanish-speaking caller asks for a human when the only available agent speaks English. Exercises the whole language chain on real audio: the multilingual intent gate reading 'una persona', language-aware selection finding no match, the fallback flag, and the translation notice actually being spoken to the caller in Spanish. The agent is seeded available via the API — no browser needed, because everything asserted here happens before an agent's audio leg exists.",
   "setup": {
+    "_comment": "One agent, activated on every queue. Which department triage picks is model behaviour — run 91 chose support for the same persona that chose sales in run 90 — and a scenario about LANGUAGE should not fail because routing picked a queue the agent was not in.",
     "agents": [
-      {
-        "name": "english-only",
-        "languages": ["en-US"],
-        "queue_slug": "sales",
-        "status": "available"
-      }
+      {"name": "english-only", "languages": ["en-US"], "queue_slug": "sales", "status": "available"},
+      {"name": "english-only", "languages": ["en-US"], "queue_slug": "support", "status": "available"},
+      {"name": "english-only", "languages": ["en-US"], "queue_slug": "billing", "status": "available"}
     ]
   },
   "missions": [

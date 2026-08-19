@@ -131,6 +131,18 @@ def seed_agents(cfg: Config, scenario: dict, workspace_id) -> list:
     stay untested. None of it needs a browser — availability is a status write
     and queue membership is a row.
     """
+    for cfg_row in (scenario.get('setup') or {}).get('queues') or []:
+        body = dict(cfg_row)
+        body['workspace_id'] = workspace_id
+        r = internal_post(cfg, '/api/testing/configure-queue', json=body)
+        if r.status_code != 200:
+            die(f"configure-queue failed ({r.status_code}): {r.text[:200]}")
+        q = r.json()
+        log(f"configured queue '{q['slug']}': "
+            f"language={q.get('language_fallback_policy')}"
+            f"/{q.get('language_wait_seconds')}s "
+            f"hold cap {q.get('max_wait_before_ai_fallback')}s")
+
     seeds = (scenario.get('setup') or {}).get('agents') or []
     if not seeds:
         return []

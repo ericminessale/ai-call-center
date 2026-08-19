@@ -207,6 +207,56 @@ def get_verdict(run_id):
     return jsonify({'found': True, 'verdict': json.loads(raw)})
 
 
+@harness_bp.route('/configure-queue', methods=['POST'])
+@require_internal_auth
+def configure_queue():
+    """Set queue routing config for a run.
+
+    Policies are expressed in seconds of caller patience, and a scenario that
+    cannot change them either waits out production timings on every call or
+    tests only the default. Call 93 died on exactly that: the language wait
+    was 60s, the caller bot's patience ran out first, and the notice it was
+    sent to listen for played to nobody.
+    """
+    from app import db
+    from app.models import Queue
+    from app.tenancy import workspace_context
+
+    data = request.get_json(silent=True) or {}
+    raw_workspace = data.get('workspace_id')
+    queue_slug = (data.get('queue_slug') or '').strip()
+    if not raw_workspace or not queue_slug:
+        return jsonify({'error': 'workspace_id and queue_slug are required'}), 400
+
+    workspace_id = raw_workspace
+    if not isinstance(raw_workspace, int) and not str(raw_workspace).isdigit():
+        from app.services.workspace_session import resolve_workspace_id
+        workspace_id = resolve_workspace_id(str(raw_workspace))
+        if workspace_id is None:
+            return jsonify({'error': f'unknown workspace {raw_workspace!r}'}), 404
+    else:
+        workspace_id = int(raw_workspace)
+
+    with workspace_context(None):
+        queue = Queue.query.filter_by(
+            slug=queue_slug, workspace_id=workspace_id,
+        ).first()
+        if queue is None:
+            return jsonify({'error': f"queue '{queue_slug}' not found"}), 404
+
+        for field in ('language_fallback_policy', 'language_wait_seconds',
+                      'max_wait_before_ai_fallback', 'routing_strategy'):
+            if field in data:
+                setattr(queue, field, data[field])
+        db.session.commit()
+        logger.info(
+            "configure-queue: '%s' policy=%s wait=%ss cap=%ss",
+            queue_slug, queue.language_fallback_policy,
+            queue.language_wait_seconds, queue.max_wait_before_ai_fallback,
+        )
+        return jsonify(queue.to_dict())
+
+
 @harness_bp.route('/seed-agent', methods=['POST'])
 @require_internal_auth
 def seed_agent():

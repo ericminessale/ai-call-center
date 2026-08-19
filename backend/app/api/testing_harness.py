@@ -235,10 +235,25 @@ def seed_agent():
     from app.tenancy import workspace_context
 
     data = request.get_json(silent=True) or {}
-    workspace_id = data.get('workspace_id')
+    raw_workspace = data.get('workspace_id')
     queue_slug = (data.get('queue_slug') or '').strip()
-    if not workspace_id or not queue_slug:
+    if not raw_workspace or not queue_slug:
         return jsonify({'error': 'workspace_id and queue_slug are required'}), 400
+
+    # /api/demo/start returns the workspace's PUBLIC id (a uuid), not the
+    # integer primary key — the runner passes through whatever it was given,
+    # so accept either. Querying with the uuid raised a 500 on the first live
+    # run, after the call had already been provisioned and paired.
+    workspace_id = raw_workspace
+    if not isinstance(raw_workspace, int) and not str(raw_workspace).isdigit():
+        from app.services.workspace_session import resolve_workspace_id
+        workspace_id = resolve_workspace_id(str(raw_workspace))
+        if workspace_id is None:
+            return jsonify({
+                'error': f'unknown workspace {raw_workspace!r}',
+            }), 404
+    else:
+        workspace_id = int(raw_workspace)
 
     languages = data.get('languages') or ['en-US']
     name = (data.get('name') or 'harness-agent').strip()

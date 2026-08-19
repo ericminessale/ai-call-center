@@ -638,6 +638,39 @@ def hold_cycle_swml(
         cap = _queue_hold_cap_seconds(queue_slug, workspace_id)
         waited = _waited_seconds(entry)
 
+        # Re-attempt dispatch on the caller's own clock.
+        #
+        # Dispatch is otherwise only tried at arrival, or when an agent
+        # TRANSITIONS to available. That leaves a hole the language policy
+        # falls straight into: wait_then_translate declines a mismatched
+        # agent at arrival (waited=0), and if that agent was already
+        # available there is never a transition — so the wait never expires
+        # and the caller holds until the cap turns them into a callback.
+        # Proven live (call 90): a Spanish caller with one English agent free
+        # the whole time was never dispatched at all.
+        #
+        # The hold cycle is already the caller's timer, so ask again here.
+        # Push-dispatch does the eligibility check with the REAL waited time
+        # and owns the atomic claim, so this is a nudge rather than a second
+        # dispatch implementation.
+        try:
+            from app.services.queue_service import QueueService
+            qs_retry = QueueService(get_redis_client(), workspace_id=workspace_id)
+            for agent_id in qs_retry.get_available_agents(queue_slug):
+                qs_retry._push_dispatch_waiting_call(str(agent_id))
+                db.session.refresh(call)
+                if call.assigned_agent_id:
+                    logger.info(
+                        f"Hold cycle {call_sid}: dispatched to agent "
+                        f"{call.assigned_agent_id} after waiting {waited}s"
+                    )
+                    return _join_conference_swml(call, base_url)
+        except Exception as e:
+            logger.warning(
+                f"Hold cycle {call_sid}: re-dispatch attempt failed "
+                f"(continuing to hold): {e}"
+            )
+
         if cap is not None and waited is not None and waited >= cap:
             claimed, callback = _claim_hold_release(
                 call, queue_slug, workspace_id, waited, cap,

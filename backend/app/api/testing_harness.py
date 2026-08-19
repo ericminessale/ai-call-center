@@ -382,6 +382,12 @@ def call_report():
                 'end_reason': call.end_reason,
                 'queue_id': call.queue_id,
                 'caller_language': call.caller_language,
+                # The language-fallback decision. Absent from this report, an
+                # assertion on it resolves to None and reads as a product
+                # failure when it is really a harness gap — which is exactly
+                # what happened on the first sofia run.
+                'needs_translation': call.needs_translation,
+                'assigned_agent_id': call.assigned_agent_id,
                 'duration': call.duration,
                 'summary': call.summary,
                 'disposition_code': call.disposition_code,

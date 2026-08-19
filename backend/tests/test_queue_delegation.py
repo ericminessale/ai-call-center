@@ -1109,3 +1109,41 @@ def test_hosted_mode_blocks_switching_to_bridge_not_editing_a_bridge_queue(app):
         'the hosted guard must reject a TRANSITION to bridge, not a queue '
         'that is already on it'
     )
+
+
+def test_the_hold_cycle_retries_dispatch_so_the_language_wait_can_expire(app):
+    """Found by a live call, not by a test.
+
+    Dispatch was only attempted at arrival and when an agent TRANSITIONS to
+    available. wait_then_translate declines a mismatched agent at arrival
+    (waited=0), so if that agent was already available there was never a
+    transition, the wait never expired, and the caller held until the cap
+    turned them into a callback. Call 90: a Spanish caller with one English
+    agent free the entire time was never dispatched at all — the default
+    policy had quietly become "wait_only, then callback".
+
+    The hold cycle is the caller's own clock, so it asks again there, using
+    push-dispatch (which re-checks eligibility with the REAL waited time and
+    owns the atomic claim) rather than a second dispatch implementation.
+    """
+    import inspect
+    from app.services import queue_dispatch as qd
+
+    source = inspect.getsource(qd.hold_cycle_swml)
+    assert '_push_dispatch_waiting_call' in source
+    assert 'get_available_agents' in source
+    # And it must hand the caller the join document when the retry lands,
+    # not keep cycling past an agent it just assigned.
+    assert '_join_conference_swml(call, base_url)' in source
+
+
+def test_the_call_report_exposes_the_translation_decision():
+    """An assertion on a field the report omits resolves to None and reads as
+    a product failure. That is how the first sofia run reported a bug that was
+    really a missing serializer line."""
+    import inspect
+    from app.api import testing_harness
+
+    source = inspect.getsource(testing_harness.call_report)
+    assert "'needs_translation': call.needs_translation" in source
+    assert "'assigned_agent_id': call.assigned_agent_id" in source

@@ -974,3 +974,58 @@ def test_a_missing_queue_row_still_connects_the_caller(app):
     from app.services.call_language import language_fallback_allowed
 
     assert language_fallback_allowed(None, waited_seconds=0) is True
+
+
+# ---------------------------------------------------------------------------
+# The policy has to be reachable, cloneable, and transport-independent.
+# ---------------------------------------------------------------------------
+
+def test_the_admin_api_can_actually_set_the_policy():
+    """A tunable nobody can tune is a hardcoded default with extra steps: the
+    create handler ignored both fields and the update handler's writable list
+    omitted them, so every queue was stuck on whatever the migration set."""
+    import inspect
+    from app.api import admin
+
+    create = inspect.getsource(admin.create_queue)
+    update = inspect.getsource(admin.update_queue)
+
+    assert 'language_fallback_policy=language_policy' in create
+    assert 'LANGUAGE_FALLBACK_POLICIES' in create, 'unknown policies must 400'
+    assert "'language_fallback_policy', 'language_wait_seconds'" in update
+    assert 'must be between 0 and 3600' in update
+
+
+def test_workspace_provisioning_clones_the_policy():
+    """Cloned queues that quietly revert to the default make a provisioned
+    workspace behave differently from the template it came from."""
+    import inspect
+    from app.services import workspace_provision
+
+    source = inspect.getsource(workspace_provision)
+    assert 'language_fallback_policy=q.language_fallback_policy' in source
+    assert 'language_wait_seconds=q.language_wait_seconds' in source
+
+
+def test_bridge_transport_applies_the_same_policy():
+    """The same queue setting must not mean different things depending on
+    which transport the call arrived over."""
+    import inspect
+    from app.services.call_transport import bridge
+
+    source = inspect.getsource(bridge)
+    assert 'allow_language_fallback=allow_fallback' in source
+    assert 'get_languages_for_agents' in source
+
+
+def test_push_dispatch_looks_past_a_call_it_cannot_take(app, redis):
+    """Head-of-line blocking: one caller the agent cannot take must not park
+    everyone queued behind them."""
+    import inspect
+    from app.services import queue_service as qs_module
+
+    source = inspect.getsource(qs_module.QueueService._push_dispatch_waiting_call)
+    assert 'PUSH_DISPATCH_SCAN_DEPTH' in source
+    assert qs_module.PUSH_DISPATCH_SCAN_DEPTH > 1
+    # Eligibility is decided per candidate inside the scan, not after it.
+    assert '_agent_may_take_call' in source

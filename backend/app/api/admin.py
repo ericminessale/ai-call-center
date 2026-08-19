@@ -334,6 +334,27 @@ def create_queue():
                 'code': 'demo_blocked',
             }), 400
 
+        # What to do when nobody available speaks the caller's language.
+        # Validated rather than trusted: an unknown policy string would make
+        # language_fallback_allowed fall through to its wait branch and hold
+        # callers for a threshold nobody configured.
+        language_policy = data.get('language_fallback_policy',
+                                   'wait_then_translate')
+        if language_policy not in Queue.LANGUAGE_FALLBACK_POLICIES:
+            return jsonify({
+                'error': 'language_fallback_policy must be one of '
+                         f'{list(Queue.LANGUAGE_FALLBACK_POLICIES)}'
+            }), 400
+        language_wait = data.get('language_wait_seconds', 60)
+        try:
+            language_wait = int(language_wait)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'language_wait_seconds must be a number'}), 400
+        if not 0 <= language_wait <= 3600:
+            return jsonify({
+                'error': 'language_wait_seconds must be between 0 and 3600'
+            }), 400
+
         queue = Queue(
             slug=slug,
             display_name=data['display_name'],
@@ -344,6 +365,8 @@ def create_queue():
             default_priority=data.get('default_priority', 5),
             sla_threshold_seconds=data.get('sla_threshold_seconds', 60),
             max_wait_before_ai_fallback=data.get('max_wait_before_ai_fallback', 120),
+            language_fallback_policy=language_policy,
+            language_wait_seconds=language_wait,
         )
         db.session.add(queue)
         db.session.commit()
@@ -388,9 +411,27 @@ def update_queue(queue_id):
                 'code': 'demo_blocked',
             }), 400
 
+        if 'language_fallback_policy' in data:
+            if data['language_fallback_policy'] not in Queue.LANGUAGE_FALLBACK_POLICIES:
+                return jsonify({
+                    'error': 'language_fallback_policy must be one of '
+                             f'{list(Queue.LANGUAGE_FALLBACK_POLICIES)}'
+                }), 400
+        if 'language_wait_seconds' in data:
+            try:
+                seconds = int(data['language_wait_seconds'])
+            except (TypeError, ValueError):
+                return jsonify({'error': 'language_wait_seconds must be a number'}), 400
+            if not 0 <= seconds <= 3600:
+                return jsonify({
+                    'error': 'language_wait_seconds must be between 0 and 3600'
+                }), 400
+            data['language_wait_seconds'] = seconds
+
         for field in ['display_name', 'description', 'is_active', 'routing_strategy',
                       'routing_transport', 'ai_agent_route', 'default_priority',
-                      'sla_threshold_seconds', 'max_wait_before_ai_fallback']:
+                      'sla_threshold_seconds', 'max_wait_before_ai_fallback',
+                      'language_fallback_policy', 'language_wait_seconds']:
             if field in data:
                 setattr(queue, field, data[field])
 

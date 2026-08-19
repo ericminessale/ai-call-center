@@ -25,6 +25,16 @@ class QueuedCall:
     caller_name: Optional[str] = None
 
 
+# How far down a queue push-dispatch looks for a call this agent can take.
+# Deep enough that one ineligible caller cannot block the queue, shallow
+# enough that going available is not a scan of everything waiting.
+PUSH_DISPATCH_SCAN_DEPTH = 10
+
+
+def agent_id_repr(agent_user):
+    return getattr(agent_user, 'id', '?')
+
+
 class QueueService:
     """Service for managing call queues and agent availability.
 
@@ -404,6 +414,60 @@ class QueueService:
         except Exception:
             return False
 
+    def _agent_may_take_call(self, agent_user, call, call_data, slug) -> bool:
+        """Whether this agent can be handed this specific queued call.
+
+        Language policy asked from the agent's side: dispatch at arrival asks
+        "may I give this call to a mismatched agent?", and here an agent has
+        just gone available and we ask it about a call already queued. Both
+        must agree, or a policy that held out at arrival hands the call to the
+        first mismatched agent seconds later.
+
+        Anything unexpected answers True — a policy check must never be the
+        reason a caller is not connected.
+        """
+        try:
+            from datetime import datetime
+            from app.models import Queue as QueueModel
+            from app.services.call_language import (
+                language_fallback_allowed, derive_call_language,
+            )
+
+            caller_language = derive_call_language(call)
+            spoken = agent_user.languages or []
+            if not caller_language or not spoken or caller_language in spoken:
+                return True
+
+            queue_row = QueueModel.query.filter_by(
+                slug=slug,
+                workspace_id=call.workspace_id or DEFAULT_WORKSPACE_ID,
+            ).first()
+            waited = None
+            stamped = (call_data.get('originally_received_at')
+                       or call_data.get('enqueued_at'))
+            if stamped:
+                try:
+                    waited = (
+                        datetime.utcnow()
+                        - datetime.fromisoformat(str(stamped))
+                    ).total_seconds()
+                except Exception:
+                    waited = None
+            if language_fallback_allowed(queue_row, waited_seconds=waited):
+                return True
+            logger.info(
+                f"Push-dispatch: agent {agent_id_repr(agent_user)} does not "
+                f"speak {caller_language} and queue '{slug}' policy says keep "
+                f"waiting — call {call.signalwire_call_sid} stays queued"
+            )
+            return False
+        except Exception as e:
+            logger.warning(
+                f"Push-dispatch: eligibility check failed (dispatching "
+                f"anyway): {e}"
+            )
+            return True
+
     def _push_dispatch_waiting_call(self, agent_id: str) -> None:
         """Notify ``agent_id`` about the oldest waiting call in any queue
         they're activated for. Caller is already in a conference; agent's
@@ -485,30 +549,17 @@ class QueueService:
 
         for slug in activated_queues:
             queue_key = self._ws_queue_key(slug, agent_ws_id)
-            head = self.redis.zrange(queue_key, 0, 0)
-            if not head:
-                continue
-            raw = head[0]
-            try:
-                call_data = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            except Exception:
-                continue
-            call_sid = call_data.get('call_id')
-            if not call_sid:
-                continue
-
-            # Skip if this agent recently declined this specific call —
-            # prevents the infinite-banner-loop when an agent declines
-            # and is then the only available candidate.
-            if self.has_recently_declined(agent_id, call_sid):
-                logger.info(
-                    f"Push-dispatch: agent {agent_id} recently declined "
-                    f"call {call_sid}; skipping (cooldown active)"
-                )
+            # Look past the head. Skipping a caller this agent cannot take —
+            # a declined call, or a language the policy says to hold for —
+            # must not park everyone queued behind them: an English agent
+            # sitting idle while an English caller waits behind a Spanish one
+            # is head-of-line blocking, not a routing policy. Ordering among
+            # ELIGIBLE callers is preserved because the scan is in queue
+            # order and takes the first one that qualifies.
+            candidates = self.redis.zrange(queue_key, 0, PUSH_DISPATCH_SCAN_DEPTH - 1)
+            if not candidates:
                 continue
 
-            # Look up the Call ORM row. We can't import at module top —
-            # circular dep with app.__init__. Defer imports here.
             try:
                 from app import db
                 from app.models import Call
@@ -518,65 +569,55 @@ class QueueService:
                 logger.error(f"Push-dispatch: failed to import deps: {e}")
                 return
 
-            call = Call.find_by_sid(call_sid)
-            if not call:
-                logger.warning(f"Push-dispatch: call {call_sid} not in DB; skipping")
-                continue
-            # Belt-and-braces: the zset was already read from the agent's
-            # workspace prefix, but never bridge a call whose row says it
-            # belongs elsewhere (stale/quarantined entries).
-            if (call.workspace_id or DEFAULT_WORKSPACE_ID) != (
-                agent_ws_id or DEFAULT_WORKSPACE_ID
-            ):
-                logger.warning(
-                    f"Push-dispatch: call {call_sid} workspace "
-                    f"{call.workspace_id} != agent workspace {agent_ws_id}; skipping"
-                )
-                continue
+            # Look PAST the head. A caller this agent cannot take — one they
+            # declined, or a language the queue policy says to hold for — must
+            # not park everyone queued behind them. An English agent idle
+            # while an English caller waits behind a Spanish one is
+            # head-of-line blocking, not a routing policy. Order among
+            # eligible callers is preserved: the scan runs in queue order and
+            # takes the first that qualifies.
+            call = None
+            call_data = None
+            call_sid = None
+            for raw in candidates:
+                try:
+                    parsed = json.loads(
+                        raw.decode() if isinstance(raw, bytes) else raw
+                    )
+                except Exception:
+                    continue
+                sid = parsed.get('call_id')
+                if not sid:
+                    continue
+                if self.has_recently_declined(agent_id, sid):
+                    logger.info(
+                        f"Push-dispatch: agent {agent_id} recently declined "
+                        f"call {sid}; looking further down the queue"
+                    )
+                    continue
+                candidate = Call.find_by_sid(sid)
+                if not candidate:
+                    logger.warning(f"Push-dispatch: call {sid} not in DB; skipping")
+                    continue
+                # Belt-and-braces: the zset was read from the agent's
+                # workspace prefix, but never bridge a call whose row says it
+                # belongs elsewhere (stale/quarantined entries).
+                if (candidate.workspace_id or DEFAULT_WORKSPACE_ID) != (
+                    agent_ws_id or DEFAULT_WORKSPACE_ID
+                ):
+                    logger.warning(
+                        f"Push-dispatch: call {sid} workspace "
+                        f"{candidate.workspace_id} != agent workspace "
+                        f"{agent_ws_id}; skipping"
+                    )
+                    continue
+                if not self._agent_may_take_call(agent_user, candidate, parsed, slug):
+                    continue
+                call, call_data, call_sid = candidate, parsed, sid
+                break
 
-            # Language policy, from the other direction. Immediate dispatch
-            # asks "may I give this call to a mismatched agent?"; here an
-            # agent has just gone available and we ask the same question about
-            # the call at the head of the queue. Without this, wait_only and
-            # wait_then_translate held out at arrival and then handed the call
-            # to the first mismatched agent who came free seconds later —
-            # policy honoured on one path and ignored on the other, which is
-            # the drift this codebase keeps producing.
-            try:
-                from app.models import Queue as QueueModel
-                from app.services.call_language import (
-                    language_fallback_allowed, derive_call_language,
-                )
-                caller_language = derive_call_language(call)
-                spoken = agent_user.languages or []
-                if caller_language and spoken and caller_language not in spoken:
-                    queue_row = QueueModel.query.filter_by(
-                        slug=slug,
-                        workspace_id=call.workspace_id or DEFAULT_WORKSPACE_ID,
-                    ).first()
-                    waited = None
-                    enqueued_at = call_data.get('originally_received_at') or                         call_data.get('enqueued_at')
-                    if enqueued_at:
-                        try:
-                            waited = (
-                                datetime.utcnow()
-                                - datetime.fromisoformat(str(enqueued_at))
-                            ).total_seconds()
-                        except Exception:
-                            waited = None
-                    if not language_fallback_allowed(queue_row, waited_seconds=waited):
-                        logger.info(
-                            f"Push-dispatch: agent {agent_id} does not speak "
-                            f"{caller_language} and queue '{slug}' policy says "
-                            "keep waiting — leaving call %s queued", call_sid,
-                        )
-                        continue
-            except Exception as e:
-                # Never let the policy check cost a caller their dispatch.
-                logger.warning(
-                    f"Push-dispatch: language policy check failed on {call_sid} "
-                    f"(dispatching anyway): {e}"
-                )
+            if call is None:
+                continue
 
             if not agent_user.signalwire_address:
                 logger.warning(

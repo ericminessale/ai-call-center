@@ -358,6 +358,8 @@ def _clone_templates(ws) -> None:
                 default_priority=q.default_priority,
                 sla_threshold_seconds=q.sla_threshold_seconds,
                 max_wait_before_ai_fallback=q.max_wait_before_ai_fallback,
+                language_fallback_policy=q.language_fallback_policy,
+                language_wait_seconds=q.language_wait_seconds,
             ))
 
         collection_id_map = {}

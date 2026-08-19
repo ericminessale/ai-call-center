@@ -129,6 +129,24 @@ def build_ingress_swml(
     # will pick them up on the next available transition).
     try:
         available_agents = qs.get_available_agents(queue_slug)
+        # Bridge transport gets the same language policy as conference. It
+        # was reaching select_agent with the default (fallback allowed), so a
+        # queue set to wait_only or wait_then_translate held out on the
+        # conference path and connected a mismatched agent instantly here —
+        # the same rule producing opposite behaviour depending on transport.
+        from app.models import Queue as QueueModel
+        from app.services.call_language import language_fallback_allowed
+        queue_row = QueueModel.query.filter_by(
+            slug=queue_slug, workspace_id=call.workspace_id,
+        ).first()
+        allow_fallback = language_fallback_allowed(queue_row, waited_seconds=0)
+        if not agent_languages and available_agents:
+            # Same gap as the conference path: an empty map makes
+            # select_agent skip language preference altogether.
+            try:
+                agent_languages = qs.get_languages_for_agents(available_agents)
+            except Exception:
+                agent_languages = {}
         for candidate_id in (available_agents or []):
             # Reuse the same routing strategy the conference path uses.
             chosen = qs.select_agent(
@@ -139,6 +157,7 @@ def build_ingress_swml(
                 call_priority=priority,
                 caller_language=caller_language,
                 agent_languages=agent_languages or {},
+                allow_language_fallback=allow_fallback,
             )
             if not chosen:
                 continue

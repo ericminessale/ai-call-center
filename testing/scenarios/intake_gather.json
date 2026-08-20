@@ -1,0 +1,70 @@
+{
+  "name": "intake_gather",
+  "description": "Department intake rebuilt on the SDK's native gather_info system. Two things need proving and they pull in opposite directions. Call 1 is the ESCAPE HATCH: gather mode forcibly deactivates every other step function - change_context and next_step included - so a caller who wants a person mid-intake can only get one because each question names transfer_to_human in its `functions`. Without that the intake becomes a runtime-enforced version of the greeting trap fixed the same day, which no prompt wording could talk its way out of. Call 2 is the PAYOFF: a cooperative caller's typed answers have to reach whoever picks up, via global_data -> transfer context -> /route -> Call.ai_context. Gathering details and then dropping them would waste the caller's time twice. Call 1 answers, call 2 only needs to reach the queue - the agent from call 1 is still holding the line, so call 2 asserts on the transfer context rather than on a second assignment.",
+  "setup": {
+    "agents": [
+      {"name": "intake-agent", "languages": ["en-US"], "queue_slug": "sales", "status": "available"},
+      {"name": "intake-agent", "languages": ["en-US"], "queue_slug": "support", "status": "available"},
+      {"name": "intake-agent", "languages": ["en-US"], "queue_slug": "billing", "status": "available"}
+    ]
+  },
+  "missions": [
+    {
+      "id": "escape-intake",
+      "label": "call 1: caller refuses intake questions and demands a person",
+      "await": {"summary": true, "transcript": true},
+      "temperature": 0.5,
+      "max_call_s": 240,
+      "answer_as_agent": {"name": "intake-agent", "wait_seconds": 90},
+      "persona": "You are Dana Whitfield, an impatient customer calling a company. Wait to be greeted first. Give your name when asked: 'Dana Whitfield.' Say you have a problem with something you bought. HARD RULE for the rest of the call: you will NOT answer any further questions. Whatever you are asked - about a product, an order, an account number, anything - decline and ask for a person instead: 'I don't want to answer questions. Please just connect me to a real person.' Say it every single time you are asked anything, no matter how many times, and always include the words 'a real person'. Once you are told you are being connected, WAIT and stay on the line; you may then hear NOTHING at all, which is expected in this test. Say 'Hello? Are you there?' once, then 'Hello?' once more. Stay on the line until you have heard FOUR hold announcements or about 16 exchanges, then say goodbye and use end_call. Never mention that you are an AI or a test. Style: short, clipped, polite but firm.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Keys exactly: mission (string, 'escape_intake'), asked_for_a_person (boolean), answered_any_intake_question (boolean - did you ever actually answer a question about a product, order or account; should be false), times_asked_a_question (integer), reached (one of 'receptionist','sales_specialist','human_queue','human','other'), heard_connecting_announcement (boolean), stuck_in_loop (boolean - true if the agent kept asking questions and never moved forward), turns (integer), notes (short string)."
+    },
+    {
+      "id": "cooperative-intake",
+      "label": "call 2: caller answers intake and the answers travel with the transfer",
+      "await": {"summary": true, "transcript": true},
+      "pause_before_s": 20,
+      "temperature": 0.5,
+      "max_call_s": 240,
+      "persona": "You are Marcus Bell, a cooperative customer calling a company. Wait to be greeted first. Give your name when asked: 'Marcus Bell.' Say you need help with a product you bought. Then ANSWER every question you are asked, briefly and clearly - this is the opposite of a difficult caller. Useful facts to use when they fit the question: the product is a Model 8 wireless thermostat; the problem is that it will not connect to wifi; you are an existing customer; your account number is 4 4 8 2 1; you bought it last month. If asked to confirm something you said, confirm it. Only after you have answered their questions, if you are offered a choice between a human specialist and an AI assistant, choose the human: 'A real person, please.' Then stay on the line. Stay until you have heard FOUR hold announcements or about 18 exchanges, then say goodbye and use end_call. Never mention that you are an AI or a test. Style: short natural spoken sentences.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Keys exactly: mission (string, 'cooperative_intake'), was_asked_questions (boolean - were you asked one or more specific questions about your product, issue or account), questions_asked (array of short strings - the questions you were asked, paraphrased), answered_them (boolean), asked_one_at_a_time (boolean - were the questions asked one at a time rather than all at once), reached (one of 'receptionist','sales_specialist','human_queue','human','other'), turns (integer), notes (short string)."
+    }
+  ],
+  "assertions": [
+    {"label": "call 1: bot returned a structured verdict",
+     "target": "verdict1.parsed", "op": "truthy", "level": "hard"},
+    {"label": "call 1: the caller asked for a person",
+     "target": "verdict1.parsed.asked_for_a_person", "op": "truthy", "level": "hard"},
+    {"label": "call 1 CORE: ESCAPE - transferred out of intake without answering it",
+     "_comment": "The assertion that matters. If gather mode had locked transfer_to_human away, this caller could never be routed at all.",
+     "target": "report1.call.assigned_agent_id", "op": "truthy", "level": "hard"},
+    {"label": "call 1 CORE: an agent answered",
+     "target": "agent1.answered", "op": "eq", "value": true, "level": "hard"},
+    {"label": "call 1 CORE: not left looping in intake",
+     "target": "verdict1.parsed.stuck_in_loop", "op": "eq", "value": false, "level": "hard"},
+    {"label": "call 1: the caller never answered an intake question (the premise)",
+     "target": "verdict1.parsed.answered_any_intake_question", "op": "eq", "value": false, "level": "soft"},
+    {"label": "call 1: the caller reached the human path",
+     "target": "verdict1.parsed.reached", "op": "contains_any",
+     "value": ["human", "human_queue"], "level": "soft"},
+
+    {"label": "call 2: bot returned a structured verdict",
+     "target": "verdict2.parsed", "op": "truthy", "level": "hard"},
+    {"label": "call 2 CORE: the caller was actually asked intake questions",
+     "target": "verdict2.parsed.was_asked_questions", "op": "truthy", "level": "hard"},
+    {"label": "call 2 CORE: the gathered answers travelled with the transfer",
+     "_comment": "context_data['intake'] is base64'd into the /route URL, which merges it into Call.ai_context. This is the whole payoff - without it the caller answers questions for nobody.",
+     "target": "report2.derived.ai_context_text", "op": "contains", "value": "intake", "level": "hard"},
+    {"label": "call 2 CORE: the caller reached a queue",
+     "target": "report2.call.queue_id", "op": "truthy", "level": "hard"},
+    {"label": "call 2: questions came one at a time (gather_info's whole point)",
+     "target": "verdict2.parsed.asked_one_at_a_time", "op": "truthy", "level": "soft"},
+    {"label": "call 2: the caller answered them",
+     "target": "verdict2.parsed.answered_them", "op": "truthy", "level": "soft"},
+    {"label": "call 2: a specific gathered field survived into the transfer context",
+     "_comment": "Department is model-driven, so any one of the six keys counts.",
+     "target": "report2.derived.ai_context_text", "op": "contains_any",
+     "value": ["issue_summary", "product", "interest", "existing_customer", "account_ref", "billing_issue"],
+     "level": "soft"}
+  ]
+}

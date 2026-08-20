@@ -485,14 +485,27 @@ def poll_report(cfg: Config, since_iso: str, gates: dict, timeout_s: int = 150):
 
 def derived_fields(report) -> dict:
     if not report:
-        return {'ai_text': '', 'caller_text': '', 'full_text': ''}
+        return {'ai_text': '', 'caller_text': '', 'full_text': '',
+                'ai_context_text': ''}
     rows = report.get('transcript') or []
     ai = ' '.join(r['text'] for r in rows
                   if r.get('text') and r.get('speaker') in ('ai', 'agent'))
     caller = ' '.join(r['text'] for r in rows
                       if r.get('text') and r.get('speaker') == 'caller')
+    # Call.ai_context comes back as a parsed dict, and every string op in
+    # check() requires isinstance(actual, str) — so a `contains` against it
+    # silently resolved to '<object>' and could never pass, whatever the
+    # transfer actually carried. Serialising it here makes the transfer context
+    # assertable without teaching the ops about nested structures.
+    context = (report.get('call') or {}).get('ai_context')
+    if isinstance(context, str):
+        context_text = context
+    elif context:
+        context_text = json.dumps(context, default=str)
+    else:
+        context_text = ''
     return {'ai_text': ai, 'caller_text': caller,
-            'full_text': f"{ai} {caller}"}
+            'full_text': f"{ai} {caller}", 'ai_context_text': context_text}
 
 
 def run_mission(cfg: Config, scenario_name: str, mission: dict) -> dict:

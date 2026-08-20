@@ -2173,6 +2173,64 @@ WRAP_UP_POST_PROMPT_FIELDS = (
 )
 
 
+# Department intake, asked through the SDK's native gather_info system rather
+# than as hand-rolled prompt questions. gather_info presents one question at a
+# time via step-instruction re-injection and writes typed answers into
+# global_data, producing ZERO tool_call/tool_result entries in LLM-visible
+# history — which is why it beats asking through tools when intake is more than
+# one field.
+#
+# TWO questions per department, deliberately. Pre-queue intake is where call
+# centers lose callers, so this asks only what triage does not already know:
+# name, language, department and a free-text reason are captured upstream, and
+# re-asking any of them is what the old single "what do you need help with"
+# step was already trying to avoid.
+#
+# Keyed by queue slug with a generic fallback, so a deployment that invents its
+# own queue still gets sane intake. Making these editable per queue in the
+# admin UI is the natural next step (same shape as the runtime queue refresh
+# noted as AI-06-future) — it needs a backend field to read them from first.
+_DEPARTMENT_INTAKE = {
+    'sales': [
+        {'key': 'interest',
+         'question': "What product or service are you interested in?"},
+        {'key': 'existing_customer',
+         'question': "Are you already a customer with us?",
+         'type': 'boolean'},
+    ],
+    'support': [
+        {'key': 'product',
+         'question': "Which product or service is this about?"},
+        {'key': 'issue_summary',
+         'question': "In one sentence, what is happening?"},
+    ],
+    'billing': [
+        # confirm=True makes the model read the answer back and get explicit
+        # agreement before submitting. Worth the extra turn on an identifier:
+        # long digit strings are exactly what ASR gets wrong, and a wrong
+        # account number sends the agent to the wrong record.
+        {'key': 'account_ref',
+         'question': "What is the account or invoice number on the bill?",
+         'confirm': True},
+        {'key': 'billing_issue',
+         'question': "What about the charge looks wrong?"},
+    ],
+}
+
+_DEFAULT_INTAKE = [
+    {'key': 'details', 'question': "Briefly, what do you need help with?"},
+]
+
+# Unlocked on EVERY intake question, and the most important line here.
+# gather mode forcibly deactivates all of the step's other functions —
+# change_context and next_step included — so a caller who says "just get me a
+# person" mid-intake cannot be given one unless the transfer tools are named
+# per question. That is the same trap just fixed in the greeting step, except
+# enforced by the runtime instead of by a prompt, which no wording could
+# talk its way out of.
+_INTAKE_ESCAPES = ["transfer_to_human", "transfer_to_ai_specialist"]
+
+
 def configure_triage_queues(agent, queues, caller=None):
     """(Re)build everything queue-shaped on a triage agent.
 
@@ -2414,19 +2472,55 @@ def configure_triage_queues(agent, queues, caller=None):
             f"The caller needs {display.lower()} help. You still have their name and "
             "what they told you from the greeting. Use it naturally.")
 
-        # Step 1: Ask what they need help with
+        # Step 1: a thin landing step, and the reason it exists.
+        # route_to_department FORCES this context with swml_change_context,
+        # which lands on the context's first step. On the first live run the
+        # gather sitting on THAT step never engaged: the model improvised its
+        # own question from the step text instead of being handed the gather's
+        # question, and global_data['intake'] came back empty. Gather mode is
+        # documented to begin "when the AI enters a step with gather_info", so
+        # a forced context change appears not to count as that entry.
+        #
+        # Landing on a pass-through step and letting NORMAL advancement enter
+        # the gather costs the caller nothing: skip_user_turn and
+        # skip_to_next_step move on without a turn of their own.
         queue_ctx.add_step("gather_reason") \
             .add_section("Goal",
-                f"Briefly ask what they need help with so you can pass useful context "
-                "to the specialist. One question is enough — don't interrogate them.") \
-            .add_section("If They Already Told You",
-                "If the caller's request is already known — they described it during the "
-                "greeting, or the route_to_department result states it — you have what "
-                "you need. Do NOT ask again; move straight on to offering transfer options.") \
-            .set_step_criteria("You have a basic understanding of what the caller needs help with") \
-            .set_valid_steps(["offer_transfer"]) \
+                f"You are now handling a {display.lower()} call. Continue "
+                "straight on to taking the caller's details.") \
+            .set_skip_user_turn(True) \
+            .set_skip_to_next_step(True) \
+            .set_valid_steps(["intake"]) \
             .set_functions(["report_sentiment", "route_to_department",
-                            "set_caller_language"])
+                            "set_caller_language"] + _INTAKE_ESCAPES)
+
+        # Step 2: structured department intake (SDK gather_info), entered by
+        # ordinary advancement from the landing step above.
+        intake = _DEPARTMENT_INTAKE.get(slug, _DEFAULT_INTAKE)
+        gather_step = queue_ctx.add_step("intake")
+        gather_step.add_section("Goal",
+            f"Take a few quick {display.lower()} details, then hand the caller "
+            "on. Ask only the questions you are given, one at a time.")
+        gather_step.set_gather_info(
+            output_key='intake',
+            completion_action='next_step',
+            prompt=(
+                f"You are taking a few {display.lower()} details before handing "
+                "the caller on. Keep it brief and conversational. If the caller "
+                "ALREADY told you an answer earlier in this call, submit that "
+                "answer instead of asking the question again. If they ask for a "
+                "person at any point, stop asking and transfer them - the "
+                "details are a convenience, never a toll gate."))
+        for question in intake:
+            gather_step.add_gather_question(
+                key=question['key'],
+                question=question['question'],
+                type=question.get('type', 'string'),
+                confirm=question.get('confirm', False),
+                functions=_INTAKE_ESCAPES)
+        gather_step.set_valid_steps(["offer_transfer"])
+        gather_step.set_functions(["report_sentiment", "route_to_department",
+                                   "set_caller_language"] + _INTAKE_ESCAPES)
 
         # Step 2: Offer transfer choice
         queue_ctx.add_step("offer_transfer") \
@@ -2656,6 +2750,15 @@ class CallCenterAgent(AgentBase):
             context_data.setdefault(
                 'caller_language', global_data['caller_language']
             )
+
+        # Structured intake gathered by gather_info lands in global_data under
+        # the step's output_key. Forward it so the agent screen-pop and the AI
+        # specialist actually receive what the caller was asked for: gathering
+        # details and then dropping them wastes the caller's time twice, once
+        # answering and again when whoever picks up asks the same thing.
+        gathered = global_data.get('intake')
+        if isinstance(gathered, dict) and gathered:
+            context_data.setdefault('intake', gathered)
 
         context_b64 = base64.urlsafe_b64encode(
             json.dumps(context_data).encode()

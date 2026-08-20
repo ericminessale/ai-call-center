@@ -1,0 +1,47 @@
+{
+  "name": "oskar_no_name",
+  "description": "Regression test for the greeting-step trap found on 2026-08-19. A caller who declines to give their name asks for a person. Before the fix this was unreachable: the greeting step's criteria required the customer to have stated their name, its only exit was route_to_department, and transfer_to_human does not exist until offer_transfer three steps later - so the caller looped forever. The live run that found it shows the caller asking eleven times and being asked for a name every time. Real callers do refuse to give names, especially annoyed ones, so a name must never be the price of reaching a human. What this asserts is the outcome, not the wording: the caller was routed and an agent answered, without ever giving a name.",
+  "setup": {
+    "agents": [
+      {"name": "noname-agent", "languages": ["en-US"], "queue_slug": "sales", "status": "available"},
+      {"name": "noname-agent", "languages": ["en-US"], "queue_slug": "support", "status": "available"},
+      {"name": "noname-agent", "languages": ["en-US"], "queue_slug": "billing", "status": "available"}
+    ]
+  },
+  "missions": [
+    {
+      "id": "oskar-noname",
+      "label": "call 1: caller refuses to give a name and asks for a person",
+      "await": {"summary": true, "transcript": true},
+      "temperature": 0.5,
+      "max_call_s": 240,
+      "answer_as_agent": {"name": "noname-agent", "wait_seconds": 90},
+      "persona": "You are a customer calling a company, and you are guarded about your privacy. HARD RULE for this whole call: NEVER say your name, and never invent one. If asked for your name, decline politely and immediately restate what you want: 'I'd rather not give my name. I just need to speak with a person, please.' Decline every single time you are asked, no matter how many times. Wait to be greeted first. Your goals in order: (1) Say you need help with a billing charge you do not recognise. (2) Ask to speak with a person: 'Can I speak to a real person, please?' (3) If asked for your name, decline as above and repeat the request for a person. (4) Once you are told you are being connected, WAIT and stay on the line. You may then hear NOTHING at all - that is expected in this test. Say 'Hello? Are you there?' once, then 'Hello?' once more. (5) Stay on the line until you have heard FOUR hold announcements or about 16 exchanges have passed, then say goodbye and use end_call. RULES: do not hang up merely because the line goes quiet after you are connected. Never mention that you are an AI or a test. Style: short natural spoken sentences, polite but firm.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Keys exactly: mission (string, 'oskar_no_name'), gave_name (boolean - did you EVER state a name; must be false if you followed instructions), asked_for_a_person (boolean), times_asked_for_name (integer - how many times the agent asked you for your name), reached (one of 'receptionist','sales_specialist','human_queue','human','other'), heard_connecting_announcement (boolean - were you told you were being connected or that an agent was joining), stuck_in_loop (boolean - true if the agent kept asking the same thing without ever moving forward), turns (integer), notes (short string)."
+    }
+  ],
+  "assertions": [
+    {"label": "bot returned a structured verdict",
+     "target": "verdict1.parsed", "op": "truthy", "level": "hard"},
+    {"label": "the caller asked for a person",
+     "target": "verdict1.parsed.asked_for_a_person", "op": "truthy", "level": "hard"},
+    {"label": "the caller never gave a name (the premise of the test)",
+     "target": "verdict1.parsed.gave_name", "op": "eq", "value": false, "level": "hard"},
+
+    {"label": "CORE: routed to a human queue without a name",
+     "target": "report1.call.assigned_agent_id", "op": "truthy", "level": "hard"},
+    {"label": "CORE: an agent answered",
+     "target": "agent1.answered", "op": "eq", "value": true, "level": "hard"},
+    {"label": "CORE: the caller was not left looping in the greeting",
+     "_comment": "This is the assertion that carries the regression. times_asked_for_name is reported in the verdict and lands in run.json for a human to read, but is deliberately NOT asserted on: it is an integer and the runner's regex ops require a string, so any matches check on it would fail regardless of value - a guard that can never pass is worse than none. The fix does not forbid asking for a name, it forbids REQUIRING one, so a couple of asks is correct behaviour.",
+     "target": "verdict1.parsed.stuck_in_loop", "op": "eq", "value": false, "level": "hard"},
+
+    {"label": "the caller was told they were being connected",
+     "target": "verdict1.parsed.heard_connecting_announcement", "op": "truthy", "level": "soft"},
+    {"label": "the caller reached the human path",
+     "target": "verdict1.parsed.reached", "op": "contains_any",
+     "value": ["human", "human_queue"], "level": "soft"},
+    {"label": "a real interaction conference was formed",
+     "target": "agent1.conference_name", "op": "non_empty", "level": "soft"}
+  ]
+}

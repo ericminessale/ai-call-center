@@ -2345,6 +2345,22 @@ def configure_triage_queues(agent, queues, caller=None):
     # Applies to whichever variant was selected above (empty when there is no
     # documented non-English language we speak).
     greeting_goal += language_clause
+    # A caller asking for a person outranks identifying them. Whichever
+    # variant above is in play, an explicit request for a human - or a
+    # refusal to give a name - has to be able to LEAVE this step:
+    # transfer_to_human does not exist until offer_transfer, three steps
+    # away, so a greeting criteria the caller will not satisfy is a caller
+    # who can never reach a person at all. Live run 2026-08-19: a caller
+    # asked eleven times and was asked for their name every time, and the
+    # model was not being stubborn - it had no tool to comply with.
+    #
+    # Relaxing the PROMPT here cannot cause a spurious transfer: whether
+    # the request was real is decided in code, by _human_request_evidence
+    # inside transfer_to_human, which routes to the AI specialist instead
+    # when that evidence is ABSENT.
+    greeting_criteria += (
+        " - OR the caller has asked to speak with a person, or has declined"
+        " to give their name. Identity is preferred, never required.")
     triage_ctx.add_step("greeting") \
         .add_section("Goal", greeting_goal) \
         .add_section("Routing From Here",
@@ -2354,6 +2370,15 @@ def configure_triage_queues(agent, queues, caller=None):
             "note of what they need. Never tell a caller you'll connect them without calling "
             "it: saying 'let me connect you' does nothing on its own.\n"
             "Departments:\n" + dept_list_text) \
+        .add_section("If They Ask For A Person",
+            "Being asked for a person outranks getting a name. Ask once more "
+            "at most, then route regardless: call route_to_department with the "
+            "department that best fits whatever they have told you"
+            + (f" (use '{queues[0]['slug']}' if nothing else fits)" if queues else "")
+            + ", and leave the name out if you do not have it. Never make a "
+            "connection conditional on a name - a caller who has asked twice "
+            "must be routed. The same applies to anyone who declines to give "
+            "their name.") \
         .set_step_criteria(greeting_criteria) \
         .set_valid_steps(["route_department"]) \
         .set_functions(["report_sentiment", "set_caller_language", "route_to_department"])

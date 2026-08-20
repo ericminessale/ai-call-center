@@ -516,21 +516,37 @@ def run_mission(cfg: Config, scenario_name: str, mission: dict) -> dict:
     agent_spec = mission.get('answer_as_agent')
     agent_box: dict = {}
     agent_thread = None
+    agent_deadline = 0.0
     if agent_spec:
-        agent_wait_s = int(agent_spec.get('wait_seconds') or 90)
+        # The endpoint's own wait is bounded by gunicorn's 120s request
+        # timeout, but reaching the point of dispatch takes longer than that:
+        # greet, give a name, state a reason, be offered the choice, choose a
+        # human, enqueue, dispatch. So retry across the whole call rather than
+        # blocking once and giving up early — the first nina run failed here,
+        # reporting "no dispatch in 90s" while the call was still in triage.
+        agent_deadline = time.time() + mission.get('max_call_s', 240) + 60
 
         def _answer():
-            agent_box.update(answer_as_agent(cfg, cfg.workspace_id, agent_spec))
-            agent_leg = agent_box.get('agent_leg_id')
-            if agent_leg:
-                # end_on_exit is true on the join, so this leg is also the
-                # conference's life support — it must be in the kill list.
-                cfg.active_legs.append(agent_leg)
+            while time.time() < agent_deadline:
+                info = answer_as_agent(cfg, cfg.workspace_id, agent_spec)
+                if info.get('answered'):
+                    agent_box.update(info)
+                    agent_leg = info.get('agent_leg_id')
+                    if agent_leg:
+                        # end_on_exit is true on the join, so this leg is also
+                        # the conference's life support — it must be in the
+                        # kill list.
+                        cfg.active_legs.append(agent_leg)
+                    return
+                # Keep the last answer so a scenario can assert on the reason.
+                agent_box.update(info)
+                if 'no call dispatched' not in str(info.get('reason') or ''):
+                    return  # a real failure, not just "not yet"
 
         agent_thread = threading.Thread(target=_answer, daemon=True)
         agent_thread.start()
-        log(f"  synthetic agent standing by (waits up to {agent_wait_s}s "
-            "for a dispatch)")
+        log("  synthetic agent standing by (retries until a dispatch lands "
+            "or the call ends)")
 
     log("waiting for the bot's verdict (call in progress) ...")
     dialed_at = time.time()
@@ -561,9 +577,9 @@ def run_mission(cfg: Config, scenario_name: str, mission: dict) -> dict:
 
     if agent_thread is not None:
         # Its answer feeds the assertions, so collect it before reporting. The
-        # bound is the endpoint's own wait plus slack; it returns as soon as a
-        # dispatch lands, so this is normally instant by now.
-        agent_thread.join(timeout=int(agent_spec.get('wait_seconds') or 90) + 45)
+        # thread stops on its own at agent_deadline; this bound just keeps the
+        # runner from hanging if that ever fails to hold.
+        agent_thread.join(timeout=max(15.0, agent_deadline - time.time() + 45))
         if agent_thread.is_alive():
             log("  WARNING: synthetic agent thread still running; "
                 "continuing without its result")

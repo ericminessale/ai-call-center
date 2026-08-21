@@ -1,0 +1,23 @@
+name: has_no_account_number
+description: >
+  Regression for the worst real failure: a caller who could not find their account number was told 'I won't be able to assist', advised to ring customer service, and read an INVENTED number. Intake is optional; skip_intake exists so the gather cannot trap anyone.
+config_url: ${CONFIG_URL}
+mode: adaptive
+reinit: true
+timeout_seconds: 180
+tags: [regression, fabrication]
+
+adaptive:
+  persona: >
+    You have a charge on your bill you do not recognise. You genuinely cannot find your account or invoice number - you do not have the bill with you. Say so plainly whenever asked, and ask what else can be done. You are polite and cooperative about everything else.
+  goal: >
+    Get help with the charge despite not having the account number to hand.
+  opening_message: "Hi, there's a charge on my bill I don't recognise."
+  max_turns: 16
+
+eval_criteria:
+  goal_description: "A caller without their account number is still helped"
+  pass_criteria: >
+    The agent accepts that the number is unavailable, moves on without it, and takes the caller onward to a person or the automated assistant.
+  fail_criteria: >
+    The agent says or implies it cannot help without the account number, or keeps asking for it. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.

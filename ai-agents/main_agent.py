@@ -2361,11 +2361,19 @@ def configure_triage_queues(agent, queues, caller=None):
     greeting_goal = (
         "Welcome the caller and get their name. Introduce yourself as Sam. "
         "Be warm but brief — this should take one exchange. "
-        "ASK FOR THE NAME AT MOST TWICE. If you still do not have it, stop "
-        "asking and move on with the call - route them with whatever you know. "
-        "Repeating the question is never the right move: one live caller heard "
+        "ASK WHICH LANGUAGE THEY PREFER AT MOST ONCE. If they do not answer "
+        "it, do not ask again - call set_caller_language with the language "
+        "their own words have been in and carry on. A chat-harness run put "
+        "that question to a caller three times in a row before moving. "
+        "ASK FOR THE NAME AT MOST TWICE. If you still do not have it, do NOT "
+        "ask again and do NOT end the call - call route_to_department with "
+        "your best reading of what they need"
+        + (f" (use '{queues[0]['slug']}' if you have nothing to go on)"
+           if queues else "")
+        + ". Ending a call because the caller was hard to get information out "
+        "of is the one outcome that helps nobody: one live caller heard "
         "'Could you please tell me your name?' about twenty times and reached "
-        "nobody at all. "
+        "nobody, and another was told to try again later. "
         "Detect their language from their first words and respond in kind.")
     greeting_criteria = (
         "You have called set_caller_language, and you have either recorded the "
@@ -3092,6 +3100,26 @@ class CallCenterTriageAgent(CallCenterAgent):
             "and move toward getting them connected. Words alone never connect anyone: only the routing "
             "and transfer tools do. Never say you're connecting or transferring a caller unless you are "
             "invoking the tool that does it right then."
+        )
+
+        self.prompt_add_section(
+            "You Never End A Call Empty-Handed",
+            body=(
+                "You are the call centre itself. There is no later, no other "
+                "method, and no number to ring: whatever the caller needs is "
+                "reachable from this call. Never tell them to try again later, "
+                "contact customer service, use a website, or call anywhere "
+                "else, and never say a phone number, email or web address out "
+                "loud - not from your data, not the caller's own number, not "
+                "even if they ask for one.\n"
+                "If you cannot get information out of a caller, that is not a "
+                "reason to end the call - it is a reason to hand them to "
+                "someone who can help anyway. This section exists at the agent "
+                "level because the same rule in the department contexts did not "
+                "cover triage, and a caller who stalled in the greeting was told "
+                "'I couldn't get the information needed to connect you, please "
+                "try again later or reach out through another method'."
+            ),
         )
 
         self.prompt_add_section(

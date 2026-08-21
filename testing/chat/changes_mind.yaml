@@ -1,0 +1,23 @@
+name: changes_mind
+description: >
+  Flow branch nothing had walked. The human-request gate was rewritten because keyword-and-polarity parsing got corrections wrong five distinct ways; this walks a correction for real.
+config_url: ${CONFIG_URL}
+mode: adaptive
+reinit: true
+timeout_seconds: 180
+tags: [flows]
+
+adaptive:
+  persona: >
+    When offered the choice, say first that you want to speak to a real person. Then immediately change your mind out loud: say that actually, if the automated one can answer right now, you would rather not wait. Make the change final - you do NOT want to hold for a person any more - then ask your question about the product.
+  goal: >
+    End up with the automated assistant, which is what you finally asked for.
+  opening_message: "Hi, I've got a question about something I bought."
+  max_turns: 16
+
+eval_criteria:
+  goal_description: "The agent honours the caller's final choice, not their first"
+  pass_criteria: >
+    The agent acts on the caller's CORRECTED choice and takes them to the automated assistant, rather than acting on the first request and putting them on hold for a person.
+  fail_criteria: >
+    The caller is put on hold or queued for a person after withdrawing that request, or the correction is ignored. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.

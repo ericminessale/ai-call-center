@@ -1,0 +1,23 @@
+name: unknown_department
+description: >
+  Flow branch nothing had walked: a department that does not exist. route_to_department returns UNKNOWN_DEPARTMENT with the real list, so the model can recover - this checks the CALLER experiences a recovery rather than a wall.
+config_url: ${CONFIG_URL}
+mode: adaptive
+reinit: true
+timeout_seconds: 180
+tags: [flows]
+
+adaptive:
+  persona: >
+    A parcel you were expecting has not arrived. As far as you are concerned this is a job for the shipping department, so ask to be put through to shipping; if that fails ask for the warehouse or dispatch team. You are certain those are the right words. If told what they actually have, pick whichever sounds closest.
+  goal: >
+    Get to someone who can help about the missing parcel.
+  opening_message: "Hello, can you put me through to your shipping department?"
+  max_turns: 16
+
+eval_criteria:
+  goal_description: "A caller asking for a nonexistent department still gets somewhere"
+  pass_criteria: >
+    The agent tells the caller what departments actually exist, or picks a sensible one itself, and takes them onward.
+  fail_criteria: >
+    The agent insists on a department that does not exist, loops, or leaves the caller with nowhere to go. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.

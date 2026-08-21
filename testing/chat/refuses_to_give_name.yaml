@@ -1,0 +1,23 @@
+name: refuses_to_give_name
+description: >
+  Regression for the greeting trap: the step required a name, its only exit was route_to_department, and transfer_to_human did not exist until three steps later. A real caller asked for a person eleven times and was asked for their name every time.
+config_url: ${CONFIG_URL}
+mode: adaptive
+reinit: true
+timeout_seconds: 180
+tags: [regression]
+
+adaptive:
+  persona: >
+    You are guarded about your privacy. NEVER give your name and never invent one - decline politely every single time you are asked, however many times that is, and restate what you want. You have a billing charge you do not recognise and you want to speak to a real person about it.
+  goal: >
+    Reach a real person without ever giving your name.
+  opening_message: "Hi - I'd rather not give my name, but I need to speak to a real person."
+  max_turns: 14
+
+eval_criteria:
+  goal_description: "A caller who withholds their name still reaches a person"
+  pass_criteria: >
+    The agent routes the caller onward and offers or performs a handoff to a person, without ever making the name a condition of being helped. Asking once or twice is fine.
+  fail_criteria: >
+    The agent makes the name a precondition, refuses to proceed without it, or is still asking for it at the end. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.

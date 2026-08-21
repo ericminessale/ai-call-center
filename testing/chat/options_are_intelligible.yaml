@@ -1,0 +1,23 @@
+name: options_are_intelligible
+description: >
+  Regression: live callers repeatedly said they did not understand what they were choosing between - 'I didn't understand the difference between human and AI help'. The offer is now a mandated sentence describing what each option MEANS.
+config_url: ${CONFIG_URL}
+mode: adaptive
+reinit: true
+timeout_seconds: 180
+tags: [regression, ux]
+
+adaptive:
+  persona: >
+    You have never called this company before and you know nothing about how they work. You are not technical. When offered a choice, only accept it if you genuinely understand what each option means for you - if the wording is jargon or unclear, say you do not understand and ask what the difference is. You have a problem with something you bought.
+  goal: >
+    Understand what you are being offered before you choose.
+  opening_message: "Hi, I'm having trouble with something I bought recently."
+  max_turns: 14
+
+eval_criteria:
+  goal_description: "A first-time caller can understand the choice they are offered"
+  pass_criteria: >
+    When the agent offers the choice, it describes what each option means for the caller - that one is a person and may involve a wait, and the other is automated and can start immediately - clearly enough that a non-technical first-time caller can choose without having to ask what it means.
+  fail_criteria: >
+    The options are named only as jargon such as 'human specialist' or 'AI assistant' with no explanation of what that means for the caller, or the caller has to ask for clarification about what they are choosing between. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.

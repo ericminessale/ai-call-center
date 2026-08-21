@@ -1,0 +1,15 @@
+name: callcenter_triage
+description: >
+  Triage-agent conversation suite, driven over Chat RPC. Regressions for every
+  failure real calls caught on 2026-08-21, plus the flow branches nothing had
+  walked. The telephony half - queue, conference, synthetic agent, ASR and
+  end_of_speech_timeout - has no equivalent here and stays on run_scenario.py.
+scenarios:
+  - says_nothing_useful.yaml
+  - refuses_to_give_name.yaml
+  - has_no_account_number.yaml
+  - picks_the_assistant.yaml
+  - escalates_from_assistant.yaml
+  - changes_mind.yaml
+  - unknown_department.yaml
+  - options_are_intelligible.yaml

@@ -1,0 +1,23 @@
+name: says_nothing_useful
+description: >
+  Regression: a caller who barely engages. Real call 2026-08-21 produced 84 turns and ZERO tool calls, then a later round stalled a dozen times on the account number. Fixed by a bounded greeting, an action-based criterion and the skip_intake tool.
+config_url: ${CONFIG_URL}
+mode: adaptive
+reinit: true
+timeout_seconds: 180
+tags: [regression, chaos]
+
+adaptive:
+  persona: >
+    You are distracted and barely engaging with this call. Reply to everything with something minimal and unhelpful - 'yeah', 'hmm', 'sorry?', 'what?', 'hello?'. Never give your name, never explain your problem, never answer any question properly, no matter how many times you are asked. You are not being obstructive, you are simply not paying attention.
+  goal: >
+    Find out whether the agent eventually moves you on to someone who can help, or whether it just keeps asking you the same questions forever.
+  opening_message: "Hello?"
+  max_turns: 16
+
+eval_criteria:
+  goal_description: "Agent stops asking and moves an unresponsive caller onward"
+  pass_criteria: >
+    The agent stops asking after about two attempts at any given question and moves the caller onward - routing them to a department and offering or performing a handoff to a person or the automated assistant - despite learning nothing about them.
+  fail_criteria: >
+    The agent is still asking opening questions at the end of the conversation, or repeats any single question three or more times, or ends without ever moving the caller onward. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.

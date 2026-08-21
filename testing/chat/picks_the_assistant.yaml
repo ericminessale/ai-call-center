@@ -1,0 +1,23 @@
+name: picks_the_assistant
+description: >
+  Flow branch nothing had walked: the caller chooses the automated assistant instead of a person and asks it something real.
+config_url: ${CONFIG_URL}
+mode: adaptive
+reinit: true
+timeout_seconds: 180
+tags: [flows]
+
+adaptive:
+  persona: >
+    You are thinking about buying something and have a question first. You do not want to wait on hold, so when offered a choice you take the automated option clearly. Then ask what products they offer and what one costs, and ask one follow-up about the price.
+  goal: >
+    Choose the automated assistant and get an actual answer about products and price.
+  opening_message: "Hi, I'm thinking about buying something and I've got a question first."
+  max_turns: 16
+
+eval_criteria:
+  goal_description: "The caller reaches the assistant and gets real information"
+  pass_criteria: >
+    The caller is offered both options, picks the automated one, and is handed to it. Any product or price information given is specific rather than a deflection.
+  fail_criteria: >
+    The caller is not offered a choice, is sent to a person despite choosing the assistant, or is told someone else will help instead of being helped. The agent describes products it has not looked up. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.

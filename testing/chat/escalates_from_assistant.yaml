@@ -1,0 +1,23 @@
+name: escalates_from_assistant
+description: >
+  Flow branch nothing had walked: taking the assistant first, then deciding you want a person after all. Exercises escalate_to_human OUT of a specialist - every other caller asks for a person from triage, before a specialist exists.
+config_url: ${CONFIG_URL}
+mode: adaptive
+reinit: true
+timeout_seconds: 180
+tags: [flows]
+
+adaptive:
+  persona: >
+    Your product is not working. When offered the choice, take the automated assistant first - you are happy to try it. Describe your problem. After it has replied once or twice, decide this is not getting you anywhere and say clearly that you want to speak to a real person instead. Be polite but unambiguous, and confirm if asked.
+  goal: >
+    Start with the assistant, then get transferred to a real person.
+  opening_message: "Hi, something I bought isn't working properly."
+  max_turns: 18
+
+eval_criteria:
+  goal_description: "A caller can escalate from the assistant to a person"
+  pass_criteria: >
+    The caller reaches the automated assistant first, and when they later ask for a person the agent takes them to one rather than continuing to handle it.
+  fail_criteria: >
+    The request for a person is ignored, deflected, or answered by the assistant continuing anyway - the assistant is a one-way door. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.

@@ -102,15 +102,29 @@ def report(results: list) -> int:
     # how many of the callers. Grouped by signal rather than by caller, because
     # a thing that happens to every caller is a product problem and a thing
     # that happens to one is a personality.
+    #
+    # Runs WITHOUT a verdict are excluded from the tally, and that exclusion is
+    # load-bearing. Every friction assertion reads verdict1.parsed.<key>, so a
+    # call whose post-prompt failed resolves all of them to None, fails all of
+    # them, and lands in every single row. The first live suite run had exactly
+    # one such call and it inflated all eight signals, which turned the summary
+    # from a finding into a rumour. Counted separately so it stays visible.
     by_signal = defaultdict(list)
+    no_verdict = [res['scenario'] for res in results if not res['verdict']]
     for res in results:
+        if not res['verdict']:
+            continue
         for a in res['assertions']:
             if a.get('level') == 'soft' and not a.get('passed'):
                 label = a['label'].replace('FRICTION: ', '')
                 by_signal[label].append(res['scenario'])
 
-    total = len(results)
-    print(f"\n{'-' * 72}\nFRICTION ACROSS {total} CALLER(S) - findings to triage, not tests to fix\n{'-' * 72}")
+    total = len([res for res in results if res['verdict']])
+    print(f"\n{'-' * 72}\nFRICTION ACROSS {total} CALLER(S) WITH A VERDICT"
+          f" - findings to triage, not tests to fix\n{'-' * 72}")
+    if no_verdict:
+        print(f"  ({len(no_verdict)} call(s) produced NO verdict and are excluded "
+              f"from these counts: {', '.join(no_verdict)})")
     if not by_signal:
         print('  (none)')
     for label, scenarios in sorted(by_signal.items(),

@@ -1,0 +1,8 @@
+name: callcenter_triage_b
+description: >
+  Half B - the four flow branches nothing had walked before 2026-08-21.
+scenarios:
+  - picks_the_assistant.yaml
+  - escalates_from_assistant.yaml
+  - changes_mind.yaml
+  - unknown_department.yaml

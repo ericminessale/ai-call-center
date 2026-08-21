@@ -2365,7 +2365,8 @@ def configure_triage_queues(agent, queues, caller=None):
         "it, do not ask again - call set_caller_language with the language "
         "their own words have been in and carry on. A chat-harness run put "
         "that question to a caller three times in a row before moving. "
-        "ASK FOR THE NAME AT MOST TWICE. If you still do not have it, do NOT "
+        "ASK FOR THE NAME AT MOST TWICE IN TOTAL, and your opening greeting COUNTS "
+        "as the first of those two. If you still do not have it, do NOT "
         "ask again and do NOT end the call - call route_to_department with "
         "your best reading of what they need"
         + (f" (use '{queues[0]['slug']}' if you have nothing to go on)"
@@ -3298,10 +3299,13 @@ class CallCenterTriageAgent(CallCenterAgent):
         if reason:
             guidance = (
                 "They have already explained what they need — do NOT ask again. "
-                "Go straight to the connection choice, BOTH options in ONE short "
-                "question: a human specialist, or the AI assistant who can answer "
-                "immediately. If their answer is unclear, interrupted, or they "
-                "just repeat their question, use transfer_to_ai_specialist."
+                "Move to the connection choice and ask it EXACTLY as your step "
+                "instructions word it. Do not invent your own phrasing for the "
+                "two options and do not call them 'a human specialist' or "
+                "'the AI assistant' — a first-time caller does not know what "
+                "either means. ONLY ONCE YOU HAVE ACTUALLY ASKED: if their "
+                "answer is unclear, interrupted, or they just repeat their "
+                "question, use transfer_to_ai_specialist."
             )
         else:
             guidance = (

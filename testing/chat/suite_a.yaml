@@ -1,0 +1,10 @@
+name: callcenter_triage_a
+description: >
+  Half A - regressions for failures real calls caught. Split from suite.yaml
+  because the local judge/tester models serialize, so eight scenarios run ~9min
+  and overrun a single foreground window.
+scenarios:
+  - says_nothing_useful.yaml
+  - refuses_to_give_name.yaml
+  - has_no_account_number.yaml
+  - options_are_intelligible.yaml

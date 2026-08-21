@@ -2228,7 +2228,8 @@ _DEFAULT_INTAKE = [
 # per question. That is the same trap just fixed in the greeting step, except
 # enforced by the runtime instead of by a prompt, which no wording could
 # talk its way out of.
-_INTAKE_ESCAPES = ["transfer_to_human", "transfer_to_ai_specialist"]
+_INTAKE_ESCAPES = ["transfer_to_human", "transfer_to_ai_specialist",
+                   "skip_intake"]
 
 # Appended to every intake question. Intake is a convenience for whoever picks
 # up, never a precondition for being helped - but the model does not infer that,
@@ -2243,7 +2244,9 @@ _INTAKE_OPTIONAL_NOTE = (
     "This answer is OPTIONAL and you may ask for it at most TWICE. If you do "
     "not have a usable answer after the second ask, do ONE of these two things "
     "immediately - never ask a third time:\n"
-    "  (a) submit 'not provided' as the answer and move on, or\n"
+    "  (a) call skip_intake, which drops the rest of the questions and takes\n"
+    "      the caller straight to choosing who they speak to, or\n"
+    "  (a2) submit 'not provided' as the answer and move on, or\n"
     "  (b) if the caller has not given a usable answer to anything on this "
     "call, stop collecting and call transfer_to_ai_specialist so a specialist "
     "can take it from here.\n"
@@ -3154,6 +3157,38 @@ class CallCenterTriageAgent(CallCenterAgent):
         )
         result.update_global_data({'language_gate_bounced': True})
         return result
+
+    @AgentBase.tool(
+        name="skip_intake",
+        description=(
+            "Stop asking intake questions and take the caller straight to "
+            "choosing who they speak to. Call this the moment the caller "
+            "cannot or will not answer an intake question after two attempts, "
+            "or is not engaging with the call at all. The intake details are a "
+            "convenience for whoever picks up, never a requirement for being "
+            "helped."
+        ),
+        parameters={},
+    )
+    def skip_intake(self, args, raw_data):
+        """Leave the intake gather. A TOOL rather than an instruction.
+
+        Three prompt-level attempts failed at this: a caller answering only
+        "yeah" and "what?" was asked for an account number about a dozen times,
+        with the escape verified present on all six questions in the served
+        document. The model sees that text and does not act on it; it does act
+        on calling a tool.
+
+        It has to be a webhook-driven step change because gather mode filters
+        next_step and change_context out of the model's reach, leaving only
+        gather_submit and whatever each question unlocks in `functions`.
+        """
+        print("skip_intake: leaving the gather for offer_transfer", flush=True)
+        return FunctionResult(
+            "Intake skipped - the caller did not have the details to hand, "
+            "which is fine. Move straight on to offering them the choice of "
+            "who to speak to."
+        ).swml_change_step("offer_transfer")
 
     @AgentBase.tool(
         name="route_to_department",

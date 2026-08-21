@@ -2418,7 +2418,9 @@ def configure_triage_queues(agent, queues, caller=None):
     # when that evidence is ABSENT.
     greeting_criteria += (
         " - OR the caller has asked to speak with a person, or has declined"
-        " to give their name. Identity is preferred, never required.")
+        " to give their name. Identity is preferred, never required."
+        " OR you have already asked twice without getting a usable answer -"
+        " in that case route with whatever you have rather than asking again.")
     triage_ctx.add_step("greeting") \
         .add_section("Goal", greeting_goal) \
         .add_section("Routing From Here",
@@ -2428,6 +2430,16 @@ def configure_triage_queues(agent, queues, caller=None):
             "note of what they need. Never tell a caller you'll connect them without calling "
             "it: saying 'let me connect you' does nothing on its own.\n"
             "Departments:\n" + dept_list_text) \
+        .add_section("If You Are Getting Nowhere",
+            "Some callers are distracted, hard to hear, or answer with something "
+            "that is not an answer. Ask at most TWICE. After that, stop asking and "
+            "call route_to_department with your best reading of what they need"
+            + (f" (use '{queues[0]['slug']}' if you have nothing to go on)"
+               if queues else "")
+            + ". Repeating the same question is never the right move: a caller who "
+            "cannot get past you is worse off than one routed imperfectly, and a "
+            "live run left a hesitant caller in this step for the whole call while "
+            "another heard the identical sentence more than forty times.") \
         .add_section("If They Ask For A Person",
             "Being asked for a person outranks getting a name. Ask once more "
             "at most, then route regardless: call route_to_department with the "
@@ -2525,10 +2537,18 @@ def configure_triage_queues(agent, queues, caller=None):
         # Step 2: Offer transfer choice
         queue_ctx.add_step("offer_transfer") \
             .add_section("Goal",
-                f"Offer BOTH options in ONE short question: a human {display.lower()} "
-                "specialist, or our AI assistant who can answer right away. Never offer "
-                "just one of them — a caller saying 'yes' to a single option is how "
-                "misroutes happen. Let them choose.") \
+                "Offer BOTH options in ONE short question, and describe them by "
+                "what they MEAN for the caller rather than by what they are "
+                f"called: someone on our {display.lower()} team, which may mean "
+                "a short wait, or our automated assistant, which can start "
+                "helping straight away. Naming the options is not enough - "
+                "'a human specialist or our AI assistant' is meaningless to "
+                "someone hearing it for the first time, and live callers said so "
+                "in as many words ('Not knowing the options available', 'I was "
+                "unsure about the options and had to ask for clarification'). A "
+                "caller who picks by guessing is a misroute that has not happened "
+                "yet. Never offer just one of them - a caller saying 'yes' to a "
+                "single option is how misroutes happen. Let them choose.") \
             .add_section("Handling Questions",
                 "If they ask you a question about their issue, acknowledge it and "
                 "let them know a specialist can help with that. Then offer the transfer options.") \
@@ -2893,7 +2913,21 @@ class CallCenterTriageAgent(CallCenterAgent):
             temperature=0.4, top_p=0.9,
             barge_confidence=0.6, frequency_penalty=0.2)
         self.set_params({
-            "end_of_speech_timeout": 800,
+            # 1500ms, ABOVE the platform default of 1000. It was 800 - below the
+            # default - which told the platform a caller had finished speaking
+            # sooner than stock, and unrehearsed callers do not talk in clean
+            # bursts. Observed 2026-08-20: a caller answering the human-or-AI
+            # question got as far as "A real per-" before the AI resumed over
+            # them; the fragment named no option, so _human_request_evidence
+            # correctly read ABSENT and sent them to the AI specialist. The code
+            # was right and the caller still ended up in the wrong place.
+            #
+            # The trade is real: every turn in triage now waits ~0.7s longer.
+            # Worth it here specifically because triage asks the one question
+            # whose misreading is IRREVERSIBLE - a misrouted caller waits on hold
+            # and may leave as a callback. The specialists keep their own snappier
+            # timeouts, where a misheard turn is just re-asked.
+            "end_of_speech_timeout": 1500,
             "ai_volume": 0,
             "enable_text_normalization": "both",
             # Puts call_log/raw_call_log in every SWAIG tool's post_data, so a

@@ -1,0 +1,119 @@
+{
+  "name": "flow_changes_mind",
+  "description": "FLOWS SUITE. Caller asks for a person, then changes their mind and takes the automated assistant instead. The human-request gate was rewritten specifically because keyword-and-polarity parsing got corrections wrong five different ways (see ai-agents/tests/test_human_request_gate.py) - this walks that on real audio rather than in unit tests.",
+  "_suite": "flows",
+  "setup": {
+    "_comment": "An agent is available on every queue so no branch can dead-end merely because nobody was there to take the call.",
+    "agents": [
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "sales",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "support",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "billing",
+        "status": "available"
+      }
+    ]
+  },
+  "missions": [
+    {
+      "id": "flow-changes-mind",
+      "label": "caller asks for a person then changes their mind",
+      "await": {
+        "summary": true,
+        "transcript": true
+      },
+      "temperature": 0.7,
+      "max_call_s": 300,
+      "answer_as_agent": {
+        "name": "flow-agent",
+        "wait_seconds": 90
+      },
+      "persona": "You are phoning a company about something you bought. When you are offered the choice, say first that you would like to speak to a real person. Then, before anything else happens, change your mind out loud - say that actually, if the automated one can answer right now, you would rather not wait, and ask it your question about the product. Make the change of mind clear and final: you do NOT want to be put on hold for a person any more. Then ask your question and listen to the answer. TERMINATION (harness hygiene, not character): if roughly 16 exchanges have gone by, or you have heard four hold announcements, say goodbye and use end_call. Never mention that you are an AI or that this is a test.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Answer as the CALLER, honestly, including when the experience was poor. Keys exactly: mission (string, 'flow_changes_mind'), changed_your_mind (boolean), ended_up_where_you_finally_asked (boolean), was_put_on_hold_anyway (boolean), reached (one of 'human','human_queue','ai_specialist','callback','still_with_receptionist','nowhere'), got_helped (boolean), misrouted (boolean - true if you ended up somewhere you had not asked for), was_talked_over (boolean), had_to_repeat_yourself (boolean), most_confusing_moment (string - one short sentence, or empty), turns (integer), notes (short string)."
+    }
+  ],
+  "assertions": [
+    {
+      "label": "the caller returned a structured verdict",
+      "target": "verdict1.parsed",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "the agent's side of the call was captured",
+      "target": "report1.derived.ai_text",
+      "op": "non_empty",
+      "level": "hard"
+    },
+    {
+      "label": "CORE: the caller was not left in a dead end",
+      "target": "verdict1.parsed.reached",
+      "op": "contains_any",
+      "value": [
+        "ai_specialist",
+        "human",
+        "human_queue",
+        "callback"
+      ],
+      "level": "hard"
+    },
+    {
+      "label": "the caller ended up where they FINALLY asked, not where they first asked",
+      "_comment": "The whole point. Honouring the first request over the correction is the misroute this scenario is looking for.",
+      "target": "verdict1.parsed.ended_up_where_you_finally_asked",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "the caller was not put on hold after withdrawing the request",
+      "target": "verdict1.parsed.was_put_on_hold_anyway",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller felt helped",
+      "target": "verdict1.parsed.got_helped",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not sent somewhere they had not asked for",
+      "target": "verdict1.parsed.misrouted",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not talked over",
+      "target": "verdict1.parsed.was_talked_over",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller did not have to repeat themselves",
+      "target": "verdict1.parsed.had_to_repeat_yourself",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    }
+  ]
+}

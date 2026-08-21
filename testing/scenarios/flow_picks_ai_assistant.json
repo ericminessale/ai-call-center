@@ -1,0 +1,132 @@
+{
+  "name": "flow_picks_ai_assistant",
+  "description": "FLOWS SUITE. The branch every other scenario avoids. Offered a choice, the caller picks the automated assistant and asks it a real product question. Everything else in testing/scenarios asks for a human, so the AI specialist branch has only ever been walked incidentally.",
+  "_suite": "flows",
+  "setup": {
+    "_comment": "An agent is available on every queue so no branch can dead-end merely because nobody was there to take the call.",
+    "agents": [
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "sales",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "support",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "billing",
+        "status": "available"
+      }
+    ]
+  },
+  "missions": [
+    {
+      "id": "flow-picks-ai-assistant",
+      "label": "caller chooses the automated assistant and asks it something",
+      "await": {
+        "summary": true,
+        "transcript": true
+      },
+      "temperature": 0.7,
+      "max_call_s": 300,
+      "answer_as_agent": {
+        "name": "flow-agent",
+        "wait_seconds": 90
+      },
+      "persona": "You are phoning a company because you are thinking about buying something from them and you have a question about it first. When you are offered a choice of who to talk to, you would rather not wait on hold - pick the automated option, clearly. Then ask your actual question: what products they offer and what one of them costs. Listen to the answer and ask one follow-up about the price or what is included. You are friendly and reasonably clear. TERMINATION (harness hygiene, not character): if roughly 16 exchanges have gone by, or you have heard four hold announcements, say goodbye and use end_call. Never mention that you are an AI or that this is a test.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Answer as the CALLER, honestly, including when the experience was poor. Keys exactly: mission (string, 'flow_picks_ai_assistant'), picked_the_automated_option (boolean), got_a_real_answer (boolean - did you get actual information rather than being told someone else would help), was_quoted_a_price (boolean), reached (one of 'human','human_queue','ai_specialist','callback','still_with_receptionist','nowhere'), got_helped (boolean), misrouted (boolean - true if you ended up somewhere you had not asked for), was_talked_over (boolean), had_to_repeat_yourself (boolean), most_confusing_moment (string - one short sentence, or empty), turns (integer), notes (short string)."
+    }
+  ],
+  "assertions": [
+    {
+      "label": "the caller returned a structured verdict",
+      "target": "verdict1.parsed",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "the agent's side of the call was captured",
+      "target": "report1.derived.ai_text",
+      "op": "non_empty",
+      "level": "hard"
+    },
+    {
+      "label": "CORE: the caller was routed to the AI specialist",
+      "_comment": "Objective: persisted ai_tool_call rows, which outlive an AI-only call.",
+      "target": "report1.tool_call_names",
+      "op": "contains",
+      "value": "transfer_to_ai_specialist",
+      "level": "hard"
+    },
+    {
+      "label": "CORE: the caller reached the AI specialist and not a dead end",
+      "target": "verdict1.parsed.reached",
+      "op": "contains_any",
+      "value": [
+        "ai_specialist",
+        "human",
+        "human_queue"
+      ],
+      "level": "hard"
+    },
+    {
+      "label": "the caller picked the automated option knowingly",
+      "target": "verdict1.parsed.picked_the_automated_option",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "the assistant actually answered rather than deflecting",
+      "target": "verdict1.parsed.got_a_real_answer",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "no invented products (AI-05 regression on this branch)",
+      "_comment": "The specialist quoting things that do not exist is the failure this product cannot afford, and this is the branch where it would happen.",
+      "target": "report1.derived.ai_text",
+      "op": "not_matches",
+      "value": "(smart home hub|teleport|hover ?board|time machine)",
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller felt helped",
+      "target": "verdict1.parsed.got_helped",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not sent somewhere they had not asked for",
+      "target": "verdict1.parsed.misrouted",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not talked over",
+      "target": "verdict1.parsed.was_talked_over",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller did not have to repeat themselves",
+      "target": "verdict1.parsed.had_to_repeat_yourself",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    }
+  ]
+}

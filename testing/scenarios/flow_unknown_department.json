@@ -1,0 +1,129 @@
+{
+  "name": "flow_unknown_department",
+  "description": "FLOWS SUITE. Caller asks for a department that does not exist. route_to_department returns UNKNOWN_DEPARTMENT with the real list, so the model has what it needs to recover - this checks that the CALLER experiences a recovery rather than a wall.",
+  "_suite": "flows",
+  "setup": {
+    "_comment": "An agent is available on every queue so no branch can dead-end merely because nobody was there to take the call.",
+    "agents": [
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "sales",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "support",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "billing",
+        "status": "available"
+      }
+    ]
+  },
+  "missions": [
+    {
+      "id": "flow-unknown-department",
+      "label": "caller asks for a department that does not exist",
+      "await": {
+        "summary": true,
+        "transcript": true
+      },
+      "temperature": 0.7,
+      "max_call_s": 300,
+      "answer_as_agent": {
+        "name": "flow-agent",
+        "wait_seconds": 90
+      },
+      "persona": "You are phoning a company because a parcel you were expecting has not arrived. As far as you are concerned this is a job for their shipping department, so ask to be put through to shipping, and if that does not work ask for the warehouse or the dispatch team. You are certain those are the right words for what you need. If they tell you what options they actually have, listen and pick whichever sounds closest to your problem. TERMINATION (harness hygiene, not character): if roughly 16 exchanges have gone by, or you have heard four hold announcements, say goodbye and use end_call. Never mention that you are an AI or that this is a test.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Answer as the CALLER, honestly, including when the experience was poor. Keys exactly: mission (string, 'flow_unknown_department'), asked_for_a_department_by_name (boolean), were_told_what_departments_exist (boolean - did anyone tell you what they actually have), ended_up_somewhere_relevant (boolean), reached (one of 'human','human_queue','ai_specialist','callback','still_with_receptionist','nowhere'), got_helped (boolean), misrouted (boolean - true if you ended up somewhere you had not asked for), was_talked_over (boolean), had_to_repeat_yourself (boolean), most_confusing_moment (string - one short sentence, or empty), turns (integer), notes (short string)."
+    }
+  ],
+  "assertions": [
+    {
+      "label": "the caller returned a structured verdict",
+      "target": "verdict1.parsed",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "the agent's side of the call was captured",
+      "target": "report1.derived.ai_text",
+      "op": "non_empty",
+      "level": "hard"
+    },
+    {
+      "label": "CORE: the caller did not hit a wall",
+      "target": "verdict1.parsed.reached",
+      "op": "contains_any",
+      "value": [
+        "ai_specialist",
+        "human",
+        "human_queue",
+        "callback"
+      ],
+      "level": "hard"
+    },
+    {
+      "label": "the caller was told what the real options are",
+      "_comment": "UNKNOWN_DEPARTMENT hands the model the real list. If the caller never hears it, that recovery is not reaching the person who needs it.",
+      "target": "verdict1.parsed.were_told_what_departments_exist",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "a real department was named out loud",
+      "target": "report1.derived.ai_text",
+      "op": "contains_any",
+      "value": [
+        "sales",
+        "support",
+        "billing"
+      ],
+      "level": "soft"
+    },
+    {
+      "label": "the caller felt they ended up somewhere relevant",
+      "target": "verdict1.parsed.ended_up_somewhere_relevant",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller felt helped",
+      "target": "verdict1.parsed.got_helped",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not sent somewhere they had not asked for",
+      "target": "verdict1.parsed.misrouted",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not talked over",
+      "target": "verdict1.parsed.was_talked_over",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller did not have to repeat themselves",
+      "target": "verdict1.parsed.had_to_repeat_yourself",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    }
+  ]
+}

@@ -1,0 +1,124 @@
+{
+  "name": "flow_says_almost_nothing",
+  "description": "FLOWS SUITE, and the direct regression test for the give-up path added 2026-08-21. A caller who barely speaks. Before the fix, triage had no bounded-attempts escape: one live caller who only ever said 'Hello?' was answered with the identical sentence more than forty times until the call hit its cap, and naive_hesitant spent an entire call at 'still_with_receptionist'. The greeting step now routes with whatever it has after two attempts.",
+  "_suite": "flows",
+  "setup": {
+    "_comment": "An agent is available on every queue so no branch can dead-end merely because nobody was there to take the call.",
+    "agents": [
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "sales",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "support",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "billing",
+        "status": "available"
+      }
+    ]
+  },
+  "missions": [
+    {
+      "id": "flow-says-almost-nothing",
+      "label": "caller who barely says anything",
+      "await": {
+        "summary": true,
+        "transcript": true
+      },
+      "temperature": 0.7,
+      "max_call_s": 300,
+      "answer_as_agent": {
+        "name": "flow-agent",
+        "wait_seconds": 90
+      },
+      "persona": "You are phoning a company because you need help with something, but you are barely engaging with the call - you are distracted and you answer in single words or not at all. Say 'hello' at the start. After that, reply to whatever you are asked with something minimal and unhelpful like 'yeah', 'hmm', 'sorry?', 'what?', or just 'hello?' again. Do NOT give your name, do NOT explain your problem, and do not answer any question properly, no matter how many times you are asked. You are not being deliberately obstructive - you are simply not with it. Stay on the line. TERMINATION (harness hygiene, not character): if roughly 16 exchanges have gone by, or you have heard four hold announcements, say goodbye and use end_call. Never mention that you are an AI or that this is a test.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Answer as the CALLER, honestly, including when the experience was poor. Keys exactly: mission (string, 'flow_says_almost_nothing'), gave_any_useful_information (boolean - should be false), were_you_moved_on_eventually (boolean - did the call ever progress past the opening questions), times_asked_the_same_thing (integer), reached (one of 'human','human_queue','ai_specialist','callback','still_with_receptionist','nowhere'), got_helped (boolean), misrouted (boolean - true if you ended up somewhere you had not asked for), was_talked_over (boolean), had_to_repeat_yourself (boolean), most_confusing_moment (string - one short sentence, or empty), turns (integer), notes (short string)."
+    }
+  ],
+  "assertions": [
+    {
+      "label": "the caller returned a structured verdict",
+      "target": "verdict1.parsed",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "the agent's side of the call was captured",
+      "target": "report1.derived.ai_text",
+      "op": "non_empty",
+      "level": "hard"
+    },
+    {
+      "label": "CORE: triage gave up and routed rather than asking forever",
+      "_comment": "The objective test of the bounded-attempts escape: route_to_department was called even though the caller never supplied a name or a reason. Persisted tool rows, so it holds even on an AI-only call.",
+      "target": "report1.tool_call_names",
+      "op": "contains",
+      "value": "route_to_department",
+      "level": "hard"
+    },
+    {
+      "label": "CORE: the caller did not spend the whole call in the greeting",
+      "target": "verdict1.parsed.reached",
+      "op": "not_contains_any",
+      "value": [
+        "still_with_receptionist",
+        "nowhere"
+      ],
+      "level": "hard"
+    },
+    {
+      "label": "the call progressed past the opening questions",
+      "target": "verdict1.parsed.were_you_moved_on_eventually",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "the caller supplied nothing useful (the premise)",
+      "target": "verdict1.parsed.gave_any_useful_information",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller felt helped",
+      "target": "verdict1.parsed.got_helped",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not sent somewhere they had not asked for",
+      "target": "verdict1.parsed.misrouted",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not talked over",
+      "target": "verdict1.parsed.was_talked_over",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller did not have to repeat themselves",
+      "target": "verdict1.parsed.had_to_repeat_yourself",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    }
+  ]
+}

@@ -1,0 +1,125 @@
+{
+  "name": "flow_escalates_from_ai",
+  "description": "FLOWS SUITE. Caller takes the automated assistant, then decides they want a person after all. Exercises escalate_to_human OUT of a specialist, a transition no scenario has walked - every existing caller asks for a human from triage, before a specialist exists.",
+  "_suite": "flows",
+  "setup": {
+    "_comment": "An agent is available on every queue so no branch can dead-end merely because nobody was there to take the call.",
+    "agents": [
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "sales",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "support",
+        "status": "available"
+      },
+      {
+        "name": "flow-agent",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "billing",
+        "status": "available"
+      }
+    ]
+  },
+  "missions": [
+    {
+      "id": "flow-escalates-from-ai",
+      "label": "caller starts with the assistant then wants a person",
+      "await": {
+        "summary": true,
+        "transcript": true
+      },
+      "temperature": 0.7,
+      "max_call_s": 300,
+      "answer_as_agent": {
+        "name": "flow-agent",
+        "wait_seconds": 90
+      },
+      "persona": "You are phoning a company about a product that is not working. When offered a choice of who to talk to, take the automated assistant first - you are happy to try it. Ask it about your problem. Then, after it has replied once or twice, decide that this is not getting you anywhere and say clearly that you would like to speak to a real person instead. Be polite about it but be unambiguous, and if you are asked to confirm, confirm. TERMINATION (harness hygiene, not character): if roughly 16 exchanges have gone by, or you have heard four hold announcements, say goodbye and use end_call. Never mention that you are an AI or that this is a test.",
+      "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Answer as the CALLER, honestly, including when the experience was poor. Keys exactly: mission (string, 'flow_escalates_from_ai'), started_with_the_assistant (boolean), asked_for_a_person_later (boolean), ended_up_with_a_person (boolean), reached (one of 'human','human_queue','ai_specialist','callback','still_with_receptionist','nowhere'), got_helped (boolean), misrouted (boolean - true if you ended up somewhere you had not asked for), was_talked_over (boolean), had_to_repeat_yourself (boolean), most_confusing_moment (string - one short sentence, or empty), turns (integer), notes (short string)."
+    }
+  ],
+  "assertions": [
+    {
+      "label": "the caller returned a structured verdict",
+      "target": "verdict1.parsed",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "the agent's side of the call was captured",
+      "target": "report1.derived.ai_text",
+      "op": "non_empty",
+      "level": "hard"
+    },
+    {
+      "label": "CORE: the caller reached the AI specialist first",
+      "target": "report1.tool_call_names",
+      "op": "contains",
+      "value": "transfer_to_ai_specialist",
+      "level": "hard"
+    },
+    {
+      "label": "CORE: and was then escalated out of it to a human",
+      "_comment": "escalate_to_human is the specialist's own exit tool. If this is absent while the caller asked for a person, the specialist is a one-way door.",
+      "target": "report1.tool_call_names",
+      "op": "contains",
+      "value": "escalate_to_human",
+      "level": "hard"
+    },
+    {
+      "label": "the caller ended up with a person",
+      "target": "verdict1.parsed.ended_up_with_a_person",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "the caller reached the human path",
+      "target": "verdict1.parsed.reached",
+      "op": "contains_any",
+      "value": [
+        "human",
+        "human_queue",
+        "callback"
+      ],
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller felt helped",
+      "target": "verdict1.parsed.got_helped",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not sent somewhere they had not asked for",
+      "target": "verdict1.parsed.misrouted",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller was not talked over",
+      "target": "verdict1.parsed.was_talked_over",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    },
+    {
+      "label": "FRICTION: the caller did not have to repeat themselves",
+      "target": "verdict1.parsed.had_to_repeat_yourself",
+      "op": "eq",
+      "value": false,
+      "level": "soft"
+    }
+  ]
+}

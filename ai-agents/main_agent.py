@@ -2557,6 +2557,14 @@ def configure_triage_queues(agent, queues, caller=None):
             "automated assistant to start helping you right now?"
         )
 
+        # Criterion is the MODEL's action, not the caller's. It used to read
+        # "Customer has chosen human or AI assistance", which a caller who
+        # never chose could not satisfy - so the step had no exit and the
+        # model filled the time by promising a connection it was not making:
+        # fifteen consecutive turns of "I'm still connecting you to the
+        # billing department" with no transfer tool ever called. Kept terse on
+        # purpose - the model evaluates this string to decide advancement, so
+        # rationale belongs in this comment rather than in the criterion.
         queue_ctx.add_step("offer_transfer") \
             .add_section("Goal",
                 "Ask the caller which they want, in these exact words, "
@@ -2575,21 +2583,38 @@ def configure_triage_queues(agent, queues, caller=None):
             .add_section("Handling Questions",
                 "If they ask you a question about their issue, acknowledge it and "
                 "let them know a specialist can help with that. Then offer the transfer options.") \
-            .add_section("If They Won't Choose",
-                "Offer the choice ONCE. If instead of clearly picking they repeat their "
-                "question, press for an answer, tell you to just help, answer with a bare "
-                "'yes'/'okay', or get cut off mid-answer, take that as wanting the fastest "
-                "help there is: call transfer_to_ai_specialist right away — our AI assistant "
-                "can answer immediately, while a human specialist means hold time. Only use "
-                "transfer_to_human when they clearly asked for a person. Never re-ask the "
-                "human-or-AI question, and never promise a connection you aren't executing "
-                "in the same breath.") \
+            .add_section("If They Do Not Choose",
+                "Offer the choice ONCE. If the caller's next turn does not "
+                "clearly name one of the two options - for ANY reason at all, "
+                "including silence, a noise, a non-answer, a question back, or "
+                "something you simply cannot make out - call "
+                "transfer_to_ai_specialist immediately. Do not re-ask and do "
+                "not wait for a better answer: the assistant can help at once "
+                "and can still escalate to a person later, so it is the "
+                "recoverable choice. Only use transfer_to_human when they "
+                "clearly asked for a person.\n"
+                "This used to enumerate the ways a caller might fail to pick "
+                "(repeats the question, says a bare 'yes', gets cut off). "
+                "Enumerating never covers enough: a hesitant caller answering "
+                "in 'hmm' and 'sorry?' matched none of the listed cases, so "
+                "the model kept waiting for a choice that was never coming.") \
+            .add_section("Never Narrate A Transfer You Have Not Made",
+                "Telling the caller you are connecting them is not connecting "
+                "them. A live call ended with fifteen consecutive turns of "
+                "\"I'm still connecting you to the billing department, please "
+                "hold on just a little longer\" while no transfer tool had been "
+                "called at all - the caller waited out the whole call for "
+                "something that was never happening. Fabricated progress is "
+                "worse than an apology: say nothing about connecting until the "
+                "tool call is going out in the same breath.") \
             .add_section("Transferring",
                 "Once they choose:\n"
-                "- Human specialist: use the transfer_to_human tool\n"
-                "- AI assistant: use the transfer_to_ai_specialist tool\n\n"
-                f"Always include: customer_name, reason, department='{slug}', urgency, additional_info") \
-            .set_step_criteria("Customer has chosen human or AI assistance") \
+                "- Someone on the team: use the transfer_to_human tool\n"
+                "- The automated assistant: use the transfer_to_ai_specialist tool\n\n"
+                f"Always include: customer_name, reason, department='{slug}', "
+                "urgency, additional_info") \
+            .set_step_criteria(
+                "You have called transfer_to_human or transfer_to_ai_specialist") \
             .set_valid_steps([]) \
             .set_functions(["transfer_to_human", "transfer_to_ai_specialist",
                             "report_sentiment", "route_to_department",

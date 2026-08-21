@@ -2350,9 +2350,15 @@ def configure_triage_queues(agent, queues, caller=None):
     greeting_goal = (
         "Welcome the caller and get their name. Introduce yourself as Sam. "
         "Be warm but brief — this should take one exchange. "
+        "ASK FOR THE NAME AT MOST TWICE. If you still do not have it, stop "
+        "asking and move on with the call - route them with whatever you know. "
+        "Repeating the question is never the right move: one live caller heard "
+        "'Could you please tell me your name?' about twenty times and reached "
+        "nobody at all. "
         "Detect their language from their first words and respond in kind.")
     greeting_criteria = (
-        "The customer has stated their name and you have called set_caller_language")
+        "You have called set_caller_language, and you have either recorded the "
+        "caller's name or already asked for it twice")
     # Language memory: the caller's documented language is now the voice this
     # call OPENS in (the agent reordered its language list). Say the first line
     # in that language, then offer English in one short phrase — the number is
@@ -3090,6 +3096,13 @@ class CallCenterTriageAgent(CallCenterAgent):
                 "If the caller starts in Spanish, switch to Spanish and call set_caller_language('es-ES')",
                 "If the caller starts in French, switch to French and call set_caller_language('fr-FR')",
                 "If you can't tell, just ask once: 'Which language do you prefer — English, Spanish, or French?'",
+                "If you asked which language they prefer and they did not answer, "
+                "call set_caller_language with the language THEIR OWN WORDS have "
+                "been in - that is an observation about this call, not a guess "
+                "about their preference, and leaving it unrecorded strands them: "
+                "the routing tools will not release a caller with no language, "
+                "and a live caller answering only 'hello' and 'yeah' spent 84 "
+                "turns going nowhere because of it",
                 "Call it silently — no fillers, no acknowledgment to the caller",
                 "If the caller SWITCHES languages mid-call, follow them and call set_caller_language again with the new code",
             ]

@@ -2210,7 +2210,7 @@ _DEPARTMENT_INTAKE = {
         # long digit strings are exactly what ASR gets wrong, and a wrong
         # account number sends the agent to the wrong record.
         {'key': 'account_ref',
-         'question': "What is the account or invoice number on the bill?",
+         'question': "What is the account or invoice number on the bill, if you have it to hand?",
          'confirm': True},
         {'key': 'billing_issue',
          'question': "What about the charge looks wrong?"},
@@ -2240,10 +2240,18 @@ _INTAKE_ESCAPES = ["transfer_to_human", "transfer_to_ai_specialist"]
 # preamble already carried a submit-'not provided' rule and was ignored; what
 # the model acts on is the instruction injected alongside each question.
 _INTAKE_OPTIONAL_NOTE = (
-    "This answer is OPTIONAL. If the caller does not have it, cannot find it, or "
-    "would rather not say, submit 'not provided' and move straight on. Never "
-    "tell the caller you cannot help without it, and never send them anywhere "
-    "else - you are already the place that helps them."
+    "This answer is OPTIONAL and you may ask for it at most TWICE. If you do "
+    "not have a usable answer after the second ask, do ONE of these two things "
+    "immediately - never ask a third time:\n"
+    "  (a) submit 'not provided' as the answer and move on, or\n"
+    "  (b) if the caller has not given a usable answer to anything on this "
+    "call, stop collecting and call transfer_to_ai_specialist so a specialist "
+    "can take it from here.\n"
+    "Both exits are available to you at every question. Never tell the caller "
+    "you cannot help without this, and never send them anywhere else - you are "
+    "already the place that helps them. A live caller answering only 'yeah' "
+    "and 'what?' was asked for an account number twelve times because only "
+    "exit (a) was offered and the model would not take it."
 )
 
 

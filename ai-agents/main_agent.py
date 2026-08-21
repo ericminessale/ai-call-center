@@ -2228,8 +2228,14 @@ _DEFAULT_INTAKE = [
 # per question. That is the same trap just fixed in the greeting step, except
 # enforced by the runtime instead of by a prompt, which no wording could
 # talk its way out of.
-_INTAKE_ESCAPES = ["transfer_to_human", "transfer_to_ai_specialist",
-                   "skip_intake"]
+# transfer_to_ai_specialist is deliberately NOT here. Unlocking it on every
+# intake question gave the model a way out of intake that BYPASSED
+# offer_transfer, and it took it: two chat runs transferred an ENGAGED caller
+# straight to the specialist without ever offering them the choice. The only
+# skip from intake is skip_intake, which lands on offer_transfer so the caller
+# is always asked. transfer_to_human stays, because a caller who explicitly
+# asks for a person should get one at once.
+_INTAKE_ESCAPES = ["transfer_to_human", "skip_intake"]
 
 # Appended to every intake question. Intake is a convenience for whoever picks
 # up, never a precondition for being helped - but the model does not infer that,
@@ -2248,8 +2254,8 @@ _INTAKE_OPTIONAL_NOTE = (
     "      the caller straight to choosing who they speak to, or\n"
     "  (a2) submit 'not provided' as the answer and move on, or\n"
     "  (b) if the caller has not given a usable answer to anything on this "
-    "call, stop collecting and call transfer_to_ai_specialist so a specialist "
-    "can take it from here.\n"
+    "call, call skip_intake as well - it drops the remaining questions and "
+    "takes them to the choice of who to speak to.\n"
     "Both exits are available to you at every question. Never tell the caller "
     "you cannot help without this, and never send them anywhere else - you are "
     "already the place that helps them. A live caller answering only 'yeah' "

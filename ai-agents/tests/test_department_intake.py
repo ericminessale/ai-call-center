@@ -56,10 +56,26 @@ def test_every_intake_question_can_escape_to_a_human(slug):
 
 
 def test_escape_list_names_the_transfer_tools():
+    """Two exits, and one tool that must NOT be here.
+
+    transfer_to_human: a caller who explicitly asks for a person gets one at
+    once, without finishing intake.
+
+    skip_intake: leaves the gather for offer_transfer, so the caller is still
+    offered the choice.
+
+    transfer_to_ai_specialist was in this list and was REMOVED on 2026-08-21.
+    Unlocking it on every question gave the model a way out of intake that
+    bypassed offer_transfer entirely, and it took it - two chat runs sent an
+    engaged caller straight to the specialist having never been offered
+    anything. The exclusion is the point of this test, not an omission.
+    """
     assert 'transfer_to_human' in main_agent._INTAKE_ESCAPES
-    # The AI specialist is the other legitimate exit: offer_transfer routes an
-    # unclear answer there deliberately, since it is the reversible option.
-    assert 'transfer_to_ai_specialist' in main_agent._INTAKE_ESCAPES
+    assert 'skip_intake' in main_agent._INTAKE_ESCAPES
+    assert 'transfer_to_ai_specialist' not in main_agent._INTAKE_ESCAPES, (
+        'unlocking the AI transfer inside intake lets the model skip the '
+        'human-or-assistant choice altogether'
+    )
 
 
 @pytest.mark.parametrize('slug', sorted(all_question_sets()))

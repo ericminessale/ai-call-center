@@ -2542,23 +2542,36 @@ def configure_triage_queues(agent, queues, caller=None):
                                    "set_caller_language"] + _INTAKE_ESCAPES)
 
         # Step 2: Offer transfer choice
+        # The exact words the caller hears, lifted out of the chained call so
+        # the quoting stays legible. An earlier inlined version rendered as
+        #   ... - that might mean a short wait - or ""would you like ...
+        # and the model, handed a malformed sentence, went straight back to
+        # paraphrasing: it asked "Would you like to speak with someone on our
+        # support team?" - the first clause only, dropping the alternative
+        # entirely - and used "human specialist" and "AI assistant" elsewhere
+        # in the same call. Mandating wording only works if the wording is
+        # well-formed.
+        choice_question = (
+            f"Would you like to speak with someone on our {display.lower()} "
+            "team - that might mean a short wait - or would you like our "
+            "automated assistant to start helping you right now?"
+        )
+
         queue_ctx.add_step("offer_transfer") \
             .add_section("Goal",
-                "Ask the caller which they want, using THESE WORDS, changing "
-                "nothing but the department name:\n"
-                f'  "Would you like to speak with someone on our '
-                f'{display.lower()} team - that might mean a short wait - or "'
-                '"would you like our automated assistant to start helping you '
-                'right now?"\n'
-                "Do not paraphrase it and do not substitute the words 'human '"
-                "'specialist' or 'AI assistant'. Naming the options that way "
-                "tells a first-time caller nothing, and describing them loosely "
-                "was not enough - the model paraphrased straight back into the "
-                "jargon and live callers said so: 'Not understanding the "
-                "difference between human and AI help'. A caller who picks by "
-                "guessing is a misroute that has not happened yet. Never offer "
-                "just one of the two - a caller saying 'yes' to a single option "
-                "is how misroutes happen.") \
+                "Ask the caller which they want, in these exact words, "
+                "changing nothing:\n"
+                f'  "{choice_question}"\n'
+                "Do not paraphrase it, and do not fall back on the phrases "
+                "'human specialist' or 'AI assistant'. Naming the options "
+                "that way tells a first-time caller nothing, and describing "
+                "them loosely was not enough - the model paraphrased straight "
+                "back into the jargon and live callers said so in as many "
+                "words: \"I didn't understand the difference between human "
+                "and AI help\". A caller who picks by guessing is a misroute "
+                "that has not happened yet. Never offer just one of the two - "
+                "a caller saying 'yes' to a single option is how misroutes "
+                "happen.") \
             .add_section("Handling Questions",
                 "If they ask you a question about their issue, acknowledge it and "
                 "let them know a specialist can help with that. Then offer the transfer options.") \

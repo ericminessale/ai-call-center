@@ -53,10 +53,11 @@
   ],
   "assertions": [
     {
-      "label": "the caller returned a structured verdict",
+      "label": "OBSERVABILITY: the caller returned a structured verdict",
       "target": "verdict1.parsed",
       "op": "truthy",
-      "level": "hard"
+      "level": "soft",
+      "_comment": "OBSERVABILITY, deliberately soft. A missing verdict means the test could not OBSERVE the call, not that the product failed it. The platform's post-prompt on the caller-bot leg returns 'There was an problem getting a response.' intermittently (seen 2026-08-20 at 52 turns and 2026-08-21 at 25 turns, so it is not simply length). On the 2026-08-21 occurrence the product side of that same call was demonstrably fine - tool_call_names route_to_department, transfer_to_human; queue_id support; status assigned - so failing the suite on it would be blaming this codebase for a platform hiccup. The product-side hard assertions still gate the run (a transcript must exist and a handoff must have fired, so a call that never happened still fails), and run_suite.py reports no-verdict runs separately and excludes them from the friction tally, so the gap stays visible."
     },
     {
       "label": "the agent's side of the call was captured",

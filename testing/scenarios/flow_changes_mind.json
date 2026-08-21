@@ -63,16 +63,28 @@
       "level": "hard"
     },
     {
-      "label": "CORE: the caller was not left in a dead end",
+      "label": "HARD BAR: the caller was actually handed on out of triage",
+      "_comment": "OBJECTIVE, and it replaced a hard assertion on verdict1.parsed.reached. That was measuring the caller's PERCEPTION of a handoff the product deliberately conceals: main_agent.py:2960 - 'change_context must NOT reveal routing ... the department shift is the same persona and voice'. A live caller who was genuinely transferred to the AI specialist (tool_call_names: transfer_to_ai_specialist, then MCP order lookups) reported 'still_with_receptionist', which is the CORRECT perception of a seamless handoff and a false failure. Persisted ai_tool_call rows say whether a handoff happened; they also outlive an AI-only call. `reached` is kept as a soft signal so the perception stays visible.",
+      "target": "report1.tool_call_names",
+      "op": "contains_any",
+      "value": [
+        "transfer_to_ai_specialist",
+        "transfer_to_human",
+        "escalate_to_human"
+      ],
+      "level": "hard"
+    },
+    {
+      "label": "the caller's own sense of where they ended up",
       "target": "verdict1.parsed.reached",
       "op": "contains_any",
       "value": [
-        "ai_specialist",
         "human",
         "human_queue",
+        "ai_specialist",
         "callback"
       ],
-      "level": "hard"
+      "level": "soft"
     },
     {
       "label": "the caller ended up where they FINALLY asked, not where they first asked",

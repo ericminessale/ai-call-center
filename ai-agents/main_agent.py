@@ -2522,7 +2522,14 @@ def configure_triage_queues(agent, queues, caller=None):
                 "ALREADY told you an answer earlier in this call, submit that "
                 "answer instead of asking the question again. If they ask for a "
                 "person at any point, stop asking and transfer them - the "
-                "details are a convenience, never a toll gate."))
+                "person at any point, stop asking and transfer them - the "
+                "details are a convenience, never a toll gate. And if the "
+                "caller cannot or will not answer a question after TWO "
+                "attempts, submit 'not provided' as the answer and move on: "
+                "asking a third time strands callers who simply do not have "
+                "the information, which a live run proved by leaving one at "
+                "'nowhere' after the same question was put to them "
+                "repeatedly."))
         for question in intake:
             gather_step.add_gather_question(
                 key=question['key'],
@@ -2537,18 +2544,21 @@ def configure_triage_queues(agent, queues, caller=None):
         # Step 2: Offer transfer choice
         queue_ctx.add_step("offer_transfer") \
             .add_section("Goal",
-                "Offer BOTH options in ONE short question, and describe them by "
-                "what they MEAN for the caller rather than by what they are "
-                f"called: someone on our {display.lower()} team, which may mean "
-                "a short wait, or our automated assistant, which can start "
-                "helping straight away. Naming the options is not enough - "
-                "'a human specialist or our AI assistant' is meaningless to "
-                "someone hearing it for the first time, and live callers said so "
-                "in as many words ('Not knowing the options available', 'I was "
-                "unsure about the options and had to ask for clarification'). A "
-                "caller who picks by guessing is a misroute that has not happened "
-                "yet. Never offer just one of them - a caller saying 'yes' to a "
-                "single option is how misroutes happen. Let them choose.") \
+                "Ask the caller which they want, using THESE WORDS, changing "
+                "nothing but the department name:\n"
+                f'  "Would you like to speak with someone on our '
+                f'{display.lower()} team - that might mean a short wait - or "'
+                '"would you like our automated assistant to start helping you '
+                'right now?"\n'
+                "Do not paraphrase it and do not substitute the words 'human '"
+                "'specialist' or 'AI assistant'. Naming the options that way "
+                "tells a first-time caller nothing, and describing them loosely "
+                "was not enough - the model paraphrased straight back into the "
+                "jargon and live callers said so: 'Not understanding the "
+                "difference between human and AI help'. A caller who picks by "
+                "guessing is a misroute that has not happened yet. Never offer "
+                "just one of the two - a caller saying 'yes' to a single option "
+                "is how misroutes happen.") \
             .add_section("Handling Questions",
                 "If they ask you a question about their issue, acknowledge it and "
                 "let them know a specialist can help with that. Then offer the transfer options.") \

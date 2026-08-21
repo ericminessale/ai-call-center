@@ -90,6 +90,12 @@ def report(results: list) -> int:
             state = 'NO ARTIFACTS'
         elif hard:
             state = f'DEAD END ({len(hard)} hard)'
+        elif not res['verdict']:
+            # Without a verdict every friction assertion resolves to None and
+            # "fails", so the soft count is meaningless here. It read
+            # "got through, 11 friction" on a call whose post-prompt had simply
+            # errored, which invited exactly the wrong conclusion.
+            state = 'NO VERDICT (post-prompt failed; friction unobservable)'
         elif soft:
             state = f'got through, {len(soft)} friction'
         else:

@@ -2230,6 +2230,22 @@ _DEFAULT_INTAKE = [
 # talk its way out of.
 _INTAKE_ESCAPES = ["transfer_to_human", "transfer_to_ai_specialist"]
 
+# Appended to every intake question. Intake is a convenience for whoever picks
+# up, never a precondition for being helped - but the model does not infer that,
+# and a live caller who could not find their account number was told "I won't be
+# able to assist with your charge issue", pointed at customer service, and given
+# an invented number (+1 202 555 1234).
+#
+# It goes here, in the per-question prompt, and not in the gather preamble. The
+# preamble already carried a submit-'not provided' rule and was ignored; what
+# the model acts on is the instruction injected alongside each question.
+_INTAKE_OPTIONAL_NOTE = (
+    "This answer is OPTIONAL. If the caller does not have it, cannot find it, or "
+    "would rather not say, submit 'not provided' and move straight on. Never "
+    "tell the caller you cannot help without it, and never send them anywhere "
+    "else - you are already the place that helps them."
+)
+
 
 def configure_triage_queues(agent, queues, caller=None):
     """(Re)build everything queue-shaped on a triage agent.
@@ -2480,7 +2496,18 @@ def configure_triage_queues(agent, queues, caller=None):
         queue_ctx = contexts.add_context(slug) \
             .set_consolidate(True)
 
-        queue_ctx.add_section("Context",
+        queue_ctx.add_section("You Are The Help, And You Never Invent Contacts",
+            "You are the call centre. Do not tell the caller to ring another "
+            "number, contact customer service, use a website, or come back "
+            "later: whatever they need is reachable from this call, through a "
+            "person or the assistant, and sending them away is a dead end "
+            "dressed up as help. NEVER say a phone number, email address or URL "
+            "that has not been given to you in this conversation or in your "
+            "knowledge - a live call ended with an invented customer service "
+            "number read out to a caller who then hung up, which is the same "
+            "class of failure as quoting a product that does not exist. If you "
+            "genuinely cannot resolve something, hand them to a person instead.") \
+            .add_section("Context",
             f"The caller needs {display.lower()} help. You still have their name and "
             "what they told you from the greeting. Use it naturally.")
 
@@ -2536,6 +2563,7 @@ def configure_triage_queues(agent, queues, caller=None):
                 question=question['question'],
                 type=question.get('type', 'string'),
                 confirm=question.get('confirm', False),
+                prompt=_INTAKE_OPTIONAL_NOTE,
                 functions=_INTAKE_ESCAPES)
         gather_step.set_valid_steps(["offer_transfer"])
         gather_step.set_functions(["report_sentiment", "route_to_department",

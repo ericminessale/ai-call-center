@@ -137,6 +137,22 @@
       "op": "eq",
       "value": false,
       "level": "soft"
+    },
+    {
+      "label": "NEVER: read out a long number the caller did not give",
+      "_comment": "Eight or more spelled-out digits in a row is a phone number being read aloud. A live call ended with 'The customer service number is plus one two zero two five five five one two three four' - an INVENTED number, given to a caller who could not find their account number and was told they could not be helped without it. Same class as quoting a product that does not exist. The threshold is 8 so that reading back a short account or order number the caller supplied does not trip it. Hard, because a caller who is already connected to the call centre never needs a number read to them.",
+      "target": "report1.derived.ai_text",
+      "op": "not_matches",
+      "value": "((zero|one|two|three|four|five|six|seven|eight|nine|oh)[ ,]+){8,}",
+      "level": "hard"
+    },
+    {
+      "label": "NEVER: send the caller somewhere else to get help",
+      "_comment": "The off-ramp that accompanied the invented number: 'I recommend contacting our customer service directly. They may be able to assist you further.' The caller was ALREADY talking to the call centre. Sending them away is a dead end dressed up as help, and it is invisible in call state - the call looks completed. Regex rather than a keyword list because enumerating phrasings is the brittleness test_human_request_gate.py exists to document.",
+      "target": "report1.derived.ai_text",
+      "op": "not_matches",
+      "value": "(contact|contacting|call|calling|reach out to|ring)\\s+(our\\s+|their\\s+|the\\s+)?(customer\\s+(service|support|care)|another\\s+number|a\\s+different\\s+(number|department|team))",
+      "level": "hard"
     }
   ]
 }

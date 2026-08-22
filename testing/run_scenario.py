@@ -183,6 +183,18 @@ def seed_agents(cfg: Config, scenario: dict, workspace_id) -> list:
             f"/{q.get('language_wait_seconds')}s "
             f"hold cap {q.get('max_wait_before_ai_fallback')}s")
 
+    contact_cfg = (scenario.get('setup') or {}).get('contact')
+    if contact_cfg:
+        body = dict(contact_cfg)
+        body['workspace_id'] = workspace_id
+        body.setdefault('phone', cfg.test_number)
+        r = internal_post(cfg, '/api/testing/seed-contact', json=body)
+        if r.status_code != 200:
+            die(f"seed-contact failed ({r.status_code}): {r.text[:200]}")
+        info = r.json()
+        log(f"seeded contact {info['phone']} "
+            f"language={info.get('preferred_language')}")
+
     seeds = (scenario.get('setup') or {}).get('agents') or []
     if not seeds:
         return []

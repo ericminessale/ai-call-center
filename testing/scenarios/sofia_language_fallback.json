@@ -49,7 +49,12 @@
         "queue_slug": "billing",
         "status": "available"
       }
-    ]
+    ],
+    "contact": {
+      "preferred_language": "es-ES",
+      "first_name": "Sof\u00eda"
+    },
+    "_contact_comment": "Seeds the caller as a Spanish speaker we already know. A FIRST-TIME Spanish caller is transcribed with en-US ASR and the platform has no auto-detect, so triage receives \"Me interesan sus productos\" as \"Means her essence is productive\" and the call dies before the language-fallback chain this scenario exists to test. Contact.preferred_language makes the call OPEN in Spanish, which is what the product already does for a known caller. The ASR limitation is recorded in PLATFORM_ISSUES.md rather than hidden by this."
   },
   "missions": [
     {

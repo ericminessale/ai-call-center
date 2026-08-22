@@ -371,6 +371,71 @@ def seed_agent():
         })
 
 
+@harness_bp.route('/seed-contact', methods=['POST'])
+@require_internal_auth
+def seed_contact():
+    """Give the caller a KNOWN language before the call is placed.
+
+    sofia needs a Spanish speaker whom triage can actually understand. A
+    first-time Spanish caller is transcribed with en-US ASR and the platform
+    has no auto-detect, so the words arrive mangled ("persona por favor" ->
+    "persona for Favor") and the call dies before the language-fallback chain
+    it is testing begins. Contact.preferred_language makes the call open in
+    that language, which is exactly what the product does for a caller it has
+    met before.
+
+    Body:
+        workspace_id:       run's demo workspace (public uuid or integer pk)
+        phone:              caller number to seed
+        preferred_language: BCP-47 code, e.g. 'es-ES'
+        first_name:         optional
+    """
+    from app import db
+    from app.models import Contact
+    from app.tenancy import workspace_context
+
+    data = request.get_json(silent=True) or {}
+    raw_workspace = data.get('workspace_id')
+    phone = (data.get('phone') or '').strip()
+    language = (data.get('preferred_language') or '').strip()
+    if not raw_workspace or not phone:
+        return jsonify({'error': 'workspace_id and phone are required'}), 400
+
+    workspace_id = raw_workspace
+    if not isinstance(raw_workspace, int) and not str(raw_workspace).isdigit():
+        from app.services.workspace_session import resolve_workspace_id
+        workspace_id = resolve_workspace_id(str(raw_workspace))
+        if workspace_id is None:
+            return jsonify({'error': f'unknown workspace {raw_workspace!r}'}), 404
+    else:
+        workspace_id = int(raw_workspace)
+
+    normalised = phone if phone.startswith('+') else '+' + phone.lstrip('+')
+    with workspace_context(None):
+        contact = Contact.query.filter(
+            Contact.workspace_id == workspace_id,
+            Contact.phone.in_([phone, normalised]),
+        ).first()
+        if contact is None:
+            contact = Contact(workspace_id=workspace_id, phone=normalised)
+            db.session.add(contact)
+        if language:
+            contact.preferred_language = language
+        if data.get('first_name'):
+            contact.first_name = data['first_name']
+        db.session.commit()
+        logger.info(
+            'seed-contact: %s language=%s in workspace %s',
+            normalised, language or '(unchanged)', workspace_id,
+        )
+        return jsonify({
+            'contact_id': contact.id,
+            'phone': contact.phone,
+            'preferred_language': contact.preferred_language,
+            'first_name': contact.first_name,
+        })
+
+
 @harness_bp.route('/call-report', methods=['GET'])
 @require_internal_auth
 def call_report():

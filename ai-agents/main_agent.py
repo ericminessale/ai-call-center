@@ -2952,6 +2952,35 @@ class CallCenterAgent(AgentBase):
             context_data['customer_name'] = self._clean_customer_name(
                 context_data['customer_name'])
 
+        # The department must name a queue that EXISTS. route_to_department
+        # validates its argument against the live queue map; the transfer tools
+        # did not, and passed whatever the model said into the /route URL. A
+        # Spanish-speaking caller had the model translate the department name and
+        # was queued to "ventas" in a workspace whose queues are sales, support
+        # and billing - so no agent could ever be selected, the call sat in
+        # waiting, and needs_translation was never set because that happens at
+        # dispatch. The caller waited for someone who could not exist.
+        #
+        # routed_department is authoritative: route_to_department already
+        # validated it. A model-supplied slug is honoured only if it names a
+        # live queue.
+        queue_map = getattr(self, '_queue_ai_map', {}) or {}
+        requested = (department or '').strip().lower()
+        if queue_map and requested not in queue_map:
+            fallback = (global_data.get('routed_department')
+                        or global_data.get('department') or '').strip().lower()
+            if fallback not in queue_map:
+                fallback = next(
+                    (cand for cand in queue_map if cand in requested), '')
+            if fallback not in queue_map:
+                fallback = next(iter(queue_map))
+            print(
+                f"transfer: department {requested!r} is not a live queue "
+                f"({sorted(queue_map)}) - using {fallback!r}",
+                flush=True,
+            )
+            department = fallback
+
         # Standard fields every queue transfer includes.
         context_data.setdefault('department', department)
         context_data.setdefault('preferred_handling', 'human')

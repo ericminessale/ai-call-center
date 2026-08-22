@@ -40,7 +40,7 @@
         "transcript": true
       },
       "temperature": 0.7,
-      "max_call_s": 300,
+      "max_call_s": 240,
       "answer_as_agent": {
         "name": "flow-agent",
         "wait_seconds": 90

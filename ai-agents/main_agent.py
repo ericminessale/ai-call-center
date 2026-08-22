@@ -2610,6 +2610,14 @@ def configure_triage_queues(agent, queues, caller=None):
                                    "set_caller_language"] + _INTAKE_ESCAPES)
 
         # Step 2: Offer transfer choice
+        # KEEP THIS SHORT. It was briefly extended with "which can answer
+        # questions and look things up for you" to preempt callers asking what
+        # the automated option does. On voice that split the question across
+        # several TTS turns, a caller talked over it, and the fragment that
+        # arrived named no option - so the unclear-answer rule sent someone who
+        # had asked for a person to the assistant instead (oskar_no_name,
+        # 2026-08-22). Comprehension is handled by the "If They Ask What The
+        # Options Mean" section below; length is not free.
         # The exact words the caller hears, lifted out of the chained call so
         # the quoting stays legible. An earlier inlined version rendered as
         #   ... - that might mean a short wait - or ""would you like ...
@@ -2622,8 +2630,7 @@ def configure_triage_queues(agent, queues, caller=None):
         choice_question = (
             f"Would you like to speak with someone on our {display.lower()} "
             "team - that might mean a short wait - or would you like our "
-            "automated assistant, which can answer questions and look "
-            "things up for you, to start helping you right now?"
+            "automated assistant to start helping you right now?"
         )
 
         # Criterion is the MODEL's action, not the caller's. It used to read
@@ -3230,9 +3237,8 @@ class CallCenterTriageAgent(CallCenterAgent):
         team = f"our {department} team" if department else "our team"
         result = FunctionResult(
             f"Would you like to speak with someone on {team} - that might "
-            "mean a short wait - or would you like our automated assistant, "
-            "which can answer questions and look things up for you, to "
-            "start helping you right now?"
+            "mean a short wait - or would you like our automated assistant "
+            "to start helping you right now?"
         )
         result.update_global_data({'offer_gate_bounced': True})
         return result

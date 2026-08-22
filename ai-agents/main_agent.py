@@ -2622,7 +2622,8 @@ def configure_triage_queues(agent, queues, caller=None):
         choice_question = (
             f"Would you like to speak with someone on our {display.lower()} "
             "team - that might mean a short wait - or would you like our "
-            "automated assistant to start helping you right now?"
+            "automated assistant, which can answer questions and look "
+            "things up for you, to start helping you right now?"
         )
 
         # Criterion is the MODEL's action, not the caller's. It used to read
@@ -2666,6 +2667,17 @@ def configure_triage_queues(agent, queues, caller=None):
                 "Enumerating never covers enough: a hesitant caller answering "
                 "in 'hmm' and 'sorry?' matched none of the listed cases, so "
                 "the model kept waiting for a choice that was never coming.") \
+            .add_section("If They Ask What The Options Mean",
+                "A caller who asks what either option is has asked a "
+                "question, not made a choice. Answer it in ONE plain "
+                "sentence - a person is one of our team and may involve a "
+                "short wait; the automated assistant answers straight away "
+                "and can still fetch a person later - then ask them to "
+                "choose. Do NOT transfer until they have chosen AFTER that "
+                "answer, even if their question mentioned one of the options "
+                "in passing: a live caller said 'I'd prefer a person, but "
+                "explain what the assistant does first' and was connected "
+                "mid-question, which answered nothing.") \
             .add_section("Never Narrate A Transfer You Have Not Made",
                 "Telling the caller you are connecting them is not connecting "
                 "them. A live call ended with fifteen consecutive turns of "
@@ -3167,7 +3179,7 @@ class CallCenterTriageAgent(CallCenterAgent):
     # A fragment of the mandated choice question. Matching on the tail avoids
     # depending on the department name, which varies per queue.
     _OFFER_MARKERS = (
-        "automated assistant to start helping",
+        "to start helping you right now",
         "speak with someone on our",
     )
 
@@ -3209,8 +3221,9 @@ class CallCenterTriageAgent(CallCenterAgent):
         team = f"our {department} team" if department else "our team"
         result = FunctionResult(
             f"Would you like to speak with someone on {team} - that might "
-            "mean a short wait - or would you like our automated assistant "
-            "to start helping you right now?"
+            "mean a short wait - or would you like our automated assistant, "
+            "which can answer questions and look things up for you, to "
+            "start helping you right now?"
         )
         result.update_global_data({'offer_gate_bounced': True})
         return result

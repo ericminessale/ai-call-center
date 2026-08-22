@@ -2873,6 +2873,35 @@ class CallCenterAgent(AgentBase):
         # SDK's inner check avoids a double prompt without removing real auth.
         return True
 
+    def _add_no_contacts_rule(self):
+        """Never say a phone number, email or URL. Every agent needs this.
+
+        Written once here because the same gap has now appeared three times:
+        a rule added to one agent's prompt, then hit in an agent that never
+        got it. never-redirect was in the queue contexts and failed in triage;
+        never-narrate was on offer_transfer and failed in triage; this one was
+        in triage and a SPECIALIST read the caller's own caller-ID back to
+        them at handoff ("Plus one two zero one nine seven one six one four
+        nine"). An earlier call invented a number outright.
+
+        Called explicitly by each agent rather than folded into __init__, so
+        a new agent missing it is greppable rather than silent.
+        """
+        self.prompt_add_section(
+            "Never Give Out A Number",
+            body=(
+                "NEVER say a phone number, email address or web address out "
+                "loud, for any reason. Not one from your global data, not the "
+                "caller's own number, not one you believe you know, and not "
+                "even when the caller asks you for one. If they ask for a "
+                "number to ring, tell them they do not need one: they are "
+                "already through to the people who can help, on this call.\n"
+                "Nor may you send them elsewhere - customer service, a "
+                "website, a different team, or back later. If you genuinely "
+                "cannot resolve something, hand them to a person instead."
+            ),
+        )
+
     def _transfer_to_human_queue(
         self,
         *,
@@ -3100,6 +3129,9 @@ class CallCenterTriageAgent(CallCenterAgent):
         # ============================================================
         # GLOBAL PROMPT - Personality and role boundaries
         # ============================================================
+        # Shared across every agent - see CallCenterAgent.
+        self._add_no_contacts_rule()
+
         self.prompt_add_section(
             "Role",
             "You are Sam, a warm and efficient call center receptionist. "
@@ -3626,6 +3658,9 @@ class SalesAISpecialist(CallCenterAgent):
         )
         self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
+        # Shared across every agent - see CallCenterAgent.
+        self._add_no_contacts_rule()
+
         self.prompt_add_section(
             "Role",
             "You are Alex, a consultative AI sales specialist. You listen first and recommend second. "
@@ -3801,6 +3836,9 @@ class SupportAISpecialist(CallCenterAgent):
         )
         self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
+        # Shared across every agent - see CallCenterAgent.
+        self._add_no_contacts_rule()
+
         self.prompt_add_section(
             "Role",
             "You are Jordan, a patient and methodical AI support specialist. "
@@ -3966,6 +4004,9 @@ class OutboundSalesAgent(CallCenterAgent):
         )
         self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
 
+        # Shared across every agent - see CallCenterAgent.
+        self._add_no_contacts_rule()
+
         self.prompt_add_section(
             "Role",
             "You are Alex, a warm and professional AI sales representative making an outbound call. "
@@ -4104,6 +4145,9 @@ class OutboundSupportAgent(CallCenterAgent):
             f'{WRAP_UP_POST_PROMPT_FIELDS}}}'
         )
         self.set_post_prompt_llm_params(temperature=0.1, top_p=0.9)
+
+        # Shared across every agent - see CallCenterAgent.
+        self._add_no_contacts_rule()
 
         self.prompt_add_section(
             "Role",

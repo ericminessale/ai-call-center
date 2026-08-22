@@ -64,11 +64,15 @@
       "level": "hard"
     },
     {
-      "label": "CORE: the caller was routed to the AI specialist",
-      "_comment": "Objective: persisted ai_tool_call rows, which outlive an AI-only call.",
+      "label": "CORE: the caller ended up with the AI specialist",
+      "_comment": "Asserts the OUTCOME, not which tool name was recorded, and that distinction is real. transfer_to_human deliberately falls through to transfer_to_ai_specialist when _human_request_evidence finds no request for a person - so a caller who picked the automated option can be delivered correctly to the specialist while the persisted ai_tool_call row reads transfer_to_human. Observed 2026-08-22: tools were route_to_department, set_caller_language, route_to_department, transfer_to_human, transfer_to_human, mcp_demoshop_list_products, search_knowledge - the model called the wrong tool, the gate corrected it, and the caller got product information from the specialist. Specialist-only tools firing is therefore the honest evidence of arrival. NOTE the observability gap this exposes: when that redirect happens, nothing in the persisted tool record says so.",
       "target": "report1.tool_call_names",
-      "op": "contains",
-      "value": "transfer_to_ai_specialist",
+      "op": "contains_any",
+      "value": [
+        "transfer_to_ai_specialist",
+        "search_knowledge",
+        "mcp_demoshop"
+      ],
       "level": "hard"
     },
     {

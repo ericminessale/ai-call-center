@@ -3164,6 +3164,50 @@ class CallCenterTriageAgent(CallCenterAgent):
     # set_caller_language lives on CallCenterAgent (base) — every agent can
     # record a language switch, not just triage.
 
+    # A fragment of the mandated choice question. Matching on the tail avoids
+    # depending on the department name, which varies per queue.
+    _OFFER_MARKERS = (
+        "automated assistant to start helping",
+        "speak with someone on our",
+    )
+
+    def _require_offer_made(self, raw_data):
+        """Gate the AI transfer on the caller having actually been ASKED.
+
+        offer_transfer's criteria is "you have called transfer_to_human or
+        transfer_to_ai_specialist", which the model can satisfy by simply
+        transferring - so nothing structural required the question to be put
+        first. Chat runs took engaged callers straight to the specialist with
+        no offer at all, because a caller asking "what options are available?"
+        reads as repeating their question, and the won't-choose rule treats
+        that as licence to transfer.
+
+        Reads the platform's own transcript (swaig_post_conversation puts
+        call_log in every tool payload) rather than trusting the model's
+        account of whether it asked. ONE bounce only, matching
+        _require_caller_language: a model that still refuses must not be able
+        to strand the caller mid-flow.
+        """
+        global_data = raw_data.get('global_data', {}) or {}
+        if global_data.get('offer_gate_bounced'):
+            return None
+        spoken = ' '.join(
+            str(entry.get('content') or '')
+            for entry in (raw_data.get('call_log') or [])
+            if entry.get('role') == 'assistant'
+        ).lower()
+        if any(marker in spoken for marker in self._OFFER_MARKERS):
+            return None
+        result = FunctionResult(
+            "OFFER_NOT_MADE: you have not actually asked this caller which "
+            "they want yet. Ask the choice question from your step "
+            "instructions, word for word, and wait for their answer before "
+            "calling this tool again. A caller asking what their options are "
+            "is asking to be told them, not asking to be transferred."
+        )
+        result.update_global_data({'offer_gate_bounced': True})
+        return result
+
     def _require_caller_language(self, raw_data):
         """One-shot PGI gate for the triage exit tools: no caller leaves
         triage without a recorded language.
@@ -3400,6 +3444,9 @@ class CallCenterTriageAgent(CallCenterAgent):
     )
     def transfer_to_ai_specialist(self, args, raw_data):
         """Transfer to AI specialist agent"""
+        offer_gate = self._require_offer_made(raw_data)
+        if offer_gate is not None:
+            return offer_gate
         gate = self._require_caller_language(raw_data)
         if gate is not None:
             return gate

@@ -5,12 +5,24 @@
     {
       "id": "maria-intro",
       "label": "call 1: Maria's first call, Spanish only",
-      "await": {"summary": true, "digest": true, "transcript": true},
+      "await": {
+        "summary": true,
+        "digest": true,
+        "transcript": true
+      },
       "temperature": 0.6,
       "max_call_s": 240,
       "languages": [
-        {"name": "Spanish", "code": "es-ES", "voice": "elevenlabs.rachel"},
-        {"name": "English", "code": "en-US", "voice": "elevenlabs.rachel"}
+        {
+          "name": "Spanish",
+          "code": "es-ES",
+          "voice": "elevenlabs.rachel"
+        },
+        {
+          "name": "English",
+          "code": "en-US",
+          "voice": "elevenlabs.rachel"
+        }
       ],
       "persona": "You are Maria Delgado, a small-business owner making a real phone call to a company's sales line for the first time. You speak ONLY Spanish on this call, every single utterance, regardless of what language the agent uses. You are the CALLER; wait for their greeting. Goals in order: (1) Introduce yourself early: 'Hola, soy Maria Delgado.' (2) Ask in Spanish what products they offer and what the most popular one costs. (3) If offered a choice between an AI specialist and a human agent, choose the AI specialist (in Spanish). If transferred, continue with the new agent. (4) Success = any substantive response about products or pricing, in any language. (5) Politely decline extras (callbacks, email) in Spanish. (6) Then thank them, say goodbye in Spanish, and immediately use the end_call function. HARD RULES: if the agent repeats essentially the same question or offer 3 times, or the call passes about 8 exchanges, say goodbye and use end_call. If put on hold, wait through at most two hold prompts, then say goodbye and use end_call. Style: natural, brief spoken Spanish; one question at a time. Never mention being an AI, a bot, or a test. Observe carefully what language the agent uses with you - you will report on it.",
       "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Keys exactly: mission (string, 'maria_intro'), goal_achieved (boolean), stated_name (boolean - did you introduce yourself as Maria Delgado), agent_spoke_spanish (boolean - did the agent conduct most of the conversation in Spanish), agent_switched_to_spanish (boolean - did the agent start in another language and then switch to Spanish), turns (integer), notes (short string in English)."
@@ -18,13 +30,24 @@
     {
       "id": "maria-return",
       "label": "call 2: Maria calls back (greeting-language memory)",
-      "await": {"summary": true, "transcript": true},
+      "await": {
+        "summary": true,
+        "transcript": true
+      },
       "pause_before_s": 8,
       "temperature": 0.5,
       "max_call_s": 240,
       "languages": [
-        {"name": "Spanish", "code": "es-ES", "voice": "elevenlabs.rachel"},
-        {"name": "English", "code": "en-US", "voice": "elevenlabs.rachel"}
+        {
+          "name": "Spanish",
+          "code": "es-ES",
+          "voice": "elevenlabs.rachel"
+        },
+        {
+          "name": "English",
+          "code": "en-US",
+          "voice": "elevenlabs.rachel"
+        }
       ],
       "persona": "You are Maria Delgado, calling the SAME company back a few minutes after your earlier Spanish-language call about product pricing. You speak ONLY Spanish. You are the CALLER; wait for their greeting and LISTEN CAREFULLY to which language their FIRST sentence is in - you will report it. Rules: (1) Open with only: 'Hola, buenas.' Do NOT give your name first. (2) If they use your name, confirm: 'Si, soy Maria.' (3) Ask one follow-up in Spanish: what was the price they mentioned before. (4) If they ask WHICH product, answer ONCE: 'el mas popular'. Never answer that a second time. (5) If offered a specialist, accept (in Spanish). (6) Once you get any substantive answer, thank them, say goodbye in Spanish, and immediately use the end_call function. MISSION-COMPLETE TRIGGERS - the moment ANY of these happens, say 'No importa, llamare mas tarde. Adios!' and immediately use end_call: (a) the agent promises to connect or transfer you for the SECOND time without a transfer happening, (b) the agent asks you to specify a product for the SECOND time after you answered, (c) you notice yourself about to repeat a question already asked twice, (d) a second hold prompt. Your observations are complete by then - ending the call is SUCCESS. Never mention being an AI or a test.",
       "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences, even if the call was cut off mid-conversation (report your best observations up to that point). Keys exactly: mission (string, 'maria_return'), greeted_in_spanish (boolean - was the agent's FIRST utterance to you in Spanish), greeted_by_name (boolean), referenced_prior_call (boolean - did they bring up your earlier call or its topic themselves), recognized_as_returning (boolean - MUST be true if greeted_in_spanish is true OR greeted_by_name is true OR referenced_prior_call is true; otherwise true only if they showed some other memory of you), goal_achieved (boolean), turns (integer), notes (short string in English)."
@@ -32,45 +55,113 @@
     {
       "id": "language-switch",
       "label": "call 3: mid-call English-to-Spanish switch",
-      "await": {"summary": true, "transcript": true},
+      "await": {
+        "summary": true,
+        "transcript": true
+      },
       "pause_before_s": 8,
       "temperature": 0.5,
       "max_call_s": 240,
       "languages": [
-        {"name": "English", "code": "en-US", "voice": "elevenlabs.rachel"},
-        {"name": "Spanish", "code": "es-ES", "voice": "elevenlabs.rachel"}
+        {
+          "name": "English",
+          "code": "en-US",
+          "voice": "elevenlabs.rachel"
+        },
+        {
+          "name": "Spanish",
+          "code": "es-ES",
+          "voice": "elevenlabs.rachel"
+        }
       ],
       "persona": "You are Maria Delgado, calling the SAME company a third time. This call is a language-switching test from your side. You are the CALLER; wait for their greeting. PHASE 1 (your first two turns): speak ONLY English, regardless of what language the agent greets you in - even if they open in Spanish, reply in English. Ask in English about their products. PHASE 2: on your third turn, say exactly: 'Actually - podemos continuar en espanol, por favor?' and from that moment speak ONLY Spanish for the rest of the call. Ask the price question again in Spanish. OBSERVE whether the agent follows you into Spanish or keeps speaking English - you will report this. After the switch, ask ONE question in Spanish and accept ANY answer, then thank them and say goodbye in Spanish and immediately use the end_call function. MISSION-COMPLETE TRIGGERS - the moment ANY of these happens, say goodbye (in whichever language) and immediately use end_call: (a) you got any answer to your post-switch Spanish question, (b) the agent has replied in English TWICE after your switch to Spanish - that IS your observation, mission complete, (c) the agent promises a transfer for the SECOND time without one happening, (d) a second hold prompt, (e) you notice yourself repeating a question already asked twice. Ending the call is SUCCESS, not failure. Never mention being an AI or a test.",
       "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences, even if the call was cut off mid-conversation (report your best observations up to that point). Keys exactly: mission (string, 'language_switch'), greeting_language (string - 'spanish', 'english', or 'other': the language of the agent's first sentence), agent_followed_switch (boolean - after you switched to Spanish, did the agent respond in Spanish), switch_was_seamless (boolean - the agent switched within one turn without asking for clarification), goal_achieved (boolean), turns (integer), notes (short string in English)."
     }
   ],
   "assertions": [
-    {"label": "call 1: bot returned a structured verdict",
-     "target": "verdict1.parsed", "op": "truthy", "level": "hard"},
-    {"label": "call 1: receptionist post-prompt landed (summary)",
-     "target": "report1.call.summary", "op": "truthy", "level": "hard"},
-    {"label": "call 1: caller-memory digest written",
-     "target": "report1.contact.interaction_digest", "op": "non_empty", "level": "hard"},
-    {"label": "call 1: call language captured as Spanish (set_caller_language)",
-     "target": "report1.call.caller_language", "op": "contains", "value": "es", "level": "hard"},
-    {"label": "call 2: bot returned a structured verdict",
-     "target": "verdict2.parsed", "op": "truthy", "level": "hard"},
-    {"label": "call 2: greeting opened in Spanish (stored-language memory)",
-     "target": "verdict2.parsed.greeted_in_spanish", "op": "eq", "value": true, "level": "hard"},
-    {"label": "call 3: bot returned a structured verdict",
-     "target": "verdict3.parsed", "op": "truthy", "level": "hard"},
-    {"label": "call 3: agent followed the mid-call switch into Spanish",
-     "target": "verdict3.parsed.agent_followed_switch", "op": "eq", "value": true, "level": "hard"},
-
-    {"label": "call 1: agent conducted the call in Spanish",
-     "target": "verdict1.parsed.agent_spoke_spanish", "op": "truthy", "level": "soft"},
-    {"label": "call 1: durable preferred_language seeded on the contact",
-     "target": "report1.contact.preferred_language", "op": "contains", "value": "es", "level": "soft"},
-    {"label": "call 2: recognized as returning (in Spanish context)",
-     "target": "verdict2.parsed.recognized_as_returning", "op": "truthy", "level": "soft"},
-    {"label": "call 3: switch was seamless (single turn, no clarification)",
-     "target": "verdict3.parsed.switch_was_seamless", "op": "truthy", "level": "soft"},
-    {"label": "call 3: call language updated after the switch",
-     "target": "report3.call.caller_language", "op": "contains", "value": "es", "level": "soft"}
+    {
+      "label": "call 1: bot returned a structured verdict",
+      "target": "verdict1.parsed",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "call 1: receptionist post-prompt landed (summary)",
+      "target": "report1.call.summary",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "the caller-memory digest was written (checked on call 2, after it settles)",
+      "target": "report2.contact.interaction_digest",
+      "op": "non_empty",
+      "level": "hard",
+      "_comment": "Targets report2, not report1, and that is not a weakening. The digest is written ASYNCHRONOUSLY after a call ends, and the runner polls report1 the moment call 1 stops - on 2026-08-22 it read [] there while the same contact held an 822-character digest minutes later, and call 2 recognised the caller by name, which is only possible if the memory existed. Asserting on call 1 tests the race, not the feature; asserting by call 2 tests that the digest is actually written and is available when the next call needs it, which is the property that matters."
+    },
+    {
+      "label": "call 1: call language captured as Spanish (set_caller_language)",
+      "target": "report1.call.caller_language",
+      "op": "contains",
+      "value": "es",
+      "level": "hard"
+    },
+    {
+      "label": "call 2: bot returned a structured verdict",
+      "target": "verdict2.parsed",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "call 2: greeting opened in Spanish (stored-language memory)",
+      "target": "verdict2.parsed.greeted_in_spanish",
+      "op": "eq",
+      "value": true,
+      "level": "hard"
+    },
+    {
+      "label": "call 3: bot returned a structured verdict",
+      "target": "verdict3.parsed",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "call 3: agent followed the mid-call switch into Spanish",
+      "target": "verdict3.parsed.agent_followed_switch",
+      "op": "eq",
+      "value": true,
+      "level": "hard"
+    },
+    {
+      "label": "call 1: agent conducted the call in Spanish",
+      "target": "verdict1.parsed.agent_spoke_spanish",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "call 1: durable preferred_language seeded on the contact",
+      "target": "report1.contact.preferred_language",
+      "op": "contains",
+      "value": "es",
+      "level": "soft"
+    },
+    {
+      "label": "call 2: recognized as returning (in Spanish context)",
+      "target": "verdict2.parsed.recognized_as_returning",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "call 3: switch was seamless (single turn, no clarification)",
+      "target": "verdict3.parsed.switch_was_seamless",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "call 3: call language updated after the switch",
+      "target": "report3.call.caller_language",
+      "op": "contains",
+      "value": "es",
+      "level": "soft"
+    }
   ]
 }

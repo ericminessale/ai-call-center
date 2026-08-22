@@ -13,7 +13,7 @@ adaptive:
   goal: >
     Start with the assistant, then get transferred to a real person.
   opening_message: "Hi, something I bought isn't working properly."
-  max_turns: 18
+  max_turns: 12
 
 eval_criteria:
   goal_description: "A caller can escalate from the assistant to a person"

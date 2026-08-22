@@ -3138,6 +3138,15 @@ class CallCenterTriageAgent(CallCenterAgent):
                 "cover triage, and a caller who stalled in the greeting was told "
                 "'I couldn't get the information needed to connect you, please "
                 "try again later or reach out through another method'."
+                "\n"
+                "And never narrate a handoff you have not performed. Saying "
+                "you are connecting someone does nothing on its own: name the "
+                "department you are ACTUALLY routing to, and only once the "
+                "tool call is going out in the same breath. A caller asking "
+                "for a department that does not exist was told repeatedly "
+                "that they were being connected to 'shipping' while the "
+                "routing tool had sent them to billing - the words and the "
+                "action disagreed, and neither reached them."
             ),
         )
 

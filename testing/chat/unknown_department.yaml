@@ -13,7 +13,7 @@ adaptive:
   goal: >
     Get to someone who can help about the missing parcel.
   opening_message: "Hello, can you put me through to your shipping department?"
-  max_turns: 16
+  max_turns: 10
 
 eval_criteria:
   goal_description: "A caller asking for a nonexistent department still gets somewhere"

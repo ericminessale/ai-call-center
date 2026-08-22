@@ -1,0 +1,7 @@
+name: callcenter_triage_c
+description: >
+  The two slowest branches, split out so they can run without competing for a
+  single foreground window against the local judge/tester models.
+scenarios:
+  - unknown_department.yaml
+  - escalates_from_assistant.yaml

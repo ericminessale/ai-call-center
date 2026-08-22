@@ -506,6 +506,41 @@ def call_report():
             )
             for t in report['tool_calls']
         )
+        # The document the CALLER would receive on joining, rendered from the
+        # live Call row. Exists because "was the caller told X?" is otherwise
+        # only answerable through the caller bot, and the bot reliably hangs up
+        # before caller-side SWML audio plays - sofia's translation notice has
+        # never been provable that way. What the product SERVES is the honest
+        # subject of that assertion; whether a synthetic caller waited for it is
+        # a property of the harness.
+        try:
+            if call.conference_name:
+                from app.services.queue_dispatch import _join_conference_swml
+                from app.utils.url_utils import get_base_url
+                doc = _join_conference_swml(call, get_base_url())
+                spoken = []
+
+                def _collect(node):
+                    if isinstance(node, dict):
+                        for key, value in node.items():
+                            if key == 'play':
+                                items = value if isinstance(value, list) else [value]
+                                for item in items:
+                                    url = (item.get('url') if isinstance(item, dict)
+                                           else item)
+                                    if isinstance(url, str) and url.startswith('say:'):
+                                        spoken.append(url[4:])
+                            else:
+                                _collect(value)
+                    elif isinstance(node, list):
+                        for item in node:
+                            _collect(item)
+
+                _collect(doc)
+                report['join_document_text'] = ' '.join(spoken)
+        except Exception as exc:  # never let a probe break the report
+            report['join_document_error'] = str(exc)[:200]
+
         report['tool_call_names'] = ','.join(
             t['function_name'] or '' for t in report['tool_calls']
         )

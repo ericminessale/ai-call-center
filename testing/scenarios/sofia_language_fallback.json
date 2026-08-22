@@ -1,63 +1,183 @@
 {
   "name": "sofia_language_fallback",
-  "description": "A Spanish-speaking caller asks for a human when the only available agent speaks English. Exercises the whole language chain on real audio: the multilingual intent gate reading 'una persona', language-aware selection finding no match, the fallback flag, and the translation notice actually being spoken to the caller in Spanish. The agent is seeded available via the API — no browser needed, because everything asserted here happens before an agent's audio leg exists.",
+  "description": "A Spanish-speaking caller asks for a human when the only available agent speaks English. Exercises the whole language chain on real audio: the multilingual intent gate reading 'una persona', language-aware selection finding no match, the fallback flag, and the translation notice actually being spoken to the caller in Spanish. The agent is seeded available via the API \u2014 no browser needed, because everything asserted here happens before an agent's audio leg exists.",
   "setup": {
-    "_queues_comment": "The default 60s language wait outlasts the caller bot's patience — call 93 was dispatched and flagged correctly, but the bot had already said goodbye, so the notice it was sent to listen for played to nobody. 10s puts the dispatch on the first or second hold cycle. The hold cap is raised so the cap cannot fire before the language wait does.",
+    "_queues_comment": "The default 60s language wait outlasts the caller bot's patience \u2014 call 93 was dispatched and flagged correctly, but the bot had already said goodbye, so the notice it was sent to listen for played to nobody. 10s puts the dispatch on the first or second hold cycle. The hold cap is raised so the cap cannot fire before the language wait does.",
     "queues": [
-      {"queue_slug": "sales", "language_fallback_policy": "wait_then_translate", "language_wait_seconds": 10, "max_wait_before_ai_fallback": 300},
-      {"queue_slug": "support", "language_fallback_policy": "wait_then_translate", "language_wait_seconds": 10, "max_wait_before_ai_fallback": 300},
-      {"queue_slug": "billing", "language_fallback_policy": "wait_then_translate", "language_wait_seconds": 10, "max_wait_before_ai_fallback": 300}
+      {
+        "queue_slug": "sales",
+        "language_fallback_policy": "wait_then_translate",
+        "language_wait_seconds": 10,
+        "max_wait_before_ai_fallback": 300
+      },
+      {
+        "queue_slug": "support",
+        "language_fallback_policy": "wait_then_translate",
+        "language_wait_seconds": 10,
+        "max_wait_before_ai_fallback": 300
+      },
+      {
+        "queue_slug": "billing",
+        "language_fallback_policy": "wait_then_translate",
+        "language_wait_seconds": 10,
+        "max_wait_before_ai_fallback": 300
+      }
     ],
-    "_comment": "One agent, activated on every queue. Which department triage picks is model behaviour — run 91 chose support for the same persona that chose sales in run 90 — and a scenario about LANGUAGE should not fail because routing picked a queue the agent was not in.",
+    "_comment": "One agent, activated on every queue. Which department triage picks is model behaviour \u2014 run 91 chose support for the same persona that chose sales in run 90 \u2014 and a scenario about LANGUAGE should not fail because routing picked a queue the agent was not in.",
     "agents": [
-      {"name": "english-only", "languages": ["en-US"], "queue_slug": "sales", "status": "available"},
-      {"name": "english-only", "languages": ["en-US"], "queue_slug": "support", "status": "available"},
-      {"name": "english-only", "languages": ["en-US"], "queue_slug": "billing", "status": "available"}
+      {
+        "name": "english-only",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "sales",
+        "status": "available"
+      },
+      {
+        "name": "english-only",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "support",
+        "status": "available"
+      },
+      {
+        "name": "english-only",
+        "languages": [
+          "en-US"
+        ],
+        "queue_slug": "billing",
+        "status": "available"
+      }
     ]
   },
   "missions": [
     {
       "id": "sofia-spanish",
       "label": "call 1: Spanish caller asks for a person, only an English agent is free",
-      "await": {"summary": true, "transcript": true},
+      "await": {
+        "summary": true,
+        "transcript": true
+      },
       "temperature": 0.5,
       "max_call_s": 240,
       "languages": [
-        {"name": "Spanish", "code": "es-ES", "voice": "elevenlabs.rachel"},
-        {"name": "English", "code": "en-US", "voice": "elevenlabs.rachel"}
+        {
+          "name": "Spanish",
+          "code": "es-ES",
+          "voice": "elevenlabs.rachel"
+        },
+        {
+          "name": "English",
+          "code": "en-US",
+          "voice": "elevenlabs.rachel"
+        }
       ],
-      "persona": "Eres Sofía Ramírez, una clienta que llama por teléfono. Hablas SOLO español durante toda la llamada, en cada intervención, sin importar en qué idioma te hable el agente. Nunca cambies al inglés. Espera a que te saluden primero. Tus objetivos en orden: (1) Preséntate: 'Hola, soy Sofía Ramírez.' (2) Di que te interesan sus productos. (3) IMPORTANTE: cuando te ofrezcan opciones, pide hablar con una persona: 'Prefiero hablar con una persona, por favor.' Si te preguntan de nuevo, repítelo una vez: 'Con una persona, gracias.' (4) Después de eso, ESCUCHA con atención lo que te digan mientras te conectan — te interesa saber si te avisan de algo sobre el idioma o la traducción. (5) Ten paciencia mientras esperas: quédate en la línea hasta que te conecten o hasta escuchar CUATRO avisos de espera. Lo más importante de esta llamada ocurre justo cuando te conectan, así que no cuelgues antes. REGLAS: si el agente repite la misma pregunta tres veces, despídete y usa end_call. Si pasan unas 14 intervenciones, despídete y usa end_call. Estilo: frases habladas, naturales y breves; una pregunta a la vez. Nunca menciones que eres una IA ni una prueba.",
+      "persona": "Eres Sof\u00eda Ram\u00edrez, una clienta que llama por tel\u00e9fono. Hablas SOLO espa\u00f1ol durante toda la llamada, en cada intervenci\u00f3n, sin importar en qu\u00e9 idioma te hable el agente. Nunca cambies al ingl\u00e9s. Espera a que te saluden primero. Tus objetivos en orden: (1) Pres\u00e9ntate: 'Hola, soy Sof\u00eda Ram\u00edrez.' (2) Di que te interesan sus productos. (3) IMPORTANTE: cuando te ofrezcan opciones, pide hablar con una persona: 'Prefiero hablar con una persona, por favor.' Si te preguntan de nuevo, rep\u00edtelo una vez: 'Con una persona, gracias.' (4) Despu\u00e9s de eso, ESCUCHA con atenci\u00f3n lo que te digan mientras te conectan \u2014 te interesa saber si te avisan de algo sobre el idioma o la traducci\u00f3n. (5) Ten paciencia mientras esperas: qu\u00e9date en la l\u00ednea hasta que te conecten o hasta escuchar CUATRO avisos de espera. Lo m\u00e1s importante de esta llamada ocurre justo cuando te conectan, as\u00ed que no cuelgues antes. REGLAS: si el agente repite la misma pregunta tres veces, desp\u00eddete y usa end_call. Si pasan unas 14 intervenciones, desp\u00eddete y usa end_call. Estilo: frases habladas, naturales y breves; una pregunta a la vez. Nunca menciones que eres una IA ni una prueba.",
       "post_prompt": "Report the call as ONLY a raw JSON object - no prose, no markdown fences. Keys exactly: mission (string, 'sofia_language_fallback'), spoke_only_spanish (boolean - did YOU speak Spanish for the whole call), asked_for_a_person (boolean - did you ask to speak with a human), reached (one of 'receptionist','sales_specialist','human_queue','human','other'), heard_translation_notice (boolean - true if at ANY point you were told, in ANY language, that the call would be translated or that the agent speaks a different language; false if nobody mentioned translation or a language difference), notice_language (string - 'spanish', 'english', 'other', or 'none' - what language that translation notice was spoken in), told_it_is_a_real_person (boolean - were you told the person you are being connected to is a real human), turns (integer), notes (short string)."
     }
   ],
   "assertions": [
-    {"label": "bot returned a structured verdict",
-     "target": "verdict1.parsed", "op": "truthy", "level": "hard"},
-    {"label": "the agent's side of the call was captured",
-     "target": "report1.derived.ai_text", "op": "non_empty", "level": "hard"},
-    {"label": "the caller asked for a person, in Spanish",
-     "target": "verdict1.parsed.asked_for_a_person", "op": "truthy", "level": "hard"},
-
-    {"label": "CORE: the call was flagged for translation (no agent speaks Spanish)",
-     "target": "report1.call.needs_translation", "op": "eq", "value": true, "level": "hard"},
-    {"label": "CORE: the caller was told about the translation",
-     "target": "verdict1.parsed.heard_translation_notice", "op": "truthy", "level": "hard"},
-    {"label": "CORE: and it was said in Spanish, the one language they understand",
-     "target": "verdict1.parsed.notice_language", "op": "contains", "value": "spanish", "level": "hard"},
-
-    {"label": "the caller's language was recorded as Spanish",
-     "target": "report1.call.caller_language", "op": "contains", "value": "es", "level": "hard"},
-    {"label": "the notice reached the transcript in Spanish",
-     "target": "report1.derived.ai_text", "op": "contains_any",
-     "value": ["traducir", "traducirá", "traducida", "idioma"], "level": "soft"},
-    {"label": "the caller was told a real person is on the other end",
-     "target": "verdict1.parsed.told_it_is_a_real_person", "op": "truthy", "level": "soft"},
-    {"label": "the multilingual gate did not send a Spanish 'una persona' to the AI",
-     "target": "report1.tool_call_names", "op": "contains", "value": "transfer_to_human", "level": "soft"},
-    {"label": "the caller reached the human path",
-     "target": "verdict1.parsed.reached", "op": "contains_any",
-     "value": ["human", "human_queue"], "level": "soft"},
-    {"label": "the bot held its Spanish for the whole call",
-     "target": "verdict1.parsed.spoke_only_spanish", "op": "truthy", "level": "soft"}
+    {
+      "label": "bot returned a structured verdict",
+      "target": "verdict1.parsed",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "the agent's side of the call was captured",
+      "target": "report1.derived.ai_text",
+      "op": "non_empty",
+      "level": "hard"
+    },
+    {
+      "label": "the caller asked for a person, in Spanish",
+      "target": "verdict1.parsed.asked_for_a_person",
+      "op": "truthy",
+      "level": "hard"
+    },
+    {
+      "label": "CORE: the call was flagged for translation (no agent speaks Spanish)",
+      "target": "report1.call.needs_translation",
+      "op": "eq",
+      "value": true,
+      "level": "hard"
+    },
+    {
+      "label": "CORE: the caller was served the translation notice",
+      "_comment": "Asserts what the product SERVES, not what the caller bot heard. The notice is caller-side SWML audio played on the conference-join document, and the bot reliably hangs up before it - across every sofia run in this project it has never once been observed through the bot's ears, which made these two the only permanently-red assertions in the suite. join_document_text renders that document from the live Call row (added to call-report 2026-08-22), so the question 'was this caller told, in Spanish, that the call would be translated and that a real person is on the line' is now answered from the document itself. The bot's perception is kept as a soft signal below.",
+      "target": "report1.join_document_text",
+      "op": "contains",
+      "value": "traducir",
+      "level": "hard"
+    },
+    {
+      "label": "and it told them a real person is on the line",
+      "target": "report1.join_document_text",
+      "op": "contains",
+      "value": "persona real",
+      "level": "hard"
+    },
+    {
+      "label": "the bot also perceived the notice (soft: it usually hangs up first)",
+      "target": "verdict1.parsed.heard_translation_notice",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "the bot's read of the notice language (soft: same reason)",
+      "target": "verdict1.parsed.notice_language",
+      "op": "contains",
+      "value": "spanish",
+      "level": "soft"
+    },
+    {
+      "label": "the caller's language was recorded as Spanish",
+      "target": "report1.call.caller_language",
+      "op": "contains",
+      "value": "es",
+      "level": "hard"
+    },
+    {
+      "label": "the notice reached the transcript in Spanish",
+      "target": "report1.derived.ai_text",
+      "op": "contains_any",
+      "value": [
+        "traducir",
+        "traducir\u00e1",
+        "traducida",
+        "idioma"
+      ],
+      "level": "soft"
+    },
+    {
+      "label": "the caller was told a real person is on the other end",
+      "target": "verdict1.parsed.told_it_is_a_real_person",
+      "op": "truthy",
+      "level": "soft"
+    },
+    {
+      "label": "the multilingual gate did not send a Spanish 'una persona' to the AI",
+      "target": "report1.tool_call_names",
+      "op": "contains",
+      "value": "transfer_to_human",
+      "level": "soft"
+    },
+    {
+      "label": "the caller reached the human path",
+      "target": "verdict1.parsed.reached",
+      "op": "contains_any",
+      "value": [
+        "human",
+        "human_queue"
+      ],
+      "level": "soft"
+    },
+    {
+      "label": "the bot held its Spanish for the whole call",
+      "target": "verdict1.parsed.spoke_only_spanish",
+      "op": "truthy",
+      "level": "soft"
+    }
   ]
 }

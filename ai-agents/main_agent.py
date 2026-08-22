@@ -3198,12 +3198,19 @@ class CallCenterTriageAgent(CallCenterAgent):
         ).lower()
         if any(marker in spoken for marker in self._OFFER_MARKERS):
             return None
+        # Ask it OURSELVES rather than instructing the model to. A
+        # FunctionResult response is spoken to the caller, so this guarantees
+        # the question is put, once, in the mandated words - the previous
+        # version returned an OFFER_NOT_MADE instruction, which the model
+        # acknowledged and then ignored, transferring on the retry that the
+        # one-bounce allowance grants it.
+        department = (global_data.get('department')
+                      or global_data.get('routed_department') or '').strip()
+        team = f"our {department} team" if department else "our team"
         result = FunctionResult(
-            "OFFER_NOT_MADE: you have not actually asked this caller which "
-            "they want yet. Ask the choice question from your step "
-            "instructions, word for word, and wait for their answer before "
-            "calling this tool again. A caller asking what their options are "
-            "is asking to be told them, not asking to be transferred."
+            f"Would you like to speak with someone on {team} - that might "
+            "mean a short wait - or would you like our automated assistant "
+            "to start helping you right now?"
         )
         result.update_global_data({'offer_gate_bounced': True})
         return result

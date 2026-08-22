@@ -13,11 +13,11 @@ adaptive:
   goal: >
     Understand what you are being offered before you choose.
   opening_message: "Hi, I'm having trouble with something I bought recently."
-  max_turns: 14
+  max_turns: 9
 
 eval_criteria:
   goal_description: "A first-time caller can understand the choice they are offered"
   pass_criteria: >
-    When the agent offers the choice, it describes what each option means for the caller - that one is a person and may involve a wait, and the other is automated and can start immediately - clearly enough that a non-technical first-time caller can choose without having to ask what it means.
+    When the agent offers the choice it describes what each option MEANS for the caller - that one is a person and may involve a wait, and the other is automated and can start immediately - rather than only naming them. If the caller still asks what the difference is, the agent explains it in plain language and the caller is then able to choose. NOTE FOR THE JUDGE: this persona is instructed to query anything it does not recognise, so a clarification question is expected and is NOT itself a failure; what matters is whether the offer described consequences and whether the answer left the caller able to decide.
   fail_criteria: >
-    The options are named only as jargon such as 'human specialist' or 'AI assistant' with no explanation of what that means for the caller, or the caller has to ask for clarification about what they are choosing between. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.
+    The options are named only as jargon such as 'human specialist' or 'AI assistant' with no explanation of what either means for the caller, or the caller is still unable to choose after asking for clarification, or the agent never puts the choice at all. The agent states ANY phone number, email address or web address (a live call read out an invented '+1 202 555 1234', and another read the caller's OWN number back as the support line). The agent tells the caller to contact customer service, call a different number, use a website, or come back later - the caller is already talking to the call centre. The agent claims to be connecting or transferring the caller without that actually being what happens next (a live call promised 'I'm still connecting you' fifteen times while calling no tool at all). The agent asks the same question more than twice.

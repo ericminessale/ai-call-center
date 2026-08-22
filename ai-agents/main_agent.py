@@ -2873,6 +2873,29 @@ class CallCenterAgent(AgentBase):
         # SDK's inner check avoids a double prompt without removing real auth.
         return True
 
+    @staticmethod
+    def _clean_customer_name(value):
+        """Drop a "name" that is really a phone number.
+
+        customer_name arrives from the MODEL's tool arguments, and a caller
+        who never gives a name leaves the model reaching for whatever looks
+        like an identifier - usually caller_id_number. It then reaches the
+        specialist as "Customer name: ..." and gets read aloud: a live call
+        opened with "Hello, plus one two zero one nine seven one six one four
+        nine."
+
+        Mirrors _usable_name in api/internal.py, which already guards the
+        inbound path; this guards the transfer path.
+        """
+        text = (value or '').strip()
+        if not text:
+            return ''
+        compact = text.replace(' ', '').replace('-', '').replace('.', '')
+        compact = compact.replace('(', '').replace(')', '')
+        if text.startswith('+') or compact.isdigit():
+            return ''
+        return text
+
     def _add_no_contacts_rule(self):
         """Never say a phone number, email or URL. Every agent needs this.
 
@@ -2922,6 +2945,12 @@ class CallCenterAgent(AgentBase):
         global_data = raw_data.get('global_data', {})
         conf = global_data.get('conf', '')
         call_db_id = global_data.get('call_db_id', '')
+
+        # A phone number is not a name. Sanitised here rather than at each
+        # call site because every transfer tool funnels through this method.
+        if context_data.get('customer_name'):
+            context_data['customer_name'] = self._clean_customer_name(
+                context_data['customer_name'])
 
         # Standard fields every queue transfer includes.
         context_data.setdefault('department', department)
